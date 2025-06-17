@@ -1,8 +1,8 @@
 # YaPodDataset Pipeline
 
-Полный пайплайн для обработки подкастов: от загрузки данных до обучения акустических моделей.
+A full pipeline for podcast processing.
 
-## Подготовка к запуску
+## Prerequisites
 
 ```bash
 sudo apt update && sudo apt install ffmpeg
@@ -11,89 +11,119 @@ cd yapoddataset
 bash create_envs.sh
 ```
 
-### Конфиг
+### Configuration
 
-Конфиг находится по пути `yapoddataset/configs/config.yaml`. В нем можно изменить все ключевые параметры.
+The configuration file is located at `yapoddataset/configs/config.yaml`. You can modify all key parameters there.
 
-**самые интересные параметры:**
+**Key Parameters:**
 
-- `podcasts_path` – путь, куда будут загружаться подкасты и где будет выполняться вся обработка.
-  - У каждого скрипта свой `podcasts_path`. Это позволяет избежать потери данных при аварийном завершении работы.
-  - К каждому скрипту прилагаются два `.sh` файла:
-    - `_yaml.sh` – позволяет перезапустить скрипт с измененными параметрами из конфига.
-    - `_args.sh` – позволяет запускать скрипт с параметрами, передаваемыми непосредственно в `.sh` файле.
+- `podcasts_path` – Path where podcasts will be downloaded and processed.
+  - Each script has its own `podcasts_path` to prevent data loss in case of a crash.
+  - Each script comes with two `.sh` files:
+    - `_yaml.sh` – Runs the script using parameters from the config.
+    - `_args.sh` – Runs the script with parameters passed directly in the `.sh` file.
 
-- `duration` – в `preprocess` определяет максимальную длину аудиофрагментов (например, `15` – значит, что все сегменты будут строго меньше 15 секунд).
+- `duration` – In `preprocess`, defines max length of audio segments (e.g., `15` means all segments will be strictly under 15 seconds).
 
-- `num_workers` – в `preprocess` задает количество параллельных процессов. (Для 4060Ti с 6 ГБ видеопамяти рекомендуется 1 процесс на 6 ГБ.)
+- `num_workers` – In `preprocess`, sets number of parallel processes.  
+  (For an RTX 4060 Ti with 6GB VRAM, 1 process per 6GB is recommended.)
 
-- `threshold` – в классификации спикеров рекомендуется оставить 0.8 (оптимальное значение, найденное экспериментально).
-  - Диапазон значений: от `0.6` до `0.9`.
-  - Меньшее значение – большее количество спикеров, большее значение – меньшее.
+- `threshold` – In speaker classification, recommended value is `0.8` (optimal value, found experimentally).
+  - Range: from `0.6` to `0.9`.
+  - Lower values result in more speakers detected; higher values in fewer.
 
-- `model_path` – путь к предобученной модели VoxBlink ResNet для классификации спикеров.
-  - [Список доступных моделей](https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md)
-  - Не скачивайте версию ONNX.
-  - Можно использовать собственный эмбеддер, изменив файл `yapoddataset/classification/emb/embeder.py`.
+- `model_path` – Path to the pre-trained VoxBlink ResNet model for speaker classification.
+  - [Available models list](https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md) 
+  - Do not use ONNX versions.
+  - You can use your own embedder by modifying `yapoddataset/classification/emb/embeder.py`.
 
-### MFA (Montreal Forced Aligner)
+## Models Location
 
-- `dataset` – по умолчанию используется `HighQuality`.
-- `num_workers` – рекомендуется указать половину доступных ядер процессора.
+All required models should be placed in the following directory:
 
-## Параметры окружения
+```
+models/
+```
 
-Создайте файл `.env` в корне проекта:
+Expected structure:
+
+```
+models/
+├── voxblink.../     # Speaker classification model
+│   └── ...
+└── nisqa_s.tar      # Audio quality assessment model
+```
+
+Make sure these directories and files are present before running any processing scripts.
+  
+## Environment Variables
+
+Create a `.env` file in the project root:
 
 ```ini
 HF_TOKEN=your_huggingface_token
 YANDEX_KEY=your_yandex_speechkit_key
 ```
 
-- `YANDEX_KEY` – необходим для скачивания датасетов.
-- `HF_TOKEN` – используется для определения количества спикеров.
+- `YANDEX_KEY` – Required for downloading datasets.
+- `HF_TOKEN` – Used for speaker count estimation.
 
-## Запуск пайплайна
+## Running the Pipeline
 
-### Базовый сценарий (BASE)
+### Basic Scenario (BASE)
 
 ```bash
 bash base.sh
 ```
 
-При запуске этого сценария:
-- Загружаются датасеты.
-- Аудио разбивается на семантические фрагменты.
-- Выполняется фильтрация по качеству.
-- Выполняется транскрибация для всех фрагментов.
-- Осуществляется разделение по спикерам.
+This scenario:
+- Downloads datasets
+- Splits audio into semantic chunks
+- Performs transcription of all segments
+- Segments by speaker
+- Applies phonemization
 
-Все метаданные сохраняются в `result.csv` в папке с подкастами.
+All metadata is saved in `result.csv` inside the podcasts folder.
 
-### Расширенный сценарий (PLUS)
+## Download Dataset Using Existing Metadata
 
-```bash
-bash plus.sh
+Before running, specify `parquet_path` and `podcasts_path`, as well as the desired podcasts in `configs/config.yaml` like this:
+
+```yaml 
+download:
+  podcasts_path: /home/nikita/podcasts_1
+  episodes_limit: 4
+  num_workers: 10
+  parquet_path: /home/nikita/podcasts_4/balalaika.parquet
+  podcasts_urls:  
+    - 'https://music.yandex.ru/album/21851634'      
+    - 'https://music.yandex.ru/album/32863444'      
+    - 'https://music.yandex.ru/album/30859840'      
+    - 'https://music.yandex.ru/album/18332051'      
 ```
 
-> **Важно!** Должен быть запущен **после** `base.sh`.
+Then run:
 
-- Эта часть кода отвечает за обучение MFA если она вам не нужна можете ее не использовать
+```bash
+bash use_meta.sh
+```
 
-## Важные замечания
+## Important Notes
 
-- **Все скрипты** необходимо запускать из корневой директории проекта.
-- Пути в конфигурационном файле **должны быть абсолютными**.
-- Скрипты обработки (`punctuation`, `accents`, `yofication`) должны выполняться **последовательно**.
-- Для работы требуются:
-  - API-ключ **Yandex Music** [Инструкция по получению](https://yandex-music.readthedocs.io/en/main/token.html).
-  - Токен **Hugging Face**.
+- All scripts must be executed from the **project root directory**.
+- Paths in the config file must be **absolute**.
+- The processing scripts (`punctuation`, `accents`, `yofication`) should be run **sequentially**.
+- You’ll need:
+  - Yandex Music API key ([How to get one](https://yandex-music.readthedocs.io/en/main/token.html)) 
+  - Hugging Face token
 
-## Используемые модели
+## Models Used
 
-- [NISQA](https://github.com/gabrielmittag/NISQA) – оценка качества аудио.
-- [GigaAM](https://github.com/salute-developers/GigaAM) – акустическая модель.
-- [ruAccent](https://github.com/Den4ikAI/ruaccent) – восстановление ударений.
-- [MFA](https://montreal-forced-aligner.readthedocs.io) – фонетическое выравнивание.
-- [VoxBlink ResNet](https://github.com/wenet-e2e/wespeaker) – классификация спикеров.
-
+- [NISQA](https://github.com/gabrielmittag/NISQA)  – Audio quality assessment.
+- [GigaAM](https://github.com/salute-developers/GigaAM)  – Acoustic model.
+- [ruAccent](https://github.com/Den4ikAI/ruaccent)  – Accent restoration.
+- [RUPynct](https://huggingface.co/RUPunct/RUPunct_big)  – Punctuation restoration.
+- [VoxBlink ResNet](https://github.com/wenet-e2e/wespeaker)  – Speaker classification.
+- [TryIPaG2P](https://github.com/NikiPshg/TryIPaG2P)  – Phonemization.
+- [Speaker Diarization](https://github.com/pyannote/pyannote-audio)  – Speaker diarization.
+- [Whisper](https://github.com/SYSTRAN/faster-whisper)  – ASR + segmentation.

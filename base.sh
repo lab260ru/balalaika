@@ -26,6 +26,7 @@ SCRIPTS=(
     "./src/yofication/yofication_yaml.sh"
     "./src/phonemizer/phonemizer_yaml.sh"
     "./src/classificaton/classification_yaml.sh"
+    "./src/collate_yamls.sh"
 )
 
 

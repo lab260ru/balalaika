@@ -1,7 +1,7 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Any, List, Dict
+from typing import Any, List
 import yaml
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
@@ -11,7 +11,7 @@ from loguru import logger
 from tryiparu import G2PModel
 from tqdm import tqdm
 
-from src.utils import get_txt_paths, load_config
+from src.utils import get_txt_paths, load_config, read_file_content
 
 g2p_model: Any = None
 
@@ -27,10 +27,8 @@ def process_text(text_path: Path) -> None:
     
     if output_path.exists():
         return
-        
-    with open(text_path, "r", encoding="utf-8") as f:
-        text = f.read().strip()
-        
+
+    text = read_file_content(text_path)    
     phonemes = g2p_model(text)
 
     with open(output_path, "w", encoding="utf-8") as f:

@@ -5,12 +5,11 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
-import yaml
 from loguru import logger
 from ruaccent import RUAccent
 from tqdm import tqdm
 
-from src.utils import load_config, get_txt_paths
+from src.utils import load_config, get_txt_paths, read_file_content
 
 accentizer = None
 
@@ -39,9 +38,8 @@ def process_file(path: Path) -> None:
         if new_path.exists():
             return
 
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read().strip()
-
+        text = read_file_content(path)
+        
         processed_text = accentizer.process_all(text)
         
         with open(new_path, "w", encoding="utf-8") as f:
@@ -51,8 +49,8 @@ def process_file(path: Path) -> None:
         logger.error(f"Error processing {path}: {e}")
         raise
 
-def get_txt_paths(path: str):
-    all_punct_paths = list(Path(path).rglob("*_punct.txt"))
+def get_valid_txt_paths(path: str):
+    all_punct_paths = get_txt_paths(path, "_punct.txt")
     valid_paths = []
 
     for punct_path in all_punct_paths:
@@ -79,14 +77,14 @@ def main(args):
         devices:{available_gpu_ids}
         """)
 
-    all_text_files = get_txt_paths(podcast_path)
+    valid_text_files = get_valid_txt_paths(podcast_path)
 
     files_for_each_gpu = [[] for _ in range(num_gpus)]
-    for i, path in enumerate(all_text_files):
+    for i, path in enumerate(valid_text_files):
         gpu_assignment_index = i % num_gpus
         files_for_each_gpu[gpu_assignment_index].append(path)
 
-    logger.info(f"Found {len(all_text_files)} files to process")
+    logger.info(f"Found {len(valid_text_files)} files to process")
 
     all_futures = []
     executors = []

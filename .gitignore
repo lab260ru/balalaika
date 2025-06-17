@@ -1,7 +1,6 @@
 *.csv
 *.mp3
 *.wav
-*.txt
 
 *.ipynb
 .env

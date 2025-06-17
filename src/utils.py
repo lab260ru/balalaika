@@ -1,17 +1,19 @@
 from pathlib import Path
 from typing import List
+import os
 import yaml
 from loguru import logger
 
 def load_config(config_path: str, process_name: str):
     config = {}
     if config_path is None or process_name is None:
+        logger.info("Configuration not provided. Parameters will be taken from argparse.")
         return config
-
     try:
         with open(config_path, 'r') as config_file:
             config = yaml.safe_load(config_file)
             config = config.get(process_name, {})
+            logger.info('Loaded parameters from config')
     except Exception as e:
         logger.error(f"Configuration loading error: {e}")
 
@@ -21,6 +23,12 @@ def load_config(config_path: str, process_name: str):
 def get_txt_paths(podcast_path: str, postfix: str) -> List[Path]:
     return list(Path(podcast_path).rglob(f"*{postfix}"))
 
+def read_file_content(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ''
 
 def get_audio_paths(podcast_path: str) -> List[Path]:
     podcast_path=Path(podcast_path)
@@ -30,7 +38,6 @@ def get_audio_paths(podcast_path: str) -> List[Path]:
         list(podcast_path.rglob("*.flac")) +
         list(podcast_path.rglob("*.ogg")) 
     )
-
 
 def process_token(token, label):
     if label == "LOWER_O":

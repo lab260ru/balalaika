@@ -9,7 +9,6 @@ import torch
 import torch.nn.functional as F
 from loguru import logger
 from tqdm import tqdm
-import yaml
 
 from emb.embeder import ResNetEmbedder
 from src.utils import load_config
@@ -288,7 +287,7 @@ def main(args):
     sc.merge_clusters()
     sc.assign_cluster_ids()
 
-    output_path = os.path.join(podcasts_path, 'clustering_result.csv')
+    output_path = os.path.join(podcasts_path, 'results.csv')
     sc.full_df.to_csv(output_path, index=False)
     logger.info(f"Clustered DataFrame saved to {output_path}")
 

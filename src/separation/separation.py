@@ -1,4 +1,3 @@
-# --- Стандартная библиотека ---
 import argparse
 import os
 import sys

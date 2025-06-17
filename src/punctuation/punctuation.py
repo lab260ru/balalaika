@@ -10,7 +10,7 @@ from loguru import logger
 from tqdm import tqdm
 from transformers import pipeline, AutoTokenizer
 
-from src.utils import load_config, get_audio_paths, process_token
+from src.utils import load_config, get_audio_paths, process_token, read_file_content
 
 model = None 
 
@@ -37,8 +37,7 @@ def make_punct_txt(
     path: Path
     ) -> None:
 
-    with open(path, "r", encoding="utf-8") as f:
-        src_text = f.read().strip()
+    src_text = read_file_content(path)
 
     punct_path = path.with_name(path.name.replace("_giga.txt", "_punct.txt"))
 

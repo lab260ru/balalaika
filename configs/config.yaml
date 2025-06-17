@@ -1,169 +1,13 @@
 download:
-  podcasts_path: /home/nikita/podcasts_4 
-  episodes_limit: 15
+  podcasts_path: /home/nikita/balalaika
+  episodes_limit: 4
   num_workers: 10
+  parquet_path: /home/nikita/balalaika/balalaika.parquet
   podcasts_urls:  
     - 'https://music.yandex.ru/album/21851634'   
-    - 'https://music.yandex.ru/album/32863444'   
-    - 'https://music.yandex.ru/album/30859840'   
-    - 'https://music.yandex.ru/album/18332051'   
-    - 'https://music.yandex.ru/album/32959994'   
-    - 'https://music.yandex.ru/album/22391094'   
-    - 'https://music.yandex.ru/album/22265729'   
-    - 'https://music.yandex.ru/album/24857516'   
-    - 'https://music.yandex.ru/album/22863978'   
-    - 'https://music.yandex.ru/album/21851495'   
-    - 'https://music.yandex.ru/album/28622371'   
-    - 'https://music.yandex.ru/album/33717842'   
-    - 'https://music.yandex.ru/album/25714256'   
-    - 'https://music.yandex.ru/album/22870289'   
-    - 'https://music.yandex.ru/album/27877383'   
-    - 'https://music.yandex.ru/album/24744659'   
-    - 'https://music.yandex.ru/album/22941317'   
-    - 'https://music.yandex.ru/album/24136869'   
-    - 'https://music.yandex.ru/album/33524904'   
-    - 'https://music.yandex.ru/album/23533439'   
-    - 'https://music.yandex.ru/album/18410464'   
-    - 'https://music.yandex.ru/album/18415577'   
-    - 'https://music.yandex.ru/album/28621252'   
-    - 'https://music.yandex.ru/album/24218474'   
-    - 'https://music.yandex.ru/album/33047349'   
-    - 'https://music.yandex.ru/album/26045722'   
-    - 'https://music.yandex.ru/album/28570749'   
-    - 'https://music.yandex.ru/album/32566883'   
-    - 'https://music.yandex.ru/album/30198807'   
-    - 'https://music.yandex.ru/album/31261180'   
-    - 'https://music.yandex.ru/album/32602856'   
-    - 'https://music.yandex.ru/album/29065398'   
-    - 'https://music.yandex.ru/album/25980412'   
-    - 'https://music.yandex.ru/album/17903098'   
-    - 'https://music.yandex.ru/album/22293467'   
-    - 'https://music.yandex.ru/album/33911723'   
-    - 'https://music.yandex.ru/album/13674065'   
-    - 'https://music.yandex.ru/album/27798647'   
-    - 'https://music.yandex.ru/album/33111708'   
-    - 'https://music.yandex.ru/album/25825516'   
-    - 'https://music.yandex.ru/album/28784774'   
-    - 'https://music.yandex.ru/album/30292585'   
-    - 'https://music.yandex.ru/album/13281767'   
-    - 'https://music.yandex.ru/album/29489720'   
-    - 'https://music.yandex.ru/album/25441583'   
-    - 'https://music.yandex.ru/album/32073380'   
-    - 'https://music.yandex.ru/album/29113159'   
-    - 'https://music.yandex.ru/album/26844544'   
-    - 'https://music.yandex.ru/album/32407118'
-    - 'https://music.yandex.ru/album/24995380'
-    - 'https://music.yandex.ru/album/24666714'
-    - 'https://music.yandex.ru/album/26429840'
-    - 'https://music.yandex.ru/album/26784450'
-    - 'https://music.yandex.ru/album/25652605'
-    - 'https://music.yandex.ru/album/24878026'
-    - 'https://music.yandex.ru/album/26638832'
-    - 'https://music.yandex.ru/album/25742129'
-    - 'https://music.yandex.ru/album/24601066'
-    - 'https://music.yandex.ru/album/25777536'
-    - 'https://music.yandex.ru/album/27029715'
-    - 'https://music.yandex.ru/album/26517637'
-    - 'https://music.yandex.ru/album/24996059'
-    - 'https://music.yandex.ru/album/25708311'
-    - 'https://music.yandex.ru/album/24968101'
-    - 'https://music.yandex.ru/album/25441583'
-    - 'https://music.yandex.ru/album/25798356'
-    - 'https://music.yandex.ru/album/25367750'
-    - 'https://music.yandex.ru/album/26762643'
-    - 'https://music.yandex.ru/album/26045811'
-    - 'https://music.yandex.ru/album/24956069'
-    - 'https://music.yandex.ru/album/25286382'
-    - 'https://music.yandex.ru/album/25786591'
-    - 'https://music.yandex.ru/album/27304622'
-    - 'https://music.yandex.ru/album/25973334'
-    - 'https://music.yandex.ru/album/26394965'
-    - 'https://music.yandex.ru/album/25825516'
-    - 'https://music.yandex.ru/album/24773100'
-    - 'https://music.yandex.ru/album/25492463'
-    - 'https://music.yandex.ru/album/25790009'
-    - 'https://music.yandex.ru/album/25587062'
-    - 'https://music.yandex.ru/album/35301297'
-    - 'https://music.yandex.ru/album/26865072'
-    - 'https://music.yandex.ru/album/25222100'
-    - 'https://music.yandex.ru/album/26457312'
-    - 'https://music.yandex.ru/album/26234123'
-    - 'https://music.yandex.ru/album/24993194'
-    - 'https://music.yandex.ru/album/30934921'
-    - 'https://music.yandex.ru/album/32602856'
-    - 'https://music.yandex.ru/album/31786621'
-    - 'https://music.yandex.ru/album/31439157'
-    - 'https://music.yandex.ru/album/30196357'
-    - 'https://music.yandex.ru/album/31307181'
-    - 'https://music.yandex.ru/album/31242447'
-    - 'https://music.yandex.ru/album/30110658'
-    - 'https://music.yandex.ru/album/33674942'
-    - 'https://music.yandex.ru/album/31261180'
-    - 'https://music.yandex.ru/album/28842475'
-    - 'https://music.yandex.ru/album/32914507'
-    - 'https://music.yandex.ru/album/29359174'
-    - 'https://music.yandex.ru/album/33305638'
-    - 'https://music.yandex.ru/album/31462322'
-    - 'https://music.yandex.ru/album/33447947'
-    - 'https://music.yandex.ru/album/32566883'
-    - 'https://music.yandex.ru/album/30292585'
-    - 'https://music.yandex.ru/album/29587891'
-    - 'https://music.yandex.ru/album/29070060'
-    - 'https://music.yandex.ru/album/29113159'
-    - 'https://music.yandex.ru/album/29815299'
-    - 'https://music.yandex.ru/album/29230920'
-    - 'https://music.yandex.ru/album/30198807'
-    - 'https://music.yandex.ru/album/32073380'
-    - 'https://music.yandex.ru/album/29489720'
-    - 'https://music.yandex.ru/album/31753219'
-    - 'https://music.yandex.ru/album/33334817'
-    - 'https://music.yandex.ru/album/29399392'
-    - 'https://music.yandex.ru/album/29958532'
-    - 'https://music.yandex.ru/album/29065398'
-    - 'https://music.yandex.ru/album/29550356'
-    - 'https://music.yandex.ru/album/30292933'
-    - 'https://music.yandex.ru/album/31538149'
-    - 'https://music.yandex.ru/album/29978747'
-    - 'https://music.yandex.ru/album/30546487'
-    - 'https://music.yandex.ru/album/20287938'
-    - 'https://music.yandex.ru/album/9310219'
-    - 'https://music.yandex.ru/album/6880204'
-    - 'https://music.yandex.ru/album/11002256'
-    - 'https://music.yandex.ru/album/6880222'
-    - 'https://music.yandex.ru/album/9444321'
-    - 'https://music.yandex.ru/album/18767784'
-    - 'https://music.yandex.ru/album/13818642'
-    - 'https://music.yandex.ru/album/24080684'
-    - 'https://music.yandex.ru/album/22267044'
-    - 'https://music.yandex.ru/album/11930969'
-    - 'https://music.yandex.ru/album/19760408'
-    - 'https://music.yandex.ru/album/10619065'
-    - 'https://music.yandex.ru/album/9294859'
-    - 'https://music.yandex.ru/album/10318106'
-    - 'https://music.yandex.ru/album/24601066'
-    - 'https://music.yandex.ru/album/15741932'
-    - 'https://music.yandex.ru/album/7447189'
-    - 'https://music.yandex.ru/album/9091989'
-    - 'https://music.yandex.ru/album/18837614'
-    - 'https://music.yandex.ru/album/17576341'
-    - 'https://music.yandex.ru/album/6408449'
-    - 'https://music.yandex.ru/album/16873809'
-    - 'https://music.yandex.ru/album/22141653'
-    - 'https://music.yandex.ru/album/29359174'
-    - 'https://music.yandex.ru/album/24956069'
-    - 'https://music.yandex.ru/album/22513954'
-    - 'https://music.yandex.ru/album/6368973'
-    - 'https://music.yandex.ru/album/33674942'
-    - 'https://music.yandex.ru/album/24237387'
-    - 'https://music.yandex.ru/album/25441583'
-    - 'https://music.yandex.ru/album/27962267'
-    - 'https://music.yandex.ru/album/13779940'
-    - 'https://music.yandex.ru/album/11700332'
-    - 'https://music.yandex.ru/album/13453463'
-    - 'https://music.yandex.ru/album/13674065' 
 
 preprocess:
-  podcasts_path: /home/nikita/podcasts_4 # full path to the folder where the podcasts are located 
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the podcasts are located 
   duration: 15
   device: 'cuda'
   num_workers: 2
@@ -172,7 +16,7 @@ preprocess:
   beam_size: 5
 
 separation:
-  podcasts_path: /home/nikita/podcasts_4 # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
   device: 'cuda'
   num_workers: 1
   use_nisqa: True 
@@ -181,31 +25,31 @@ separation:
   one_speaker: False
 
 transcription:
-  podcasts_path: /home/nikita/podcasts_4 # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
   model_name: "rnnt"  
   num_workers: 4 # per one gpu
 
 punctuation:
-  podcasts_path: /home/nikita/podcasts_4 # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
   model_name: "RUPunct/RUPunct_big"
   num_workers: 4 # per one gpu
 
 accent:
-  podcasts_path: /home/nikita/podcasts_4 # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
   num_workers: 4
   model_name: turbo3.1
   device: cuda
 
 yofication:
-  podcasts_path: /home/nikita/podcasts_4 # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
   num_workers: 2
 
 phonemizer:
-  podcasts_path: /home/nikita/podcasts_4 # full path to the folder where the text files are located
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the text files are located
   num_workers: 2 # per one gpu
 
 classification:
-  podcasts_path: /home/nikita/podcasts_4
+  podcasts_path: /home/nikita/balalaika
   threshold: 0.8
   device: cuda
   model_path: models/voxblink2_samresnet100_ft
