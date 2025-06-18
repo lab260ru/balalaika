@@ -13,5 +13,5 @@ activate_venv ".support_venv"
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 CONFIG_PATH="$SCRIPT_DIR/../../configs/config.yaml"
 
-python3 -m src.classificatoin.classificatoin \
+python3 -m src.classification.classification \
     --config "$CONFIG_PATH"

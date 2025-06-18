@@ -28,7 +28,7 @@ def process_text(text_path: Path) -> None:
     if output_path.exists():
         return
 
-    text = read_file_content(text_path)    
+    text = read_file_content(text_path)   
     phonemes = g2p_model(text)
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -43,7 +43,7 @@ def get_valid_text_paths(src_path: str) -> List[Path]:
         phonemes_path = e_path.with_name(f"{e_path.stem}_phonemes.txt")
         
         if not phonemes_path.exists():
-            valid_paths.append(phonemes_path.absolute())
+            valid_paths.append(e_path.absolute())
 
     return valid_paths
 

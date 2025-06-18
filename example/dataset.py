@@ -33,7 +33,7 @@ class BalalaikaDataset(Dataset):
             else:
                 continue
 
-        print(f"Найдено {len(self.valid_items)} совпадений между Parquet и аудиофайлами")
+        print(f"Found {len(self.valid_items)} matches between Parquet and audio files")
 
     def __len__(self):
         return len(self.valid_items)

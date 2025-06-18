@@ -1,10 +1,32 @@
 download:
   podcasts_path: /home/nikita/balalaika
-  episodes_limit: 4
+  episodes_limit: 5
   num_workers: 10
   parquet_path: /home/nikita/balalaika/balalaika.parquet
   podcasts_urls:  
     - 'https://music.yandex.ru/album/21851634'   
+    - 'https://music.yandex.ru/album/32863444'   
+    - 'https://music.yandex.ru/album/30859840'   
+    - 'https://music.yandex.ru/album/18332051'   
+    - 'https://music.yandex.ru/album/32959994'   
+    - 'https://music.yandex.ru/album/22391094'   
+    - 'https://music.yandex.ru/album/22265729'   
+    - 'https://music.yandex.ru/album/24857516'   
+    - 'https://music.yandex.ru/album/22863978'   
+    - 'https://music.yandex.ru/album/21851495'   
+    - 'https://music.yandex.ru/album/28622371'   
+    - 'https://music.yandex.ru/album/33717842'   
+    - 'https://music.yandex.ru/album/25714256'   
+    - 'https://music.yandex.ru/album/22870289'   
+    - 'https://music.yandex.ru/album/27877383'   
+    - 'https://music.yandex.ru/album/24744659'   
+    - 'https://music.yandex.ru/album/22941317'   
+    - 'https://music.yandex.ru/album/24136869'   
+    - 'https://music.yandex.ru/album/33524904'   
+    - 'https://music.yandex.ru/album/23533439'   
+    - 'https://music.yandex.ru/album/18410464'   
+    - 'https://music.yandex.ru/album/18415577'   
+    - 'https://music.yandex.ru/album/28621252'   
 
 preprocess:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the podcasts are located 
@@ -13,12 +35,12 @@ preprocess:
   num_workers: 2
   whisper_model: 'large-v3'
   compute_type: 'float16'
-  beam_size: 5
+  beam_size: 1
 
 separation:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
   device: 'cuda'
-  num_workers: 1
+  num_workers: 2
   use_nisqa: True 
   use_mono: True  
   nisqa_config: "/home/nikita/yapoddataset/configs/nisqa_s.yaml"
@@ -42,7 +64,7 @@ accent:
 
 yofication:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
-  num_workers: 2
+  num_workers: 4
 
 phonemizer:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the text files are located
@@ -50,6 +72,7 @@ phonemizer:
 
 classification:
   podcasts_path: /home/nikita/balalaika
+  num_workers: 8
   threshold: 0.8
   device: cuda
   model_path: models/voxblink2_samresnet100_ft

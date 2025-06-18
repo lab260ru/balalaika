@@ -30,6 +30,7 @@ def process_audio_row(row: pd.Series, base_path: Path) -> Dict[str, str]:
 
 
 def main(args: argparse.Namespace) -> None:
+    print(args.config_path)
     base_path = Path(
         load_config(args.config_path, 'download').get('podcasts_path', '../../podcasts')
         if args.config_path else args.podcasts_path
@@ -47,7 +48,7 @@ def main(args: argparse.Namespace) -> None:
             df.at[idx, col] = extracted_data[col]
 
     df.drop_duplicates(subset='audio_path', inplace=True)
-    output_path = base_path / "parquet.csv"
+    output_path = base_path / "balalaika.parquet"
     df.to_parquet(output_path, engine='pyarrow', index=False)
 
 if __name__ == "__main__":

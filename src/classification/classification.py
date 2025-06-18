@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from loguru import logger
 from tqdm import tqdm
 
-from emb.embeder import ResNetEmbedder
+from src.classification.emb.embeder import ResNetEmbedder
 from src.utils import load_config
 
 class SpeakerClustering:
@@ -23,6 +23,7 @@ class SpeakerClustering:
         ):
 
         self.podcasts_path = podcasts_path
+        print(podcasts_path)
         df_path = os.path.join(podcasts_path, 'results.csv')
         self.full_df = pd.read_csv(df_path)  
         
@@ -225,12 +226,12 @@ def precompute_embeddings(
     return fullness_results
 
 def main(args):
-    config = load_config(args.config_path, 'classificaton')
-    podcasts_path = config.get('podcasts_path', args.podcasts_path)
-    threshold = config.get('threshold', args.threshold)
-    model_path = config.get('model_path', args.model_path)
-    device = config.get('device', args.device)
-    workers_per_gpu = config.get('workers_per_gpu', args.workers_per_gpu)
+    config = load_config(args.config_path, 'classification')
+    podcasts_path = config.get('podcasts_path', '../../../podcasts') if args.podcasts_path is None else args.podcasts_path 
+    threshold = config.get('threshold', 0.85) if args.threshold is None else args.threshold 
+    model_path = config.get('model_path', '/models/voxblink2_samresnet100_ft') if args.model_path is None else args.model_path
+    device =  config.get('device', 'cuda') if args.device is None else args.device  
+    num_workers =  config.get('num_workers', 8) if args.num_workers is None else args.num_workers  
 
     logger.info(
         f"""
@@ -239,7 +240,7 @@ def main(args):
         threshold: {threshold}
         emb model path: {model_path}
         device: {device}
-        workers per GPU: {workers_per_gpu}
+        workers per GPU: {num_workers}
         """
     )
 
@@ -266,7 +267,7 @@ def main(args):
         fullness_results = precompute_embeddings(
             missing_files,
             model_path,
-            num_workers_per_gpu=workers_per_gpu
+            num_workers_per_gpu=num_workers
         )
 
         for path, fullness in fullness_results.items():
@@ -295,12 +296,12 @@ if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     
     parser = argparse.ArgumentParser(description="Classification speaker")
-    parser.add_argument("--config_path", default=None, help="Path to the configuration file")
-    parser.add_argument("--podcasts_path", default=None, help="Path to the podcast folder")
-    parser.add_argument("--threshold", default=0.8, type=float, help="Threshold for clustering")
-    parser.add_argument("--model_path", default='voxblink2_samresnet100_ft', type=str, help="embedder model path")
-    parser.add_argument("--device", default='cuda', type=str, help="embedder device")
-    parser.add_argument("--workers_per_gpu", default=8, type=int, help="Number of workers per GPU")
+    parser.add_argument("--config_path", help="Path to the configuration file")
+    parser.add_argument("--podcasts_path", help="Path to the podcast folder")
+    parser.add_argument("--threshold", type=float, help="Threshold for clustering")
+    parser.add_argument("--model_path", type=str, help="embedder model path")
+    parser.add_argument("--device", type=str, help="embedder device")
+    parser.add_argument("--num_workers", type=int, help="Number of workers per GPU")
 
     args = parser.parse_args()
     main(args)
