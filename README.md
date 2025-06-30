@@ -10,6 +10,61 @@ sudo apt update && sudo apt install ffmpeg
 cd yapoddataset
 bash create_envs.sh
 ```
+### Download and Prepare Data
+
+To download and prepare the dataset, follow these instructions:
+
+#### Quick Setup (Using Default Parameters)
+If you want to download and prepare the data with default settings, simply run:
+Choose one of the preconfigured dataset sizes:
+#### 100-hour dataset (Balalaika100H):
+```bash
+bash use_meta_100h.sh
+```
+#### 500-hour dataset:
+```bash
+bash use_meta_500h.sh
+```
+#### 2000-hour dataset:
+```bash
+bash use_meta_2000h.sh
+```
+## Download Dataset Using Existing Metadata
+
+if you want to use all the metadata that we have, download balalaika parquet and balalaika.pcl and then run
+```bash
+bash use_meta.sh
+```
+
+## Running the Pipeline
+
+### Basic Scenario (BASE) 
+if you want to post the data yourself
+```bash
+bash base.sh configs/config
+```
+  
+## Environment Variables
+
+Create a `.env` file in the project root:
+
+```ini
+HF_TOKEN=your_huggingface_token
+YANDEX_KEY=your_yandex_speechkit_key
+```
+
+- `YANDEX_KEY` – Required for downloading datasets.
+- `HF_TOKEN` – Used for speaker count estimation.
+
+
+This scenario:
+- Downloads datasets
+- Splits audio into semantic chunks
+- Performs transcription of all segments
+- Segments by speaker
+- Applies phonemization
+
+All metadata is saved in `result.csv` inside the podcasts folder.
 
 ### Configuration
 
@@ -55,58 +110,6 @@ models/
 ```
 
 Make sure these directories and files are present before running any processing scripts.
-  
-## Environment Variables
-
-Create a `.env` file in the project root:
-
-```ini
-HF_TOKEN=your_huggingface_token
-YANDEX_KEY=your_yandex_speechkit_key
-```
-
-- `YANDEX_KEY` – Required for downloading datasets.
-- `HF_TOKEN` – Used for speaker count estimation.
-
-## Running the Pipeline
-
-### Basic Scenario (BASE)
-
-```bash
-bash base.sh
-```
-
-This scenario:
-- Downloads datasets
-- Splits audio into semantic chunks
-- Performs transcription of all segments
-- Segments by speaker
-- Applies phonemization
-
-All metadata is saved in `result.csv` inside the podcasts folder.
-
-## Download Dataset Using Existing Metadata
-
-Before running, specify `parquet_path` and `podcasts_path`, as well as the desired podcasts in `configs/config.yaml` like this:
-
-```yaml 
-download:
-  podcasts_path: /home/nikita/podcasts_1
-  episodes_limit: 4
-  num_workers: 10
-  parquet_path: /home/nikita/podcasts_4/balalaika.parquet
-  podcasts_urls:  
-    - 'https://music.yandex.ru/album/21851634'      
-    - 'https://music.yandex.ru/album/32863444'      
-    - 'https://music.yandex.ru/album/30859840'      
-    - 'https://music.yandex.ru/album/18332051'      
-```
-
-Then run:
-
-```bash
-bash use_meta.sh
-```
 
 ## Important Notes
 

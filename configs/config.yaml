@@ -1,7 +1,7 @@
 download:
   podcasts_path: /home/nikita/balalaika
-  episodes_limit: 5
-  num_workers: 10
+  episodes_limit: 8
+  num_workers: 2
   parquet_path: /home/nikita/balalaika/balalaika.parquet
   podcasts_urls:  
     - 'https://music.yandex.ru/album/21851634'   
@@ -27,7 +27,22 @@ download:
     - 'https://music.yandex.ru/album/18410464'   
     - 'https://music.yandex.ru/album/18415577'   
     - 'https://music.yandex.ru/album/28621252'   
-
+    - 'https://music.yandex.ru/album/32602856'   
+    - 'https://music.yandex.ru/album/29065398'   
+    - 'https://music.yandex.ru/album/25980412'   
+    - 'https://music.yandex.ru/album/17903098'   
+    - 'https://music.yandex.ru/album/22293467'   
+    - 'https://music.yandex.ru/album/33911723'   
+    - 'https://music.yandex.ru/album/13674065'   
+    - 'https://music.yandex.ru/album/27798647'   
+    - 'https://music.yandex.ru/album/33111708'   
+    - 'https://music.yandex.ru/album/25825516'   
+    - 'https://music.yandex.ru/album/28784774'   
+    - 'https://music.yandex.ru/album/30292585'   
+    - 'https://music.yandex.ru/album/13281767'   
+    - 'https://music.yandex.ru/album/29489720'   
+    - 'https://music.yandex.ru/album/25441583'   
+    
 preprocess:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the podcasts are located 
   duration: 15
@@ -35,15 +50,15 @@ preprocess:
   num_workers: 2
   whisper_model: 'large-v3'
   compute_type: 'float16'
-  beam_size: 1
+  beam_size: 5
 
 separation:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
   device: 'cuda'
-  num_workers: 2
+  num_workers: 4
   use_nisqa: True 
   use_mono: True  
-  nisqa_config: "/home/nikita/yapoddataset/configs/nisqa_s.yaml"
+  nisqa_config: "configs/nisqa_s.yaml"
   one_speaker: False
 
 transcription:

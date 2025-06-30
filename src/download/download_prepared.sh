@@ -11,11 +11,11 @@ activate_venv() {
 }
 
 PODCASTS_PATH=$(realpath "$1")
-PARQUET_PATH=$(realpath "$2")
+PICKLE_PATH=$(realpath "$2")
 
 VENV_PATH=".main_venv"
 activate_venv "$VENV_PATH"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-python3 -m src.recovery_from_meta --podcasts_path $PODCASTS_PATH --parquet_path $PARQUET_PATH 
+python3 -m src.download.download_prepared --pickle_path "$PICKLE_PATH"  --podcasts_path "$PODCASTS_PATH"

@@ -1,4 +1,5 @@
 #!/bin/bash
+
 activate_venv() {
     local venv_path=$1
     if [ ! -f "$venv_path/bin/activate" ]; then
@@ -9,9 +10,13 @@ activate_venv() {
     echo "Activated: $(which python)"
 }
 
-activate_venv ".support_venv"
-SCRIPT_DIR=$(dirname "$(realpath "$0")")
-CONFIG_PATH="$SCRIPT_DIR/../../configs/config.yaml"
+if [ -z "${1:-}" ]; then
+    echo "Usage: $0 <config_path>"
+    exit 1
+fi
 
-python3 -m src.classification.classification \
-    --config "$CONFIG_PATH"
+CONFIG_PATH=$(realpath "$1")
+
+activate_venv ".support_venv"
+
+python3 -m src.classification.classification --config "$CONFIG_PATH"

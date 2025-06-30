@@ -1,3 +1,4 @@
+#!/bin/bash
 set -euo pipefail
 
 MAIN_VENV=".main_venv"
@@ -13,6 +14,13 @@ activate_venv() {
     echo "Activated: $(which python)"
 }
 
+if [ -z "${1:-}" ]; then
+    echo "Usage: $0 <config_path>"
+    exit 1
+fi
+
+CONFIG_PATH=$(realpath "$1")
+
 [ ! -d "$MAIN_VENV" ] && { echo "Main venv not found at $MAIN_VENV"; exit 1; }
 [ ! -d "$SUPPORT_VENV" ] && { echo "Support venv not found at $SUPPORT_VENV"; exit 1; }
 
@@ -25,10 +33,9 @@ SCRIPTS=(
     "./src/accents/accents_yaml.sh"
     "./src/yofication/yofication_yaml.sh"
     "./src/phonemizer/phonemizer_yaml.sh"
-    "./src/classificaton/classification_yaml.sh"
+    "./src/classification/classification_yaml.sh"
     "./src/collate_yamls.sh"
 )
-
 
 activate_venv "$MAIN_VENV"
 
@@ -37,7 +44,7 @@ for script in "${SCRIPTS[@]}"; do
     
     if [[ "$script" == *"separation_yaml.sh"* || "$script" == *"accents_yaml.sh"* || "$script" == *"classification_yaml.sh"* || "$script" == *"phonemizer_yaml.sh"* ]]; then
         echo "Switching to support virtual environment..."
-        deactivate
+        deactivate || true
         activate_venv "$SUPPORT_VENV"
     fi
 
@@ -46,16 +53,16 @@ for script in "${SCRIPTS[@]}"; do
         exit 1
     fi
 
-    bash "$script" || {
+    bash "$script" "$CONFIG_PATH" || {
         echo -e "\033[1;31mError in $script\033[0m"
         exit 1
     }
     
     if [[ "$script" == *"separation_yaml.sh"* || "$script" == *"accents_yaml.sh"* ]]; then
         echo "Switching back to main virtual environment..."
-        deactivate
+        deactivate || true
         activate_venv "$MAIN_VENV"
     fi
 done
 
-echo -e  "\n\033[1;32mAll scripts executed successfully!\033[0m"
+echo -e "\n\033[1;32mAll scripts executed successfully!\033[0m"

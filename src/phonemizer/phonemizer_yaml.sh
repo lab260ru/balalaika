@@ -10,9 +10,15 @@ activate_venv() {
     echo "Activated: $(which python)"
 }
 
-activate_venv ".support_venv"
-SCRIPT_DIR=$(dirname "$(realpath "$0")")
-CONFIG_PATH="$SCRIPT_DIR/../../configs/config.yaml"
+if [ -z "${1:-}" ]; then
+    echo "Usage: $0 <config_path>"
+    exit 1
+fi
 
-python3 -m  src.phonemizer.phonemizer \
-    --config_path "$CONFIG_PATH"
+CONFIG_PATH=$(realpath "$1")
+
+activate_venv ".support_venv"
+
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+
+python3 -m src.phonemizer.phonemizer --config_path "$CONFIG_PATH"

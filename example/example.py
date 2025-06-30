@@ -6,6 +6,7 @@ if __name__ == "__main__":
         parquet_path='../balalaika/balalaika.parquet'
     )
     print(dataset[1])
+    print(len(dataset))
     # ('/home/nikita/podcasts_1/21851634/102739417/469.72_483.93_21851634_102739417.mp3',
     #  {'audio_path': '21851634/102739417/469.72_483.93_21851634_102739417.mp3',
     #  'is_mono': True,

@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
 from pathlib import Path
-import yaml
 
 import music_tag
 import requests
@@ -77,7 +76,7 @@ def download_episode(client, part, info_podcast, folder_podcast):
     )
 
 
-def download_podcast(client, url, podcasts_path, episodes_limit=None, num_workers=1):
+def download_podcast(client, url, podcasts_path, episodes_limit=None, num_workers=1, episode_ids=None):
     podcast_id = extract_podcast_id(url)
 
     s = client.albumsWithTracks(album_id=podcast_id)
@@ -102,8 +101,15 @@ def download_podcast(client, url, podcasts_path, episodes_limit=None, num_worker
         for part in volume:
             if episodes_limit and episode_counter >= episodes_limit:
                 break
-            all_parts.append(part)
-            episode_counter += 1
+
+            if episode_ids is None:
+                all_parts.append(part)
+                episode_counter += 1
+            elif part['id'] not in episode_ids:
+                continue
+            else:
+                all_parts.append(part)
+
         if episodes_limit and episode_counter >= episodes_limit:
             break
 

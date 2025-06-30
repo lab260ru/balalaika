@@ -3,8 +3,8 @@
 # wget ... (download meta .parquet )
 # wget ... (download meta .pickle )
 
-PODCASTS_PATH="../Balalaika"
-PICKLE_PATH="Balalaika.pkl"
+PODCASTS_PATH="../Balalaika100H"
+PICKLE_PATH="100hBalalaika.pkl"
 PARQUET_PATH="/home/nikita/balalaika/balalaika.parquet"
 
 bash src/download/download_prepared.sh $PODCASTS_PATH $PICKLE_PATH
