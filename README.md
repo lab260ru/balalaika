@@ -31,7 +31,7 @@ bash use_meta_2000h.sh
 ```
 ## Download Dataset Using Existing Metadata
 
-if you want to use all the metadata that we have, download balalaika parquet and balalaika.pcl and then run
+if you want to use all the metadata that we have, download balalaika parquet and balalaika.pkl and then run
 ```bash
 bash use_meta.sh
 ```
