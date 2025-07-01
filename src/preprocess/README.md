@@ -9,7 +9,7 @@ sh predprocess/predprocess_args.sh
 ### Running the Code via Config File  
 Example:
 ~~~ 
-sh predprocess/predprocess_yaml.sh
+sh predprocess/predprocess_yaml.sh config_path
 ~~~  
 
 ## Explanation of Parameters

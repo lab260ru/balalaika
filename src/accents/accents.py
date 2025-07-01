@@ -3,6 +3,7 @@ import multiprocessing
 import os
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import List
 
 import torch
 from loguru import logger
@@ -28,10 +29,7 @@ def init_process(
     )
 
 
-def process_file(path: Path) -> None:
-    if str(path).endswith('_accent.txt') or str(path).endswith('_giga.txt') or str(path).endswith('_giga.txt'):
-        return
-    
+def process_file(path: Path):    
     try:
         new_path = path.with_name(path.stem.replace("_punct", "_accent") + ".txt")
 
@@ -49,7 +47,7 @@ def process_file(path: Path) -> None:
         logger.error(f"Error processing {path}: {e}")
         raise
 
-def get_valid_txt_paths(path: str):
+def get_valid_txt_paths(path: str) -> List[str]:
     all_punct_paths = get_txt_paths(path, "_punct.txt")
     valid_paths = []
 

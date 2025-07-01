@@ -6,7 +6,6 @@ from typing import Any, List, Tuple
 
 import torch
 import torchaudio
-import yaml
 from loguru import logger
 from tqdm import tqdm
 from faster_whisper import WhisperModel
@@ -130,7 +129,7 @@ def cut_audio(
     episode_id: str,
     format: str = 'mp3',
     duration:float = 15.0
-) -> None:
+):
     try:
         os.makedirs(output_folder, exist_ok=True)
         for i, (start_idx, end_idx) in enumerate(pieces):
@@ -169,7 +168,7 @@ def process_audio_file(
     path_audio: str,
     duration: float,
     beam_size: int
-) -> None:
+):
     album_id = os.path.basename(os.path.dirname(path_audio))
     episode_id = os.path.splitext(os.path.basename(path_audio))[0]
     
@@ -218,7 +217,7 @@ def init_process(
     device: str,
     compute_type: str = 'float16',
     device_index = [0]
-)-> None:
+):
     
     global model
     model = WhisperModel(
@@ -230,7 +229,6 @@ def init_process(
     
 
 def main(args):
-    
     load_dotenv()
     hf_key = os.getenv("HF_TOKEN")
     login(token=hf_key)

@@ -3,13 +3,11 @@ import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import List
 
 import gigaam 
-import pandas as pd
 import torch
 import torchaudio
-import yaml
 from loguru import logger
 from tqdm import tqdm
 
@@ -21,14 +19,14 @@ model = None
 def init_process(
     model_name: str,
     device_str: str 
-) -> None:
+):
     global model
     model = gigaam.load_model(model_name, device=device_str)
 
 
 def make_txt(
     path: Path
-) -> None:
+):
     
     text = model.transcribe(str(path))
     text_path = path.with_name(f"{path.stem}_giga.txt")
@@ -50,7 +48,7 @@ def get_valid_audio_paths(src_path: str) -> List[Path]:
     
     return valid_paths
 
-def main(args: argparse.Namespace) -> None:
+def main(args):
     config = load_config(args.config_path, 'transcription')
 
     model_name = args.model_name if args.model_name else config.get('model_name', 'rnnt')

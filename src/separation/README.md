@@ -9,7 +9,7 @@ bash separation/separation_args.sh
 ### Running the Code via Config File  
 Example:
 ~~~ 
-bash separation/separation_yaml.sh
+bash separation/separation_yaml.sh config_path
 ~~~  
 
 ## Explanation of Parameters
@@ -25,6 +25,9 @@ After running the script, a results.csv file will be created in the specified `p
 
 ~~~ 
 podcasts/
+└── {album_id}/
+|   └── {episode_id}/
+|   ....
 └── results.csv
 ~~~
 

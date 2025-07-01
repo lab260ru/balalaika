@@ -29,7 +29,7 @@ def process_audio_row(row: pd.Series, base_path: Path) -> Dict[str, str]:
     return results
 
 
-def main(args: argparse.Namespace) -> None:
+def main(args):
     print(args.config_path)
     base_path = Path(
         load_config(args.config_path, 'download').get('podcasts_path', '../../podcasts')

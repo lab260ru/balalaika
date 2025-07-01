@@ -9,7 +9,7 @@ sh accents/accents_args.sh
 ### Running the Code via Config File
 Example:
 ~~~sh
-bash accents/accents_yaml.sh
+bash accents/accents_yaml.sh config_path
 ~~~
 
 ## Explanation of Parameters

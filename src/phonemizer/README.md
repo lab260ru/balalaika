@@ -9,7 +9,7 @@ sh phonemizer/phonemizer_args.sh
 ### Running the Code via Config File
 Example:
 ~~~sh
-bash phonemizer/phonemizer_yaml.sh
+bash phonemizer/phonemizer_yaml.sh config_path
 ~~~
 
 ## Explanation of Parameters

@@ -9,7 +9,7 @@ bash download/download_args.sh
 ### Running the Code via Config File
 Example:
 ~~~ 
-bash download/download_yaml.sh
+bash download/download_yaml.sh config_path
 ~~~  
 
 ## Explanation of Parameters

@@ -4,7 +4,6 @@ import os
 import torchaudio
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Tuple
 from loguru import logger
 
 from src.utils import load_config
@@ -13,7 +12,7 @@ def process_audio_file(
     audio_path: str,
     podcasts_path: str,
     metadata_grouped: pd.core.groupby.generic.DataFrameGroupBy
-) -> None:
+):
     try:
         parts = audio_path.split(os.sep)
         playlist_id = int(parts[-2])

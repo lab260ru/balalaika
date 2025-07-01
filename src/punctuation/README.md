@@ -9,7 +9,7 @@ sh punctuation/punctuation_args.sh
 ### Running the Code via Config File
 Example:
 ```sh
-bash punctuation/punctuation_yaml.sh
+bash punctuation/punctuation_yaml.sh config_path
 ```
 
 ## Explanation of Parameters

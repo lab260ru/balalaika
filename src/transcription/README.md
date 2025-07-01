@@ -9,7 +9,7 @@ sh transcription/transcription_args.sh
 ### Running the Code via Config File  
 Example:
 ~~~ 
-sh transcription/transcription_yaml.sh
+sh transcription/transcription_yaml.sh config_path
 ~~~  
 
 ## Explanation of Parameters

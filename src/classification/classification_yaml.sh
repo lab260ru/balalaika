@@ -19,4 +19,4 @@ CONFIG_PATH=$(realpath "$1")
 
 activate_venv ".support_venv"
 
-python3 -m src.classification.classification --config "$CONFIG_PATH"
+python3 -m src.classification.classification --config_path "$CONFIG_PATH"

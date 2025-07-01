@@ -1,12 +1,10 @@
 import argparse
 import os
-import sys
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List
 import yaml
-import shutil
 
 import numpy as np
 import pandas as pd
@@ -16,7 +14,6 @@ from dotenv import load_dotenv
 from loguru import logger
 from pyannote.audio import Pipeline
 from tqdm import tqdm
-from transformers import pipeline 
 
 from src.libs.nisqa.core.model_torch import model_init
 from src.libs.nisqa.utils.process_utils import process
@@ -196,6 +193,7 @@ def _process_audio_task(audio_path: str) -> Dict:
             torch.cuda.empty_cache()
 
 def main(args):
+    load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
     config = load_config(args.config_path, 'separation')
 
@@ -294,6 +292,6 @@ if __name__ == "__main__":
     parser.add_argument("--one_speaker", type=bool, 
                         help="Boolean flag to indicate if only one speaker is expected per audio file")
     parser.add_argument("--num_workers", type=int, 
-                        help="Boolean flag to indicate if only one speaker is expected per audio file")
+                        help="Number of worker processes per GPU for parallel processing.")
     args = parser.parse_args()
     main(args)

@@ -1,8 +1,6 @@
 import argparse
-import os
 from pathlib import Path
 from typing import Any, List
-import yaml
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 
@@ -15,14 +13,14 @@ from src.utils import get_txt_paths, load_config, read_file_content
 
 g2p_model: Any = None
 
-def init_process(device_str: str) -> None:
+def init_process(device_str: str):
     global g2p_model
     g2p_model = G2PModel(
         load_dataset=True,
         device=device_str
     )
 
-def process_text(text_path: Path) -> None:
+def process_text(text_path: Path):
     output_path = text_path.with_name(f"{text_path.stem}_phonemes.txt")
     
     if output_path.exists():

@@ -23,7 +23,6 @@ class SpeakerClustering:
         ):
 
         self.podcasts_path = podcasts_path
-        print(podcasts_path)
         df_path = os.path.join(podcasts_path, 'results.csv')
         self.full_df = pd.read_csv(df_path)  
         

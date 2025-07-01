@@ -3,8 +3,10 @@
 *.wav
 test.py
 *.pkl
-
+chromadb
+cl_*.py
 *.ipynb
+
 .env
 __pycache__/
 *.py[cod]
@@ -12,7 +14,6 @@ __pycache__/
 
 .main_venv
 .support_venv
-.mfa_venv
 
 *.so
 

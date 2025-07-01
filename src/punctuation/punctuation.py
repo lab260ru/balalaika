@@ -35,7 +35,7 @@ def init_process(
 
 def make_punct_txt(
     path: Path
-    ) -> None:
+    ):
 
     src_text = read_file_content(path)
 
@@ -56,7 +56,7 @@ def make_punct_txt(
     with open(punct_path, "w", encoding="utf-8") as f:
         f.write(output)
 
-def get_valid_txt_paths(src_path: str) -> List[Path]:
+def get_valid_txt_paths(src_path: str) -> List[str]:
     all_audio_paths = get_audio_paths(src_path)
     
     valid_paths = []
@@ -70,7 +70,7 @@ def get_valid_txt_paths(src_path: str) -> List[Path]:
     return valid_paths
 
 
-def main(args: argparse.Namespace) -> None:
+def main(args):
     config = load_config(args.config_path, 'punctuation')
     num_workers_per_gpu = args.num_workers if args.num_workers else config.get('num_workers', 4)
     model_name = args.model_name if args.model_name else config.get('model_name', 'RUPunct/RUPunct_big')

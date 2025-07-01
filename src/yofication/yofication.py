@@ -10,7 +10,7 @@ import os
 
 from src.utils import get_txt_paths, load_config
 
-def make_txt_with_e(path: Path) -> None:
+def make_txt_with_e(path: Path):
 
     new_path = path.with_name(path.name.replace('_accent.txt', '_e.txt'))
 
@@ -30,7 +30,7 @@ def make_txt_with_e(path: Path) -> None:
     except Exception as e:
         logger.error(f"Error {path}: {e}")
 
-def get_valit_txt_paths(podcasts_path: str):
+def get_valit_txt_paths(podcasts_path: str) -> List[Path]:
     valis_paths = []
     accent_paths = get_txt_paths(podcasts_path, '_accent.txt')
     for accent_path in accent_paths:
@@ -68,7 +68,7 @@ def main(args):
                 logger.error(f"Processing failed: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Punctuation restoration script.")
+    parser = argparse.ArgumentParser(description="restoring the letters ё.")
     parser.add_argument(
         "--podcasts_path",
         type=str,
