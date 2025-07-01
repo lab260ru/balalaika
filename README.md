@@ -36,8 +36,8 @@ sudo apt update && sudo apt install -y ffmpeg
 Clone the repository and set up the environment:
 
 ```bash
-git clone https://github.com/your-org/yapoddataset.git
-cd yapoddataset
+git clone https://github.com/mtuciru/balalaika
+cd balalaika
 bash create_envs.sh
 ```
 
@@ -54,22 +54,27 @@ To download and prepare the dataset with default settings, choose one of the pre
   ```bash
   bash use_meta_100h.sh
   ```
+
 * **500-hour dataset**
 
   ```bash
   bash use_meta_500h.sh
   ```
+
 * **1000-hour dataset**
 
   ```bash
   bash use_meta_1000h.sh
   ```
+
 * **2000-hour dataset**
 
   ```bash
   bash use_meta_2000h.sh
   ```
+
 All metadata can also be downloaded from [Hugging Face – MTUCI](https://huggingface.co/MTUCI).
+
 ### Custom Metadata Download
 
 If you already have generated metadata files (`balalaika.parquet` and `balalaika.pkl`), place them in the project root and run:
