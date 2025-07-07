@@ -11,7 +11,7 @@ activate_venv() {
 }
 
 
-activate_venv ".support_venv"
+activate_venv ".dev_venv"
 
 PODCASTS_PATH="../../../podcasts"
 MODEL_NAME="turbo3.1"

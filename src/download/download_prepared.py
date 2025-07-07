@@ -51,7 +51,7 @@ def main(args):
 
     podcast_episode_map = group_episodes_by_podcast(urls)
 
-    podcasts_path = args.podcasts_path if args.podcasts_path else Path.home() / "podcasts"
+    podcasts_path = args.podcasts_path if args.podcasts_path else "../../../balalaika"
     Path(podcasts_path).mkdir(parents=True, exist_ok=True)
 
     num_workers = args.num_workers

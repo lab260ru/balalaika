@@ -7,7 +7,7 @@ create_venv_env() {
     
     if [ ! -d "$env_name" ]; then
         echo "Creating $env_name environment..."
-        python -m venv "$env_name"
+        uv venv "$env_name"
     
         if [ -f "$env_name/Scripts/activate" ]; then
             source "$env_name/Scripts/activate"
@@ -18,7 +18,7 @@ create_venv_env() {
             exit 1
         fi
         
-        pip install -r "$requirements_file"
+        uv pip install -r "$requirements_file"
         deactivate
     else
         echo "Environment $env_name already exists"
@@ -50,5 +50,4 @@ python -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)" || {
     exit 1
 }
 
-create_venv_env ".main_venv" "requirements_main.txt"
-create_venv_env ".support_venv" "requirements_support.txt"
+create_venv_env ".user_venv" "requirements_user.txt"

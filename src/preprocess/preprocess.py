@@ -207,6 +207,8 @@ def process_audio_file(
 
     except Exception as e:
         logger.error(f"Processing error {path_audio}: {e}")
+        torch.cuda.empty_cache()
+
         
     if len(os.listdir(episode_folder)) > 0 or len(pieces) == 0  : # the audio was cut or we couldn't cut it considering our length
         os.remove(path_audio)

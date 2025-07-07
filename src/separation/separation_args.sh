@@ -10,13 +10,12 @@ activate_venv() {
     echo "Activated: $(which python)"
 }
 
-VENV_PATH=".support_venv"
-activate_venv "$VENV_PATH"
+activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 CONFIG_PATH="$SCRIPT_DIR/../../configs/config.yaml"
 NISQA_CONFIG_PATH="$SCRIPT_DIR/../../configs/nisqa_config.yaml"
-PODCASTS_PATH="../podcasts"
+PODCASTS_PATH="../../../balalaika"
 USE_NISQA="True"
 USE_MONO="True"
 ONE_SPEAKER="False"

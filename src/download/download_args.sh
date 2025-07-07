@@ -10,13 +10,12 @@ activate_venv() {
     echo "Activated: $(which python)"
 }
 
-VENV_PATH=".main_venv"
-activate_venv "$VENV_PATH"
+activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
 
-PODCASTS_PATH="your/path"  
+PODCASTS_PATH="../../../podcasts"  
 EPISODES_LIMIT=2
 NUM_WORKERS=2
 

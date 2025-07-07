@@ -11,10 +11,10 @@ activate_venv() {
 }
 
 
-activate_venv ".support_venv"
+activate_venv ".dev_venv"
 
 MODEL_PATH="$SCRIPT_DIR/voxblink2_samresnet100_ft"
-PODCASTS_PATH="/mnt/datasets/podcasts"
+PODCASTS_PATH=""../../../podcasts""
 THRESHOLD=0.8
 DEVICE="cuda:0"
 

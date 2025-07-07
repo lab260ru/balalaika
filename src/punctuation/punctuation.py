@@ -74,7 +74,7 @@ def main(args):
     config = load_config(args.config_path, 'punctuation')
     num_workers_per_gpu = args.num_workers if args.num_workers else config.get('num_workers', 4)
     model_name = args.model_name if args.model_name else config.get('model_name', 'RUPunct/RUPunct_big')
-    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../podcasts')
+    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../balalaika')
 
     all_text_files = get_valid_txt_paths(podcasts_path)
 

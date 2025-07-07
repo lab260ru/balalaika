@@ -53,7 +53,7 @@ def main(args):
 
     model_name = args.model_name if args.model_name else config.get('model_name', 'rnnt')
     num_workers_per_gpu = args.num_workers if args.num_workers else config.get('num_workers', 4)
-    src_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../podcasts')
+    src_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../balalaika')
 
     all_audio_paths = get_valid_audio_paths(src_path)
     logger.info(f"Found {len(all_audio_paths)} audio files to process.")

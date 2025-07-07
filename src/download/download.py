@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
 from pathlib import Path
+import pickle
 
 import music_tag
 import requests
@@ -146,9 +147,17 @@ def main(args):
     if not client:
         return
 
-    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path',[])
+    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path','../../../balalaika')
     episodes_limit = args.episodes_limit if args.episodes_limit else config.get('episodes_limit',1)
-    podcasts_urls = config.get('podcasts_urls', [])
+    urls_pickle_path = args.podcasts_urls_file if args.podcasts_urls_file else config.get('podcasts_urls_file','alboms.pkl')
+
+    try:
+        with open(urls_pickle_path, 'rb') as file:
+                podcasts_urls = pickle.load(file)
+    except:
+        logger.info('URLS not found')
+        podcasts_urls = []
+
     logger.info(f"{len(podcasts_urls)} number of podcasts downloaded")
 
     num_workers = args.num_workers if args.num_workers else config.get('num_workers')
@@ -188,6 +197,11 @@ if __name__ == "__main__":
         help="Path to the configuration file"
     )
     parser.add_argument(
+        "--podcasts_urls_file",
+        default=None,
+        help="Path to the pickle file with album urls"
+    )
+    parser.add_argument(
         "--podcasts_path", 
         default=None,
         help="Path for saving podcasts"
@@ -200,7 +214,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num_workers",
-        default=2,
+        default=None,
         type=int,
         help="num workers"
     )

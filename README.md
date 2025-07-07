@@ -27,6 +27,8 @@ Ensure you have the following tools installed on your system:
 
 ```bash
 sudo apt update && sudo apt install -y ffmpeg
+wget -qO- https://astral.sh/uv/install.sh | sh
+
 ````
 
 ---
@@ -38,7 +40,10 @@ Clone the repository and set up the environment:
 ```bash
 git clone https://github.com/mtuciru/balalaika
 cd balalaika
-bash create_envs.sh
+# Use this if you want to annotate/modify the dataset
+bash create_dev_env.sh
+# Use this if you only want to use the pre-annotated dataset
+bash create_user_env.sh 
 ```
 
 ---
@@ -133,7 +138,7 @@ Create a `.env` file in the project root with the following:
 
 ```ini
 HF_TOKEN=<your_huggingface_token>
-YANDEX_KEY=<your_yandex_speechkit_key>
+YANDEX_KEY=<your_yandex_music_token>
 ```
 
 * `HF_TOKEN`: Required for speaker count estimation.

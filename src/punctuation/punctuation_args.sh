@@ -11,10 +11,10 @@ activate_venv() {
 }
 
 
-activate_venv ".main_venv"
+activate_venv ".dev_venv"
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-PODCASTS_PATH="../../../podcasts"
+PODCASTS_PATH="../../../balalaika"
 MODEL_NAME="RUPunct/RUPunct_big"
 NUM_WORKERS=4
 

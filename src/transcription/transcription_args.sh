@@ -10,11 +10,11 @@ activate_venv() {
     echo "Activated: $(which python)"
 }
 
-activate_venv ".main_venv"
+activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-PODCASTS_PATH="../../../podcasts"
+PODCASTS_PATH="../../../balalaika"
 NUM_WORKERS=4
 MODEL_NAME="rnnt"
 

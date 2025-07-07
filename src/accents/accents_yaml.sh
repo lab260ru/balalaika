@@ -17,6 +17,6 @@ fi
 
 CONFIG_PATH=$(realpath "$1")
 
-activate_venv ".support_venv"
+activate_venv ".dev_venv"
 
 python3 -m src.accents.accents --config_path "$CONFIG_PATH"

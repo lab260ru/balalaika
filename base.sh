@@ -31,7 +31,6 @@ SCRIPTS=(
     "./src/transcription/transcription_yaml.sh"
     "./src/punctuation/punctuation_yaml.sh"
     "./src/accents/accents_yaml.sh"
-    "./src/yofication/yofication_yaml.sh"
     "./src/phonemizer/phonemizer_yaml.sh"
     "./src/classification/classification_yaml.sh"
     "./src/collate_yamls.sh"
@@ -41,12 +40,6 @@ activate_venv "$MAIN_VENV"
 
 for script in "${SCRIPTS[@]}"; do
     echo -e "\n\033[1;34m=== Executing $script ===\033[0m"
-    
-    if [[ "$script" == *"separation_yaml.sh"* || "$script" == *"accents_yaml.sh"* || "$script" == *"classification_yaml.sh"* || "$script" == *"phonemizer_yaml.sh"* ]]; then
-        echo "Switching to support virtual environment..."
-        deactivate || true
-        activate_venv "$SUPPORT_VENV"
-    fi
 
     if [ ! -f "$script" ]; then
         echo -e "\033[1;31mError: Script $script not found\033[0m"
@@ -57,12 +50,6 @@ for script in "${SCRIPTS[@]}"; do
         echo -e "\033[1;31mError in $script\033[0m"
         exit 1
     }
-    
-    if [[ "$script" == *"separation_yaml.sh"* || "$script" == *"accents_yaml.sh"* ]]; then
-        echo "Switching back to main virtual environment..."
-        deactivate || true
-        activate_venv "$MAIN_VENV"
-    fi
 done
 
 echo -e "\n\033[1;32mAll scripts executed successfully!\033[0m"

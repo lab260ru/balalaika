@@ -33,15 +33,15 @@ def process_text(text_path: Path):
         f.write(" ".join(phonemes))
 
 def get_valid_text_paths(src_path: str) -> List[Path]:
-    all_paths = get_txt_paths(src_path, '_e.txt')
+    all_paths = get_txt_paths(src_path, '_giga.txt')
     valid_paths = []
     
-    for e_path in all_paths:
-        e_path = Path(e_path)
-        phonemes_path = e_path.with_name(f"{e_path.stem}_phonemes.txt")
+    for giga_path in all_paths:
+        giga_path = Path(giga_path)
+        phonemes_path = giga_path.with_name(f"{giga_path.stem}_phonemes.txt")
         
         if not phonemes_path.exists():
-            valid_paths.append(e_path.absolute())
+            valid_paths.append(giga_path.absolute())
 
     return valid_paths
 

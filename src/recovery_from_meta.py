@@ -1,7 +1,7 @@
 import argparse
 import pandas as pd
 import os
-import torchaudio
+from pydub import AudioSegment
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
@@ -27,24 +27,25 @@ def process_audio_file(
         dest_dir = os.path.join(podcasts_path, str(playlist_id), str(podcast_id))
         os.makedirs(dest_dir, exist_ok=True)
 
-        src_audio, sr = torchaudio.load(audio_path)
+        audio = AudioSegment.from_mp3(audio_path)
 
         saved = False
         for _, row in episode_meta.iterrows():
-            start = float(row['start'])
-            end = float(row['end'])
-
-            start_sample = int(start * sr)
-            end_sample = int(end * sr)
-            new_audio = src_audio[:, start_sample:end_sample]
-
-            new_name = f"{start:.2f}_{end:.2f}_{playlist_id}_{podcast_id}.mp3"
+            start_sec = float(row['start'])
+            end_sec = float(row['end'])
+            
+            start_ms = int(start_sec * 1000)
+            end_ms = int(end_sec * 1000)
+            
+            segment = audio[start_ms:end_ms]
+            
+            new_name = f"{start_sec:.2f}_{end_sec:.2f}_{playlist_id}_{podcast_id}.mp3"
             dest_path = os.path.join(dest_dir, new_name)
             
             if os.path.exists(dest_path):
                 continue
 
-            torchaudio.save(dest_path, new_audio, sr)
+            segment.export(dest_path, format="mp3")
             saved = True
 
         if saved and os.listdir(dest_dir):
@@ -53,10 +54,11 @@ def process_audio_file(
     except Exception as e:
         logger.error(f"Error processing {audio_path}: {e}")
 
+
 def main(args):
     config = load_config(args.config_path, 'download')
     parquet_path = args.parquet_path or config.get('parquet_path', '../../balalaika.parquet')
-    podcasts_path = args.podcasts_path or config.get('podcasts_path', '../../../podcasts')
+    podcasts_path = args.podcasts_path or config.get('podcasts_path', '../../../balalaika')
     num_workers = args.num_workers or config.get('num_workers', 2)
 
     logger.info("Loading metadata...")

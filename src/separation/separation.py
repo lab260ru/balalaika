@@ -197,7 +197,7 @@ def main(args):
     hf_token = os.getenv("HF_TOKEN")
     config = load_config(args.config_path, 'separation')
 
-    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '/../../../podcasts')
+    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '/../../../balalaika')
     one_speaker = args.one_speaker if args.one_speaker else config.get('one_speaker', False)
     use_nisqa = args.use_nisqa if args.use_nisqa else config.get('use_nisqa', True)
     use_mono = args.use_mono if args.use_mono else config.get('use_mono', True)
@@ -255,7 +255,7 @@ def main(args):
         actual_max_workers = 1 
         if gpu_id_assignment_queue.empty():
             gpu_id_assignment_queue.put(None)
-
+    
     with ProcessPoolExecutor(
         max_workers=actual_max_workers,
         mp_context=multiprocessing.get_context('spawn'),

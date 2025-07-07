@@ -20,7 +20,7 @@ bash phonemizer/phonemizer_yaml.sh config_path
 
 ## Output Structure
 
-For each text file ending with `_e.txt`, a corresponding `_phonemes.txt` file will be created:
+For each text file ending with `_giga.txt`, a corresponding `_phonemes.txt` file will be created:
 
 ~~~
 podcasts/
@@ -30,8 +30,7 @@ podcasts/
         ├── {start_time}_{end_time}_{album_id}_{episode_id}_giga.txt
         ├── {start_time}_{end_time}_{album_id}_{episode_id}_punct.txt
         ├── {start_time}_{end_time}_{album_id}_{episode_id}_accent.txt
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_e.txt
-        └── {start_time}_{end_time}_{album_id}_{episode_id}_e_phonemes.txt
+        └── {start_time}_{end_time}_{album_id}_{episode_id}_giga_phonemes.txt
 ~~~
 
 ### File Descriptions
@@ -39,7 +38,4 @@ podcasts/
 - `_giga.txt`: Initial transcription without punctuation
 - `_punct.txt`: Text with restored punctuation
 - `_accent.txt`: Text with restored accents
-- `_e.txt`: Text with yofication applied
-- `_e_phonemes.txt`: Final text converted to phonemes
-
-The script processes all `_e.txt` files found in the directory structure and creates corresponding `_e_phonemes.txt` files. Processing is done in parallel using available GPUs for better performance. 
+- `_giga_phonemes.txt`: Text converted to phonemes

@@ -17,8 +17,9 @@ fi
 
 CONFIG_PATH=$(realpath "$1")
 
-VENV_PATH=".main_venv"
-activate_venv "$VENV_PATH"
+# VENV_PATH=".main_venv"
+# activate_venv "$VENV_PATH"
+activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 

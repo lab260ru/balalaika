@@ -1,11 +1,12 @@
 # bin/bash
 
-# wget ... (download meta .parquet )
-# wget ... (download meta .pickle )
+wget https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.parquet
+wget https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.pkl
 
-PODCASTS_PATH="../Balalaika500H"
-PICKLE_PATH="500hBalalaika.pkl"
-PARQUET_PATH="/home/nikita/balalaika/balalaika.parquet"
+PODCASTS_PATH="../Balalaika100H"
+PICKLE_PATH="Balalaika100H.pkl"
+PARQUET_PATH="Balalaika100H.parquet"
+NUM_WORKERS=4
 
-bash src/download/download_prepared.sh $PODCASTS_PATH $PICKLE_PATH
-bash src/recovery_from_meta_yamls.sh $PODCASTS_PATH $PARQUET_PATH
+bash src/download/download_prepared.sh $PODCASTS_PATH $PICKLE_PATH $NUM_WORKERS
+bash src/recovery_from_meta_yamls.sh $PODCASTS_PATH $PARQUET_PATH $NUM_WORKERS

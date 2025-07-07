@@ -39,7 +39,6 @@ if __name__ == "__main__":
     'giga': 'папа едет домой и оля сейчас ...',
     'punct': 'Папа едет домой. И Оля сейчас поедет домой. ...',
     'whisper': 'Папа едет домой. И Оля сейчас поедет домой. ...',
-    'e': 'папа едет домой и оля сейчас ...'
   }
 )
 ```
@@ -57,7 +56,6 @@ if __name__ == "__main__":
 - **`giga`** — raw ASR output from GigaAM.
 - **`punct`** — GigaAM output with punctuation.
 - **`whisper`** — transcription from Whisper model.
-- **`e`** — GigaAM output with correct usage of the letter `ё`.
 
 ---
 

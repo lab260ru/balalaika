@@ -14,11 +14,10 @@ def process_audio_row(row: pd.Series, base_path: Path) -> Dict[str, str]:
 
     file_types = {
         'accent': '_accent.txt',
-        'phonemes': '_e_phonemes.txt',
+        'phonemes': '_phonemes.txt',
         'giga': '_giga.txt',
         'punct': '_punct.txt',
         'whisper': '_whisper.txt',
-        'e': '_e.txt'
     }
 
     results = {}
@@ -32,13 +31,13 @@ def process_audio_row(row: pd.Series, base_path: Path) -> Dict[str, str]:
 def main(args):
     print(args.config_path)
     base_path = Path(
-        load_config(args.config_path, 'download').get('podcasts_path', '../../podcasts')
+        load_config(args.config_path, 'download').get('podcasts_path', '../../balalaika')
         if args.config_path else args.podcasts_path
     )
 
     df = pd.read_csv(base_path / "results.csv")
 
-    columns_to_add = ['accent', 'phonemes', 'giga', 'punct', 'whisper', 'e']
+    columns_to_add = ['accent', 'phonemes', 'giga', 'punct', 'whisper']
     for col in columns_to_add:
         df[col] = ''
 

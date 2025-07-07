@@ -10,12 +10,12 @@ activate_venv() {
     echo "Activated: $(which python)"
 }
 
-activate_venv ".support_venv"
+activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 CONFIG_PATH="$SCRIPT_DIR/../../configs/config.yaml"
 
-PODCASTS_PATH="../../../podcasts"
+PODCASTS_PATH="../../../balalaika"
 NUM_WORKERS=8
 DEVICE="cuda" 
 

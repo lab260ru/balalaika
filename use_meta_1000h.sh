@@ -1,11 +1,25 @@
 # bin/bash
 
-# wget ... (download meta .parquet )
-# wget ... (download meta .pickle )
+
+activate_venv() {
+    local venv_path=$1
+    if [ ! -f "$venv_path/bin/activate" ]; then
+        echo "Error: Virtual environment not found at $venv_path"
+        exit 1
+    fi
+    source "$venv_path/bin/activate"
+    echo "Activated: $(which python)"
+}
+
+wget https://huggingface.co/datasets/MTUCI/Balalaika1000H/resolve/main/Balalaika1000H.parquet
+wget https://huggingface.co/datasets/MTUCI/Balalaika1000H/resolve/main/Balalaika1000H.pkl
 
 PODCASTS_PATH="../Balalaika1000H"
-PICKLE_PATH="500hBalalaika.pkl"
-PARQUET_PATH="/home/nikita/balalaika/balalaika.parquet"
+PICKLE_PATH="Balalaika1000H.pkl"
+PARQUET_PATH="Balalaika1000H.parquet"
+NUM_WORKERS=4
 
-bash src/download/download_prepared.sh $PODCASTS_PATH $PICKLE_PATH
-bash src/recovery_from_meta_yamls.sh $PODCASTS_PATH $PARQUET_PATH
+activate_venv ".user_venv"
+
+bash src/download/download_prepared.sh $PODCASTS_PATH $PICKLE_PATH $NUM_WORKERS
+bash src/recovery_from_meta_yamls.sh $PODCASTS_PATH $PARQUET_PATH $NUM_WORKERS

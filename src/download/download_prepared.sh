@@ -14,11 +14,8 @@ PODCASTS_PATH=$(realpath "$1")
 PICKLE_PATH=$(realpath "$2")
 NUM_WORKERS=4
 
-VENV_PATH=".main_venv"
-activate_venv "$VENV_PATH"
+activate_venv ".user_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-python3 -m src.download.download_prepared --pickle_path "$PICKLE_PATH" \ 
-                                          --podcasts_path "$PODCASTS_PATH" \ 
-                                          --num_workers "$NUM_WORKERS"
+python3 -m src.download.download_prepared --pickle_path "$PICKLE_PATH" --podcasts_path "$PODCASTS_PATH" --num_workers "$NUM_WORKERS"

@@ -62,7 +62,7 @@ def main(args):
     num_workers = args.num_workers if args.num_workers else config.get('num_workers', 4)
     model_name = args.model_name if args.model_name else config.get('model_name', 'turbo3.1')
     device = args.device if args.device else config.get('device', 'cuda')
-    podcast_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../podcasts')
+    podcast_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../balalaika')
 
     available_gpu_ids = list(range(torch.cuda.device_count()))
     num_gpus = len(available_gpu_ids)
