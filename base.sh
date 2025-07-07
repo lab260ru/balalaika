@@ -1,9 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-MAIN_VENV=".main_venv"
-SUPPORT_VENV=".support_venv"
-
 activate_venv() {
     local venv_path=$1
     if [ ! -f "$venv_path/bin/activate" ]; then
@@ -21,9 +18,6 @@ fi
 
 CONFIG_PATH=$(realpath "$1")
 
-[ ! -d "$MAIN_VENV" ] && { echo "Main venv not found at $MAIN_VENV"; exit 1; }
-[ ! -d "$SUPPORT_VENV" ] && { echo "Support venv not found at $SUPPORT_VENV"; exit 1; }
-
 SCRIPTS=(
     "./src/download/download_yaml.sh"
     "./src/preprocess/preprocess_yaml.sh"
@@ -36,7 +30,7 @@ SCRIPTS=(
     "./src/collate_yamls.sh"
 )
 
-activate_venv "$MAIN_VENV"
+activate_venv ".dev_venv"
 
 for script in "${SCRIPTS[@]}"; do
     echo -e "\n\033[1;34m=== Executing $script ===\033[0m"

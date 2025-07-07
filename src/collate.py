@@ -18,6 +18,7 @@ def process_audio_row(row: pd.Series, base_path: Path) -> Dict[str, str]:
         'giga': '_giga.txt',
         'punct': '_punct.txt',
         'whisper': '_whisper.txt',
+        'phonemes': '_giga_phonemes.txt'
     }
 
     results = {}
@@ -37,7 +38,7 @@ def main(args):
 
     df = pd.read_csv(base_path / "results.csv")
 
-    columns_to_add = ['accent', 'phonemes', 'giga', 'punct', 'whisper']
+    columns_to_add = ['accent', 'phonemes', 'giga', 'punct', 'whisper', 'phonemes']
     for col in columns_to_add:
         df[col] = ''
 

@@ -1,8 +1,8 @@
 download:
   podcasts_path: /home/nikita/balalaika 
-  episodes_limit: 10
+  episodes_limit: 20
   num_workers: 4
-  podcasts_urls_file: ''
+  podcasts_urls_file: '/home/nikita/yapoddataset/20000_more_albums.pkl'
   
 preprocess:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the podcasts are located 

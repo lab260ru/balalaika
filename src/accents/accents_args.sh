@@ -13,7 +13,7 @@ activate_venv() {
 
 activate_venv ".dev_venv"
 
-PODCASTS_PATH="../../../podcasts"
+PODCASTS_PATH="../../../balalaika"
 MODEL_NAME="turbo3.1"
 DEVICE="cuda"
 NUM_WORKERS=4

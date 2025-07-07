@@ -15,7 +15,7 @@ activate_venv ".dev_venv"
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
 
-PODCASTS_PATH="../../../podcasts"  
+PODCASTS_PATH="../../../balalaika"  
 EPISODES_LIMIT=2
 NUM_WORKERS=2
 

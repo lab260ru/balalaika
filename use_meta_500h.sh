@@ -1,7 +1,20 @@
 # bin/bash
 
+
+activate_venv() {
+    local venv_path=$1
+    if [ ! -f "$venv_path/bin/activate" ]; then
+        echo "Error: Virtual environment not found at $venv_path"
+        exit 1
+    fi
+    source "$venv_path/bin/activate"
+    echo "Activated: $(which python)"
+}
+
 wget https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.parquet
 wget https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.pkl
+
+activate_venv ".user_venv"
 
 PODCASTS_PATH="../Balalaika100H"
 PICKLE_PATH="Balalaika100H.pkl"
