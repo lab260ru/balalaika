@@ -78,7 +78,7 @@ def make_txt_and_tst(path: Path, with_timestamps: bool):
     txt_path = path.with_name(f"{path.stem}_giga.txt")
     tst_path = path.with_name(f"{path.stem}_giga.tst")
     
-    if os.path.existst(txt_path):
+    if os.path.exists(txt_path):
         return
 
     # Timestamp-enabled path using the CTC decoder
