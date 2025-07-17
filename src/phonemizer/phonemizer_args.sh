@@ -17,7 +17,6 @@ CONFIG_PATH="$SCRIPT_DIR/../../configs/config.yaml"
 
 PODCASTS_PATH="../../../balalaika"
 NUM_WORKERS=8
-DEVICE="cuda" 
 
 python3 -m src.phonemizer.phonemizer \
     --podcasts_path "$PODCASTS_PATH" \

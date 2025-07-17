@@ -6,6 +6,7 @@ test.py
 chromadb
 cl_*.py
 *.ipynb
+*.bin
 
 .env
 __pycache__/

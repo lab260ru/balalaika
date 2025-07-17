@@ -36,7 +36,6 @@ def get_whisper_segments(
     segments, info  = model.transcribe(
         path_audio, 
         beam_size=beam_size,
-        language='ru'
         )
 
     timesteps_starts = []
@@ -239,12 +238,18 @@ def main(args):
 
     podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../podcasts')
     duration = args.duration if args.duration else config.get('duration', 15)
-    device = args.device if args.device else config.get('device', 'cuda')
     num_workers = args.num_workers if args.num_workers else config.get('num_workers', 4)
     whisper_model = args.whisper_model if args.whisper_model else config.get('whisper_model', 'large-v3')
     compute_type = args.compute_type if args.compute_type else config.get('compute_type', 'float16')
     beam_size = args.beam_size if args.beam_size else config.get('beam_size', 5)
-    device_index = list(range(torch.cuda.device_count()))
+    device = 'cuda'
+    available_gpu_ids = list(range(torch.cuda.device_count()))
+
+    num_gpus = len(available_gpu_ids)
+
+    if num_gpus == 0:
+        logger.error("No GPUs available. Exiting.")
+        return
 
     audio_paths = get_audio_paths(podcasts_path)
 
@@ -256,9 +261,8 @@ def main(args):
     podcasts_path:{podcasts_path} 
     whisper_model:{whisper_model}
     duration:{duration} 
-    device:{device} 
     num_workers:{num_workers}
-    device_index:{device_index}
+    devices:{available_gpu_ids}
     compute_type:{compute_type}
     beam_size:{beam_size}
     """)
@@ -266,7 +270,7 @@ def main(args):
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=init_process,
-        initargs=(whisper_model, device, compute_type, device_index, )
+        initargs=(whisper_model, device, compute_type, available_gpu_ids, )
         ) as executor:
         futures = [
             executor.submit(process_audio_file, path_audio, duration, beam_size)
@@ -312,11 +316,6 @@ if __name__ == "__main__":
         help="Duration in seconds", 
         type=int, 
         )
-    parser.add_argument(
-        "--device", 
-        help="Device", 
-        type=str, 
-    )
     parser.add_argument(
         "--num_workers", 
         help="Number of workers", 

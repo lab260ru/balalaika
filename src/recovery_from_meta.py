@@ -6,8 +6,6 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 
-from src.utils import load_config
-
 def process_audio_file(
     audio_path: str,
     podcasts_path: str,
@@ -56,10 +54,9 @@ def process_audio_file(
 
 
 def main(args):
-    config = load_config(args.config_path, 'download')
-    parquet_path = args.parquet_path or config.get('parquet_path', '../../balalaika.parquet')
-    podcasts_path = args.podcasts_path or config.get('podcasts_path', '../../../balalaika')
-    num_workers = args.num_workers or config.get('num_workers', 2)
+    parquet_path = args.parquet_path
+    podcasts_path = args.podcasts_path
+    num_workers = args.num_workers
 
     logger.info("Loading metadata...")
     df = pd.read_parquet(parquet_path)
@@ -99,9 +96,20 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Create Dataset using meta")
-    parser.add_argument("--parquet_path", "-p", type=str, help="Path to parquet file")
-    parser.add_argument("--config_path", "-c", type=str, help="Path to config file")
-    parser.add_argument("--podcasts_path", "-d", type=str, help="Path to podcasts directory")
-    parser.add_argument("--num_workers", "-n", type=int, help="Number of parallel workers")
+    parser.add_argument(
+        "--podcasts_path",
+        type=str,
+        help="Path to podcasts directory"
+        )
+    parser.add_argument(
+        "--parquet_path",
+        type=str,
+        help="Path to parquet file"
+        )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        help="Number of parallel workers"
+        )
     args = parser.parse_args()
     main(args)

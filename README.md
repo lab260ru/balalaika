@@ -118,7 +118,6 @@ All output metadata will be saved in `podcasts/result.csv`.
 
 The main configuration file is located at `yapoddataset/configs/config.yaml`. Key parameters:
 
-* `device`: Compute device (e.g., `cpu`, `cuda`) calculations are automatically parallelized to available resources..
 * `podcasts_path`: Absolute path where downloaded and processed files are stored.
 * `duration`: Maximum length of audio segments in seconds (e.g., `15`).
 * `num_workers`: Number of parallel processes per gpu  (in preprocess 1 process - 9 GB VRAM).

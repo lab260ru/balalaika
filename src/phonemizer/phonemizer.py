@@ -56,6 +56,10 @@ def main(args):
     available_gpu_ids = list(range(torch.cuda.device_count()))
     num_gpus = len(available_gpu_ids)
     
+    if num_gpus == 0:
+        logger.error("No GPUs available. Exiting.")
+        return
+    
     logger.info(
         f"""
         Starting phoneme conversion with parameters:

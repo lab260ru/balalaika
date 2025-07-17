@@ -19,7 +19,6 @@ class SpeakerClustering:
             podcasts_path: str,
             threshold=0.85,
             model_path: str = 'voxblink2_samresnet100_ft',
-            device: str = 'cuda:0'
         ):
 
         self.podcasts_path = podcasts_path
@@ -32,7 +31,6 @@ class SpeakerClustering:
         self.df = self.full_df[self.full_df['is_mono'] == True].copy() 
         self.threshold = threshold
         self.model_path = model_path
-        self.device = device
         self.all_clusters = []  # {"embeddings": list, "paths": list}
 
     def norm_cos_sim(self, emb1: torch.Tensor, emb2: torch.Tensor) -> float:
@@ -157,7 +155,7 @@ def init_worker(model_path, device_str):
 def compute_embedding_for_file(audio_path):
     try:
         emb, fullness = worker_embedder(audio_path)
-        if emb is not None:
+        if fullness:
             emb_path = audio_path.rsplit('.', 1)[0] + '.emb'
             torch.save((emb, fullness), emb_path)
             return audio_path, fullness
@@ -229,8 +227,14 @@ def main(args):
     podcasts_path = config.get('podcasts_path', '../../../podcasts') if args.podcasts_path is None else args.podcasts_path 
     threshold = config.get('threshold', 0.85) if args.threshold is None else args.threshold 
     model_path = config.get('model_path', '/models/voxblink2_samresnet100_ft') if args.model_path is None else args.model_path
-    device =  config.get('device', 'cuda') if args.device is None else args.device  
-    num_workers =  config.get('num_workers', 8) if args.num_workers is None else args.num_workers  
+    num_workers =  config.get('num_workers', 8) if args.num_workers is None else args.num_workers 
+
+    available_gpu_ids = list(range(torch.cuda.device_count()))
+    num_gpus = len(available_gpu_ids)
+
+    if num_gpus == 0:
+        logger.error("No GPUs available. Exiting.")
+        return
 
     logger.info(
         f"""
@@ -238,7 +242,7 @@ def main(args):
         podcasts path: {podcasts_path}
         threshold: {threshold}
         emb model path: {model_path}
-        device: {device}
+        list available devices: {available_gpu_ids}
         workers per GPU: {num_workers}
         """
     )
@@ -247,7 +251,6 @@ def main(args):
         podcasts_path=podcasts_path, 
         threshold=threshold,
         model_path=model_path,
-        device=device
     )
     
     audio_files = [
@@ -295,12 +298,31 @@ if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     
     parser = argparse.ArgumentParser(description="Classification speaker")
-    parser.add_argument("--config_path", help="Path to the configuration file")
-    parser.add_argument("--podcasts_path", help="Path to the podcast folder")
-    parser.add_argument("--threshold", type=float, help="Threshold for clustering")
-    parser.add_argument("--model_path", type=str, help="embedder model path")
-    parser.add_argument("--device", type=str, help="embedder device")
-    parser.add_argument("--num_workers", type=int, help="Number of workers per GPU")
-
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        help="Path to the configuration file"
+        )
+    parser.add_argument(
+        "--podcasts_path",
+        type=str,
+        help="Path to the podcast folder"
+        )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        help="Threshold for clustering"
+        )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        help="embedder model path"
+        )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        help="Number of workers per GPU"
+        )
+    
     args = parser.parse_args()
     main(args)

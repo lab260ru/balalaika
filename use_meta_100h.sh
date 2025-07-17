@@ -14,8 +14,8 @@ wget https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika1
 wget https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.pkl
 
 PODCASTS_PATH="../Balalaika100H"
-PICKLE_PATH="/home/nikita/yapoddataset/Balalaika100H.pkl"
-PARQUET_PATH="/home/nikita/yapoddataset/Balalaika100H.parquet"
+PICKLE_PATH="Balalaika100H.pkl"
+PARQUET_PATH="Balalaika100H.parquet"
 NUM_WORKERS=4
 
 activate_venv ".user_venv"

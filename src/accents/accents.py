@@ -61,11 +61,15 @@ def main(args):
     config = load_config(args.config_path, 'accent')
     num_workers = args.num_workers if args.num_workers else config.get('num_workers', 4)
     model_name = args.model_name if args.model_name else config.get('model_name', 'turbo3.1')
-    device = args.device if args.device else config.get('device', 'cuda')
     podcast_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../balalaika')
 
     available_gpu_ids = list(range(torch.cuda.device_count()))
     num_gpus = len(available_gpu_ids)
+
+    if num_gpus == 0:
+        logger.error("No GPUs available. Exiting.")
+        return
+    
     logger.info(
         f"""
         Using parms 
@@ -124,33 +128,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Accent restoration script.")
     parser.add_argument(
         "--config_path",
-        "-с",
         type=str,
         help="Path to config"
         )
     parser.add_argument(
         "--podcasts_path",
-        "-p",
         type=str,
         help="Path to dataset directory"
         )
     parser.add_argument(
         "--num_workers",
-        "-w",
         type=int,
         help="Number of worker processes"
         )
     parser.add_argument(
         "--model_name",
-        "-m",
         type=str,
         help="Model version"
         )
-    parser.add_argument(
-        "--device",
-        "-d",
-        type=str,
-        help="Device (cpu/cuda)"
-        )
+    
     args = parser.parse_args()
     main(args)
