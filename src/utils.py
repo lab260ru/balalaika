@@ -1,6 +1,5 @@
 from pathlib import Path
 from typing import List
-import os
 import yaml
 from loguru import logger
 
