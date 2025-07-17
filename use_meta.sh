@@ -13,9 +13,9 @@ activate_venv() {
 # wget ... (download meta .parquet )
 # wget ... (download meta .pickle )
 
-PODCASTS_PATH="../Balalaika100H"
-PICKLE_PATH="Balalaika100H.pkl"
-PARQUET_PATH="Balalaika100H.parquet"
+PODCASTS_PATH="Balalaika"
+PICKLE_PATH="Balalaika.pkl"
+PARQUET_PATH="Balalaika.parquet"
 NUM_WORKERS=4
 
 activate_venv ".user_venv"
