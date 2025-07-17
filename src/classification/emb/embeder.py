@@ -35,10 +35,12 @@ class ResNetEmbedder:
 
     def __call__(self, path):
         wav = self._preprocess(path)
+        
+        if wav is None: 
+            return None, None
+
         duration = wav.shape[-1] / self.resample_rate
         fullness = duration / self.total_duration
-        if wav is None: 
-            return None
             
         feats = self.compute_fbank(wav)
         feats = feats.unsqueeze(0).to(self.device)
@@ -73,11 +75,14 @@ class ResNetEmbedder:
                 threshold=0.4,
                 return_seconds=False
             )
-            
 
-            segments = [waveform[:, seg['start']:seg['end']] 
-                    for seg in speech_segments]
-            waveform = torch.cat(segments, dim=-1)
+        if len(speech_segments) == 0: # empty audio
+            return
+
+        segments = [waveform[:, seg['start']:seg['end']] 
+                for seg in speech_segments]
+        
+        waveform = torch.cat(segments, dim=-1)
                 
         return waveform
 

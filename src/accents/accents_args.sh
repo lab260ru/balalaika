@@ -15,11 +15,9 @@ activate_venv ".dev_venv"
 
 PODCASTS_PATH="../../../balalaika"
 MODEL_NAME="turbo3.1"
-DEVICE="cuda"
 NUM_WORKERS=4
 
 python3 -m src.accents.accents \
     --podcasts_path "$PODCASTS_PATH" \
     --model_name "$MODEL_NAME" \
-    --device "$DEVICE" \
     --num_workers "$NUM_WORKERS"

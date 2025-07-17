@@ -12,7 +12,7 @@ activate_venv() {
 
 PODCASTS_PATH=$(realpath "$1")
 PICKLE_PATH=$(realpath "$2")
-NUM_WORKERS=4
+NUM_WORKERS="$3"
 
 activate_venv ".user_venv"
 

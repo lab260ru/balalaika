@@ -81,6 +81,10 @@ def main(args):
     available_gpu_ids = list(range(torch.cuda.device_count()))
     num_gpus = len(available_gpu_ids)
 
+    if num_gpus == 0:
+        logger.error("No GPUs available. Exiting.")
+        return
+
     logger.info(
         f"""
         Starting punctuation restoration with parameters:
@@ -132,10 +136,26 @@ if __name__ == "__main__":
     multiprocessing.set_start_method("spawn")
 
     parser = argparse.ArgumentParser(description="Punctuation restoration script using multiple GPUs.")
-    parser.add_argument("--config_path", type=str, help="Path to the configuration file")
-    parser.add_argument("--podcasts_path", type=str, help="Path to the dataset directory containing .txt files")
-    parser.add_argument("--num_workers", type=int, help="Number of worker processes per GPU")
-    parser.add_argument("--model_name", type=str, help="Hugging Face NER model name for punctuation")
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        help="Path to the configuration file"
+        )
+    parser.add_argument(
+        "--podcasts_path",
+        type=str,
+        help="Path to the dataset directory containing .txt files"
+        )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        help="Number of worker processes per GPU"
+        )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        help="Hugging Face NER model name for punctuation"
+        )
 
     args = parser.parse_args()
     main(args)

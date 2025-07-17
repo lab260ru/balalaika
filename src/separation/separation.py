@@ -24,15 +24,11 @@ _global_worker = None
 class Worker:
     def __init__(
         self,
-        use_nisqa: bool,
-        use_mono: bool,
         one_speaker: bool,
         nisqa_config_path: str,
         gpu_id: int,
         hf_token: str,
     ):
-        self.use_nisqa = use_nisqa
-        self.use_mono = use_mono
         self.one_speaker = one_speaker
         self.nisqa_config_path = nisqa_config_path
         self.hf_token = hf_token
@@ -43,7 +39,7 @@ class Worker:
         
         torch.cuda.set_device(self.device)
 
-        if self.use_nisqa:
+        try:
             with open(self.nisqa_config_path, "r") as f:
                 args_yaml = yaml.load(f, Loader=yaml.FullLoader)
 
@@ -52,29 +48,28 @@ class Worker:
             
             self.nisqa_model, self.h0, self.c0 = model_init(args)
             self.nisqa_args = args
+        except Exception as e:
+            logger.warning(f"{e} on {self.device}.")
 
-        if self.use_mono:
-            try:
-                self.diarization_model = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    use_auth_token=self.hf_token
-                ).to(torch.device(self.device))
-            except Exception as e:
-                logger.warning(f"{e} on {self.device}.")
+      
+        try:
+            self.diarization_model = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=self.hf_token
+            ).to(torch.device(self.device))
+        except Exception as e:
+            logger.warning(f"{e} on {self.device}.")
 
     def process_audio(self, audio_path: str) -> Dict:
         audio_path = Path(audio_path)
-        frame_duration = self.nisqa_args.get("frame") if self.use_nisqa else 0
+        frame_duration = self.nisqa_args.get("frame")
         audio_frames, sr, audio = self._preprocess_audio(str(audio_path), frame_duration)
 
         is_mono = True 
-        if self.use_mono:
-            is_mono = self._check_single_speaker(audio, sr) 
+        is_mono = self._check_single_speaker(audio, sr) 
 
-        NOI = COL = DISC = LOUD = MOS = None
-        if self.use_nisqa:
-            avg_out = self._nisqua_predict(audio_frames, sr) 
-            NOI, COL, DISC, LOUD, MOS = avg_out
+        avg_out = self._nisqua_predict(audio_frames, sr) 
+        NOI, COL, DISC, LOUD, MOS = avg_out
 
         file_parts = audio_path.name.split('_')
         playlist_id = file_parts[-2] if len(file_parts) > 0 else 'N/A'
@@ -111,9 +106,6 @@ class Worker:
         return frames, sr, audio
 
     def _check_single_speaker(self, waveform: torch.Tensor, sr: int) -> bool:
-      
-        if not self.use_mono:
-            return True 
         try:
             diarization = self.diarization_model({
                 "waveform": waveform.unsqueeze(0), 
@@ -139,9 +131,7 @@ class Worker:
 
 
     def _nisqua_predict(self, frames: List[torch.Tensor], sr: int) -> np.ndarray:
-        if not self.use_nisqa:
-            return np.array([None, None, None, None, None])
-        
+
         outputs = []
         h, c = self.h0.clone().to(self.device), self.c0.clone().to(self.device) 
         
@@ -153,8 +143,6 @@ class Worker:
 
 
 def _worker_initializer(
-    use_nisqa: bool,
-    use_mono: bool,
     one_speaker: bool,
     nisqa_config_path: str, 
     hf_token: str,
@@ -167,8 +155,6 @@ def _worker_initializer(
             gpu_id = gpu_id_assignment_queue.get()
         
         _global_worker = Worker(
-            use_nisqa=use_nisqa,
-            use_mono=use_mono,
             one_speaker=one_speaker,
             nisqa_config_path=nisqa_config_path,
             gpu_id=gpu_id,
@@ -199,12 +185,15 @@ def main(args):
 
     podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '/../../../balalaika')
     one_speaker = args.one_speaker if args.one_speaker else config.get('one_speaker', False)
-    use_nisqa = args.use_nisqa if args.use_nisqa else config.get('use_nisqa', True)
-    use_mono = args.use_mono if args.use_mono else config.get('use_mono', True)
     num_workers = args.num_workers if args.num_workers else config.get('num_workers', 4)
-    nisqa_config_path = args.nisqa_config if args.nisqa_config else config.get('nisqa_config', '')
 
+    nisqa_config_path = args.nisqa_config if args.nisqa_config else config.get('nisqa_config', '')
     num_gpus = torch.cuda.device_count()
+
+    if num_gpus == 0:
+        logger.error("No GPUs available. Exiting.")
+        return
+    
     actual_max_workers = num_gpus
     gpu_ids_available = list(range(num_gpus))
 
@@ -212,8 +201,6 @@ def main(args):
                 Using params:
                 Podcasts path: {podcasts_path}
                 One speaker : {one_speaker}
-                Use NISQA : {use_nisqa}
-                Use mono : {use_mono}
                 num_workers : {num_workers}
                 Number of GPUs detected: {num_gpus}
                 """)
@@ -260,7 +247,7 @@ def main(args):
         max_workers=actual_max_workers,
         mp_context=multiprocessing.get_context('spawn'),
         initializer=_worker_initializer,
-        initargs=(use_nisqa, use_mono, one_speaker, nisqa_config_path, hf_token, gpu_id_assignment_queue)
+        initargs=(one_speaker, nisqa_config_path, hf_token, gpu_id_assignment_queue)
     ) as executor:
         futures = [executor.submit(_process_audio_task, str(path)) for path in audio_paths_to_process]
 
@@ -282,16 +269,31 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process audio files using multiple GPUs")
-    parser.add_argument("--config_path", type=str, help="Path to the YAML configuration file.")
-    parser.add_argument("--nisqa_config", type=str, help="Path to the NISQA YAML configuration file.")
-    parser.add_argument("--podcasts_path", type=str, help="Path to the directory containing podcast audio files.")
-    parser.add_argument("--use_nisqa", type=bool, 
-                    help="Boolean flag indicating whether to use NISQA model for audio quality estimation.")
-    parser.add_argument("--use_mono", type=bool,
-                    help="Boolean flag indicating whether the input audio should be converted to mono before processing.")
-    parser.add_argument("--one_speaker", type=bool, 
-                        help="Boolean flag to indicate if only one speaker is expected per audio file")
-    parser.add_argument("--num_workers", type=int, 
-                        help="Number of worker processes per GPU for parallel processing.")
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        help="Path to the YAML configuration file."
+        )
+    parser.add_argument(
+        "--nisqa_config",
+        type=str,
+        help="Path to the NISQA YAML configuration file."
+        )
+    parser.add_argument(
+        "--podcasts_path",
+        type=str,
+        help="Path to the directory containing podcast audio files."
+        )
+    parser.add_argument(
+        "--one_speaker",
+        type=bool, 
+        help="Boolean flag to indicate if only one speaker is expected per audio file"
+        )
+    parser.add_argument(
+        "--num_workers",
+        type=int, 
+        help="Number of worker processes per GPU for parallel processing."
+        )
+    
     args = parser.parse_args()
     main(args)

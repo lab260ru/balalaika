@@ -16,10 +16,8 @@ activate_venv ".dev_venv"
 MODEL_PATH="$SCRIPT_DIR/voxblink2_samresnet100_ft"
 PODCASTS_PATH=""../../../podcasts""
 THRESHOLD=0.8
-DEVICE="cuda:0"
 
 python -m src.classificatoin.classificatoin \
     --podcasts_path "$PODCASTS_PATH" \
     --model_path "$MODEL_PATH" \
     --threshold "$THRESHOLD" \
-    --device "$DEVICE" \
