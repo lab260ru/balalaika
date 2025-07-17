@@ -13,7 +13,7 @@ activate_venv() {
 wget https://huggingface.co/datasets/MTUCI/Balalaika2000H/resolve/main/Balalaika2000H.parquet
 wget https://huggingface.co/datasets/MTUCI/Balalaika2000H/resolve/main/Balalaika2000H.pkl
 
-PODCASTS_PATH="../Balalaika2000H"
+PODCASTS_PATH="Balalaika2000H"
 PICKLE_PATH="Balalaika2000H.pkl"
 PARQUET_PATH="Balalaika2000H.parquet"
 NUM_WORKERS=4

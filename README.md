@@ -52,12 +52,27 @@ bash create_user_env.sh
 
 ### Quick Setup (Default Parameters)
 
-To download and prepare the dataset with default settings, choose one of the preconfigured dataset sizes (100, 200, 500, 1000, 2000) hours:
+To download and prepare the dataset with default settings, choose one of the preconfigured dataset sizes:
 
-* **n-hour dataset**
-
+* **100-hour dataset**
   ```bash
-  bash use_meta_{n}h.sh
+  bash use_meta_100h.sh
+  ```
+
+* **500-hour dataset**
+  ```bash
+  bash use_meta_500h.sh
+  ```
+
+* **1000-hour dataset**
+  ```bash
+  bash use_meta_1000h.sh
+  ```
+
+* **2000-hour dataset**
+  ```bash
+  bash use_meta_2000h.sh
+  ```
 
 All metadata can also be downloaded from [Hugging Face – MTUCI](https://huggingface.co/MTUCI).
 

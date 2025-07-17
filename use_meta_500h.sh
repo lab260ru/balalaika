@@ -16,7 +16,7 @@ wget https://huggingface.co/datasets/MTUCI/Balalaika500H/resolve/main/Balalaika5
 
 activate_venv ".user_venv"
 
-PODCASTS_PATH="../Balalaika500H"
+PODCASTS_PATH="Balalaika500H"
 PICKLE_PATH="Balalaika500H.pkl"
 PARQUET_PATH="Balalaika500H.parquet"
 NUM_WORKERS=4

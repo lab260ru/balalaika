@@ -7,3 +7,4 @@ yandex-music==2.2.0
 music-tag==0.4.3
 tqdm
 requests
+PyYAML
