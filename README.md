@@ -167,7 +167,7 @@ models/
 
 Supported models:
 
-- [NISQA](https://github.com/gabrielmittag/NISQA)  – Audio quality assessment.
+- [NISQA](https://github.com/deepvk/NISQA-s)  – Audio quality assessment.
 - [GigaAM](https://github.com/salute-developers/GigaAM)  – ASR.
 - [ruAccent](https://github.com/Den4ikAI/ruaccent)  – Accent restoration.
 - [RUPynct](https://huggingface.co/RUPunct/RUPunct_big)  – Punctuation restoration.
