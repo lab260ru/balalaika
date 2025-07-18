@@ -112,7 +112,7 @@ All output metadata will be saved in `podcasts/result.csv`.
 
 ## Configuration
 
-The main configuration file is located at `yapoddataset/configs/config.yaml`. This file is organized into several sections, each corresponding to a specific stage of the podcast processing pipeline. Below is a detailed explanation of the key parameters within each section.
+The main configuration file is located at `configs/config.yaml`. This file is organized into several sections, each corresponding to a specific stage of the podcast processing pipeline. Below is a detailed explanation of the key parameters within each section.
 
 ---
 
