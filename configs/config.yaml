@@ -1,0 +1,49 @@
+download:
+  podcasts_path: /home/nikita/balalaika 
+  episodes_limit: 1
+  num_workers: 4
+  podcasts_urls_file: ''
+  
+preprocess:
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the podcasts are located 
+  duration: 15
+  num_workers: 2
+  whisper_model: 'large-v3'
+  compute_type: 'float16'
+  beam_size: 5
+
+separation:
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
+  num_workers: 4
+  nisqa_config: "configs/nisqa_s.yaml"
+  one_speaker: False
+
+transcription:
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
+  model_name: "rnnt"  
+  num_workers: 4 # per one gpu
+  with_timestamps: False # ctc only support
+  lm_path: '' # path to lm.bin
+  
+punctuation:
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
+  model_name: "RUPunct/RUPunct_big"
+  num_workers: 4 # per one gpu
+
+accent:
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
+  num_workers: 8
+  model_name: turbo3.1
+  
+phonemizer:
+  podcasts_path: /home/nikita/balalaika # full path to the folder where the text files are located
+  num_workers: 4 # per one gpu
+
+classification:
+  podcasts_path: /home/nikita/balalaika
+  num_workers: 8
+  threshold: 0.8
+  model_path: models/voxblink2_samresnet100_ft
+
+
+  

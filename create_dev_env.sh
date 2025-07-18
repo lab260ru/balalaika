@@ -1,0 +1,55 @@
+#!/bin/bash
+set -euo pipefail
+
+create_venv_env() {
+    local env_name=$1
+    local requirements_file=$2
+    
+    if [ ! -d "$env_name" ]; then
+        echo "Creating $env_name environment..."
+        uv venv "$env_name"
+    
+        if [ -f "$env_name/Scripts/activate" ]; then
+            source "$env_name/Scripts/activate"
+        elif [ -f "$env_name/bin/activate" ]; then
+            source "$env_name/bin/activate"
+        else
+            echo "Error: Could not find activate script in $env_name"
+            exit 1
+        fi
+        
+        uv pip install -r "$requirements_file"
+        deactivate
+    else
+        echo "Environment $env_name already exists"
+        
+        if [ -f "$env_name/Scripts/activate" ]; then
+            source "$env_name/Scripts/activate"
+        elif [ -f "$env_name/bin/activate" ]; then
+            source "$env_name/bin/activate"
+        else
+            echo "Error: Could not find activate script in $env_name"
+            exit 1
+        fi
+        
+        if ! pip check; then
+            echo "Some dependencies are missing or incompatible in $env_name, reinstalling..."
+            pip install -r "$requirements_file" --force-reinstall
+        fi
+        deactivate
+    fi
+}
+
+if ! command -v python &> /dev/null; then
+    echo "Python not found! Please install Python 3.10+"
+    exit 1
+fi
+
+python -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)" || {
+    echo "Requires Python 3.10 or newer!"
+    exit 1
+}
+
+# create_venv_env ".main_venv" "requirements_main.txt"
+# create_venv_env ".support_venv" "requirements_support.txt"
+create_venv_env ".dev_venv" "requirements_dev.txt"
