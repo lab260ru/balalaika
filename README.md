@@ -1,8 +1,16 @@
-# Balalaika Pipeline
+# A Data-Centric Framework for Addressing Phonetic and Prosodic Challenges in Russian Speech Generative Models
 
-A complete production-ready pipeline for processing podcast audio data, from download to feature extraction.
+Russian speech synthesis presents distinctive challenges, including vowel reduction, consonant devoicing, variable stress patterns, homograph ambiguity, and unnatural intonation. This paper introduces Balalaika, a novel dataset comprising more than 2,000 hours of studio-quality Russian speech with comprehensive textual annotations, including punctuation and stress markings. Experimental results show that models trained on Balalaika significantly outperform those trained on existing datasets in both speech synthesis and enhancement tasks.
 
 ---
+
+## Quick Start 👟
+```bash
+git clone https://github.com/mtuciru/balalaika && cd balalaika
+bash create_user_env.sh        # sets up venv + pip deps
+bash use_meta_500h.sh          # pick 100h / 500h / 1000h / 2000h as needed
+
+```
 
 ## Table of Contents
 
@@ -17,7 +25,8 @@ A complete production-ready pipeline for processing podcast audio data, from dow
 6. [Environment Variables](#environment-variables)
 7. [Models](#models)
 8. [Citation](#citation)
-9. [Acknowledgments](#acknowledgments)
+<!-- 9. [Acknowledgments](#acknowledgments) -->
+9. [License](#license)
 
 ---
 
@@ -26,10 +35,16 @@ A complete production-ready pipeline for processing podcast audio data, from dow
 Ensure you have the following tools installed on your system:
 
 ```bash
-sudo apt update && sudo apt install -y ffmpeg
+sudo apt update && sudo apt install -y \
+  ffmpeg \                 # video/audio toolkit
+  python3 \                # Python
+  python3-pip \            # Pip package manager
+  python3-venv \           # std-lib virtual-env support
+  python3-dev \            # headers for compiling native wheels
+  python-is-python3
 wget -qO- https://astral.sh/uv/install.sh | sh
 
-````
+```
 
 ---
 
@@ -230,7 +245,7 @@ YANDEX_KEY=<your_yandex_music_token>
 
 - All scripts must be executed from the **project root directory**.
 - Paths in the config file must be **absolute**.
-- The processing scripts (punctuation, accents, yofication) should be run **sequentially**.
+- The processing scripts (punctuation, accents) should be run **sequentially**.
 - You’ll need:
   - Yandex Music API key ([How to get one](https://yandex-music.readthedocs.io/en/main/token.html)) 
   - Hugging Face token
@@ -241,7 +256,7 @@ Place all required models under the `models/` directory with the following struc
 
 ```
 models/
-├── vosblink_resnet/        # Speaker classification model
+├── voxblink_resnet/        # Speaker classification model
 │   └── ...
 └── nisqa_s.tar             # Audio quality assessment model
 ```
@@ -267,12 +282,37 @@ If you use this pipeline in your research or production, please cite:
 
 ---
 
-## References and Acknowledgements
+<!-- ## References and Acknowledgements
 
 Thanks to all the developers and contributors who made this project possible.
 
 <a href="https://github.com/mtuciru/balalaika/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=yeongpin/balalaikap&preview=true&max=&columns=" />
-</a>
+</a> -->
 
 
+## License
+
+
+### Dataset: Balalaika  
+- **CC BY-NC-ND 4.0** – non-commercial, no derivatives, research use only.  
+- Cite the corpus and do **not** redistribute files without written permission.
+
+### Code  
+- **CC BY-NC-SA 3.0** – You may use, modify, and share the material for academic, non-commercial purposes only.
+-You must retain the copyright and license notices; contact the authors for commercial use.
+
+
+### Third-Party Models & Libraries  
+Comply with each component’s original license in addition to the above:
+
+| Component | License |
+|-----------|---------|
+| NISQA-s | Apache 2.0 |
+| GigaAM | MIT |
+| ruAccent | CC BY-NC-ND 4.0 |
+| RUPunct | CC BY-NC-ND 4.0 |
+| VoxBlink ResNet | Apache 2.0 |
+| TryIPaG2P | MIT |
+| pyannote-audio | MIT |
+| Faster-Whisper | MIT |
