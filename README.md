@@ -26,6 +26,7 @@ bash use_meta_500h.sh          # pick 100h / 500h / 1000h / 2000h as needed
 7. [Models](#models)
 8. [Citation](#citation)
 <!-- 9. [Acknowledgments](#acknowledgments) -->
+9. [License](#license)
 
 ---
 
@@ -244,7 +245,7 @@ YANDEX_KEY=<your_yandex_music_token>
 
 - All scripts must be executed from the **project root directory**.
 - Paths in the config file must be **absolute**.
-- The processing scripts (punctuation, accents, yofication) should be run **sequentially**.
+- The processing scripts (punctuation, accents) should be run **sequentially**.
 - You’ll need:
   - Yandex Music API key ([How to get one](https://yandex-music.readthedocs.io/en/main/token.html)) 
   - Hugging Face token
@@ -290,3 +291,28 @@ Thanks to all the developers and contributors who made this project possible.
 </a> -->
 
 
+## License
+
+
+### Dataset: Balalaika  
+- **CC BY-NC-ND 4.0** – non-commercial, no derivatives, research use only.  
+- Cite the corpus and do **not** redistribute files without written permission.
+
+### Code  
+- **CC BY-NC-SA 3.0** – You may use, modify, and share the material for academic, non-commercial purposes only.
+-You must retain the copyright and license notices; contact the authors for commercial use.
+
+
+### Third-Party Models & Libraries  
+Comply with each component’s original license in addition to the above:
+
+| Component | License |
+|-----------|---------|
+| NISQA-s | Apache 2.0 |
+| GigaAM | MIT |
+| ruAccent | CC BY-NC-ND 4.0 |
+| RUPunct | CC BY-NC-ND 4.0 |
+| VoxBlink ResNet | Apache 2.0 |
+| TryIPaG2P | MIT |
+| pyannote-audio | MIT |
+| Faster-Whisper | MIT |
