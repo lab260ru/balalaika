@@ -211,6 +211,15 @@ models/
 
 Если вы используете датасет в своей работе, пожалуйста процитируйте нас
 ```
+@misc{borodin2025datacentricframeworkaddressingphonetic,
+      title={A Data-Centric Framework for Addressing Phonetic and Prosodic Challenges in Russian Speech Generative Models}, 
+      author={Kirill Borodin and Nikita Vasiliev and Vasiliy Kudryavtsev and Maxim Maslov and Mikhail Gorodnichev and Oleg Rogov and Grach Mkrtchian},
+      year={2025},
+      eprint={2507.13563},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2507.13563}, 
+}
 ```
 
 <!-- ## Благодарности
