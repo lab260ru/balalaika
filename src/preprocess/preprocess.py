@@ -2,18 +2,18 @@ import argparse
 import os
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import torch
 import torchaudio
 from loguru import logger
 from tqdm import tqdm
-from faster_whisper import WhisperModel
 from dotenv import load_dotenv
 
 from huggingface_hub import login
 
 from src.utils import load_config
+from src.libs.smart_turn.offline_svad import OfflineVAD
 
 def get_audio_paths(directory: str) -> List[str]:
     audio_paths = []
@@ -23,179 +23,132 @@ def get_audio_paths(directory: str) -> List[str]:
             continue
         if os.path.isdir(full_path):
             audio_paths.extend(get_audio_paths(full_path))
-        elif entry.endswith(".mp3") :
+        elif entry.endswith(".mp3"):
             audio_paths.append(full_path)
     return audio_paths
 
-def get_whisper_segments(
-    model: Any,
-    path_audio: str,
-    beam_size: int = 5
-) -> Tuple[List[float], List[float], List[str]]:
+def postprocess_vad_result(vad_result: List[Dict[str, Any]], duration: float = 15.0) -> Tuple[List[float], List[float]]:
+    speech_intervals = [
+        {'start_time': item['start_time'], 'end_time': item['end_time']}
+        for item in vad_result if item['prediction'] == 1
+    ]
     
-    segments, info  = model.transcribe(
-        path_audio, 
-        beam_size=beam_size,
-        )
+    if not speech_intervals:
+        return [], []
 
     timesteps_starts = []
     timesteps_ends = []
-    
-    timestamps_text = []
 
-    for segment in segments:
-        timesteps_starts.append(segment.start)
-        timesteps_ends.append(segment.end + 0.05)
-        timestamps_text.append(segment.text)
-    
-    assert len(timesteps_starts) == len(timesteps_ends) == len(timestamps_text), "Mismatch in timestamps lengths."
-    return timesteps_starts, timesteps_ends, timestamps_text
+    current_start = speech_intervals[0]['start_time']
+    current_end = speech_intervals[0]['end_time']
 
+    for interval in speech_intervals[1:]:
+        next_start = interval['start_time']
+        next_end = interval['end_time']
 
-def get_piece_idx(
-    timesteps_starts: List[float],
-    timesteps_ends: List[float],
-    duration: float = 15.0,
-) -> List[Tuple[int, int]]:
-    """
-    Groups speech segments into optimal chunks respecting duration constraints,
-    returning indices of the original segments rather than time intervals.
+        if next_end - current_start <= duration:
+            current_end = next_end
+        else:
+            if duration / 3 <= current_end - current_start <= duration:
+                timesteps_starts.append(current_start)
+                timesteps_ends.append(current_end)
+            current_start = next_start
+            current_end = next_end
 
-    Processes speech segments to identify optimal groupings that:
-    1. Do not exceed specified maximum duration when combined
-    2. Contain complete consecutive speech segments
-    3. Maintain natural segmentation boundaries
+    if duration / 3 <= current_end - current_start <= duration:
+        timesteps_starts.append(current_start)
+        timesteps_ends.append(current_end)
 
-    Args:
-        timesteps_starts: Start times of speech segments (seconds)
-        timesteps_ends: End times of speech segments (seconds)
-        duration: Maximum allowed combined duration in seconds (default: 15.0)
-
-    Returns:
-        List of tuples representing segment index ranges:
-        - Each tuple contains (start_index, end_index) of segments in original lists
-        - Index ranges reference positions in timesteps_starts/timesteps_ends
-        - Resulting combined segments would be between duration//3 and duration seconds
-        - Maintains original segment order
-
-    Example:
-        Input segments:
-        starts = [0.0, 2.5, 5.5, 12.5]
-        ends = [2.15, 5.15, 12.15, 18.15]
-        
-        Output with duration=15:
-        [(0, 2), (3, 3)]  # First 3 segments grouped, last segment standalone
-    """
-        
-    if not timesteps_starts or not timesteps_ends:
-        return []
-
-    pieces = []
-    n = len(timesteps_starts)
-    m = len(timesteps_ends)
-    start_idx = 0
-
-    while start_idx < n:
-        left_s = timesteps_starts[start_idx]
-        end_idx = start_idx
-        temp_duration = 0.0
-
-        while end_idx < m:
-            right_s = timesteps_ends[end_idx]
-            temp_duration = right_s - left_s
-            if temp_duration > duration:
-                break
-            end_idx += 1
-
-        if end_idx > start_idx:
-            current_duration = timesteps_ends[end_idx - 1] - left_s
-            if (current_duration >= duration / 3) and (current_duration <= duration):
-                pieces.append((start_idx, end_idx - 1))
-
-        start_idx = max(end_idx, start_idx + 1)
-
-    return pieces
+    return timesteps_starts, timesteps_ends
 
 def cut_audio(
     audio: torch.Tensor,
     sr: int,
-    pieces: List[Tuple[int, int]],
-    satrt_timestamps: List[float],
+    start_timestamps: List[float],
     end_timestamps: List[float],
-    text_segments: List[str],
     output_folder: str,
     album_id: str,
     episode_id: str,
     format: str = 'mp3',
-    duration:float = 15.0
+    duration: float = 15.0
 ):
     try:
         os.makedirs(output_folder, exist_ok=True)
-        for i, (start_idx, end_idx) in enumerate(pieces):
-
-            start_time = satrt_timestamps[start_idx]
-            end_time = end_timestamps[end_idx]
-
-            if end_time - start_time <= duration / 3 :
+        segments_created = 0
+        for start_time, end_time in zip(start_timestamps, end_timestamps):
+            if end_time - start_time <= duration / 3:
                 continue
             
             start_sample = int(start_time * sr)
             end_sample = int(end_time * sr)
             end_sample = min(audio.shape[-1], end_sample)
-            assert end_sample > start_sample
+            if end_sample <= start_sample:
+                continue
 
             segment = audio[:, start_sample:end_sample]
             output_audio_filename = f"{start_time:.2f}_{end_time:.2f}_{album_id}_{episode_id}.{format}"
-            output_whisper_filename = f"{start_time:.2f}_{end_time:.2f}_{album_id}_{episode_id}_whisper.txt"
-
             output_audio_path = os.path.join(output_folder, output_audio_filename)
-            output_whisper_path = os.path.join(output_folder, output_whisper_filename)
-
-            whisper_text = ' '.join(text_segments[start_idx:end_idx + 1])
-            with open(output_whisper_path, 'w', encoding='utf-8') as f:
-                f.write(whisper_text)
-
+            
             torchaudio.save(output_audio_path, segment, sr)
+            segments_created += 1
 
-        logger.success(f"The folder has been processed : {output_folder}")
+        logger.success(f"Processed {segments_created} segments: {output_folder}")
 
     except Exception as e:
-        logger.error(f"Error : {e}")
+        logger.error(f"Error in cut_audio: {e}")
         raise
 
-def process_audio_file(
-    path_audio: str,
-    duration: float,
-    beam_size: int
-):
+def init_vad_process(gpu_id: int, vad_args: Dict[str, Any]):
+    global smart_vad
+    
+    if torch.cuda.is_available():
+        device = f"cuda:{gpu_id}"
+        torch.cuda.set_device(device)
+    else:
+        device = "cpu"
+        logger.warning(f"No GPU available, using CPU for process")
+    
+    smart_vad = OfflineVAD(
+        silero_vad_threshold=vad_args['silero_vad_threshold'],
+        smart_vad_threshold=vad_args['smart_vad_threshold'],
+        smart_vad_path=vad_args['smart_vad_path'],
+        device=device
+    )
+    logger.info(f"VAD initialized on {device}")
+
+def process_audio_file(path_audio: str, duration: float):
+    global smart_vad
+    
     album_id = os.path.basename(os.path.dirname(path_audio))
     episode_id = os.path.splitext(os.path.basename(path_audio))[0]
-    
-    logger.info(f"Processing: Album={album_id}, Episode={episode_id}")
-
     episode_folder = os.path.join(os.path.dirname(path_audio), episode_id)
 
     try:
         audio, sr = torchaudio.load(path_audio)
-
         if audio.shape[-1] / sr <= duration:
             return
     except Exception as e:
-        os.remove(path_audio)
-        logger.info(f"broken file {path_audio}: {e}")
+        logger.error(f"Broken file {path_audio}: {e}")
+        if os.path.exists(path_audio):
+            os.remove(path_audio)
         return
-    
+
     try:
-        timesteps_starts, timesteps_ends, timestamps_text = get_whisper_segments(model, path_audio, beam_size)
-        pieces = get_piece_idx(timesteps_starts, timesteps_ends, duration)
+        vad_result = smart_vad.process_file(path_audio)
+        import pickle
+        with open('data.pkl', 'wb') as file:
+            pickle.dump(vad_result, file)
+        timesteps_starts, timesteps_ends = postprocess_vad_result(vad_result, duration=duration)
+        
+        if not timesteps_starts:
+            logger.warning(f"No speech segments found in {path_audio}")
+            return
 
         cut_audio(
             audio=audio,
             sr=sr,
-            pieces=pieces,
-            satrt_timestamps=timesteps_starts,
+            start_timestamps=timesteps_starts,
             end_timestamps=timesteps_ends,
-            text_segments=timestamps_text,
             output_folder=episode_folder,
             album_id=album_id,
             episode_id=episode_id,
@@ -203,124 +156,101 @@ def process_audio_file(
             duration=duration
         )
 
-
     except Exception as e:
         logger.error(f"Processing error {path_audio}: {e}")
-        torch.cuda.empty_cache()
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        
-    if len(os.listdir(episode_folder)) > 0 or len(pieces) == 0  : # the audio was cut or we couldn't cut it considering our length
+    if os.path.exists(episode_folder) and os.listdir(episode_folder):
         os.remove(path_audio)
-        logger.info(f"Temporary file deleted: {path_audio}")
-
-def init_process(
-    whisper_model: str,
-    device: str,
-    compute_type: str = 'float16',
-    device_index = [0]
-):
-    
-    global model
-    model = WhisperModel(
-        whisper_model,
-        device=device,
-        compute_type=compute_type,
-        device_index=device_index,
-        )
-    
+        logger.info(f"Original file deleted: {path_audio}")
 
 def main(args):
     load_dotenv()
-    hf_key = os.getenv("HF_TOKEN")
+    hf_key=os.environ.get('HF_TOKEN')
     login(token=hf_key)
 
     config = load_config(args.config_path, 'preprocess')
 
-    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../podcasts')
-    duration = args.duration if args.duration else config.get('duration', 15)
-    num_workers = args.num_workers if args.num_workers else config.get('num_workers', 4)
-    whisper_model = args.whisper_model if args.whisper_model else config.get('whisper_model', 'large-v3')
-    compute_type = args.compute_type if args.compute_type else config.get('compute_type', 'float16')
-    beam_size = args.beam_size if args.beam_size else config.get('beam_size', 5)
-    device = 'cuda'
-    available_gpu_ids = list(range(torch.cuda.device_count()))
+    podcasts_path = args.podcasts_path or config.get('podcasts_path', '../../../podcasts')
+    duration = args.duration or config.get('duration', 15)
+    num_workers = args.num_workers or config.get('num_workers', 4)
+    smart_vad_model = args.smart_vad_model or config.get('smart_vad_model', "pipecat-ai/smart-turn-v2")
 
-    num_gpus = len(available_gpu_ids)
-
+    num_gpus = torch.cuda.device_count()
+    available_gpus = list(range(num_gpus))
     if num_gpus == 0:
         logger.error("No GPUs available. Exiting.")
         return
+        
 
     audio_paths = get_audio_paths(podcasts_path)
+    if not audio_paths:
+        logger.info("No audio files found.")
+        return
 
-    max_workers = min(num_workers, os.cpu_count())
+    vad_args = {
+        'silero_vad_threshold': 0.5,
+        'smart_vad_threshold': 0.5,
+        'smart_vad_path': smart_vad_model
+    }
 
-    logger.info(
-    f"""
-    Using parms 
-    podcasts_path:{podcasts_path} 
-    whisper_model:{whisper_model}
-    duration:{duration} 
-    num_workers:{num_workers}
-    devices:{available_gpu_ids}
-    compute_type:{compute_type}
-    beam_size:{beam_size}
+    logger.info(f"""
+    Starting processing with:
+    Podcasts path: {podcasts_path}
+    Smart VAD model: {smart_vad_model}
+    Segment duration: {duration} seconds
+    Workers per GPU: {num_workers}
+    Available GPUs: {available_gpus}
+    Files to process: {len(audio_paths)}
     """)
 
-    with ProcessPoolExecutor(
-        max_workers=max_workers,
-        initializer=init_process,
-        initargs=(whisper_model, device, compute_type, available_gpu_ids, )
-        ) as executor:
-        futures = [
-            executor.submit(process_audio_file, path_audio, duration, beam_size)
-            for path_audio in audio_paths
-        ]
-        for future in tqdm(as_completed(futures), total=len(futures)):
+    all_futures = []
+    executors = []
+    
+    for gpu_id in available_gpus:
+        executor = ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=init_vad_process,
+            initargs=(gpu_id, vad_args)
+        )
+
+        executors.append(executor)
+ 
+        files_for_gpu = []
+        for i, path in enumerate(audio_paths):
+            if i % len(available_gpus) == gpu_id % len(available_gpus):
+                files_for_gpu.append(path)
+        
+        logger.info(f"GPU {gpu_id}: processing {len(files_for_gpu)} files")
+    
+        for path in files_for_gpu:
+            future = executor.submit(process_audio_file, path, duration)
+            all_futures.append(future)
+
+    with tqdm(total=len(all_futures), desc="Processing podcasts") as pbar:
+        for future in as_completed(all_futures):
             try:
                 future.result()
             except Exception as e:
                 logger.error(f"Error processing file: {e}")
+            finally:
+                pbar.update(1)
+
+    for executor in executors:
+        executor.shutdown()
 
 if __name__ == "__main__":
     torchaudio.set_audio_backend('soundfile')
     multiprocessing.set_start_method('spawn', force=True)
-    parser = argparse.ArgumentParser(description="Process audio files using whisper model.")
-    parser.add_argument(
-        "--config_path",
-        help="Path to YAML configuration file",
-        type=str,
-    )
-    parser.add_argument(
-        "--podcasts_path",
-        help="Path to podcasts folder", 
-        type=str, 
-    )
-    parser.add_argument(
-        "--whisper_model",
-        help="name of model", 
-        type=str, 
-    )
-    parser.add_argument(
-        "--compute_type",
-        help="compute type", 
-        type=str, 
-    )
-    parser.add_argument(
-        "--beam_size",
-        help="beam size", 
-        type=int,
-    )
-    parser.add_argument(
-        "--duration", 
-        help="Duration in seconds", 
-        type=int, 
-        )
-    parser.add_argument(
-        "--num_workers", 
-        help="Number of workers", 
-        type=int, 
-    )
-
+    
+    parser = argparse.ArgumentParser(description="Process audio files using smart-turn VAD model.")
+    parser.add_argument("--config_path", type=str, help="Path to YAML configuration file")
+    parser.add_argument("--podcasts_path", type=str, help="Path to podcasts folder")
+    parser.add_argument("--smart_vad_model", type=str, help="Name of smart-turn model")
+    parser.add_argument("--duration", type=int, help="Target segment duration in seconds")
+    parser.add_argument("--num_workers", type=int, help="Number of worker processes per GPU")
+    
     args = parser.parse_args()
     main(args)

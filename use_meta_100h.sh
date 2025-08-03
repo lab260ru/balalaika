@@ -1,5 +1,6 @@
-# bin/bash
+#!/bin/bash
 
+# Функция активации виртуального окружения
 activate_venv() {
     local venv_path=$1
     if [ ! -f "$venv_path/bin/activate" ]; then
@@ -7,18 +8,52 @@ activate_venv() {
         exit 1
     fi
     source "$venv_path/bin/activate"
-    echo "Activated: $(which python)"
+    echo "Activated virtual environment: $(which python)"
 }
 
-wget https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.parquet
-wget https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.pkl
+# Функция для безопасной загрузки файлов
+download_if_not_exists() {
+    local url=$1
+    local filename=$2
+    
+    if [ ! -f "$filename" ]; then
+        echo "Downloading $filename..."
+        wget "$url" -O "$filename" || {
+            echo "Error: Failed to download $filename"
+            exit 1
+        }
+    else
+        echo "$filename already exists, skipping download."
+    fi
+}
 
+# Основные параметры
 PODCASTS_PATH="Balalaika100H"
 PICKLE_PATH="Balalaika100H.pkl"
 PARQUET_PATH="Balalaika100H.parquet"
 NUM_WORKERS=4
 
+# URL для загрузки
+PICKLE_URL="https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.pkl"
+PARQUET_URL="https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.parquet"
+
+# Скачиваем файлы (если их нет)
+download_if_not_exists "$PICKLE_URL" "$PICKLE_PATH"
+download_if_not_exists "$PARQUET_URL" "$PARQUET_PATH"
+
+# Активируем виртуальное окружение
 activate_venv ".user_venv"
 
-bash src/download/download_prepared.sh $PODCASTS_PATH $PICKLE_PATH $NUM_WORKERS
-bash src/recovery_from_meta_yamls.sh $PODCASTS_PATH $PARQUET_PATH $NUM_WORKERS
+# Запускаем обработку
+echo "Starting processing..."
+bash src/download/download_prepared.sh "$PODCASTS_PATH" "$PICKLE_PATH" "$NUM_WORKERS" || {
+    echo "Error in download_prepared.sh"
+    exit 1
+}
+
+bash src/recovery_from_meta_yamls.sh "$PODCASTS_PATH" "$PARQUET_PATH" "$NUM_WORKERS" || {
+    echo "Error in recovery_from_meta_yamls.sh"
+    exit 1
+}
+
+echo "All operations completed successfully."

@@ -66,7 +66,10 @@ class Worker:
         audio_frames, sr, audio = self._preprocess_audio(str(audio_path), frame_duration)
 
         is_mono = True 
-        is_mono = self._check_single_speaker(audio, sr) 
+        is_mono = self._check_single_speaker(
+            waveform=audio,
+            sr=sr,
+            audio_path=audio_path) 
 
         avg_out = self._nisqua_predict(audio_frames, sr) 
         NOI, COL, DISC, LOUD, MOS = avg_out
@@ -105,18 +108,23 @@ class Worker:
         
         return frames, sr, audio
 
-    def _check_single_speaker(self, waveform: torch.Tensor, sr: int) -> bool:
+    def _check_single_speaker(self, waveform: torch.Tensor, sr: int, audio_path: str) -> bool:
         try:
             diarization = self.diarization_model({
                 "waveform": waveform.unsqueeze(0), 
                 "sample_rate": sr
             })
+            base_path = os.path.splitext(audio_path)[0]
+            rttm_path = base_path + '.rttm'
+
+            self._save_rttm_file(
+                diarization=diarization,
+                rttm_path=rttm_path
+                )
+
             is_single_speaker = len({speaker for _, _, speaker in diarization.itertracks(yield_label=True)}) == 1
             
-            if not is_single_speaker and self.one_speaker:
-                audio_path = str(waveform.audio_path) 
-                base_path = os.path.splitext(audio_path)[0]  
-                
+            if not is_single_speaker and self.one_speaker: 
                 for ext in ['.mp3', '_giga.txt', '_punct.txt', '_accent.txt', '_e.txt', '_e_phonemes.txt']:
                     file_path = base_path + ext
                     if os.path.exists(file_path):
@@ -140,7 +148,10 @@ class Worker:
             outputs.append(out[0].cpu().numpy())
         
         return np.mean(outputs, axis=0)
-
+    
+    def _save_rttm_file(self, diarization, rttm_path):
+        with open(rttm_path, "w") as rttm:
+            diarization.write_rttm(rttm)
 
 def _worker_initializer(
     one_speaker: bool,

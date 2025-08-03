@@ -1,4 +1,4 @@
-# bin/bash
+#!/bin/bash
 
 activate_venv() {
     local venv_path=$1
@@ -7,18 +7,36 @@ activate_venv() {
         exit 1
     fi
     source "$venv_path/bin/activate"
-    echo "Activated: $(which python)"
+    echo "Activated virtual environment: $(which python)"
 }
 
-wget https://huggingface.co/datasets/MTUCI/Balalaika2000H/resolve/main/Balalaika2000H.parquet
-wget https://huggingface.co/datasets/MTUCI/Balalaika2000H/resolve/main/Balalaika2000H.pkl
+download_if_not_exists() {
+    local url=$1
+    local filename=$2
+    
+    if [ ! -f "$filename" ]; then
+        echo "Downloading $filename..."
+        wget "$url" -O "$filename" || {
+            echo "Error: Failed to download $filename"
+            exit 1
+        }
+    else
+        echo "$filename already exists, skipping download."
+    fi
+}
 
 PODCASTS_PATH="Balalaika2000H"
 PICKLE_PATH="Balalaika2000H.pkl"
 PARQUET_PATH="Balalaika2000H.parquet"
 NUM_WORKERS=4
 
+PICKLE_URL="https://huggingface.co/datasets/MTUCI/Balalaika2000H/resolve/main/Balalaika2000H.pkl"
+PARQUET_URL="https://huggingface.co/datasets/MTUCI/Balalaika2000H/resolve/main/Balalaika2000H.parquet"
+
+download_if_not_exists "$PICKLE_URL" "$PICKLE_PATH"
+download_if_not_exists "$PARQUET_URL" "$PARQUET_PATH"
+
 activate_venv ".user_venv"
 
-bash src/download/download_prepared.sh $PODCASTS_PATH $PICKLE_PATH $NUM_WORKERS
-bash src/recovery_from_meta_yamls.sh $PODCASTS_PATH $PARQUET_PATH $NUM_WORKERS
+bash src/download/download_prepared.sh "$PODCASTS_PATH" "$PICKLE_PATH" "$NUM_WORKERS" 
+bash src/recovery_from_meta_yamls.sh "$PODCASTS_PATH" "$PARQUET_PATH" "$NUM_WORKERS"
