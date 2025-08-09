@@ -33,7 +33,7 @@ def process_text(text_path: Path):
         f.write(" ".join(phonemes))
 
 def get_valid_text_paths(src_path: str) -> List[Path]:
-    all_paths = get_txt_paths(src_path, '_giga.txt')
+    all_paths = get_txt_paths(src_path, '_rover.txt')
     valid_paths = []
     
     for giga_path in all_paths:

@@ -1,4 +1,5 @@
 *.csv
+.torch_hub/*
 *.mp3
 *.wav
 test.py

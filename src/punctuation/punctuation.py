@@ -39,7 +39,7 @@ def make_punct_txt(
 
     src_text = read_file_content(path)
 
-    punct_path = path.with_name(path.name.replace("_giga.txt", "_punct.txt"))
+    punct_path = path.with_name(path.name.replace("_rover.txt", "_punct.txt"))
 
     if str(path).endswith('_punct.txt') or str(path).endswith('_accent.txt') or os.path.exists(punct_path):
         return
@@ -61,7 +61,7 @@ def get_valid_txt_paths(src_path: str) -> List[str]:
     
     valid_paths = []
     for audio_path in all_audio_paths:
-        giga_path = audio_path.with_name(audio_path.stem + "_giga.txt")
+        giga_path = audio_path.with_name(audio_path.stem + "_rover.txt")
         punct_path = audio_path.with_name(audio_path.stem + "_punct.txt")
         
         if os.path.exists(giga_path) and not os.path.exists(punct_path):

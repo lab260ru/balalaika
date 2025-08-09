@@ -16,13 +16,13 @@ SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
 PODCASTS_PATH="/home/nikita/Balalaika100H"
 NUM_WORKERS=1
-MODEL_NAME="ctc"
+MODEL_NAMES=('giga_ctc' 'giga_rnnt' 'vosk' 'ton')
 LM_PATH="/home/nikita/yapoddataset/ru.lm.bin"
 WITH_TIMESTAMPS=True
 
 python -m src.transcription.transcription \
     --podcasts_path "$PODCASTS_PATH" \
     --num_workers "$NUM_WORKERS" \
-    --model_name "$MODEL_NAME" \
+    --model_names "$MODEL_NAMES" \
     --lm_path "$LM_PATH" \
     --with_timestamps "$WITH_TIMESTAMPS" 

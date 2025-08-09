@@ -119,7 +119,7 @@ class SpeakerClustering:
                     comp_embs = torch.stack(comp_cluster["embeddings"])
                     comp_avg = comp_embs.mean(dim=0)
                     sim = self.norm_cos_sim(base_avg, comp_avg)
-                    if sim >= self.threshold:
+                    if sim >= 0.9:
                         base_cluster["embeddings"].extend(comp_cluster["embeddings"])
                         base_cluster["paths"].extend(comp_cluster["paths"])
 
@@ -225,7 +225,7 @@ def precompute_embeddings(
 def main(args):
     config = load_config(args.config_path, 'classification')
     podcasts_path = config.get('podcasts_path', '../../../podcasts') if args.podcasts_path is None else args.podcasts_path 
-    threshold = config.get('threshold', 0.85) if args.threshold is None else args.threshold 
+    threshold = config.get('threshold', 0.7) if args.threshold is None else args.threshold 
     model_path = config.get('model_path', '/models/voxblink2_samresnet100_ft') if args.model_path is None else args.model_path
     num_workers =  config.get('num_workers', 8) if args.num_workers is None else args.num_workers 
 

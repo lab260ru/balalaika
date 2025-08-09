@@ -16,10 +16,9 @@ def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Option
 
     file_types = {
         'accent': '_accent.txt',
-        'giga': '_giga.txt',
+        'rover': '_rover.txt',
         'punct': '_punct.txt',
-        'whisper': '_whisper.txt',
-        'phonemes': '_giga_phonemes.txt'
+        'phonemes': '_rover_phonemes.txt'
     }
 
     results = {'audio_path': audio_path_str}

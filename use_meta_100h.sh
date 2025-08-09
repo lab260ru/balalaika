@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# Функция активации виртуального окружения
 activate_venv() {
     local venv_path=$1
     if [ ! -f "$venv_path/bin/activate" ]; then
@@ -11,7 +10,6 @@ activate_venv() {
     echo "Activated virtual environment: $(which python)"
 }
 
-# Функция для безопасной загрузки файлов
 download_if_not_exists() {
     local url=$1
     local filename=$2
@@ -27,24 +25,19 @@ download_if_not_exists() {
     fi
 }
 
-# Основные параметры
 PODCASTS_PATH="Balalaika100H"
 PICKLE_PATH="Balalaika100H.pkl"
 PARQUET_PATH="Balalaika100H.parquet"
 NUM_WORKERS=4
 
-# URL для загрузки
 PICKLE_URL="https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.pkl"
 PARQUET_URL="https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.parquet"
 
-# Скачиваем файлы (если их нет)
 download_if_not_exists "$PICKLE_URL" "$PICKLE_PATH"
 download_if_not_exists "$PARQUET_URL" "$PARQUET_PATH"
 
-# Активируем виртуальное окружение
 activate_venv ".user_venv"
 
-# Запускаем обработку
 echo "Starting processing..."
 bash src/download/download_prepared.sh "$PODCASTS_PATH" "$PICKLE_PATH" "$NUM_WORKERS" || {
     echo "Error in download_prepared.sh"

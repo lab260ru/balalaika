@@ -1,39 +1,39 @@
 download:
   podcasts_path: /home/nikita/balalaika 
-  episodes_limit: 1
-  num_workers: 4
-  podcasts_urls_file: ''
+  episodes_limit: 1 # limit on downloading episodes from one playlist
+  num_workers: 1
+  podcasts_urls_file: '/home/nikita/yapoddataset/20000_more_albums.pkl' # pkl with urls
   
 preprocess:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the podcasts are located 
-  duration: 15
-  num_workers: 2
-  whisper_model: 'large-v3'
-  compute_type: 'float16'
-  beam_size: 5
+  duration: 15 # in seconds (each sample will be no longer than this time.)
+  num_workers: 1
+  smart_vad_model: pipecat-ai/smart-turn-v2
+  
 
 separation:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
-  num_workers: 4
+  num_workers: 1
   nisqa_config: "configs/nisqa_s.yaml"
-  one_speaker: False
+  one_speaker: False # When this option is enabled, only single-speaker audio recordings are downloaded.
 
 transcription:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
-  model_name: "rnnt"  
-  num_workers: 4 # per one gpu
-  with_timestamps: False # ctc only support
-  lm_path: '' # path to lm.bin
+  num_workers: 1 # per one gpu
+  model_names: ['vosk', 'tone', 'giga_rnnt', 'giga_ctc', 'giga_ctc_lm']
+  vosk_path: /home/nikita/yapoddataset/models/vosk-model-ru
+  lm_path: '/home/nikita/yapoddataset/kenlm.bin' # path to lm.bin
+  with_timestamps: True
   
 punctuation:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
-  model_name: "RUPunct/RUPunct_big"
+  model_name: "RUPunct/RUPunct_big" # RUPunct model name 
   num_workers: 4 # per one gpu
 
 accent:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
-  num_workers: 8
-  model_name: turbo3.1
+  num_workers: 4 # per one gpu
+  model_name: turbo3.1 # ruAccent model name 
   
 phonemizer:
   podcasts_path: /home/nikita/balalaika # full path to the folder where the text files are located
@@ -41,9 +41,9 @@ phonemizer:
 
 classification:
   podcasts_path: /home/nikita/balalaika
-  num_workers: 8
-  threshold: 0.8
-  model_path: models/voxblink2_samresnet100_ft
+  num_workers: 4 # per one gpu
+  threshold: 0.6
+  model_path: models/voxblink2_samresnet100_ft # .pt format model from https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md
 
 
   

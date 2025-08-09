@@ -79,7 +79,7 @@ def main(args):
         devices:{available_gpu_ids}
         """)
 
-    valid_text_files = get_valid_txt_paths(podcast_path)
+    valid_text_files = get_valid_txt_paths(podcast_path)[:5]
 
     files_for_each_gpu = [[] for _ in range(num_gpus)]
     for i, path in enumerate(valid_text_files):
