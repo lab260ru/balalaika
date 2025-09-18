@@ -21,7 +21,7 @@ def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Option
         'phonemes': '_rover_phonemes.txt'
     }
 
-    results = {'audio_path': audio_path_str}
+    results = {'filepath': audio_path_str}
     for key, suffix in file_types.items():
         file_path = base_path / dir_path / f"{base_name}{suffix}"
         results[key] = read_file_content(file_path)
@@ -37,10 +37,10 @@ def main(args):
     )
 
 
-    df = pd.read_csv(base_path / "results.csv")
-    df.drop_duplicates(subset='audio_path', inplace=True)
+    df = pd.read_csv(base_path / "balalaika.csv")
+    df.drop_duplicates(subset='filepath', inplace=True)
     
-    audio_paths = df['audio_path'].tolist()
+    audio_paths = df['filepath'].tolist()
     results = []
 
     num_workers = 32
@@ -64,7 +64,7 @@ def main(args):
         
     extracted_df = pd.DataFrame(results)
 
-    final_df = pd.merge(df, extracted_df, on='audio_path', how='left')
+    final_df = pd.merge(df, extracted_df, on='filepath', how='left')
 
     output_path = base_path / "balalaika.parquet"
     final_df.to_parquet(output_path, engine='pyarrow', index=False)

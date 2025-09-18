@@ -12,54 +12,126 @@ from dotenv import load_dotenv
 
 from huggingface_hub import login
 
-from src.utils import load_config
+from src.utils import load_config, get_audio_paths
 from src.libs.smart_turn.offline_svad import OfflineVAD
 
-def get_audio_paths(directory: str) -> List[str]:
-    audio_paths = []
-    for entry in os.listdir(directory):
-        full_path = os.path.join(directory, entry)
-        if len(os.path.basename(full_path).split('_')) == 4:
-            continue
-        if os.path.isdir(full_path):
-            audio_paths.extend(get_audio_paths(full_path))
-        elif entry.endswith(".mp3"):
-            audio_paths.append(full_path)
-    return audio_paths
+from typing import List, Dict, Any, Tuple
 
-def postprocess_vad_result(vad_result: List[Dict[str, Any]], duration: float = 15.0) -> Tuple[List[float], List[float]]:
-    speech_intervals = [
-        {'start_time': item['start_time'], 'end_time': item['end_time']}
-        for item in vad_result if item['prediction'] == 1
-    ]
-    
-    if not speech_intervals:
+def postprocess_vad_result(
+    vad_result: List[Dict[str, Any]],
+    duration: float = 15.0,
+    min_duration: float = 1.0,
+    gap_threshold: float = 30.0
+) -> Tuple[List[float], List[float]]:
+    """
+    Сбалансированный алгоритм для постобработки результатов VAD.
+    Приоритет: законченные фразы, но заполняются большие промежутки между ними.
+    """
+    if not vad_result:
         return [], []
 
-    timesteps_starts = []
-    timesteps_ends = []
+    # Этап 1: Сохраняем все семантически законченные фразы (prediction=1)
+    primary_segments = []
+    
+    # Итерируем по результатам и объединяем последовательные "законченные" сегменты
+    current_segment_start = None
+    
+    for i, item in enumerate(vad_result):
+        if item['prediction'] == 1:
+            if current_segment_start is None:
+                # Начало нового потенциального сегмента
+                current_segment_start = item['start_time']
+            # Конец текущего потенциального сегмента
+            segment_end = item['end_time']
+            segment_duration = segment_end - current_segment_start
+            
+            # Проверяем, не превышаем ли мы максимальную длительность
+            if segment_duration > duration:
+                # Сохраняем предыдущий сегмент и начинаем новый
+                if i > 0 and vad_result[i-1]['prediction'] == 1:
+                    primary_segments.append((current_segment_start, vad_result[i-1]['end_time']))
+                current_segment_start = item['start_time']
 
-    current_start = speech_intervals[0]['start_time']
-    current_end = speech_intervals[0]['end_time']
+    # Сохраняем последний накопленный сегмент
+    if current_segment_start is not None:
+        last_item = vad_result[-1]
+        primary_segments.append((current_segment_start, last_item['end_time']))
 
-    for interval in speech_intervals[1:]:
-        next_start = interval['start_time']
-        next_end = interval['end_time']
+    # Фильтруем сегменты по длительности
+    primary_segments = [(s, e) for s, e in primary_segments if min_duration <= e - s <= duration]
+    
+    # Сортируем и убираем дубликаты
+    primary_segments = sorted(list(set(primary_segments)), key=lambda x: x[0])
 
-        if next_end - current_start <= duration:
-            current_end = next_end
-        else:
-            if duration / 3 <= current_end - current_start <= duration:
-                timesteps_starts.append(current_start)
-                timesteps_ends.append(current_end)
-            current_start = next_start
-            current_end = next_end
+    if not primary_segments:
+        return [], []
+    
+    # Этап 2: Заполняем большие промежутки между сохранёнными сегментами
+    filled_segments = []
+    last_end_time = 0.0
+    
+    for start, end in primary_segments:
+        gap_duration = start - last_end_time
+        if gap_duration > gap_threshold:
+            filled_segments.extend(_fill_gap(vad_result, last_end_time, start, duration, min_duration))
+        last_end_time = end
 
-    if duration / 3 <= current_end - current_start <= duration:
-        timesteps_starts.append(current_start)
-        timesteps_ends.append(current_end)
+    # Проверяем промежуток в конце
+    audio_end = vad_result[-1]['end_time']
+    if audio_end - last_end_time > gap_threshold:
+        filled_segments.extend(_fill_gap(vad_result, last_end_time, audio_end, duration, min_duration))
+    
+    # Объединяем итоговые сегменты
+    all_segments = primary_segments + filled_segments
+    all_segments = sorted(list(set(all_segments)), key=lambda x: x[0])
+    
+    all_starts = [s for s, e in all_segments]
+    all_ends = [e for s, e in all_segments]
 
-    return timesteps_starts, timesteps_ends
+    return all_starts, all_ends
+
+
+def _fill_gap(
+    vad_result: List[Dict[str, Any]],
+    gap_start: float,
+    gap_end: float,
+    duration: float,
+    min_duration: float
+) -> List[Tuple[float, float]]:
+    """
+    Вспомогательная функция: разбивает промежуток [gap_start, gap_end] на сегменты
+    длиной [min_duration, duration], используя интервалы из vad_result.
+    """
+    filled_segments = []
+    
+    current_time = gap_start
+    while current_time < gap_end:
+        # Находим следующий интервал, который начинается после current_time
+        next_interval_index = -1
+        for i, item in enumerate(vad_result):
+            if item['start_time'] >= current_time:
+                next_interval_index = i
+                break
+        
+        if next_interval_index == -1:
+            break
+            
+        seg_start = vad_result[next_interval_index]['start_time']
+        seg_end = vad_result[next_interval_index]['end_time']
+
+        # Объединяем интервалы, пока не превысим max_duration или не дойдем до конца промежутка
+        for j in range(next_interval_index + 1, len(vad_result)):
+            if vad_result[j]['end_time'] - seg_start > duration or vad_result[j]['end_time'] > gap_end:
+                break
+            seg_end = vad_result[j]['end_time']
+        
+        seg_duration = seg_end - seg_start
+        if min_duration <= seg_duration <= duration:
+            filled_segments.append((seg_start, seg_end))
+            
+        current_time = seg_end
+        
+    return filled_segments
 
 def cut_audio(
     audio: torch.Tensor,
@@ -124,7 +196,10 @@ def process_audio_file(path_audio: str, duration: float):
     episode_folder = os.path.join(os.path.dirname(path_audio), episode_id)
 
     try:
+        # TODO: don't forget to remove the code
         audio, sr = torchaudio.load(path_audio)
+        if audio.shape[-1] / sr <= 5:
+            logger.info(f"{path_audio} -- removed {audio.shape[-1] / sr} duration")
         if audio.shape[-1] / sr <= duration:
             return
     except Exception as e:
@@ -135,13 +210,13 @@ def process_audio_file(path_audio: str, duration: float):
 
     try:
         vad_result = smart_vad.process_file(path_audio)
-        import pickle
-        with open('data.pkl', 'wb') as file:
-            pickle.dump(vad_result, file)
+        # import pickle
+        # with open('data.pkl', 'wb') as file:
+        #     pickle.dump(vad_result, file)
         timesteps_starts, timesteps_ends = postprocess_vad_result(vad_result, duration=duration)
-        
         if not timesteps_starts:
-            logger.warning(f"No speech segments found in {path_audio}")
+            logger.warning(f"No speech segments found in {path_audio}, removed")
+            os.remove(path_audio)
             return
 
         cut_audio(
@@ -177,7 +252,7 @@ def main(args):
     duration = args.duration or config.get('duration', 15)
     num_workers = args.num_workers or config.get('num_workers', 4)
     smart_vad_model = args.smart_vad_model or config.get('smart_vad_model', "pipecat-ai/smart-turn-v2")
-
+    
     num_gpus = torch.cuda.device_count()
     available_gpus = list(range(num_gpus))
     if num_gpus == 0:
@@ -191,8 +266,8 @@ def main(args):
         return
 
     vad_args = {
-        'silero_vad_threshold': 0.5,
-        'smart_vad_threshold': 0.5,
+        'silero_vad_threshold': 0.4,
+        'smart_vad_threshold': 0.4,
         'smart_vad_path': smart_vad_model
     }
 

@@ -15,6 +15,7 @@ from src.transcription.transcripton_base import *
 from src.utils import get_audio_paths, load_config
 
 model = None
+SUPPORTED_TIME_STAMPS = ['giga_ctc_lm', 'tone']
 
 def init_worker(model_name: str, device_str: str, **kwargs):
     """
@@ -25,11 +26,11 @@ def init_worker(model_name: str, device_str: str, **kwargs):
     
     try:
         if 'giga' in model_name:
-            model = GigaAMWrapper(model_id=model_name, device=device_str, lm_path=kwargs.get('lm_path'))
+            model = GigaAMWrapper(model_id=model_name, device=device_str, **kwargs)
         elif 'tone' in model_name:
-            model = ToneWrapper(model_id=model_name, device=device_str)
+            model = ToneWrapper(model_id=model_name, device=device_str, **kwargs)
         elif 'vosk' in model_name:
-            model = VoskWrapper(model_id=kwargs.get('vosk_path'), device=device_str)
+            model = VOSKCUDAWrapper(model_id=kwargs.get('vosk_path'), device=device_str, **kwargs)
         else:
             raise ValueError(f"Unknown model type for '{model_name}'")
         logger.info(f"Worker initialized successfully for model '{model_name}' on {device_str}.")
@@ -38,38 +39,41 @@ def init_worker(model_name: str, device_str: str, **kwargs):
         model = None
 
 
-def process_file(path: Path, model_name_for_output: str, with_timestamps: bool):
+def process_batch(paths: List[Path], model_name_for_output: str, with_timestamps: bool):
     """
-    Transcribes a single audio file using the globally initialized model.
+    Transcribes a batch of audio files using the globally initialized model.
     Generates .txt and optionally .tst files.
     """
     global model
     if model is None:
-        logger.error(f"Model is not initialized in this worker. Skipping {path.name}.")
+        logger.error(f"Model is not initialized in this worker. Skipping batch starting with {paths[0].name}.")
         return
 
-    txt_path = path.with_name(f"{path.stem}_{model_name_for_output}.txt")
-    tst_path = path.with_name(f"{path.stem}_{model_name_for_output}.tst")
-
-    if txt_path.exists():
-        logger.info(f"Skipping already transcribed file: {txt_path}")
-        return
+    txt_paths = [path.with_name(f"{path.stem}_{model_name_for_output}.txt") for path in paths]
+    tst_paths = [path.with_name(f"{path.stem}_{model_name_for_output}.tst") for path in paths]
+    audio_paths_str = [str(p) for p in paths]
 
     try:
         if with_timestamps:
-            plain_text, tst_content = model.transcribe_with_timestamps(str(path))
+            plain_texts, tst_contents = model.transcribe_batch_with_timestamps(audio_paths_str)
         else:
-            plain_text = model.transcribe(str(path))
-            tst_content = ""
+            plain_texts = model.transcribe_batch(audio_paths_str)
+            
 
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(plain_text)
+        # Transcribe
+        for txt_path, plain_text in zip(txt_paths, plain_texts):
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(plain_text)
 
-        if with_timestamps and tst_content:
-            with open(tst_path, "w", encoding="utf-8") as f:
-                f.write(tst_content)
+        # Timestamps
+        if with_timestamps and tst_contents:
+            for tst_path, tst_content in zip(tst_paths, tst_contents):
+                if tst_content:
+                    with open(tst_path, "w", encoding="utf-8") as f:
+                        f.write(tst_content)
+
     except Exception as e:
-        logger.error(f"Failed to process {path.name}: {e}")
+        logger.error(f"Failed to process batch starting with {paths[0].name}: {e}")
 
 
 def get_valid_audio_paths(src_path: str, model_name_for_output: str) -> List[Path]:
@@ -86,14 +90,9 @@ def get_valid_audio_paths(src_path: str, model_name_for_output: str) -> List[Pat
 
 
 def main(args):
-    config = load_config(args.config_path, 'transcription') if args.config_path else {}
-
-    model_names = args.model_names or config.get('model_names', ['giga_rnnt'])
-    num_workers_per_gpu = args.num_workers or config.get('num_workers', 1)
-    src_path = args.podcasts_path or config.get('podcasts_path', '.')
-    lm_path = args.lm_path or config.get('lm_path', None)
-    with_timestamps = args.with_timestamps or config.get('with_timestamps', False)
-    vosk_path = args.vosk_path or config.get('vosk_path', None)
+    config = load_config(args.config_path, 'transcription')
+    model_names = config.get('model_names', ['giga_rnnt'])
+    src_path = config.get('podcasts_path', '.')
 
     logger.info(f"Starting transcription run for models: {model_names}")
 
@@ -103,18 +102,21 @@ def main(args):
         raise 
     
     num_devices = len(available_gpu_ids)
-
     for model_name in model_names:
         logger.info(f"--- Processing model: {model_name} ---")
-
+        model_config = config.get('giga') if 'giga' in model_name else  config.get(model_name)
+        num_workers_per_gpu = model_config.get('num_workers')
+        batch_size = model_config.get('batch_size')
         model_name_for_output = 'vosk' if 'vosk' in model_name else model_name
-        timestamps_supported = 'giga_ctc' in model_name or 'tone' in model_name or 'vosk' in model_name
-
+        with_timestamps = config.get('with_timestamps')
+        timestamps_supported = model_name in SUPPORTED_TIME_STAMPS
         current_with_timestamps = with_timestamps and timestamps_supported
+        
         if with_timestamps and not timestamps_supported:
             logger.warning(f"Timestamps requested but not supported for model '{model_name}'. Disabling.")
 
         all_audio_paths = get_valid_audio_paths(src_path, model_name_for_output)
+        
         if not all_audio_paths:
             logger.info(f"No new audio files to process for model '{model_name}'. Skipping.")
             continue
@@ -123,15 +125,12 @@ def main(args):
 
         files_for_each_device = [[] for _ in range(num_devices)]
         for i, path in enumerate(all_audio_paths):
-            device_assignment_index = i % num_devices
-            files_for_each_device[device_assignment_index].append(path)
+            files_for_each_device[i % num_devices].append(path)
 
         all_futures = []
         executors = []
         
-        init_kwargs = {'lm_path': lm_path, 'vosk_path': vosk_path}
-        task_fn = partial(process_file, model_name_for_output=model_name_for_output, with_timestamps=current_with_timestamps)
-
+        task_fn = partial(process_batch, model_name_for_output=model_name_for_output, with_timestamps=current_with_timestamps)
         for i, device_id in enumerate(available_gpu_ids):
             device_str = f'cuda:{device_id}' if device_id != 'cpu' else 'cpu'
             files_for_this_device = files_for_each_device[i]
@@ -141,7 +140,7 @@ def main(args):
 
             logger.info(f"Creating ProcessPoolExecutor for {device_str} with {num_workers_per_gpu} workers for {len(files_for_this_device)} files.")
             
-            initializer_fn = partial(init_worker, model_name, device_str, **init_kwargs)
+            initializer_fn = partial(init_worker, model_name, device_str, **model_config)
 
             executor = ProcessPoolExecutor(
                 max_workers=num_workers_per_gpu,
@@ -150,9 +149,11 @@ def main(args):
             )
             executors.append(executor)
 
-            for path in files_for_this_device:
-                future = executor.submit(task_fn, path)
-                all_futures.append(future)
+            for j in range(0, len(files_for_this_device), batch_size):
+                batch = files_for_this_device[j:j + batch_size]
+                if batch:
+                    future = executor.submit(task_fn, batch)
+                    all_futures.append(future)
 
         for future in tqdm(as_completed(all_futures), total=len(all_futures), desc=f"Transcribing ({model_name})"):
             try:
@@ -165,7 +166,8 @@ def main(args):
         
         logger.info(f"Finished processing model: {model_name}")
 
-    rover_wrapper = ROVERWrapper(podcasts_path=src_path)
+    logger.info(f"Starting ROVER processing")
+    rover_wrapper = ROVERWrapper(podcasts_path=src_path, model_names=model_names)
     rover_wrapper.aggregate_and_save()
 
     logger.info(f"Finished processing ROVER")
@@ -173,16 +175,7 @@ def main(args):
 
 if __name__ == "__main__":
     multiprocessing.set_start_method('spawn', force=True)
-    torchaudio.set_audio_backend('soundfile')
-
     parser = argparse.ArgumentParser(description="Transcribe audio files in parallel using multiple GPUs/CPUs.")
     parser.add_argument("--config_path", type=str, help="Path to the configuration YAML file.")
-    parser.add_argument("--podcasts_path", type=str, help="Path to the directory containing audio files.")
-    parser.add_argument("--num_workers", type=int, help="Number of worker processes per device.")
-    parser.add_argument("--model_names", nargs='+', help="One or more model names to use (e.g., 'giga_ctc_lm' 'tone' 'vosk').")
-    parser.add_argument("--lm_path", type=str, help="Path to the KenLM language model binary file for GigaAM-CTC.")
-    parser.add_argument('--vosk_path', type=str, help="Path to the Vosk model directory.")
-    parser.add_argument('--with_timestamps', action='store_true', help="Enable to generate .tst files with word timestamps (if supported by model).")
-
     args = parser.parse_args()
     main(args)

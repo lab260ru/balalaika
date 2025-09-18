@@ -21,4 +21,4 @@ activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-python3 -m src.collate --config_path "$CONFIG_PATH"
+taskset -c 0-24 python3 -m src.collate --config_path "$CONFIG_PATH"

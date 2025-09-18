@@ -29,14 +29,16 @@ def read_file_content(file_path):
     except FileNotFoundError:
         return ''
 
-def get_audio_paths(podcast_path: str) -> List[Path]:
+def get_audio_paths(podcast_path: str):
     podcast_path=Path(podcast_path)
     return (
         list(podcast_path.rglob("*.mp3")) +
         list(podcast_path.rglob("*.wav")) +
         list(podcast_path.rglob("*.flac")) +
-        list(podcast_path.rglob("*.ogg")) 
+        list(podcast_path.rglob("*.ogg")) +
+        list(podcast_path.rglob("*.opus")) 
     )
+
 
 def process_token(token, label):
     if label == "LOWER_O":

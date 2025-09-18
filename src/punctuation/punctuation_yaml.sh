@@ -20,4 +20,4 @@ CONFIG_PATH=$(realpath "$1")
 activate_venv ".dev_venv"
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-python3 -m src.punctuation.punctuation --config_path "$CONFIG_PATH"
+taskset -c 0-24 python3 -m src.punctuation.punctuation --config_path "$CONFIG_PATH"

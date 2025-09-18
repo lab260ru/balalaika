@@ -8,6 +8,7 @@ chromadb
 cl_*.py
 *.ipynb
 *.bin
+temp/*
 
 .env
 __pycache__/

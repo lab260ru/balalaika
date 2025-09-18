@@ -18,4 +18,4 @@ activate_venv ".user_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-python3 -m src.download.download_prepared --pickle_path "$PICKLE_PATH" --podcasts_path "$PODCASTS_PATH" --num_workers "$NUM_WORKERS"
+taskset -c 0-24  python3 -m src.download.download_prepared --pickle_path "$PICKLE_PATH" --podcasts_path "$PODCASTS_PATH" --num_workers "$NUM_WORKERS"

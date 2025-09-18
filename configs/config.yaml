@@ -1,49 +1,60 @@
 download:
-  podcasts_path: /home/nikita/balalaika 
+  podcasts_path: /mnt/disk1tb/radio-v4
   episodes_limit: 1 # limit on downloading episodes from one playlist
   num_workers: 1
   podcasts_urls_file: '/home/nikita/yapoddataset/20000_more_albums.pkl' # pkl with urls
   
 preprocess:
-  podcasts_path: /home/nikita/balalaika # full path to the folder where the podcasts are located 
+  podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the podcasts are located 
   duration: 15 # in seconds (each sample will be no longer than this time.)
-  num_workers: 1
-  smart_vad_model: pipecat-ai/smart-turn-v2
+  num_workers: 2
+  smart_vad_model: /home/nikita/yapoddataset/src/libs/smart_turn/smart-turn-v3.0.onnx
   
-
 separation:
-  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
-  num_workers: 1
-  nisqa_config: "configs/nisqa_s.yaml"
-  one_speaker: False # When this option is enabled, only single-speaker audio recordings are downloaded.
+  podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the chopped podcasts are located 
+  # diar parms
+  num_workers_diarization: 4
+  one_speaker: True # When this option is enabled, only single-speaker audio recordings are downloaded.
+  # nisqa parms
+  bs: 32
+  num_workers_nisqa: 12
+  # audio detect 
+  num_workers_detect: 4
+  checkpoint_path: /home/nikita/audio_detect/wavlm-endpointing-model/checkpoint-3000/model.safetensors # /home/nikita/yapoddataset/models/audio_detect/model.safetensors
+  threshold: 0.2442
 
 transcription:
-  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
-  num_workers: 1 # per one gpu
-  model_names: ['vosk', 'tone', 'giga_rnnt', 'giga_ctc', 'giga_ctc_lm']
-  vosk_path: /home/nikita/yapoddataset/models/vosk-model-ru
-  lm_path: '/home/nikita/yapoddataset/kenlm.bin' # path to lm.bin
+  podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the chopped podcasts are located 
   with_timestamps: True
+  model_names: ['giga_ctc_lm', 'vosk', 'tone', 'giga_ctc', 'giga_rnnt'] # 'tone' ['vosk','tone']
+
+  giga: 
+    num_workers: 4 # per one gpu
+    batch_size: 16 # if supported
+    lm_path: '/home/nikita/yapoddataset/kenlm.bin' # path to lm.bin for giga ctc model
+
+  vosk:
+    vosk_path: /home/nikita/yapoddataset/models/vosk-model-ru
+    num_workers: 4 # per one gpu
+    batch_size: 12 # if supported
+    beam_size: 4
+    lm_scale: 0.2 
+    ngram_lm_scale: -0.1
+
+  tone:
+    num_workers: 4 # per one gpu
+    batch_size: 16 # if supported 
   
 punctuation:
-  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the chopped podcasts are located 
   model_name: "RUPunct/RUPunct_big" # RUPunct model name 
-  num_workers: 4 # per one gpu
+  num_workers: 2 # per one gpu
 
 accent:
-  podcasts_path: /home/nikita/balalaika # full path to the folder where the chopped podcasts are located 
-  num_workers: 4 # per one gpu
+  podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the chopped podcasts are located 
+  num_workers: 2 # per one gpu
   model_name: turbo3.1 # ruAccent model name 
   
 phonemizer:
-  podcasts_path: /home/nikita/balalaika # full path to the folder where the text files are located
-  num_workers: 4 # per one gpu
-
-classification:
-  podcasts_path: /home/nikita/balalaika
-  num_workers: 4 # per one gpu
-  threshold: 0.6
-  model_path: models/voxblink2_samresnet100_ft # .pt format model from https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md
-
-
-  
+  podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the text files are located
+  num_workers: 2 # per one gpu

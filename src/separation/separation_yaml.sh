@@ -21,4 +21,6 @@ activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-python3 -m src.separation.separation --config_path "$CONFIG_PATH"
+taskset -c 0-24  python3 -m src.separation.music_detect --config_path "$CONFIG_PATH"
+taskset -c 0-24  python3 -m src.separation.nisqa --config_path "$CONFIG_PATH"
+taskset -c 0-24  python3 -m src.separation.diarization --config_path "$CONFIG_PATH"

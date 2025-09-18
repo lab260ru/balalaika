@@ -40,16 +40,4 @@ create_venv_env() {
     fi
 }
 
-if ! command -v python &> /dev/null; then
-    echo "Python not found! Please install Python 3.10+"
-    exit 1
-fi
-
-python -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)" || {
-    echo "Requires Python 3.10 or newer!"
-    exit 1
-}
-
-# create_venv_env ".main_venv" "requirements_main.txt"
-# create_venv_env ".support_venv" "requirements_support.txt"
 create_venv_env ".dev_venv" "requirements_dev.txt"

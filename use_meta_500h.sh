@@ -30,8 +30,8 @@ PICKLE_PATH="Balalaika500H.pkl"
 PARQUET_PATH="Balalaika500H.parquet"
 NUM_WORKERS=4
 
-PICKLE_URL="https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.pkl"
-PARQUET_URL="https://huggingface.co/datasets/MTUCI/Balalaika100H/resolve/main/Balalaika100H.parquet"
+PICKLE_URL="https://huggingface.co/datasets/MTUCI/Balalaika500H/resolve/main/Balalaika500H.pkl"
+PARQUET_URL="https://huggingface.co/datasets/MTUCI/Balalaika500H/resolve/main/Balalaika500H.parquet"
 
 download_if_not_exists "$PICKLE_URL" "$PICKLE_PATH"
 download_if_not_exists "$PARQUET_URL" "$PARQUET_PATH"
