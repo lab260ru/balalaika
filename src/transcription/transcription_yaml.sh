@@ -21,4 +21,4 @@ activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-taskset -c 0-24 python3 -m src.transcription.transcription --config_path "$CONFIG_PATH"
+taskset -c 25-48  python3 -m src.transcription.transcription --config_path "$CONFIG_PATH" 

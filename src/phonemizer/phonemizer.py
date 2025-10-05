@@ -11,6 +11,12 @@ from tqdm import tqdm
 
 from src.utils import get_txt_paths, load_config, read_file_content
 
+torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
+
 g2p_model: Any = None
 
 def init_process(device_str: str):

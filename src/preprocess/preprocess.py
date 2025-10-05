@@ -17,6 +17,28 @@ from src.libs.smart_turn.offline_svad import OfflineVAD
 
 from typing import List, Dict, Any, Tuple
 
+torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
+
+smart_vad = None
+
+
+def initializer_wrapper(args_dict: Dict[str, Any], gpus_count: int):
+    """
+    Initializer for each worker process. Assigns a GPU and creates a VAD instance.
+    This function runs once when each worker process is created.
+    """
+    # Get a unique ID for each worker process (note: _identity is an internal API)
+    worker_id = multiprocessing.current_process()._identity[0] - 1
+    # Assign a GPU to the worker in a round-robin fashion
+    gpu_id = worker_id % gpus_count if gpus_count > 0 else 0
+    
+    # Call the original VAD initialization function for this specific worker
+    init_vad_process(gpu_id=gpu_id, vad_args=args_dict)
+
 def postprocess_vad_result(
     vad_result: List[Dict[str, Any]],
     duration: float = 15.0,
@@ -196,10 +218,14 @@ def process_audio_file(path_audio: str, duration: float):
     episode_folder = os.path.join(os.path.dirname(path_audio), episode_id)
 
     try:
+        
         # TODO: don't forget to remove the code
         audio, sr = torchaudio.load(path_audio)
         if audio.shape[-1] / sr <= 5:
             logger.info(f"{path_audio} -- removed {audio.shape[-1] / sr} duration")
+            os.remove(path_audio)
+        # # TODO: don't forget to remove the code
+
         if audio.shape[-1] / sr <= duration:
             return
     except Exception as e:
@@ -243,80 +269,75 @@ def process_audio_file(path_audio: str, duration: float):
 
 def main(args):
     load_dotenv()
-    hf_key=os.environ.get('HF_TOKEN')
-    login(token=hf_key)
+    hf_key = os.environ.get('HF_TOKEN')
+    if hf_key:
+        login(token=hf_key)
+    else:
+        logger.warning("HF_TOKEN not found in environment.")
 
     config = load_config(args.config_path, 'preprocess')
 
     podcasts_path = args.podcasts_path or config.get('podcasts_path', '../../../podcasts')
     duration = args.duration or config.get('duration', 15)
-    num_workers = args.num_workers or config.get('num_workers', 4)
     smart_vad_model = args.smart_vad_model or config.get('smart_vad_model', "pipecat-ai/smart-turn-v2")
-    
+
+    # --- Начало измененной логики параллелизации ---
+
+    # 1. Определяем количество воркеров НА КАЖДУЮ GPU
     num_gpus = torch.cuda.device_count()
-    available_gpus = list(range(num_gpus))
-    if num_gpus == 0:
-        logger.error("No GPUs available. Exiting.")
-        return
-        
+    
+    # Аргумент --num_workers теперь означает "количество процессов на одну GPU". По умолчанию 1.
+    workers_per_gpu = config.get('num_workers', 4)
+
+    if num_gpus > 0:
+        # Общее число процессов = (количество GPU) * (процессов на GPU)
+        total_workers = num_gpus * workers_per_gpu
+        logger.info(f"Найдено {num_gpus} GPU. Запускаем по {workers_per_gpu} процесса на каждую.")
+        logger.info(f"Общее количество рабочих процессов: {total_workers}.")
+    else:
+        # В режиме CPU --num_workers задает общее число процессов.
+        cpu_count = os.cpu_count()
+        total_workers = workers_per_gpu if args.num_workers else max(1, cpu_count // 2)
+        logger.warning(f"GPU не найдены. Запускаем {total_workers} процессов на CPU.")
 
     audio_paths = get_audio_paths(podcasts_path)
     if not audio_paths:
-        logger.info("No audio files found.")
+        logger.info("Аудиофайлы для обработки не найдены.")
         return
 
     vad_args = {
         'silero_vad_threshold': 0.4,
         'smart_vad_threshold': 0.4,
-        'smart_vad_path': smart_vad_model
+        'smart_vad_path': smart_vad_model,
     }
 
     logger.info(f"""
-    Starting processing with:
-    Podcasts path: {podcasts_path}
-    Smart VAD model: {smart_vad_model}
-    Segment duration: {duration} seconds
-    Workers per GPU: {num_workers}
-    Available GPUs: {available_gpus}
-    Files to process: {len(audio_paths)}
+    Запуск параллельной обработки:
+    Путь к подкастам: {podcasts_path}
+    Модель Smart VAD: {smart_vad_model}
+    Длительность сегмента: {duration} секунд
+    Общее число воркеров: {total_workers}
+    Файлов для обработки: {len(audio_paths)}
     """)
 
-    all_futures = []
-    executors = []
-    
-    for gpu_id in available_gpus:
-        executor = ProcessPoolExecutor(
-            max_workers=num_workers,
-            initializer=init_vad_process,
-            initargs=(gpu_id, vad_args)
-        )
 
-        executors.append(executor)
- 
-        files_for_gpu = []
-        for i, path in enumerate(audio_paths):
-            if i % len(available_gpus) == gpu_id % len(available_gpus):
-                files_for_gpu.append(path)
+    with ProcessPoolExecutor(
+        max_workers=total_workers,
+        initializer=initializer_wrapper,
+        initargs=(vad_args, num_gpus)
+    ) as executor:
         
-        logger.info(f"GPU {gpu_id}: processing {len(files_for_gpu)} files")
-    
-        for path in files_for_gpu:
-            future = executor.submit(process_audio_file, path, duration)
-            all_futures.append(future)
+        futures = [executor.submit(process_audio_file, path, duration) for path in audio_paths]
 
-    with tqdm(total=len(all_futures), desc="Processing podcasts") as pbar:
-        for future in as_completed(all_futures):
+        for future in tqdm(as_completed(futures), total=len(audio_paths), desc="Обработка подкастов"):
             try:
                 future.result()
             except Exception as e:
-                logger.error(f"Error processing file: {e}")
-            finally:
-                pbar.update(1)
+                logger.error(f"Задача завершилась с ошибкой: {e}")
 
-    for executor in executors:
-        executor.shutdown()
+    logger.info("Все файлы обработаны.")
 
-if __name__ == "__main__":
+if __name__ == "__main__":  
     torchaudio.set_audio_backend('soundfile')
     multiprocessing.set_start_method('spawn', force=True)
     

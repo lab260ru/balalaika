@@ -3,135 +3,74 @@ import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import List
 
 import torch
-import torchaudio
-import transformers
 from loguru import logger
 from safetensors import safe_open
 from tqdm import tqdm
 
-from src.separation.model import WavLMForEndpointing
+from src.separation.model import WavLMForMusicDetection
 from src.utils import get_audio_paths, load_config
 
-g_model = None
-g_processor = None
-g_device = None
-g_threshold = None
 
-
-def init_process(
-    model_name: str,
+def process_files_on_device(
+    audio_paths: List[Path],
     checkpoint_path: str,
     device: str,
-    threshold: float
-) -> None:
+    threshold: float,
+    batch_size: int
+) -> int:
     """
-    Initializes the model, processor, device, and threshold for a worker process.
-    This function runs once for each process in the ProcessPoolExecutor.
+    Processes a list of audio files on a single device (GPU).
+
+    This function initializes the model, gets predictions for all files,
+    and deletes those that exceed the threshold.
+
+    Returns:
+        The number of deleted files.
     """
-    global g_model, g_processor, g_device, g_threshold
-
-    logger.info(f"Initializing the process on the device {device}...")
-
-    g_device = device
-    g_threshold = threshold
-
+    logger.info(f"Starting process on device {device} for {len(audio_paths)} files...")
+    deleted_count = 0
+    
     try:
-        g_processor = transformers.AutoFeatureExtractor.from_pretrained(model_name)
-        config = transformers.AutoConfig.from_pretrained(model_name)
-        model = WavLMForEndpointing(config)
+        # 1. Initialize the model, specifying the device and batch size
+        model = WavLMForMusicDetection(batch_size=batch_size, device=device)
 
+        # 2. Load the weights
         with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
-            state_dict = {key: f.get_tensor(key) for key in f.keys()}
-        
-        # Load the state dict and then move the model to the correct device
+            state_dict = {k: f.get_tensor(k) for k in f.keys()}
         model.load_state_dict(state_dict)
-        model.to(g_device)
-        model.eval()
 
-        g_model = model
-        logger.info(f"The process on the {device} device has been successfully initialized.")
-    except Exception as e:
-        logger.error(f"Error initializing the process on the device {device}: {e}")
-        # Re-raise the exception to prevent the process from starting incorrectly
-        raise
+        # 3. Get probabilities for all files in a single call
+        # Convert Path objects to strings, as the model expects
+        string_paths = [str(p) for p in audio_paths]
+        probs = model.predict_proba(string_paths)
 
+        # 4. Check and delete files
+        for path, prob in zip(audio_paths, probs):
+            score = prob.item()
+            if score > threshold:
+                logger.info(f"Deleting file: {path} (score: {score:.4f})")
+                os.remove(path)
+                deleted_count += 1
 
-def process_audio_file(audio_path: Path) -> Optional[str]:
-    """
-    Processes a single audio file to check if it should be removed.
-    Returns the path of the deleted file if removed, otherwise returns None.
-    """
-    global g_model, g_processor, g_device, g_threshold
-
-    # If globals aren't initialized, something went wrong with init_process
-    if g_model is None or g_processor is None or g_device is None:
-        logger.error(f"Global variables are not initialized in the process.")
-        return None
-
-    try:
-        waveform, sample_rate = torchaudio.load(audio_path)
-        
-        # TODO: don't forget to remove the code
-
-        if (waveform.shape[-1] / sample_rate) <= 5:
-            os.remove(audio_path)
-            logger.info(f"{audio_path} -- removed {waveform.shape[-1] / sample_rate}")
-            
-        # TODO: don't forget to remove the code
-
-        # Resample if not 16kHz
-        if sample_rate != 16000:
-            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
-            waveform = resampler(waveform)
-
-        # Convert stereo to mono if necessary
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-        
-        # Ensure waveform is on the correct device for processing
-        waveform = waveform.to(g_device)
-
-        inputs = g_processor(
-            waveform.squeeze().cpu().numpy(), # Use .cpu().numpy() to handle device
-            sampling_rate=16000,
-            return_tensors="pt",
-            padding=False,
-            truncation=False,
-        )
-       
-        # Move input tensors to the correct device
-        inputs = {key: inputs[key].to(g_device) for key in inputs.keys()}
-
-        with torch.no_grad():
-            result = g_model(**inputs)
-
-        # Check the condition and remove the file
-        if result['logits'][0][0].item() > g_threshold:
-            # Use os.remove for a more direct delete operation
-            # Add a log message to confirm the action
-            logger.info(f"Удаление файла: {audio_path} (score: {result['logits'][0][0].item():.4f})")
-            os.remove(audio_path)
-            return str(audio_path) # Return the path of the removed file
-        
-        # Return None if the file is not removed
-        return None
+        logger.info(f"Process on {device} finished. Deleted {deleted_count} files.")
+        return deleted_count
 
     except Exception as e:
-        logger.error(f"Error in file processing{audio_path}: {e}")
-        return None # Return None in case of an error
+        logger.error(f"Error in process on device {device}: {e}")
+        return 0  # Return 0 deleted files in case of an error
 
 
 def main(args):
     """
-    Main function to orchestrate the multiprocessing and audio processing.
+    Main function to orchestrate the multiprocessing of audio files.
     """
     config = load_config(args.config_path, 'separation')
 
-    num_workers_per_gpu = config.get('num_workers_detect', 2)
-    model_name = 'microsoft/wavlm-base-plus'
+    # Get parameters from the config
+    batch_size = config.get('batch_size', 32)
     checkpoint_path = config.get('checkpoint_path', '/path/to/your/model.safetensors')
     audio_data_path = config.get('podcasts_path', '/path/to/your/audio')
     threshold = config.get('threshold', 0.5)
@@ -142,75 +81,73 @@ def main(args):
         return
 
     if not torch.cuda.is_available():
-        logger.error("There are no available GPUs. Exit.")
+        logger.error("No available GPUs. Exiting.")
         return
 
     available_gpu_ids = list(range(torch.cuda.device_count()))
     num_gpus = len(available_gpu_ids)
+    
+    # We now use 1 worker per GPU
+    total_workers = num_gpus
 
     logger.info(
         f"""
         Starting audio processing:
         - Data path: {audio_data_path}
-        - Model: {model_name}
         - Checkpoint: {checkpoint_path}
         - Number of GPUs: {num_gpus} (IDs: {available_gpu_ids})
-        - Workers on GPU: {num_workers_per_gpu}
-        - Total workers: {num_gpus * num_workers_per_gpu}
+        - Total workers: {total_workers}
         - Total files to process: {len(all_audio_files)}
-        - Threshold {threshold}
+        - Deletion threshold: {threshold}
+        - Batch size per GPU: {batch_size}
         """
     )
 
-    # Use a dictionary to map GPU IDs to a list of files for better clarity
+    # Distribute the files among the available GPUs
     files_per_gpu = {gpu_id: [] for gpu_id in available_gpu_ids}
     for i, path in enumerate(all_audio_files):
-        gpu_assignment_index = i % num_gpus
-        gpu_id = available_gpu_ids[gpu_assignment_index]
+        gpu_id = available_gpu_ids[i % num_gpus]
         files_per_gpu[gpu_id].append(path)
 
-    all_futures = []
-    executors = []
+    futures = []
+    # Create a single process pool for all GPUs
+    with ProcessPoolExecutor(max_workers=total_workers) as executor:
+        for gpu_id, files_for_this_gpu in files_per_gpu.items():
+            if not files_for_this_gpu:
+                continue
 
-    for gpu_id, files_for_this_gpu in files_per_gpu.items():
-        if not files_for_this_gpu:
-            continue
+            device_str = f'cuda:{gpu_id}'
+            logger.info(f"Submitting task for {device_str} with {len(files_for_this_gpu)} files.")
+            
+            # Submit one large task for each GPU
+            future = executor.submit(
+                process_files_on_device,
+                files_for_this_gpu,
+                checkpoint_path,
+                device_str,
+                threshold,
+                batch_size
+            )
+            futures.append(future)
 
-        device_str = f'cuda:{gpu_id}'
-        logger.info(f"Creating a ProcessPoolExecutor for {device_str} with {num_workers_per_gpu} workers for {len(files_for_this_gpu)} files.")
+    logger.info(f"All {len(futures)} tasks have been submitted for processing. Awaiting completion...")
 
-        executor = ProcessPoolExecutor(
-            max_workers=num_workers_per_gpu,
-            initializer=init_process,
-            initargs=(model_name, checkpoint_path, device_str, threshold)
-        )
-        executors.append(executor)
-
-        for path in files_for_this_gpu:
-            future = executor.submit(process_audio_file, path)
-            all_futures.append(future)
-
-    logger.info(f"All {len(all_futures)} issues have been sent for processing. Waiting for completion...")
-
-    deleted_files_count = 0
-    with tqdm(total=len(all_futures), desc="Audio file processing") as pbar:
-        for future in as_completed(all_futures):
-            result = future.result()
-            if result:
-                deleted_files_count += 1
+    total_deleted_count = 0
+    # The progress bar will show the completion of tasks per GPU
+    with tqdm(total=len(futures), desc="Processing on GPUs") as pbar:
+        for future in as_completed(futures):
+            # Collect the number of deleted files from each process
+            total_deleted_count += future.result()
             pbar.update(1)
-
-    for executor in executors:
-        executor.shutdown()
     
-    logger.info(f"Processing is completed. Total deleted {deleted_files_count} files.")
+    logger.info(f"Processing complete. Total files deleted: {total_deleted_count}.")
 
 
 if __name__ == "__main__":
-    # It's good practice to set the start method at the top level
+    # It's recommended to set the start method to 'spawn' for CUDA compatibility
     multiprocessing.set_start_method("spawn", force=True)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config_path", type=str, required=True)
+    parser = argparse.ArgumentParser(description="Music detection and removal script.")
+    parser.add_argument("--config_path", type=str, required=True, help="Path to the config file.")
     args = parser.parse_args()
     main(args)

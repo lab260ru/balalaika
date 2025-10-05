@@ -16,6 +16,12 @@ from tqdm import tqdm
 
 from src.utils import get_audio_paths, load_config
 
+torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
+
 diarization_pipeline = None
 
 def init_worker(hf_token: str, device_str: str):
@@ -25,7 +31,7 @@ def init_worker(hf_token: str, device_str: str):
     try:
         torch.cuda.set_device(device_str)
         diarization_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
+            "pyannote/speaker-diarization-community-1",
             use_auth_token=hf_token
         ).to(torch.device(device_str))
         logger.info(f"Worker initialized successfully for diarization on {device_str}.")

@@ -12,6 +12,11 @@ from transformers import pipeline, AutoTokenizer
 
 from src.utils import load_config, get_audio_paths, process_token, read_file_content
 
+torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
 model = None 
 
 def init_process(

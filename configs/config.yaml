@@ -1,14 +1,18 @@
 download:
   podcasts_path: /mnt/disk1tb/radio-v4
-  episodes_limit: 1 # limit on downloading episodes from one playlist
+  episodes_limit: 100 # limit on downloading episodes from one playlist
   num_workers: 1
-  podcasts_urls_file: '/home/nikita/yapoddataset/20000_more_albums.pkl' # pkl with urls
+  podcasts_urls_file: '/home/nikita/yapoddataset/pickls/single.pkl' # pkl with urls
   
 preprocess:
   podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the podcasts are located 
   duration: 15 # in seconds (each sample will be no longer than this time.)
   num_workers: 2
   smart_vad_model: /home/nikita/yapoddataset/src/libs/smart_turn/smart-turn-v3.0.onnx
+
+  silero_vad_threshold:  0.4
+  smart_vad_threshold: 0.4 
+
   
 separation:
   podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the chopped podcasts are located 
@@ -19,8 +23,8 @@ separation:
   bs: 32
   num_workers_nisqa: 12
   # audio detect 
-  num_workers_detect: 4
-  checkpoint_path: /home/nikita/audio_detect/wavlm-endpointing-model/checkpoint-3000/model.safetensors # /home/nikita/yapoddataset/models/audio_detect/model.safetensors
+  num_workers_detect: 2
+  checkpoint_path: /home/nikita/audio_detect/wavlm-endpointing-model/checkpoint-3000/music_detection.safetensors # /home/nikita/yapoddataset/models/audio_detect/model.safetensors
   threshold: 0.2442
 
 transcription:
@@ -29,20 +33,20 @@ transcription:
   model_names: ['giga_ctc_lm', 'vosk', 'tone', 'giga_ctc', 'giga_rnnt'] # 'tone' ['vosk','tone']
 
   giga: 
-    num_workers: 4 # per one gpu
+    num_workers: 2 # per one gpu
     batch_size: 16 # if supported
     lm_path: '/home/nikita/yapoddataset/kenlm.bin' # path to lm.bin for giga ctc model
 
   vosk:
     vosk_path: /home/nikita/yapoddataset/models/vosk-model-ru
-    num_workers: 4 # per one gpu
+    num_workers: 2 # per one gpu
     batch_size: 12 # if supported
     beam_size: 4
     lm_scale: 0.2 
     ngram_lm_scale: -0.1
 
   tone:
-    num_workers: 4 # per one gpu
+    num_workers: 2 # per one gpu
     batch_size: 16 # if supported 
   
 punctuation:

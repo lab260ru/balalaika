@@ -119,11 +119,11 @@ def main():
         
         run_nisqa_with_config(nisqa_config)
         
-        logger.info("Обработка NISQA завершена. Сохранение результатов...")
+        logger.info("NISQA processing is complete. Saving the results...")
         _save_results(output_dir=output_dir, final_output_path=final_output_path)
         
     except Exception as e:
-        logger.error(f"Произошла ошибка во время выполнения NISQA: {e}", exc_info=True)
+        logger.error(f"An error occurred during the execution of NISQA: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

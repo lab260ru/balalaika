@@ -14,6 +14,11 @@ from tqdm import tqdm
 from src.transcription.transcripton_base import *
 from src.utils import get_audio_paths, load_config
 
+torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
 model = None
 SUPPORTED_TIME_STAMPS = ['giga_ctc_lm', 'tone']
 
