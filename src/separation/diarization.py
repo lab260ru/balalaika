@@ -126,9 +126,9 @@ def main(args):
     hf_token = os.getenv("HF_TOKEN")
     config = load_config(args.config_path, 'separation')
 
-    podcasts_path = args.podcasts_path or config.get('podcasts_path', './data')
-    one_speaker = args.one_speaker or config.get('one_speaker', False)
-    num_workers_per_gpu = args.num_workers or config.get('num_workers_diarization', 1)
+    podcasts_path = config.get('podcasts_path', './data')
+    one_speaker = config.get('one_speaker', False)
+    num_workers_per_gpu = config.get('num_workers_diarization', 1)
 
     result_csv_path = Path(podcasts_path) / 'balalaika.csv'
     available_gpu_ids = list(range(torch.cuda.device_count()))
@@ -137,12 +137,10 @@ def main(args):
         return
 
     logger.info(f"""
-                --- Starting Diarization ---
                 Podcasts path: {podcasts_path}
                 One speaker mode: {one_speaker}
                 Workers per GPU: {num_workers_per_gpu}
                 GPUs detected: {len(available_gpu_ids)}
-                --------------------------
                 """)
 
     all_audio_paths = get_unprocessed_audio_paths(
@@ -241,21 +239,6 @@ if __name__ == "__main__":
         "--config_path",
         type=str,
         help="Path to the main YAML configuration file."
-    )
-    parser.add_argument(
-        "--podcasts_path",
-        type=str,
-        help="Path to the directory containing audio files."
-    )
-    parser.add_argument(
-        "--one_speaker",
-        action='store_true',
-        help="Enable one-speaker mode. If set, files with multiple speakers will be deleted."
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        help="Number of worker processes to spawn per GPU."
     )
 
     args = parser.parse_args()

@@ -147,9 +147,9 @@ def main(args):
     if not client:
         return
 
-    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path','../../../balalaika')
-    episodes_limit = args.episodes_limit if args.episodes_limit else config.get('episodes_limit',1)
-    urls_pickle_path = args.podcasts_urls_file if args.podcasts_urls_file else config.get('podcasts_urls_file','alboms.pkl')
+    podcasts_path = config.get('podcasts_path','../../../balalaika')
+    episodes_limit = config.get('episodes_limit',1)
+    urls_pickle_path = config.get('podcasts_urls_file','alboms.pkl')
 
     try:
         with open(urls_pickle_path, 'rb') as file:
@@ -196,28 +196,6 @@ if __name__ == "__main__":
         default="./configs/config.yaml",
         help="Path to the configuration file"
     )
-    parser.add_argument(
-        "--podcasts_urls_file",
-        default=None,
-        help="Path to the pickle file with album urls"
-    )
-    parser.add_argument(
-        "--podcasts_path", 
-        default=None,
-        help="Path for saving podcasts"
-    )
-    parser.add_argument(
-        "--episodes_limit",
-        default=None,
-        type=int,
-        help="Limit for episodes to download"
-    )
-    parser.add_argument(
-        "--num_workers",
-        default=None,
-        type=int,
-        help="num workers"
-    )
-    
+
     args = parser.parse_args()
     main(args)

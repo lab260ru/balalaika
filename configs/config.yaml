@@ -8,12 +8,12 @@ preprocess:
   podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the podcasts are located 
   duration: 15 # in seconds (each sample will be no longer than this time.)
   num_workers: 2
-  smart_vad_model: /home/nikita/yapoddataset/src/libs/smart_turn/smart-turn-v3.0.onnx
+  vad_args:
+    smart_vad_model: /home/nikita/yapoddataset/src/libs/smart_turn/smart-turn-v3.0.onnx
+    silero_vad_threshold:  0.4
+    smart_vad_threshold: 0.4 
 
-  silero_vad_threshold:  0.4
-  smart_vad_threshold: 0.4 
-
-  
+    
 separation:
   podcasts_path: /mnt/disk1tb/radio-v4 # full path to the folder where the chopped podcasts are located 
   # diar parms

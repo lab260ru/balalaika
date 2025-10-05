@@ -53,8 +53,8 @@ def get_valid_text_paths(src_path: str) -> List[Path]:
 
 def main(args):
     config = load_config(args.config_path, 'phonemizer')
-    num_workers = args.num_workers if args.num_workers else config.get('num_workers', 4)
-    src_path_str = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../podcasts')
+    num_workers = config.get('num_workers', 4)
+    src_path_str = config.get('podcasts_path', '../../../podcasts')
     
     all_text_paths = get_valid_text_paths(src_path_str)
     logger.info(f"Found {len(all_text_paths)} text files to process")
@@ -121,16 +121,6 @@ if __name__ == "__main__":
         "--config_path",
         type=str,
         help="Path to the configuration YAML file."
-    )
-    parser.add_argument(
-        "--podcasts_path",
-        type=str,
-        help="Path to the directory containing audio files (e.g., MP3s)."
-    )
-    parser.add_argument(
-        "--num_workers", 
-        type=int,
-        help="Number of worker processes per GPU for parallel processing."
     )
 
     args = parser.parse_args()

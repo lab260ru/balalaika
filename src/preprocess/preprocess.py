@@ -45,50 +45,38 @@ def postprocess_vad_result(
     min_duration: float = 1.0,
     gap_threshold: float = 30.0
 ) -> Tuple[List[float], List[float]]:
-    """
-    Сбалансированный алгоритм для постобработки результатов VAD.
-    Приоритет: законченные фразы, но заполняются большие промежутки между ними.
-    """
+
     if not vad_result:
         return [], []
 
-    # Этап 1: Сохраняем все семантически законченные фразы (prediction=1)
     primary_segments = []
     
-    # Итерируем по результатам и объединяем последовательные "законченные" сегменты
     current_segment_start = None
     
     for i, item in enumerate(vad_result):
         if item['prediction'] == 1:
             if current_segment_start is None:
-                # Начало нового потенциального сегмента
                 current_segment_start = item['start_time']
-            # Конец текущего потенциального сегмента
             segment_end = item['end_time']
             segment_duration = segment_end - current_segment_start
             
-            # Проверяем, не превышаем ли мы максимальную длительность
             if segment_duration > duration:
-                # Сохраняем предыдущий сегмент и начинаем новый
                 if i > 0 and vad_result[i-1]['prediction'] == 1:
                     primary_segments.append((current_segment_start, vad_result[i-1]['end_time']))
                 current_segment_start = item['start_time']
 
-    # Сохраняем последний накопленный сегмент
     if current_segment_start is not None:
         last_item = vad_result[-1]
         primary_segments.append((current_segment_start, last_item['end_time']))
 
-    # Фильтруем сегменты по длительности
     primary_segments = [(s, e) for s, e in primary_segments if min_duration <= e - s <= duration]
     
-    # Сортируем и убираем дубликаты
     primary_segments = sorted(list(set(primary_segments)), key=lambda x: x[0])
 
     if not primary_segments:
         return [], []
     
-    # Этап 2: Заполняем большие промежутки между сохранёнными сегментами
+    # stage 2 
     filled_segments = []
     last_end_time = 0.0
     
@@ -98,12 +86,10 @@ def postprocess_vad_result(
             filled_segments.extend(_fill_gap(vad_result, last_end_time, start, duration, min_duration))
         last_end_time = end
 
-    # Проверяем промежуток в конце
     audio_end = vad_result[-1]['end_time']
     if audio_end - last_end_time > gap_threshold:
         filled_segments.extend(_fill_gap(vad_result, last_end_time, audio_end, duration, min_duration))
     
-    # Объединяем итоговые сегменты
     all_segments = primary_segments + filled_segments
     all_segments = sorted(list(set(all_segments)), key=lambda x: x[0])
     
@@ -120,15 +106,11 @@ def _fill_gap(
     duration: float,
     min_duration: float
 ) -> List[Tuple[float, float]]:
-    """
-    Вспомогательная функция: разбивает промежуток [gap_start, gap_end] на сегменты
-    длиной [min_duration, duration], используя интервалы из vad_result.
-    """
+
     filled_segments = []
     
     current_time = gap_start
     while current_time < gap_end:
-        # Находим следующий интервал, который начинается после current_time
         next_interval_index = -1
         for i, item in enumerate(vad_result):
             if item['start_time'] >= current_time:
@@ -141,7 +123,6 @@ def _fill_gap(
         seg_start = vad_result[next_interval_index]['start_time']
         seg_end = vad_result[next_interval_index]['end_time']
 
-        # Объединяем интервалы, пока не превысим max_duration или не дойдем до конца промежутка
         for j in range(next_interval_index + 1, len(vad_result)):
             if vad_result[j]['end_time'] - seg_start > duration or vad_result[j]['end_time'] > gap_end:
                 break
@@ -236,9 +217,6 @@ def process_audio_file(path_audio: str, duration: float):
 
     try:
         vad_result = smart_vad.process_file(path_audio)
-        # import pickle
-        # with open('data.pkl', 'wb') as file:
-        #     pickle.dump(vad_result, file)
         timesteps_starts, timesteps_ends = postprocess_vad_result(vad_result, duration=duration)
         if not timesteps_starts:
             logger.warning(f"No speech segments found in {path_audio}, removed")
@@ -277,48 +255,33 @@ def main(args):
 
     config = load_config(args.config_path, 'preprocess')
 
-    podcasts_path = args.podcasts_path or config.get('podcasts_path', '../../../podcasts')
-    duration = args.duration or config.get('duration', 15)
-    smart_vad_model = args.smart_vad_model or config.get('smart_vad_model', "pipecat-ai/smart-turn-v2")
+    podcasts_path = config.get('podcasts_path', '../../../podcasts')
+    duration = config.get('duration', 15)
+    vad_args = config.get('vad_args')
 
-    # --- Начало измененной логики параллелизации ---
-
-    # 1. Определяем количество воркеров НА КАЖДУЮ GPU
     num_gpus = torch.cuda.device_count()
-    
-    # Аргумент --num_workers теперь означает "количество процессов на одну GPU". По умолчанию 1.
+
     workers_per_gpu = config.get('num_workers', 4)
 
     if num_gpus > 0:
-        # Общее число процессов = (количество GPU) * (процессов на GPU)
         total_workers = num_gpus * workers_per_gpu
-        logger.info(f"Найдено {num_gpus} GPU. Запускаем по {workers_per_gpu} процесса на каждую.")
-        logger.info(f"Общее количество рабочих процессов: {total_workers}.")
-    else:
-        # В режиме CPU --num_workers задает общее число процессов.
-        cpu_count = os.cpu_count()
-        total_workers = workers_per_gpu if args.num_workers else max(1, cpu_count // 2)
-        logger.warning(f"GPU не найдены. Запускаем {total_workers} процессов на CPU.")
+        logger.info (f"Found {num_gpus} GPU. We run {workers_per_gpu} processes for each one.")
+        logger.info (f"Total number of work processes: {total_workers}.")
 
     audio_paths = get_audio_paths(podcasts_path)
     if not audio_paths:
-        logger.info("Аудиофайлы для обработки не найдены.")
+        logger.info ("No audio files found for processing.")
         return
 
-    vad_args = {
-        'silero_vad_threshold': 0.4,
-        'smart_vad_threshold': 0.4,
-        'smart_vad_path': smart_vad_model,
-    }
 
-    logger.info(f"""
-    Запуск параллельной обработки:
-    Путь к подкастам: {podcasts_path}
-    Модель Smart VAD: {smart_vad_model}
-    Длительность сегмента: {duration} секунд
-    Общее число воркеров: {total_workers}
-    Файлов для обработки: {len(audio_paths)}
-    """)
+    logger.info (f"""
+        Running parallel processing:
+        The path to Podcasts: {podcasts_path}
+        Smart VAD model: {smart_vad_model}
+        Segment duration: {duration} seconds
+        Total number of workers: {total_workers}
+        Files to process: {len(audio_paths)}
+        """)
 
 
     with ProcessPoolExecutor(
@@ -333,9 +296,9 @@ def main(args):
             try:
                 future.result()
             except Exception as e:
-                logger.error(f"Задача завершилась с ошибкой: {e}")
+                logger.error(f"The task ended with an error:{e}")
 
-    logger.info("Все файлы обработаны.")
+    logger.info("All files have been processed.")
 
 if __name__ == "__main__":  
     torchaudio.set_audio_backend('soundfile')
@@ -343,10 +306,5 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Process audio files using smart-turn VAD model.")
     parser.add_argument("--config_path", type=str, help="Path to YAML configuration file")
-    parser.add_argument("--podcasts_path", type=str, help="Path to podcasts folder")
-    parser.add_argument("--smart_vad_model", type=str, help="Name of smart-turn model")
-    parser.add_argument("--duration", type=int, help="Target segment duration in seconds")
-    parser.add_argument("--num_workers", type=int, help="Number of worker processes per GPU")
-    
     args = parser.parse_args()
     main(args)

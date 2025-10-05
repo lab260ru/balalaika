@@ -12,6 +12,12 @@ from tqdm import tqdm
 
 from src.utils import load_config, get_txt_paths, read_file_content
 
+torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
+
 accentizer = None
 
 def init_process(
@@ -59,9 +65,9 @@ def get_valid_txt_paths(path: str) -> List[str]:
 
 def main(args):
     config = load_config(args.config_path, 'accent')
-    num_workers = args.num_workers if args.num_workers else config.get('num_workers', 4)
-    model_name = args.model_name if args.model_name else config.get('model_name', 'turbo3.1')
-    podcast_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../balalaika')
+    num_workers = config.get('num_workers', 4)
+    model_name = config.get('model_name', 'turbo3.1')
+    podcast_path = config.get('podcasts_path', '../../../balalaika')
 
     available_gpu_ids = list(range(torch.cuda.device_count()))
     num_gpus = len(available_gpu_ids)
@@ -130,21 +136,6 @@ if __name__ == "__main__":
         "--config_path",
         type=str,
         help="Path to config"
-        )
-    parser.add_argument(
-        "--podcasts_path",
-        type=str,
-        help="Path to dataset directory"
-        )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        help="Number of worker processes"
-        )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        help="Model version"
         )
     
     args = parser.parse_args()
