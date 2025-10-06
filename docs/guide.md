@@ -48,7 +48,7 @@ dataset/
 ```
 
 # if only transcriptions are needed
-`base.sh 
+`base.sh`
 
 ```
 SCRIPTS=(
