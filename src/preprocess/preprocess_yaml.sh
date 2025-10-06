@@ -21,4 +21,4 @@ activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-taskset -c 0-24 python3 -m src.preprocess.preprocess --config_path "$CONFIG_PATH"
+python3 -m src.preprocess.preprocess --config_path "$CONFIG_PATH"

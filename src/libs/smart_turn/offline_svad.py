@@ -5,6 +5,7 @@ import numpy as np
 import onnxruntime as ort
 import time 
 from transformers import WhisperFeatureExtractor
+from huggingface_hub import hf_hub_download
 
 class OfflineVAD:
     def __init__(
@@ -14,16 +15,20 @@ class OfflineVAD:
             device: str = 'cuda:1',
             resample_rate: int = 16_000,
             max_speech_duration_s: float = 8,
-            smart_vad_path: str = "pipecat-ai/smart-turn-v3"
+            smart_vad_model: str = "pipecat-ai/smart-turn-v3"
             ):
             
         self.silero_vad_threshold = silero_vad_threshold
         self.smart_vad_threshold = smart_vad_threshold
         self.max_speech_duration_s= max_speech_duration_s
         self.sample_rate = resample_rate
-        self.smart_vad_path = smart_vad_path
+        self.smart_vad_model = smart_vad_model
         self.device = device
         self.device_id = device.split(':')[1] if ':' in self.device else 0 
+
+        # download smart vad 
+        if not os.path.exists(self.smart_vad_model):
+            self._load_from_hf()
 
         # Initialize VAD models
         self._init_silero_vad()
@@ -57,7 +62,7 @@ class OfflineVAD:
         so.inter_op_num_threads = 1
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(
-            self.smart_vad_path, sess_options=so,     
+            self.smart_vad_model, sess_options=so,     
             providers=[
                 (
                     "CUDAExecutionProvider",
@@ -74,6 +79,15 @@ class OfflineVAD:
 
         wav_tensor = self.read_audio(audio_path, sampling_rate=self.sample_rate)
         return wav_tensor
+    
+    def _load_from_hf(self):
+        return hf_hub_download(
+            repo_id="pipecat-ai/smart-turn-v3",
+            filename="smart-turn-v3.0.onnx",
+            local_dir="./models",         
+            local_dir_use_symlinks=False  
+        )
+
     
     def predict_endpoint(self, audio_array):
         """
@@ -179,7 +193,7 @@ if __name__ == "__main__":
     print(len(TEST_WAV_FILES))
 
     vad_processor = OfflineVAD(
-        smart_vad_path='/home/nikita/yapoddataset/src/libs/smart_turn/smart-turn-v3.0.onnx',
+        smart_vad_model='/home/nikita/yapoddataset/src/libs/smart_turn/smart-turn-v3.0.onnx',
         device='cuda:2'
         )
     

@@ -184,9 +184,7 @@ def init_vad_process(gpu_id: int, vad_args: Dict[str, Any]):
         logger.warning(f"No GPU available, using CPU for process")
     
     smart_vad = OfflineVAD(
-        silero_vad_threshold=vad_args['silero_vad_threshold'],
-        smart_vad_threshold=vad_args['smart_vad_threshold'],
-        smart_vad_path=vad_args['smart_vad_path'],
+        **vad_args,
         device=device
     )
     logger.info(f"VAD initialized on {device}")
@@ -198,15 +196,14 @@ def process_audio_file(path_audio: str, duration: float):
     episode_id = os.path.splitext(os.path.basename(path_audio))[0]
     episode_folder = os.path.join(os.path.dirname(path_audio), episode_id)
 
-    try:
-        
-        # TODO: don't forget to remove the code
-        audio, sr = torchaudio.load(path_audio)
-        if audio.shape[-1] / sr <= 5:
-            logger.info(f"{path_audio} -- removed {audio.shape[-1] / sr} duration")
-            os.remove(path_audio)
-        # # TODO: don't forget to remove the code
+    # TODO: don't forget to remove the code
+    audio, sr = torchaudio.load(path_audio)
+    if audio.shape[-1] / sr <= 3:
+        logger.info(f"{path_audio} -- removed {audio.shape[-1] / sr} duration")
+        os.remove(path_audio)
+    # # TODO: don't forget to remove the code
 
+    try:
         if audio.shape[-1] / sr <= duration:
             return
     except Exception as e:
@@ -277,7 +274,6 @@ def main(args):
     logger.info (f"""
         Running parallel processing:
         The path to Podcasts: {podcasts_path}
-        Smart VAD model: {smart_vad_model}
         Segment duration: {duration} seconds
         Total number of workers: {total_workers}
         Files to process: {len(audio_paths)}
@@ -292,7 +288,7 @@ def main(args):
         
         futures = [executor.submit(process_audio_file, path, duration) for path in audio_paths]
 
-        for future in tqdm(as_completed(futures), total=len(audio_paths), desc="Обработка подкастов"):
+        for future in tqdm(as_completed(futures), total=len(audio_paths), desc="Podcast Processing"):
             try:
                 future.result()
             except Exception as e:

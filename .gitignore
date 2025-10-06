@@ -9,7 +9,7 @@ cl_*.py
 *.ipynb
 *.bin
 temp/*
-
+models/*
 .env
 __pycache__/
 *.py[cod]

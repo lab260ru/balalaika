@@ -1,3 +1,4 @@
+import os
 import math
 import random
 from abc import ABC, abstractmethod
@@ -21,6 +22,7 @@ from loguru import logger
 from torch.nn.utils.rnn import pad_sequence
 from tone import StreamingCTCPipeline, TextPhrase
 from tqdm import tqdm
+from huggingface_hub import snapshot_download, hf_hub_download 
 
 from src.utils import read_file_content, get_audio_paths
 from src.utils_asr import (AttributeDict, LmScorer, NgramLm,
@@ -87,6 +89,9 @@ class GigaAMWrapper(ASRWrapper):
         self.target_sr = 16_000
         self.decoder = None
         self.sec_per_frame = self.GIGA_AM_FRAME_SIZE_MS / 1000.0
+        
+        if self.use_lm and not os.path.exists(lm_path):
+            self._downlaod_lm()
 
         if self.use_lm:
             if self.model_type != 'ctc':
@@ -171,6 +176,17 @@ class GigaAMWrapper(ASRWrapper):
             end_time = end_frame * self.sec_per_frame
             output_lines.append(f"{word} {start_time:.3f} {end_time:.3f}")
         return "\n".join(output_lines)
+    
+    def _downlaod_lm(self):
+        return hf_hub_download(
+            repo_id="NikiPshg/lm",
+            filename="ru.lm.bin",
+            local_dir="./models",         
+            local_dir_use_symlinks=False  
+        )
+
+
+
 
 
 class ToneWrapper(ASRWrapper):
@@ -241,6 +257,10 @@ class VOSKCUDAWrapper(ASRWrapper):
         super().__init__(model_id, device)
         logger.info(f"Initializing VOSK CUDA model '{self.model_id}' on device {self.device}")
         vosk_path = Path(kwargs['vosk_path'])
+        
+        if not os.path.exists(str(vosk_path)):
+            self._load_from_hf()
+
         self.nn_model_filename = str(vosk_path / 'am' / 'jit_script.pt')
         self.ngram_path = str(vosk_path / 'lm' / '2gram.fst.txt')
         self.lm_exp_dir_vosk = str(vosk_path / 'lm')
@@ -328,12 +348,22 @@ class VOSKCUDAWrapper(ASRWrapper):
             audio = torch.mean(audio, dim=0, keepdim=True)
         return audio.squeeze(0)
     
+    def _load_from_hf(self):
+        return snapshot_download(
+            repo_id="alphacep/vosk-model-ru",
+            local_dir="./models/vosk-model-ru",         
+            local_dir_use_symlinks=False  
+        )
 
 class VoskSherpaOnnxWrapper(ASRWrapper):
     """Wrapper for Vosk-style models using sherpa-onnx."""
     def __init__(self, model_id: str, device: str = 'cpu', **kwargs):
         logger.info(f"Initializing sherpa-onnx based ASR model from '{model_id}' on {device}")
         device = 'cpu'
+        
+        if not os.path.exists(model_id):
+            self._load_from_hf()
+
         model_path = Path(model_id)
         encoder_path = str(model_path / "am-onnx" / "encoder.onnx")
         decoder_path = str(model_path / "am-onnx" / "decoder.onnx")
@@ -410,6 +440,13 @@ class VoskSherpaOnnxWrapper(ASRWrapper):
             results_timestamps.append(result_timestamps)
         
         return result_texts, results_timestamps
+    
+    def _load_from_hf(self):
+        return snapshot_download(
+            repo_id="alphacep/vosk-model-ru",
+            local_dir="./models/vosk-model-ru",         
+            local_dir_use_symlinks=False  
+        )
 
 
 class ROVERWrapper:

@@ -6,148 +6,125 @@ from pathlib import Path
 from typing import List
 
 import torch
+import yaml
 from loguru import logger
-from safetensors import safe_open
 from tqdm import tqdm
+from safetensors import safe_open
 
-from src.separation.model import WavLMForMusicDetection
+from src.separation.musicdetector import WavLMForMusicDetection
 from src.utils import get_audio_paths, load_config
 
 
-def process_files_on_device(
-    audio_paths: List[Path],
-    checkpoint_path: str,
-    device: str,
+def process_and_delete_chunk(
+    files: List[Path],
+    device_str: str,
+    model_path: str,
     threshold: float,
     batch_size: int
 ) -> int:
     """
-    Processes a list of audio files on a single device (GPU).
-
-    This function initializes the model, gets predictions for all files,
-    and deletes those that exceed the threshold.
-
-    Returns:
-        The number of deleted files.
+    Initializes a model on a specific device, processes a chunk of files in batches,
+    and deletes those with music. Designed to run in a separate process.
     """
-    logger.info(f"Starting process on device {device} for {len(audio_paths)} files...")
     deleted_count = 0
-    
     try:
-        # 1. Initialize the model, specifying the device and batch size
-        model = WavLMForMusicDetection(batch_size=batch_size, device=device)
+        model = WavLMForMusicDetection(device=device_str, batch_size=batch_size)
+        
+        with safe_open(model_path, framework="pt") as f:
+            model.load_state_dict({k: f.get_tensor(k) for k in f.keys()})
 
-        # 2. Load the weights
-        with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
-            state_dict = {k: f.get_tensor(k) for k in f.keys()}
-        model.load_state_dict(state_dict)
-
-        # 3. Get probabilities for all files in a single call
-        # Convert Path objects to strings, as the model expects
-        string_paths = [str(p) for p in audio_paths]
-        probs = model.predict_proba(string_paths)
-
-        # 4. Check and delete files
-        for path, prob in zip(audio_paths, probs):
-            score = prob.item()
-            if score > threshold:
-                logger.info(f"Deleting file: {path} (score: {score:.4f})")
-                os.remove(path)
-                deleted_count += 1
-
-        logger.info(f"Process on {device} finished. Deleted {deleted_count} files.")
-        return deleted_count
-
+        logger.info(f"Worker (PID: {os.getpid()}) initialized on {device_str} for {len(files)} files.")
     except Exception as e:
-        logger.error(f"Error in process on device {device}: {e}")
-        return 0  # Return 0 deleted files in case of an error
+        logger.error(f"Failed to initialize worker on {device_str} with model {model_path}: {e}")
+        return 0
 
+    for i in tqdm(range(0, len(files), batch_size)):
+        batch_paths = files[i:i + batch_size]
+        if not batch_paths:
+            continue
+
+        try:
+            audio_paths_str = [str(p) for p in batch_paths]
+            probabilities = model.predict_proba(audio_paths_str)
+
+            for path, prob in zip(batch_paths, probabilities):
+                prob_item = prob.item()
+                if prob_item > threshold:
+                    try:
+                        os.remove(path)
+                        deleted_count += 1
+                    except OSError as e:
+                        logger.error(f"Error deleting file {path} on {device_str}: {e}")
+
+        except Exception as e:
+            batch_start = batch_paths[0].name if batch_paths else "N/A"
+            logger.error(f"Error processing batch starting with {batch_start} on {device_str}: {e}")
+
+    return deleted_count
 
 def main(args):
     """
-    Main function to orchestrate the multiprocessing of audio files.
+    Main function to distribute audio processing tasks across multiple GPUs and workers.
     """
     config = load_config(args.config_path, 'separation')
+    music_detect_config = config.get('music_detect', {})
+    
+    src_path = config.get('podcasts_path')
+    n_workers_per_gpu = music_detect_config.get('num_workers', 1)
+    threshold = music_detect_config.get('threshold', 0.5)
+    model_path = music_detect_config.get('music_detect_model')
+    batch_size = music_detect_config.get('bs', 16)
 
-    # Get parameters from the config
-    batch_size = config.get('batch_size', 32)
-    checkpoint_path = config.get('checkpoint_path', '/path/to/your/model.safetensors')
-    audio_data_path = config.get('podcasts_path', '/path/to/your/audio')
-    threshold = config.get('threshold', 0.5)
-
-    all_audio_files = get_audio_paths(audio_data_path)
-    if not all_audio_files:
-        logger.warning(f"Audio files not found in {audio_data_path}")
-        return
-
-    if not torch.cuda.is_available():
-        logger.error("No available GPUs. Exiting.")
+    if not all([src_path, model_path]):
+        logger.error("Config missing required parameters: 'podcasts_path' or 'music_detect_model'.")
         return
 
     available_gpu_ids = list(range(torch.cuda.device_count()))
-    num_gpus = len(available_gpu_ids)
-    
-    # We now use 1 worker per GPU
-    total_workers = num_gpus
+    if not available_gpu_ids:
+        logger.error("No CUDA-enabled GPUs found. Exiting.")
+        return
 
-    logger.info(
-        f"""
-        Starting audio processing:
-        - Data path: {audio_data_path}
-        - Checkpoint: {checkpoint_path}
-        - Number of GPUs: {num_gpus} (IDs: {available_gpu_ids})
-        - Total workers: {total_workers}
-        - Total files to process: {len(all_audio_files)}
-        - Deletion threshold: {threshold}
-        - Batch size per GPU: {batch_size}
-        """
-    )
+    all_audio_paths = get_audio_paths(src_path)
+    if not all_audio_paths:
+        logger.warning(f"No audio files found in '{src_path}'.")
+        return
+    logger.info(f"Found {len(all_audio_paths)} audio files to process.")
 
-    # Distribute the files among the available GPUs
-    files_per_gpu = {gpu_id: [] for gpu_id in available_gpu_ids}
-    for i, path in enumerate(all_audio_files):
-        gpu_id = available_gpu_ids[i % num_gpus]
-        files_per_gpu[gpu_id].append(path)
+    num_devices = len(available_gpu_ids)
+    total_workers = n_workers_per_gpu * num_devices
+    logger.info(f"Found {num_devices} GPUs. Launching {n_workers_per_gpu} workers per GPU for a total of {total_workers} workers.")
 
-    futures = []
-    # Create a single process pool for all GPUs
-    with ProcessPoolExecutor(max_workers=total_workers) as executor:
-        for gpu_id, files_for_this_gpu in files_per_gpu.items():
-            if not files_for_this_gpu:
-                continue
+    files_for_each_worker = [[] for _ in range(total_workers)]
+    for i, path in enumerate(all_audio_paths):
+        files_for_each_worker[i % total_workers].append(path)
 
-            device_str = f'cuda:{gpu_id}'
-            logger.info(f"Submitting task for {device_str} with {len(files_for_this_gpu)} files.")
-            
-            # Submit one large task for each GPU
-            future = executor.submit(
-                process_files_on_device,
-                files_for_this_gpu,
-                checkpoint_path,
-                device_str,
-                threshold,
-                batch_size
-            )
-            futures.append(future)
-
-    logger.info(f"All {len(futures)} tasks have been submitted for processing. Awaiting completion...")
+    tasks = []
+    for i in range(total_workers):
+        worker_files = files_for_each_worker[i]
+        if not worker_files:
+            continue
+        
+        device_str = f'cuda:{available_gpu_ids[i % num_devices]}'
+        
+        tasks.append(
+            (worker_files, device_str, model_path, threshold, batch_size)
+        )
 
     total_deleted_count = 0
-    # The progress bar will show the completion of tasks per GPU
-    with tqdm(total=len(futures), desc="Processing on GPUs") as pbar:
+    with ProcessPoolExecutor(max_workers=total_workers, mp_context=multiprocessing.get_context('spawn')) as executor:
+        futures = [executor.submit(process_and_delete_chunk, *task) for task in tasks]
+        
         for future in as_completed(futures):
-            # Collect the number of deleted files from each process
-            total_deleted_count += future.result()
-            pbar.update(1)
-    
-    logger.info(f"Processing complete. Total files deleted: {total_deleted_count}.")
+            try:
+                total_deleted_count += future.result()
+            except Exception as e:
+                logger.error(f"A worker process task failed: {e}")
 
+    logger.success(f"Total files deleted: {total_deleted_count}")
 
 if __name__ == "__main__":
-    # It's recommended to set the start method to 'spawn' for CUDA compatibility
-    multiprocessing.set_start_method("spawn", force=True)
-
-    parser = argparse.ArgumentParser(description="Music detection and removal script.")
-    parser.add_argument("--config_path", type=str, required=True, help="Path to the config file.")
-    args = parser.parse_args()
-    main(args)
+    multiprocessing.set_start_method('spawn', force=True)
+    parser = argparse.ArgumentParser(description="Parallel music detection and deletion based on a config file.")
+    parser.add_argument("--config_path", type=str, required=True, help="Path to the YAML configuration file.")
+    parsed_args = parser.parse_args()
+    main(parsed_args)
