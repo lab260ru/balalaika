@@ -32,7 +32,7 @@ def init_worker(hf_token: str, device_str: str):
         torch.cuda.set_device(device_str)
         diarization_pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-community-1",
-            use_auth_token=hf_token
+            token=hf_token
         ).to(torch.device(device_str))
         logger.info(f"Worker initialized successfully for diarization on {device_str}.")
     except Exception as e:
@@ -61,13 +61,13 @@ def process_file(path: Path, one_speaker: bool) -> Dict:
             "waveform": audio,
             "sample_rate": sr
         })
-        
+        speaker_diarization = diarization.speaker_diarization
         # 3. Save RTTM and check speaker count
         base_path_str = str(path.with_suffix(''))
         rttm_path = base_path_str + '.rttm'
-        _save_rttm_file(diarization=diarization, rttm_path=rttm_path)
+        _save_rttm_file(diarization=speaker_diarization, rttm_path=rttm_path)
 
-        num_speakers = len({speaker for _, _, speaker in diarization.itertracks(yield_label=True)})
+        num_speakers = len(set([speaker for _, speaker in speaker_diarization]))
         is_single_speaker = num_speakers == 1
 
         # 4. Handle multi-speaker files if one_speaker mode is enabled
@@ -124,11 +124,13 @@ def get_unprocessed_audio_paths(podcasts_path: str, result_csv_path: str) -> Lis
 def main(args):
     load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
-    config = load_config(args.config_path, 'separation')
 
+    config = load_config(args.config_path, 'separation')
     podcasts_path = config.get('podcasts_path', './data')
-    one_speaker = config.get('one_speaker', False)
-    num_workers_per_gpu = config.get('num_workers_diarization', 1)
+
+    diarization_config = config.get('diarization')
+    one_speaker = diarization_config.get('one_speaker', False)
+    num_workers_per_gpu = diarization_config.get('num_workers', 1)
 
     result_csv_path = Path(podcasts_path) / 'balalaika.csv'
     available_gpu_ids = list(range(torch.cuda.device_count()))
