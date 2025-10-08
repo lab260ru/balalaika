@@ -90,7 +90,7 @@ class GigaAMWrapper(ASRWrapper):
         self.decoder = None
         self.sec_per_frame = self.GIGA_AM_FRAME_SIZE_MS / 1000.0
         
-        if self.use_lm and not os.path.exists(lm_path):
+        if self.use_lm and not os.path.exists(kwargs['lm_path']):
             self._downlaod_lm()
 
         if self.use_lm:
@@ -180,8 +180,9 @@ class GigaAMWrapper(ASRWrapper):
     def _downlaod_lm(self):
         return hf_hub_download(
             repo_id="NikiPshg/lm",
-            filename="ru.lm.bin",
-            local_dir="./models",         
+            filename="kenlm.bin",
+            local_dir="./models",
+            repo_type='dataset',      
             local_dir_use_symlinks=False  
         )
 
