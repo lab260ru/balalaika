@@ -179,7 +179,7 @@ class GigaAMWrapper(ASRWrapper):
     
     def _downlaod_lm(self):
         return hf_hub_download(
-            repo_id="NikiPshg/lm",
+            repo_id="MTUCI/lm",
             filename="kenlm.bin",
             local_dir="./models",
             repo_type='dataset',      

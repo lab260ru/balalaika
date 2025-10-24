@@ -26,7 +26,7 @@ def init_process(
     ) -> None:
     global accentizer
 
-    device = 'CUDA' if ('cuda' in device) # RUAccent is waiting for CUDA without the cuda ID
+    device = 'CUDA' if ('cuda' in device) else 'CPU' # RUAccent is waiting for CUDA without the cuda ID
     accentizer = RUAccent()
     accentizer.load(
         omograph_model_size=model_name,
