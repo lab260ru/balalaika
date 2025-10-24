@@ -6,7 +6,7 @@ from typing import Dict, Optional
 import concurrent.futures
 from loguru import logger
 
-from src.utils import load_config, read_file_content
+from src.utils import load_config, read_file_content, get_audio_paths
 
 def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Optional[str]]:
 
@@ -30,20 +30,23 @@ def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Option
 
 
 def main(args):
+    config = load_config(args.config_path, 'download')
+    base_path = Path(config.get('podcasts_path', '../../balalaika'))
+    num_workers = config.get('num_workers', 32)
 
-    base_path = Path(
-        load_config(args.config_path, 'download').get('podcasts_path', '../../balalaika')
-        if args.config_path else args.podcasts_path
-    )
-
-
-    df = pd.read_csv(base_path / "balalaika.csv")
-    df.drop_duplicates(subset='filepath', inplace=True)
+    df_path = Path(base_path) / "balalaika.csv"
+    if df_path.exists():
+        logger.info(f"Loading existing dataframe from {df_path}")
+        df = pd.read_csv(df_path)
+        df.drop_duplicates(subset='filepath', inplace=True)
+    else:
+        logger.info(f"No existing dataframe found. Creating new one from audio paths.")
+        audio_paths = [str(path) for path in get_audio_paths(base_path)]
+        df = pd.DataFrame({'filepath': audio_paths})
     
     audio_paths = df['filepath'].tolist()
     results = []
 
-    num_workers = 32
     logger.info(f"Starting processing with {num_workers} workers")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -78,12 +81,6 @@ if __name__ == "__main__":
         type=str,
         help="Path to config file"
     )
-    parser.add_argument(
-        "--podcasts_path",
-        type=str,
-        default='../../balalaika', 
-        help="Path to dataset directory"
-    )
-    
+
     args = parser.parse_args()
     main(args)
