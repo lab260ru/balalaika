@@ -14,10 +14,10 @@ from tqdm import tqdm
 from src.transcription.transcripton_base import *
 from src.utils import get_audio_paths, load_config
 
-torch.backends.cuda.matmul.allow_tf32 = True 
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-torch.backends.cuda.enable_math_sdp(False)
+# torch.backends.cuda.matmul.allow_tf32 = True 
+# torch.backends.cuda.enable_flash_sdp(True)
+# torch.backends.cuda.enable_mem_efficient_sdp(True)
+# torch.backends.cuda.enable_math_sdp(False)
 
 model = None
 SUPPORTED_TIME_STAMPS = ['giga_ctc_lm', 'tone']
@@ -42,6 +42,49 @@ def init_worker(model_name: str, device_str: str, **kwargs):
     except Exception as e:
         logger.error(f"Failed to initialize worker for model '{model_name}' on {device_str}: {e}")
         model = None
+        
+def normalize_text(text: str) -> str:
+    """
+    Normalize text for comparison (lowercase, remove extra spaces, punctuation).
+    """
+    import re
+    text = text.lower().strip()
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+def check_transcription_sim(audio_path: Path, model_names: List[str]):
+    """
+    Checks if all given models produced identical transcriptions for this audio file.
+    """
+    first_text = None
+    for model_name in model_names:
+        text = load_transcription(audio_path, model_name)
+        if text is None or not text.strip():
+            continue
+            
+        normalized = normalize_text(text)
+        if first_text is None:
+            first_text = normalized
+        elif normalized != first_text:
+            return False
+    
+    return first_text is not None  
+
+
+
+def load_transcription(audio_path: Path, model_name: str):
+    """
+    Load transcription for a specific audio file and model.
+    """
+    txt_path = audio_path.with_name(f"{audio_path.stem}_{model_name}.txt")
+    if txt_path.exists():
+        try:
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+        except Exception as e:
+            logger.error(f"Failed to read {txt_path}: {e}")
+            return None
 
 
 def process_batch(paths: List[Path], model_name_for_output: str, with_timestamps: bool):
@@ -107,6 +150,7 @@ def main(args):
         raise 
     
     num_devices = len(available_gpu_ids)
+    processed_models = []
     for model_name in model_names:
         logger.info(f"--- Processing model: {model_name} ---")
         model_config = config.get('giga') if 'giga' in model_name else  config.get(model_name)
@@ -124,7 +168,25 @@ def main(args):
         
         if not all_audio_paths:
             logger.info(f"No new audio files to process for model '{model_name}'. Skipping.")
+            processed_models.append(model_name)
             continue
+        
+        if len(processed_models) == 3:
+            last_three_models = processed_models[-3:]
+            filtered_paths = []
+            logger.info(f"Checking for consensus among last 3 models: {last_three_models}")
+            for p in tqdm(all_audio_paths, desc=f"Consensus check ({model_name})"):
+                if check_transcription_sim(p, last_three_models):
+                    logger.info(f"Skipping {p.name} — 3 previous models gave identical result.")
+                    continue
+                filtered_paths.append(p)
+            all_audio_paths = filtered_paths
+
+        if not all_audio_paths:
+            logger.info(f"All files already consistent across last 3 models. Skipping model {model_name}.")
+            processed_models.append(model_name)
+            continue
+
         
         logger.info(f"Found {len(all_audio_paths)} new audio files to process for '{model_name}'.")
 
@@ -170,6 +232,10 @@ def main(args):
             executor.shutdown(wait=True)
         
         logger.info(f"Finished processing model: {model_name}")
+        processed_models.append(model_name) 
+
+            
+        
 
     logger.info(f"Starting ROVER processing")
     rover_wrapper = ROVERWrapper(podcasts_path=src_path, model_names=model_names)
