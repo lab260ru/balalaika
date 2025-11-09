@@ -107,3 +107,11 @@ def process_token(token, label):
         return token.upper() + "..."
     if label == "UPPER_TOTAL_QUESTIONVOSKL":
         return token.upper() + "?!"
+    
+    
+def normalize_text(text: str) -> str:
+    import re
+    text = text.lower().strip()
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text
