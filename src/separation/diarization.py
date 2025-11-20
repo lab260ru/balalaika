@@ -102,23 +102,17 @@ def process_file(path: Path, one_speaker: bool) -> Dict:
 
 
 def get_unprocessed_audio_paths(podcasts_path: str, result_csv_path: str) -> List[Path]:
-    all_audio_paths = get_audio_paths(podcasts_path)
+    all_audio_paths = set(get_audio_paths(podcasts_path))
     processed_audio_paths = []
     
     if result_csv_path.exists():
         logger.info(f"Resuming from existing results file: {result_csv_path}")
         df = pd.read_csv(result_csv_path)
-        processed_audio_paths = df.set_index('filepath').to_dict('index')
+        processed_audio_paths = set(df[df[['is_single_speaker']].notna()].to_list())
 
-    unprocessed_paths = [
-        Path(path) for path in processed_audio_paths.keys()
-        if not isinstance(
-            processed_audio_paths[path].get('is_single_speaker'),
-            bool
-            )
-    ]
+    unprocessed_paths = all_audio_paths - processed_audio_paths
     
-    return unprocessed_paths
+    return list(unprocessed_paths)
 
 
 def main(args):

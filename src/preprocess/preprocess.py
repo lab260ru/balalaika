@@ -144,14 +144,14 @@ def cut_audio(
     output_folder: str,
     album_id: str,
     episode_id: str,
-    format: str = 'mp3',
+    format: str = 'opus',
     duration: float = 15.0
 ):
     try:
         os.makedirs(output_folder, exist_ok=True)
         segments_created = 0
         for start_time, end_time in zip(start_timestamps, end_timestamps):
-            if end_time - start_time <= duration / 3:
+            if end_time - start_time <= duration / 2:
                 continue
             
             start_sample = int(start_time * sr)
@@ -198,7 +198,7 @@ def process_audio_file(path_audio: str, duration: float):
 
     # TODO: don't forget to remove the code
     audio, sr = torchaudio.load(path_audio)
-    if audio.shape[-1] / sr <= 3:
+    if audio.shape[-1] / sr <= 2:
         logger.info(f"{path_audio} -- removed {audio.shape[-1] / sr} duration")
         os.remove(path_audio)
     # # TODO: don't forget to remove the code

@@ -1,13 +1,15 @@
+cache_path: ./cache
+
 download:
-  podcasts_path: ""
+  podcasts_path: /mnt/drive2_8tb/yt-subs-rus-6k
   episodes_limit: 100 # limit on downloading episodes from one playlist
-  num_workers: 1
+  num_workers: 4
   podcasts_urls_file: '' # pkl with urls
   
 preprocess:
-  podcasts_path: "" # full path to the folder where the podcasts are located 
+  podcasts_path: /mnt/drive2_8tb/yt-subs-rus-6k # full path to the folder where the podcasts are located 
   duration: 15 # in seconds (each sample will be no longer than this time.)
-  num_workers: 4
+  num_workers: 2
   vad_args:
     smart_vad_model: ./models/smart-turn-v3.0.onnx
     silero_vad_threshold:  0.4
@@ -15,54 +17,55 @@ preprocess:
 
     
 separation:
-  podcasts_path: "" # full path to the folder where the chopped podcasts are located
+  podcasts_path: /mnt/drive2_8tb/yt-subs-rus-6k # full path to the folder where the chopped podcasts are located
 
   diarization:
-    num_workers: 4 # per gpu
+    num_workers: 1 # per gpu
     one_speaker: True # When this option is enabled, only single-speaker audio recordings are downloaded.
 
   nisqa:
     bs: 32
     num_workers: 12
+    nisqa_config_path: ./configs/nisqa_b.yaml
 
   music_detect:
     bs: 32
     num_workers: 1 # per gpu
     music_detect_model: ./models/music_detection.safetensors
-    threshold: 0.2442
+    threshold: 0.6
 
 transcription:
-  podcasts_path: "" # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /mnt/drive2_8tb/yt-subs-rus-6k # full path to the folder where the chopped podcasts are located 
   with_timestamps: True
-  model_names: ['vosk', 'tone','giga_ctc', 'giga_rnnt', 'giga_ctc_lm'] # 'tone' ['vosk','tone']
+  model_names:  ['vosk', 'tone','giga_ctc', 'giga_rnnt', 'giga_ctc_lm'] #  ['vosk', 'tone','giga_ctc', 'giga_rnnt', 'giga_ctc_lm']
 
   giga: 
-    num_workers: 4 # per one gpu
+    num_workers: 1 
     batch_size: 16 # if supported
     lm_path: './models/kenlm.bin' # path to lm.bin for giga ctc model
 
   vosk:
     vosk_path: ./models/vosk-model-ru
-    num_workers: 4 # per one gpu
+    num_workers: 1 
     batch_size: 16 # if supported
     beam_size: 4
     lm_scale: 0.2 
     ngram_lm_scale: -0.1
 
   tone:
-    num_workers: 4 # per one gpu
+    num_workers: 1 
     batch_size: 16 # if supported 
   
 punctuation:
-  podcasts_path: "" # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /mnt/drive2_8tb/yt-subs-rus-6k # full path to the folder where the chopped podcasts are located 
   model_name: "RUPunct/RUPunct_big" # RUPunct model name 
   num_workers: 1 # per one gpu
 
 accent:
-  podcasts_path: "" # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /mnt/drive2_8tb/yt-subs-rus-6k # full path to the folder where the chopped podcasts are located 
   num_workers: 1 # per one gpu
   model_name: turbo3.1 # ruAccent model name 
   
 phonemizer:
-  podcasts_path: "" # full path to the folder where the text files are located
+  podcasts_path: /mnt/drive2_8tb/yt-subs-rus-6k # full path to the folder where the text files are located
   num_workers: 1 # per one gpu

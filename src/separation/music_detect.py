@@ -1,130 +1,126 @@
 import argparse
-import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import torch
+import torch.multiprocessing as mp
 from pathlib import Path
 from typing import List
-
-import torch
-import yaml
 from loguru import logger
 from tqdm import tqdm
 from safetensors import safe_open
+from transformers import AutoFeatureExtractor
+from torch.utils.data import DataLoader
 
-from src.separation.musicdetector import WavLMForMusicDetection
+from musicdetection.audio_cache import create_audio_length_cache
+from musicdetection.dataset import MusicDetectionDataset, AudioCollate
+from musicdetection.core.model import WavLMForMusicDetection
+from musicdetection.audio_sampler import LengthBasedBatchSampler
 from src.utils import get_audio_paths, load_config
 
+# Optimizations
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cuda.enable_flash_sdp(True)
 
-def process_and_delete_chunk(
-    files: List[Path],
-    device_str: str,
-    model_path: str,
-    threshold: float,
-    batch_size: int
-) -> int:
-    """
-    Initializes a model on a specific device, processes a chunk of files in batches,
-    and deletes those with music. Designed to run in a separate process.
-    """
-    deleted_count = 0
-    try:
-        model = WavLMForMusicDetection(device=device_str, batch_size=batch_size)
-        
-        with safe_open(model_path, framework="pt") as f:
-            model.load_state_dict({k: f.get_tensor(k) for k in f.keys()})
-
-        logger.info(f"Worker (PID: {os.getpid()}) initialized on {device_str} for {len(files)} files.")
-    except Exception as e:
-        logger.error(f"Failed to initialize worker on {device_str} with model {model_path}: {e}")
-        return 0
-
-    for i in tqdm(range(0, len(files), batch_size)):
-        batch_paths = files[i:i + batch_size]
-        if not batch_paths:
-            continue
-
-        try:
-            audio_paths_str = [str(p) for p in batch_paths]
-            probabilities = model.predict_proba(audio_paths_str)
-
-            for path, prob in zip(batch_paths, probabilities):
-                prob_item = prob.item()
-                if prob_item > threshold:
-                    try:
-                        os.remove(path)
-                        deleted_count += 1
-                    except OSError as e:
-                        logger.error(f"Error deleting file {path} on {device_str}: {e}")
-
-        except Exception as e:
-            batch_start = batch_paths[0].name if batch_paths else "N/A"
-            logger.error(f"Error processing batch starting with {batch_start} on {device_str}: {e}")
-
-    return deleted_count
-
-def main(args):
-    """
-    Main function to distribute audio processing tasks across multiple GPUs and workers.
-    """
-    config = load_config(args.config_path, 'separation')
-    music_detect_config = config.get('music_detect', {})
+def create_loader(paths: List[str], model_name: str, batch_size: int, num_workers: int, cache_file: Path):
+    """Creates a DataLoader with caching of audio lengths."""
+    print(cache_file)
+    audio_lengths = create_audio_length_cache(file_paths=paths, cache_file=str(cache_file))
+    processor = AutoFeatureExtractor.from_pretrained(model_name)
     
-    src_path = config.get('podcasts_path')
-    n_workers_per_gpu = music_detect_config.get('num_workers', 1)
-    threshold = music_detect_config.get('threshold', 0.5)
-    model_path = music_detect_config.get('music_detect_model')
-    batch_size = music_detect_config.get('bs', 16)
+    dataset = MusicDetectionDataset(file_paths=paths, target_sample_rate=processor.sampling_rate)
+    sampler = LengthBasedBatchSampler(paths, audio_lengths, batch_size=batch_size, shuffle=False)
+    
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=AudioCollate(processor),
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=num_workers > 0
+    )
 
-    if not all([src_path, model_path]):
-        logger.error("Config missing required parameters: 'podcasts_path' or 'music_detect_model'.")
-        return
+def load_model(model_path: str, base_model: str, device: torch.device):
+    """Loads the model and weights."""
+    model = WavLMForMusicDetection(base_model_name=base_model)
+    with safe_open(model_path, framework="pt", device="cpu") as f:
+        model.load_state_dict({k: f.get_tensor(k) for k in f.keys()})
+    return model.to(device).eval()
 
-    available_gpu_ids = list(range(torch.cuda.device_count()))
-    if not available_gpu_ids:
-        logger.error("No CUDA-enabled GPUs found. Exiting.")
-        return
+def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
+    my_paths = all_paths[rank::world_size]
+    if not my_paths: return
 
-    all_audio_paths = get_audio_paths(src_path)
-    if not all_audio_paths:
-        logger.warning(f"No audio files found in '{src_path}'.")
-        return
-    logger.info(f"Found {len(all_audio_paths)} audio files to process.")
+    device = torch.device(f"cuda:{rank}")
+    cfg = config.get('music_detect', {})
+    
+    # Params
+    threshold = cfg.get('threshold', 0.5)
+    cache_dir = Path(cfg.get('cache_path', './cache')) / f'nisqa_temp_worker_{rank}'
+                                            # cache/nisqa_temp_worker_0/nisqa_temp/audio_lengths_cache.json
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    num_devices = len(available_gpu_ids)
-    total_workers = n_workers_per_gpu * num_devices
-    logger.info(f"Found {num_devices} GPUs. Launching {n_workers_per_gpu} workers per GPU for a total of {total_workers} workers.")
+    logger.info(f"[{device}] Processing {len(my_paths)} files...")
 
-    files_for_each_worker = [[] for _ in range(total_workers)]
-    for i, path in enumerate(all_audio_paths):
-        files_for_each_worker[i % total_workers].append(path)
-
-    tasks = []
-    for i in range(total_workers):
-        worker_files = files_for_each_worker[i]
-        if not worker_files:
-            continue
+    try:
+        # 1. Setup Data & Model
+        dataloader = create_loader(
+            my_paths, 
+            cfg.get('base_model', 'microsoft/wavlm-base-plus'),
+            cfg.get('bs', 32),
+            cfg.get('num_workers', 4),
+            cache_dir / 'audio_lengths.json'
+        )
         
-        device_str = f'cuda:{available_gpu_ids[i % num_devices]}'
-        
-        tasks.append(
-            (worker_files, device_str, model_path, threshold, batch_size)
+        model = load_model(
+            cfg.get('music_detect_model'), 
+            cfg.get('base_model', 'microsoft/wavlm-base-plus'), 
+            device
         )
 
-    total_deleted_count = 0
-    with ProcessPoolExecutor(max_workers=total_workers, mp_context=multiprocessing.get_context('spawn')) as executor:
-        futures = [executor.submit(process_and_delete_chunk, *task) for task in tasks]
-        
-        for future in as_completed(futures):
-            try:
-                total_deleted_count += future.result()
-            except Exception as e:
-                logger.error(f"A worker process task failed: {e}")
+        # 2. Inference Loop
+        deleted_count = 0
+        with torch.inference_mode():
+            for batch, paths in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
+                if batch is None: continue
 
-    logger.success(f"Total files deleted: {total_deleted_count}")
+                # Forward pass
+                probs = model(batch['input_values'].to(device))
+                
+                # Zip paths with probabilities -> Tuple(path, prob)[[]]
+                predictions = zip(paths, probs.detach().flatten())
+
+                # Filter and Delete
+                for path, prob in predictions:
+                    if prob > threshold:
+                        try:
+                            os.remove(path)
+                            deleted_count += 1
+                        except OSError:
+                            pass
+
+        logger.success(f"[{device}] Done. Deleted {deleted_count} files.")
+
+    except Exception as e:
+        logger.exception(f"Worker {rank} error: {e}")
+
+def main(args):
+    mp.set_start_method('spawn', force=True)
+    config = load_config(args.config_path, 'separation')
+    
+    if not (podcasts_path := config.get('podcasts_path')):
+        logger.error("No podcasts_path in config")
+        return
+
+    if not (all_paths := [str(p) for p in get_audio_paths(podcasts_path)]):
+        logger.warning("No audio files found.")
+        return
+
+    if (n_gpus := torch.cuda.device_count()) == 0:
+        logger.error("No GPU found.")
+        return
+
+    mp.spawn(run_worker, args=(n_gpus, all_paths, config), nprocs=n_gpus, join=True)
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn', force=True)
-    parser = argparse.ArgumentParser(description="Parallel music detection and deletion based on a config file.")
-    parser.add_argument("--config_path", type=str, required=True, help="Path to the YAML configuration file.")
-    parsed_args = parser.parse_args()
-    main(parsed_args)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config_path", type=str, required=True)
+    main(parser.parse_args())
