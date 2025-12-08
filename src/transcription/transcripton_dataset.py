@@ -2,8 +2,8 @@ import os
 import json
 import torch
 import torchaudio
-import logging
 from typing import List, Tuple, Optional
+import miniaudio
 from torch.utils.data import Dataset, Sampler
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
@@ -109,19 +109,8 @@ class ToneAudioDataset(Dataset):
             if not os.path.exists(path):
                 return None, path
 
-            waveform, sr = torchaudio.load(path)
-            
-            if sr != self.target_sr:
-                waveform = torchaudio.functional.resample(
-                    waveform, orig_freq=sr, new_freq=self.target_sr
-                )
-
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-
-            waveform = (waveform * 32768.0).clamp(-32768, 32767).to(torch.int32)
-            
-            audio_np = waveform.squeeze(0).numpy()
+            audio = miniaudio.decode_file(str(path), nchannels=1, sample_rate=self.target_sr)
+            audio_np = np.asarray(audio.samples, dtype=np.int16).astype(np.int32)
             
             return audio_np, path
 

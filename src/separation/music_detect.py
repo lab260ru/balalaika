@@ -22,7 +22,7 @@ torch.backends.cuda.enable_flash_sdp(True)
 
 def create_loader(paths: List[str], model_name: str, batch_size: int, num_workers: int, cache_file: Path):
     """Creates a DataLoader with caching of audio lengths."""
-    print(cache_file)
+
     audio_lengths = create_audio_length_cache(file_paths=paths, cache_file=str(cache_file))
     processor = AutoFeatureExtractor.from_pretrained(model_name)
     
@@ -34,8 +34,7 @@ def create_loader(paths: List[str], model_name: str, batch_size: int, num_worker
         batch_sampler=sampler,
         collate_fn=AudioCollate(processor),
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=num_workers > 0
+        pin_memory=True
     )
 
 def load_model(model_path: str, base_model: str, device: torch.device):
@@ -79,11 +78,12 @@ def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
         # 2. Inference Loop
         deleted_count = 0
         with torch.inference_mode():
-            for batch, paths in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
-                if batch is None: continue
+            for batch in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
+                if batch is None:
+                     continue
 
                 # Forward pass
-                probs = model(batch['input_values'].to(device))
+                probs, paths = model.predict_proba(batch)
                 
                 # Zip paths with probabilities -> Tuple(path, prob)[[]]
                 predictions = zip(paths, probs.detach().flatten())

@@ -117,6 +117,7 @@ def run_inference_on_device(cuda_id: int, world_size: int, model_name: str, all_
                 if not batch_audios: continue
                 
                 if process_timestamps:
+                    # tone model does not support batch processing
                     texts, tstamps = model.transcribe_audio_data_with_timestamps(batch_audios)
                 else:
                     texts = model.transcribe_audio_data(batch_audios)
