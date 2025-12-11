@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import List
 import yaml
 from loguru import logger
+import re
 
 def load_config(config_path: str, process_name: str):
     config = {}
@@ -107,3 +108,9 @@ def process_token(token, label):
         return token.upper() + "..."
     if label == "UPPER_TOTAL_QUESTIONVOSKL":
         return token.upper() + "?!"
+
+def normalize_text(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text
