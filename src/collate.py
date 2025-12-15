@@ -6,7 +6,7 @@ from typing import Dict, Optional
 import concurrent.futures
 from loguru import logger
 
-from src.utils import load_config, read_file_content, get_audio_paths
+from src.utils.utils import load_config, read_file_content, get_audio_paths
 
 def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Optional[str]]:
 
@@ -18,7 +18,7 @@ def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Option
         'accent': '_accent.txt',
         'rover': '_rover.txt',
         'punct': '_punct.txt',
-        'phonemes': '_rover_phonemes.txt'
+        'phonemes': '_rover_phonemes.txt',
     }
 
     results = {'filepath': audio_path_str}

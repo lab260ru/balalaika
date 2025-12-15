@@ -19,9 +19,11 @@ from tone import StreamingCTCPipeline, TextPhrase
 from tqdm import tqdm
 from huggingface_hub import snapshot_download, hf_hub_download 
 
-from src.utils import read_file_content, get_audio_paths
-from src.utils_asr import (AttributeDict, LmScorer, NgramLm,
-                           modified_beam_search_LODR)
+from src.utils.utils import read_file_content, get_audio_paths
+from src.utils.vosk_utils import (
+    AttributeDict, LmScorer, NgramLm,
+    modified_beam_search_LODR
+    )
 
 
 class ASRWrapper(ABC):

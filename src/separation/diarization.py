@@ -14,7 +14,7 @@ from loguru import logger
 from pyannote.audio import Pipeline
 from tqdm import tqdm
 
-from src.utils import get_audio_paths, load_config
+from src.utils.utils import get_audio_paths, load_config
 
 torch.backends.cuda.matmul.allow_tf32 = True 
 torch.backends.cuda.enable_flash_sdp(True)
@@ -108,17 +108,23 @@ def get_unprocessed_audio_paths(podcasts_path: str, result_csv_path: str) -> Lis
     if result_csv_path.exists():
         logger.info(f"Resuming from existing results file: {result_csv_path}")
         df = pd.read_csv(result_csv_path)
-        processed_audio_paths = set(df[df[['is_single_speaker']].notna()].to_list())
-
-    unprocessed_paths = all_audio_paths - processed_audio_paths
+        if 'is_single_speaker' not in df.columns:
+            logger.warning("Column 'is_single_speaker' not found in results file. Treating all entries as unprocessed.")
+            processed_audio_paths = set()
+        else:
+            processed_mask = df['is_single_speaker'].notna()
+            processed_audio_paths = set(df.loc[processed_mask, 'filepath'].astype(str).tolist())
+    else:
+        return all_audio_paths
     
+    unprocessed_paths = all_audio_paths - processed_audio_paths
     return list(unprocessed_paths)
 
 
 def main(args):
     load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
-
+    print(args.config_path)
     config = load_config(args.config_path, 'separation')
     podcasts_path = config.get('podcasts_path', './data')
 

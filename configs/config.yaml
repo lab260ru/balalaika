@@ -1,13 +1,13 @@
 cache_path: ./cache
 
 download:
-  podcasts_path: /home/nikita/balalaika_pipe_datasets/test
+  podcasts_path: /mnt/drive2_8tb/ruls/train/audio
   episodes_limit: 100 # limit on downloading episodes from one playlist
   num_workers: 4
   podcasts_urls_file: '' # pkl with urls
   
 preprocess:
-  podcasts_path: /home/nikita/balalaika_pipe_datasets/test # full path to the folder where the podcasts are located 
+  podcasts_path: /mnt/drive2_8tb/ruls/train/audio # full path to the folder where the podcasts are located 
   duration: 15 # in seconds (each sample will be no longer than this time.)
   num_workers: 2
   vad_args:
@@ -17,7 +17,7 @@ preprocess:
 
     
 separation:
-  podcasts_path: /home/nikita/balalaika_pipe_datasets/test # full path to the folder where the chopped podcasts are located
+  podcasts_path: /mnt/drive2_8tb/ruls/train/audio # full path to the folder where the chopped podcasts are located
 
   diarization:
     num_workers: 1 # per gpu
@@ -35,7 +35,7 @@ separation:
     threshold: 0.6
 
 transcription:
-  podcasts_path: /home/nikita/balalaika_pipe_datasets/test # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /mnt/drive2_8tb/ruls/train/audio # full path to the folder where the chopped podcasts are located 
   consensus_num: 3 # number of models to use for consensus transcription
   with_timestamps: True
   model_names:  ['giga_ctc', 'giga_rnnt', 'giga_ctc_lm', 'vosk', 'tone',] #  ['vosk', 'tone','giga_ctc', 'giga_rnnt', 'giga_ctc_lm']
@@ -58,15 +58,15 @@ transcription:
     batch_size: 16 # if supported 
   
 punctuation:
-  podcasts_path: /home/nikita/balalaika_pipe_datasets/test # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /mnt/drive2_8tb/ruls/train/audio # full path to the folder where the chopped podcasts are located 
   model_name: "RUPunct/RUPunct_big" # RUPunct model name 
   num_workers: 1 # per one gpu
 
 accent:
-  podcasts_path: /home/nikita/balalaika_pipe_datasets/test # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /mnt/drive2_8tb/ruls/train/audio # full path to the folder where the chopped podcasts are located 
   num_workers: 1 # per one gpu
   model_name: turbo3.1 # ruAccent model name 
   
 phonemizer:
-  podcasts_path: /home/nikita/balalaika_pipe_datasets/test # full path to the folder where the text files are located
+  podcasts_path: /mnt/drive2_8tb/ruls/train/audio # full path to the folder where the text files are located
   num_workers: 1 # per one gpu

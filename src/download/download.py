@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from loguru import logger
 from yandex_music import Client
 
-from src.utils import load_config
+from src.utils.utils import load_config
 
 def init_client(client_key):
     try:

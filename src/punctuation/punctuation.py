@@ -10,7 +10,7 @@ from loguru import logger
 from tqdm import tqdm
 from transformers import pipeline, AutoTokenizer
 
-from src.utils import load_config, get_audio_paths, process_token, read_file_content
+from src.utils.utils import load_config, get_audio_paths, process_token, read_file_content
 
 torch.backends.cuda.matmul.allow_tf32 = True 
 torch.backends.cuda.enable_flash_sdp(True)

@@ -14,7 +14,7 @@ from musicdetection.audio_cache import create_audio_length_cache
 from musicdetection.dataset import MusicDetectionDataset, AudioCollate
 from musicdetection.core.model import WavLMForMusicDetection
 from musicdetection.audio_sampler import LengthBasedBatchSampler
-from src.utils import get_audio_paths, load_config
+from src.utils.utils import get_audio_paths, load_config
 
 # Optimizations
 torch.backends.cuda.matmul.allow_tf32 = True

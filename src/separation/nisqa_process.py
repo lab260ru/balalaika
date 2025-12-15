@@ -11,7 +11,7 @@ from multiprocessing import cpu_count
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.utils import get_audio_paths, load_config
+from src.utils.utils import get_audio_paths, load_config
 
 from nisqab.core.model_torch import model_init
 from nisqab.utils.dataset import NISQADataset, collate_fn

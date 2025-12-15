@@ -17,7 +17,7 @@ from src.transcription.transcripton_dataset import (
     ToneAudioDataset, collate_tone,
     VoskAudioDataset, collate_vosk
 )
-from src.utils import get_audio_paths, load_config
+from src.utils.utils import get_audio_paths, load_config
 
 torch.backends.cuda.matmul.allow_tf32 = True 
 torch.backends.cuda.enable_flash_sdp(True)
@@ -117,7 +117,6 @@ def run_inference_on_device(cuda_id: int, world_size: int, model_name: str, all_
                 if not batch_audios: continue
                 
                 if process_timestamps:
-                    # tone model does not support batch processing
                     texts, tstamps = model.transcribe_audio_data_with_timestamps(batch_audios)
                 else:
                     texts = model.transcribe_audio_data(batch_audios)

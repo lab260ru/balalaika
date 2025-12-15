@@ -10,7 +10,7 @@ from loguru import logger
 from ruaccent import RUAccent
 from tqdm import tqdm
 
-from src.utils import load_config, get_txt_paths, read_file_content
+from src.utils.utils import load_config, get_txt_paths, read_file_content
 
 torch.backends.cuda.matmul.allow_tf32 = True 
 torch.backends.cuda.enable_flash_sdp(True)

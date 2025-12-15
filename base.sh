@@ -17,11 +17,11 @@ if [ -z "${1:-}" ]; then
 fi
 
 CONFIG_PATH=$(realpath "$1")
-
+echo $CONFIG_PATH "--src"
 SCRIPTS=(
     # "./src/download/download_yaml.sh"
     # "./src/preprocess/preprocess_yaml.sh"
-    "./src/separation/separation_yaml.sh"
+    # "./src/separation/separation_yaml.sh"
     "./src/transcription/transcription_yaml.sh"
     "./src/punctuation/punctuation_yaml.sh"
     "./src/accents/accents_yaml.sh"
