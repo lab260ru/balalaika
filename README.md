@@ -1,4 +1,4 @@
-# YapodDataset Pipeline
+# Balalaika Pipeline
 
 A complete production-ready pipeline for processing audio data, from download to feature extraction. This pipeline handles audio preprocessing, speaker diarization, transcription, punctuation restoration, accent restoration, and phonemization.
 
@@ -96,15 +96,15 @@ If you use this pipeline or the Balalaika dataset in your research, please cite:
 
 The pipeline integrates the following models and tools:
 
-- **[NISQA](https://github.com/deepvk/NISQA-s)**: Audio quality assessment
+- **[NISQA](https://github.com/gabrielmittag/NISQA)**: Audio quality assessment
 - **[GigaAM](https://github.com/salute-developers/GigaAM)**: ASR models (CTC, RNNT, CTC+LM)
 - **[ruAccent](https://github.com/Den4ikAI/ruaccent)**: Accent restoration
 - **[RUPunct](https://huggingface.co/RUPunct/RUPunct_big)**: Punctuation restoration
 - **[Vosk](https://alphacephei.com/vosk/)**: ASR model
-- **[T-one](https://github.com/mtuciru/T-one-cuda-onnx)**: ASR model
-- **[TryIPaG2P](https://github.com/NikiPshg/TryIPaG2P)**: Phonemization
+- **[T-one](https://github.com/voicekit-team/T-one)**: ASR model
+- **[TryIPaG2P](https://github.com/mtuciru/IpaG2p)**: Phonemization
 - **[Speaker Diarization](https://github.com/pyannote/pyannote-audio)**: Speaker diarization
-- **[Smart Turn VAD](https://github.com/snakers4/silero-vad)**: Voice Activity Detection
+- **[Smart Turn VAD](https://github.com/pipecat-ai/smart-turn)**: Voice Activity Detection
 
 ---
 
