@@ -198,7 +198,7 @@ def process_audio_file(path_audio: str, duration: float):
 
     # TODO: don't forget to remove the code
     audio, sr = torchaudio.load(path_audio)
-    if (audio.shape[-1] / sr) <= 2 or(audio.shape[-1] / sr >= 12):
+    if (audio.shape[-1] / sr) <= 1 or audio.shape[-1] / sr > 15:
         logger.info(f"{path_audio} -- removed {audio.shape[-1] / sr} duration")
         os.remove(path_audio)
     # # TODO: don't forget to remove the code

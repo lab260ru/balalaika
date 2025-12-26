@@ -21,4 +21,6 @@ activate_venv ".dev_venv"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
+python3 -m src.preprocess.crest_factor_remover --config_path "$CONFIG_PATH"
+python3 -m src.preprocess.preprocess_audio --config_path "$CONFIG_PATH"
 python3 -m src.preprocess.preprocess --config_path "$CONFIG_PATH"

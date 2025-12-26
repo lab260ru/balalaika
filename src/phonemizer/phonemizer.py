@@ -9,7 +9,7 @@ from loguru import logger
 from tryiparu import G2PModel
 from tqdm import tqdm
 
-from src.utils import get_txt_paths, load_config, read_file_content
+from src.utils.utils import get_txt_paths, load_config, read_file_content
 
 torch.backends.cuda.matmul.allow_tf32 = True 
 torch.backends.cuda.enable_flash_sdp(True)

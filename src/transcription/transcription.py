@@ -154,15 +154,60 @@ def run_inference_on_device(cuda_id: int, world_size: int, model_name: str, all_
         logger.exception(f"Critical error in worker {cuda_id} for model {model_name}: {e}")
 
 
-def get_valid_audio_paths(src_path: str, model_name_for_output: str) -> List[Path]:
+def check_consensus_reached(audio_path: Path, model_names: List[str], consensus_num: int) -> bool:
+    """Check if consensus_num models have produced the same transcription for this audio file."""
+    from collections import Counter
+    from src.utils.utils import read_file_content
+    
+    transcriptions = []
+    for model_name in model_names:
+        model_name_for_file = 'vosk' if 'vosk' in model_name else model_name
+        transcript_path = audio_path.with_name(f"{audio_path.stem}_{model_name_for_file}.txt")
+        
+        if transcript_path.exists():
+            try:
+                text = read_file_content(transcript_path)
+                if text:
+                    # Normalize text for comparison (lowercase, strip)
+                    normalized = text.lower().strip()
+                    transcriptions.append(normalized)
+            except Exception:
+                pass
+    
+    if len(transcriptions) < consensus_num:
+        return False
+    
+    # Count occurrences of each transcription
+    counter = Counter(transcriptions)
+    # Check if any transcription appears at least consensus_num times
+    return max(counter.values()) >= consensus_num
+
+
+def get_valid_audio_paths(src_path: str, model_name_for_output: str, processed_models: List[str], consensus_num: int) -> List[Path]:
     all_audio_paths = get_audio_paths(src_path)
     if not all_audio_paths:
         return []
 
+    # Filter out files that already have transcription for this model
     valid_paths = [
         p for p in all_audio_paths 
         if not p.with_name(f"{p.stem}_{model_name_for_output}.txt").exists()
     ]
+    
+    # Filter out files that already reached consensus
+    if consensus_num > 0 and len(processed_models) >= consensus_num:
+        consensus_count = 0
+        filtered_paths = []
+        for p in valid_paths:
+            if check_consensus_reached(p, processed_models, consensus_num):
+                consensus_count += 1
+            else:
+                filtered_paths.append(p)
+        
+        if consensus_count > 0:
+            logger.info(f"Skipping {consensus_count} files that already reached consensus ({consensus_num} models agree).")
+        valid_paths = filtered_paths
+    
     return valid_paths
 
 
@@ -170,6 +215,7 @@ def main(args):
     config = load_config(args.config_path, 'transcription')
     model_names = config.get('model_names', ['giga_rnnt'])
     src_path = config.get('podcasts_path', '.')
+    consensus_num = config.get('consensus_num', 0)  # 0 means process all models
 
     available_gpu_ids = list(range(torch.cuda.device_count()))
     if not available_gpu_ids:
@@ -178,13 +224,18 @@ def main(args):
     
     num_gpus = len(available_gpu_ids)
     logger.info(f"Detected {num_gpus} GPUs. Starting processing pipeline.")
+    if consensus_num > 0:
+        logger.info(f"Consensus mode enabled: will skip files where {consensus_num} models agree.")
 
-    for model_name in model_names:
-        logger.info(f"=== Processing model: {model_name} ===")
+    for model_idx, model_name in enumerate(model_names):
+        logger.info(f"=== Processing model {model_idx + 1}/{len(model_names)}: {model_name} ===")
         
         model_name_for_output = 'vosk' if 'vosk' in model_name else model_name
         
-        all_paths = get_valid_audio_paths(src_path, model_name_for_output)
+        # Get models processed so far (before current model)
+        processed_models = model_names[:model_idx] if consensus_num > 0 else []
+        
+        all_paths = get_valid_audio_paths(src_path, model_name_for_output, processed_models, consensus_num)
         
         if not all_paths:
             logger.info(f"No new files for {model_name}. Skipping.")
