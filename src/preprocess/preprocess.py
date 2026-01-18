@@ -15,8 +15,6 @@ from huggingface_hub import login
 from src.utils.utils import load_config, get_audio_paths
 from src.libs.smart_turn.offline_svad import OfflineVAD
 
-from typing import List, Dict, Any, Tuple
-
 torch.backends.cuda.matmul.allow_tf32 = True 
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)

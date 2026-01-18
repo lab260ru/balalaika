@@ -67,10 +67,11 @@ Splits long audio files into shorter segments (default: 15 seconds) using Voice 
 ---
 
 ### 3. Separation (`src/separation/`)
-Performs three types of analysis:
+Performs four types of analysis:
 - **Diarization**: Identifies and separates different speakers, creates `.rttm` files
 - **NISQA**: Assesses audio quality metrics
 - **Music Detection**: Detects music segments in audio
+- **Silence Detection**: Analyzes silence patterns in audio
 
 **Input**: Segmented audio files  
 **Output**: 
@@ -78,13 +79,29 @@ Performs three types of analysis:
 - **`balalaika.csv`**: Metadata file containing:
   - Single speaker flags (indicating whether each audio segment contains only one speaker)
   - Audio quality metrics (from NISQA assessment)
+  - **Silence percent**: Percentage of silence in each audio segment
+  - **Max silence duration**: Maximum continuous silence duration in seconds
   - File paths and processing status
 - Files with detected music are **automatically deleted** during music detection stage
 - Can filter out multi-speaker files if `one_speaker: True` is set (files are deleted)
 
 **Configuration**: `config.yaml` → `separation` section
+- `diarization`: Speaker diarization settings
+  - `num_workers`: Number of workers per GPU
+  - `one_speaker`: Filter for single-speaker audio only
+- `nisqa`: Audio quality assessment settings
+  - `bs`: Batch size
+  - `num_workers`: Number of workers
+  - `nisqa_config_path`: Path to NISQA config
+- `music_detect`: Music detection settings
+  - `bs`: Batch size
+  - `num_workers`: Number of workers per GPU
+  - `music_detect_model`: Path to model
+  - `threshold`: Detection threshold
+- `silence_detect`: Silence detection settings
+  - `num_workers`: Number of workers per GPU
 
-**Note**: The `balalaika.csv` file is created/updated during the separation stage and contains important metadata about each audio segment, including speaker information and quality metrics. Files detected as containing music are removed from the dataset.
+**Note**: The `balalaika.csv` file is created/updated during the separation stage and contains important metadata about each audio segment, including speaker information, quality metrics, and silence analysis. Files detected as containing music are removed from the dataset.
 
 ---
 
@@ -214,6 +231,9 @@ For each audio segment, the pipeline generates:
 - `balalaika.csv`: Created during separation stage, contains:
   - Single speaker flags (indicating one-speaker vs multi-speaker segments)
   - Audio quality metrics (NISQA scores)
+  - **Silence metrics**: 
+    - `silence_percent`: Percentage of silence in each segment
+    - `max_silence_duration`: Maximum continuous silence duration (seconds)
   - File paths and processing status
   - Files with music are automatically deleted and not included
 
@@ -283,7 +303,7 @@ The stages must be run in this order:
    - **Crest Factor Removal** → Removes files with excessive peak/RMS ratio
    - **Loudness Normalization** → Normalizes audio loudness (overwrites files)
    - **Audio Segmentation** → Segments audio into chunks using VAD
-3. **Separation** → Diarization, quality assessment, music detection
+3. **Separation** → Diarization, quality assessment, music detection, silence detection
 4. **Transcription** → Creates individual model transcriptions + `_rover.txt` (consensus)
 5. **Punctuation** → Processes `_rover.txt` → `_punct.txt`
 6. **Accents** → Processes `_punct.txt` → `_accent.txt`

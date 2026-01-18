@@ -35,6 +35,11 @@ separation:
     music_detect_model: ./models/music_detection.safetensors
     threshold: 0.6
 
+  silence_detect:
+    num_workers: 2 # per gpu
+    vad_threshold: 0.5
+    max_silence_duration: 1.0 # maximum duration of silence to be marked
+
 transcription:
   podcasts_path: /mnt/drive2_8tb/biggest-ru-book # full path to the folder where the chopped podcasts are located 
   consensus_num: 3 # number of models to use for consensus transcription

@@ -63,7 +63,7 @@ The pipeline consists of the following stages:
    - **Crest Factor Removal** - Removes files with excessive peak-to-RMS ratio
    - **Loudness Normalization** - Normalizes audio loudness (ITU-R BS.1770-4)
    - **Audio Segmentation** - Segments audio into chunks using VAD
-3. **Separation** - Speaker diarization, quality assessment, music detection
+3. **Separation** - Speaker diarization, quality assessment, music detection, silence analysis
 4. **Transcription** - Multi-model ASR with ROVER consensus (optimized with early stopping when models agree)
 5. **Punctuation** - Punctuation restoration
 6. **Accents** - Accent restoration

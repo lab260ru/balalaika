@@ -209,6 +209,9 @@ Once your dataset is organized, you can skip the download stage and start from p
 **Important**: After the preprocessing stage (`./src/preprocess/preprocess_yaml.sh`), the separation stage creates a `balalaika.csv` file in your dataset directory. This file contains:
 - **Single speaker flags**: Indicates whether each audio segment contains only one speaker
 - **Audio quality metrics**: NISQA quality assessment scores for each segment
+- **Silence metrics**: 
+  - `silence_percent`: Percentage of silence in each audio segment
+  - `max_silence_duration`: Maximum continuous silence duration in seconds
 - **File paths**: References to all processed audio files
 
 Additionally, files detected as containing music are **automatically deleted** during the music detection step in the separation stage.
