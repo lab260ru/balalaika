@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 import torchaudio
 from loguru import logger
-from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+from silero_vad import read_audio, get_speech_timestamps
 from tqdm import tqdm
 
 from src.utils.utils import get_audio_paths, load_config
@@ -120,7 +120,8 @@ def calculate_silence_metrics(path: Path, vad_threshold: float = 0.5) -> Dict:
         return {
             'filepath': str(path),
             'silence_percent': round(silence_percent, 2),
-            'max_silence_duration': round(max_silence_duration, 2)
+            'max_silence_duration': round(max_silence_duration, 2),
+            'total_duration': round(total_duration, 2),
         }
         
     except Exception as e:
@@ -154,7 +155,7 @@ def get_unprocessed_audio_paths(podcasts_path: str, result_csv_path: Path) -> Li
         return list(all_audio_paths)
     
     unprocessed_paths = all_audio_paths - processed_audio_paths
-    return list(unprocessed_paths)
+    return list(all_audio_paths)
 
 
 def main(args):

@@ -105,16 +105,19 @@ def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
 def main(args):
     mp.set_start_method('spawn', force=True)
     config = load_config(args.config_path, 'separation')
+    podcasts_path = config.get('podcasts_path')
+    all_paths = list(get_audio_paths(podcasts_path))
+    n_gpus = torch.cuda.device_count()
     
-    if not (podcasts_path := config.get('podcasts_path')):
+    if not podcasts_path:
         logger.error("No podcasts_path in config")
         return
 
-    if not (all_paths := [str(p) for p in get_audio_paths(podcasts_path)]):
+    if not all_paths:
         logger.warning("No audio files found.")
         return
 
-    if (n_gpus := torch.cuda.device_count()) == 0:
+    if n_gpus == 0:
         logger.error("No GPU found.")
         return
 

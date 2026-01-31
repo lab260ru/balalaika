@@ -20,13 +20,13 @@ CONFIG_PATH=$(realpath "$1")
 echo $CONFIG_PATH "--src"
 SCRIPTS=(
     # "./src/download/download_yaml.sh"
-    # "./src/preprocess/preprocess_yaml.sh"
-    # "./src/separation/separation_yaml.sh"
-    "./src/transcription/transcription_yaml.sh"
-    "./src/punctuation/punctuation_yaml.sh"
-    "./src/accents/accents_yaml.sh"
-    "./src/phonemizer/phonemizer_yaml.sh"
-    "./src/collate_yamls.sh"
+    "./src/preprocess/preprocess_yaml.sh"
+    "./src/separation/separation_yaml.sh"
+    # "./src/transcription/transcription_yaml.sh"
+    # "./src/punctuation/punctuation_yaml.sh"
+    # "./src/accents/accents_yaml.sh"
+    # "./src/phonemizer/phonemizer_yaml.sh"
+    # "./src/collate_yamls.sh"
 )
 
 activate_venv ".dev_venv"
