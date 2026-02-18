@@ -1,35 +1,84 @@
-## Usage/Examples
+## Transcription (onnx-asr)
 
-### Running the Code via Command-Line Arguments  
-You can modify the parameters directly in the shell script (`transcription/transcription_args.sh`) and then run it:
-~~~ 
-sh transcription/transcription_args.sh
-~~~  
+ASR-транскрипция реализована через [onnx-asr](https://github.com/istupakov/onnx-asr) — единый интерфейс для множества ASR-моделей на базе ONNX Runtime.
 
-### Running the Code via Config File  
-Example:
-~~~ 
-sh transcription/transcription_yaml.sh config_path
-~~~  
+### Поддерживаемые модели
 
-## Explanation of Parameters
+| Имя в конфиге    | onnx-asr модель                          | Язык         |
+|------------------|------------------------------------------|--------------|
+| `giga_ctc`       | `gigaam-v3-ctc`                          | Русский      |
+| `giga_rnnt`      | `gigaam-v3-rnnt`                         | Русский      |
+| `vosk`           | `alphacep/vosk-model-ru`                 | Русский      |
+| `vosk_small`     | `alphacep/vosk-model-small-ru`           | Русский      |
+| `tone`           | `t-tech/t-one`                           | Русский      |
+| `parakeet_v2`    | `nemo-parakeet-tdt-0.6b-v2`             | English      |
+| `parakeet_v3`    | `nemo-parakeet-tdt-0.6b-v3`             | Multilingual |
+| `canary`         | `nemo-canary-1b-v2`                      | Multilingual |
+| `whisper_base`   | `whisper-base`                           | Multilingual |
+| `whisper_turbo`  | `onnx-community/whisper-large-v3-turbo`  | Multilingual |
 
-- `--config_path`: Path to the YAML configuration file.  
-  *Note: When provided, the config file may include additional settings such as `model_name` and `device`.*
-- `--podcasts_path`: Path to the directory containing audio files for transcription (default: "../../../podcasts").
-- `--num_workers`: Number of worker processes per GPU for parallel processing (default: 4).
-- `--model_name`: Name of the model to use for transcription (default: "rnnt").  
+Модели загружаются автоматически из Hugging Face при первом запуске.
 
-## Output Structure
+### Запуск
 
-For each `.mp3` audio file found within the specified `podcasts_path`, a corresponding `_giga.txt` file will be created in the same directory containing the transcription:
+```bash
+sh src/transcription/transcription_yaml.sh configs/config.yaml
+```
+
+### Конфигурация (`configs/config.yaml`)
+
+```yaml
+transcription:
+  podcasts_path: /path/to/dataset
+  consensus_num: 3        # пропуск файлов при совпадении N моделей
+  with_timestamps: True
+  use_tensorrt: False     # TensorRT EP (fp16, максимальная скорость)
+  use_vad: False          # Silero VAD для длинных аудио
+  model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
+
+  giga:
+    batch_size: 16        # размер батча (подбирается под VRAM)
+    # quantization: int8  # опциональная квантизация
+
+  vosk:
+    batch_size: 16
+    # vosk_path: ./models/vosk-model-ru  # локальная модель (иначе скачивается из HF)
+
+  tone:
+    batch_size: 16
+```
+
+### GPU-инференс
+
+- **CUDA**: используется по умолчанию (`CUDAExecutionProvider`)
+- **TensorRT**: `use_tensorrt: True` — fp16, максимальная скорость на NVIDIA GPU
+- **Мульти-GPU**: файлы автоматически распределяются между всеми доступными GPU
+- **Батчи**: `batch_size` контролирует количество файлов в одном батче
+
+### Выходная структура
+
+Для каждого аудиофайла создаётся файл с транскрипцией:
 
 ```
-podcasts/
+dataset/
 └── {album_id}/
     └── {episode_id}/
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}.mp3
-        └── {start_time}_{end_time}_{album_id}_{episode_id}_giga.txt
+        ├── audio.wav
+        ├── audio_giga_ctc.txt      # транскрипция GigaAM CTC
+        ├── audio_giga_ctc.tst      # таймстемпы (если with_timestamps: True)
+        ├── audio_giga_rnnt.txt     # транскрипция GigaAM RNN-T
+        ├── audio_vosk.txt          # транскрипция Vosk
+        └── audio_tone.txt          # транскрипция T-one
 ```
 
-The `_giga.txt` file contains the transcribed text from the audio file. The transcription is performed using the specified model (default: "rnnt") and is processed in parallel using multiple GPUs if available.
+### Зависимости
+
+```bash
+pip install onnx-asr[gpu,hub] soundfile
+```
+
+Для TensorRT (опционально):
+
+```bash
+pip install onnxruntime-gpu[cuda,cudnn] tensorrt-cu12-libs
+```

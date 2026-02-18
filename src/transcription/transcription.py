@@ -1,271 +1,289 @@
 import argparse
-import torch
-import torch.multiprocessing as mp
+import multiprocessing as mp
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+from collections import Counter
 from loguru import logger
 from tqdm import tqdm
 
-from src.transcription.transcripton_base import (
-    GigaAMWrapper, 
-    ToneWrapper, 
-    VOSKCUDAWrapper, 
-    ROVERWrapper
-)
-from src.transcription.transcripton_dataset import (
-    GigaAudioDataset, collate_giga, LengthGroupedSampler,
-    ToneAudioDataset, collate_tone,
-    VoskAudioDataset, collate_vosk
-)
-from src.utils.utils import get_audio_paths, load_config
+import onnx_asr
 
-torch.backends.cuda.matmul.allow_tf32 = True 
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
+try:
+    import soundfile as sf
+    HAS_SOUNDFILE = True
+except ImportError:
+    HAS_SOUNDFILE = False
 
-SUPPORTED_TIME_STAMPS = ['giga_ctc_lm', 'tone']
+from src.utils.utils import get_audio_paths, load_config, read_file_content
 
-def save_results(paths: List[str], texts: List[str], timestamps: List[str], model_suffix: str):
-    """Helper to save text and timestamp files."""
-    for path_str, text, ts_content in zip(paths, texts, timestamps):
+MODEL_MAP = {
+    'giga_rnnt': 'gigaam-v3-rnnt',
+    'giga_ctc': 'gigaam-v3-ctc',
+    'giga_ctc_lm': 'gigaam-v3-ctc',
+    'tone': 't-tech/t-one',
+    'vosk': 'alphacep/vosk-model-ru',
+    'vosk_small': 'alphacep/vosk-model-small-ru',
+    'parakeet_v2': 'nemo-parakeet-tdt-0.6b-v2',
+    'parakeet_v3': 'nemo-parakeet-tdt-0.6b-v3',
+    'canary': 'nemo-canary-1b-v2',
+    'whisper_base': 'whisper-base',
+    'whisper_turbo': 'onnx-community/whisper-large-v3-turbo',
+}
+
+SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
+
+
+def get_gpu_count() -> int:
+    try:
+        import onnxruntime as ort
+        if 'CUDAExecutionProvider' not in ort.get_available_providers():
+            return 0
+    except ImportError:
+        return 0
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return len([line for line in result.stdout.strip().split('\n') if line.strip()])
+    except Exception:
+        pass
+    return 1
+
+
+def get_providers(cuda_id: int, use_tensorrt: bool = False) -> list:
+    if use_tensorrt:
+        return [
+            ("TensorrtExecutionProvider", {
+                "device_id": cuda_id,
+                "trt_max_workspace_size": 6 * 1024**3,
+                "trt_fp16_enable": True,
+            }),
+            ("CUDAExecutionProvider", {"device_id": cuda_id}),
+        ]
+    return [("CUDAExecutionProvider", {"device_id": cuda_id})]
+
+
+def save_results(paths: List[str], texts: List[str], timestamps: Optional[List[str]], model_suffix: str):
+    for i, (path_str, text) in enumerate(zip(paths, texts)):
         path = Path(path_str)
-        
+
         txt_path = path.with_name(f"{path.stem}_{model_suffix}.txt")
         try:
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(text)
         except Exception as e:
-            logger.error(f"Failed to write TXT for {path.name}: {e}")
+            logger.error(f"Write TXT failed {path.name}: {e}")
 
-        if ts_content:
+        ts = timestamps[i] if timestamps and i < len(timestamps) else ''
+        if ts:
             tst_path = path.with_name(f"{path.stem}_{model_suffix}.tst")
             try:
                 with open(tst_path, "w", encoding="utf-8") as f:
-                    f.write(ts_content)
+                    f.write(ts)
             except Exception as e:
-                logger.error(f"Failed to write TST for {path.name}: {e}")
+                logger.error(f"Write TST failed {path.name}: {e}")
 
 
-def run_inference_on_device(cuda_id: int, world_size: int, model_name: str, all_file_paths: List[Path], config: dict):
-    if not all_file_paths:
-        return
+def load_batch(file_paths: List[str]):
+    """Read batch — pass WAV paths directly to onnx-asr; non-WAV read via soundfile."""
+    all_wav = all(Path(f).suffix.lower() == '.wav' for f in file_paths)
+    if all_wav or not HAS_SOUNDFILE:
+        return file_paths, None
 
-    my_files = all_file_paths[cuda_id::world_size]
-    
+    waveforms, sr = [], None
+    for f in file_paths:
+        wf, file_sr = sf.read(f, dtype='float32')
+        if wf.ndim > 1:
+            wf = wf.mean(axis=1)
+        waveforms.append(wf)
+        sr = file_sr
+    return waveforms, sr
+
+
+def format_timestamps(result) -> str:
+    if hasattr(result, 'tokens') and result.tokens:
+        return '\n'.join(
+            f"{getattr(t, 'start', 0):.3f}\t{getattr(t, 'end', 0):.3f}\t{getattr(t, 'text', '')}"
+            for t in result.tokens
+        )
+    return ''
+
+
+def run_worker(cuda_id: int, world_size: int, model_name: str,
+               all_files: List[str], config: dict):
+    """Inference worker: loads onnx-asr model on a single GPU and processes its shard."""
+    my_files = all_files[cuda_id::world_size]
     if not my_files:
         return
 
-    device_str = f"cuda:{cuda_id}"
-    logger.info(f"Worker {cuda_id}/{world_size} started for '{model_name}' on {device_str}. Processing {len(my_files)} files.")
+    model_cfg = config.get('giga', {}) if 'giga' in model_name else config.get(model_name, {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    batch_size = model_cfg.get('batch_size', 16)
+    use_trt = config.get('use_tensorrt', False)
+    quantization = model_cfg.get('quantization')
 
-    model_config = config.get('giga') if 'giga' in model_name else config.get(model_name, {})
-    batch_size = model_config.get('batch_size', 8)
-    num_workers = model_config.get('num_workers', 4) 
+    onnx_name = MODEL_MAP.get(model_name, model_name)
+    output_suffix = 'vosk' if 'vosk' in model_name else model_name
+    do_timestamps = config.get('with_timestamps', False) and model_name in SUPPORTED_TIMESTAMPS
 
-    lengths_cache_path = config.get('audio_lengths_cache', './cache/audio_lengths_cache.json')
+    local_path = model_cfg.get('vosk_path') if 'vosk' in model_name else model_cfg.get('model_path')
 
-    model_name_for_output = 'vosk' if 'vosk' in model_name else model_name
-    
-    with_timestamps = config.get('with_timestamps', False)
-    timestamps_supported = any(x in model_name for x in SUPPORTED_TIME_STAMPS)
-    process_timestamps = with_timestamps and timestamps_supported
-    
-    my_files_str = [str(p) for p in my_files]
+    logger.info(f"Worker {cuda_id}/{world_size}: {onnx_name} on cuda:{cuda_id}, {len(my_files)} files, batch={batch_size}")
 
     try:
-        if 'giga' in model_name:
-            model = GigaAMWrapper(model_id=model_name, device=device_str, **model_config)
-            
-            dataset = GigaAudioDataset(my_files_str, target_sr=16000)
-            sampler = LengthGroupedSampler(dataset, lengths_cache_path, batch_size)
-            
-            loader = torch.utils.data.DataLoader(
-                dataset, 
-                batch_size=batch_size, 
-                sampler=sampler, 
-                num_workers=num_workers,
-                collate_fn=collate_giga,
-                pin_memory=True,
-                persistent_workers=True if num_workers > 0 else False
-            )
-            
-            for batch_wavs, batch_lengths, batch_paths in tqdm(loader, desc=f"Giga-{cuda_id}", position=cuda_id):
-                if batch_wavs is None: continue
-                
-                if process_timestamps:
-                    texts, tstamps = model.transcribe_tensors_with_timestamps(batch_wavs, batch_lengths)
-                else:
-                    texts = model.transcribe_tensors(batch_wavs, batch_lengths)
-                    tstamps = [''] * len(texts)
-                
-                save_results(batch_paths, texts, tstamps, model_name_for_output)
+        providers = get_providers(cuda_id, use_trt)
+        load_args = [onnx_name] + ([local_path] if local_path else [])
+        load_kwargs = {"providers": providers}
+        if quantization:
+            load_kwargs["quantization"] = quantization
 
-        elif 'tone' in model_name:
-            model = ToneWrapper(model_id=model_name, device=device_str, **model_config)
-            
-            dataset = ToneAudioDataset(my_files_str, target_sr=8000)
-            loader = torch.utils.data.DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                collate_fn=collate_tone,
-                pin_memory=False
-            )
-            
-            for batch_audios, batch_paths in tqdm(loader, desc=f"Tone-{cuda_id}", position=cuda_id):
-                if not batch_audios: continue
-                
-                if process_timestamps:
-                    texts, tstamps = model.transcribe_audio_data_with_timestamps(batch_audios)
-                else:
-                    texts = model.transcribe_audio_data(batch_audios)
-                    tstamps = [''] * len(texts)
-                    
-                save_results(batch_paths, texts, tstamps, model_name_for_output)
+        model = onnx_asr.load_model(*load_args, **load_kwargs)
 
-        elif 'vosk' in model_name:
-            model = VOSKCUDAWrapper(model_id=model_config.get('vosk_path'), device=device_str, **model_config)
-            
-            dataset = VoskAudioDataset(my_files_str, target_sr=16000)
-            sampler = LengthGroupedSampler(dataset, lengths_cache_path, batch_size)
-            
-            loader = torch.utils.data.DataLoader(
-                dataset,
-                batch_size=batch_size,
-                sampler=sampler,
-                num_workers=num_workers,
-                collate_fn=collate_vosk,
-                pin_memory=True
-            )
-            
-            for batch_waveforms, batch_paths in tqdm(loader, desc=f"Vosk-{cuda_id}", position=cuda_id):
-                if not batch_waveforms: continue
-                
-                texts = model.transcribe_batch_data(batch_waveforms)
-                tstamps = [''] * len(texts)
-                
-                save_results(batch_paths, texts, tstamps, model_name_for_output)
-        
-        else:
-            logger.error(f"Unknown model type: {model_name}")
+        if do_timestamps:
+            model = model.with_timestamps()
+
+        if config.get('use_vad', False):
+            vad_params = config.get('vad_params', {})
+            vad = onnx_asr.load_vad("silero", **vad_params)
+            model = model.with_vad(vad)
+
+        for i in tqdm(range(0, len(my_files), batch_size), desc=f"ASR-{cuda_id}", position=cuda_id):
+            batch = my_files[i:i + batch_size]
+
+            try:
+                data, sr = load_batch(batch)
+                kw = {"sample_rate": sr} if sr else {}
+                results = model.recognize(data, **kw)
+            except Exception as e:
+                logger.error(f"Batch failed: {e}. Falling back to single-file mode.")
+                results = []
+                for f in batch:
+                    try:
+                        results.append(model.recognize(f))
+                    except Exception as e2:
+                        logger.error(f"File failed {f}: {e2}")
+                        results.append("")
+
+            if not isinstance(results, list):
+                results = [results]
+
+            texts = [str(r) for r in results]
+            ts = [format_timestamps(r) for r in results] if do_timestamps else None
+
+            save_results(batch, texts, ts, output_suffix)
 
     except Exception as e:
-        logger.exception(f"Critical error in worker {cuda_id} for model {model_name}: {e}")
+        logger.exception(f"Worker {cuda_id} fatal error ({model_name}): {e}")
 
 
-def check_consensus_reached(audio_path: Path, model_names: List[str], consensus_num: int) -> bool:
-    """Check if consensus_num models have produced the same transcription for this audio file."""
-    from collections import Counter
-    from src.utils.utils import read_file_content
-    
-    transcriptions = []
-    for model_name in model_names:
-        model_name_for_file = 'vosk' if 'vosk' in model_name else model_name
-        transcript_path = audio_path.with_name(f"{audio_path.stem}_{model_name_for_file}.txt")
-        
-        if transcript_path.exists():
+def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int) -> bool:
+    texts = []
+    for mn in model_names:
+        suffix = 'vosk' if 'vosk' in mn else mn
+        tp = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
+        if tp.exists():
             try:
-                text = read_file_content(transcript_path)
-                if text:
-                    # Normalize text for comparison (lowercase, strip)
-                    normalized = text.lower().strip()
-                    transcriptions.append(normalized)
+                t = read_file_content(tp)
+                if t:
+                    texts.append(t.lower().strip())
             except Exception:
                 pass
-    
-    if len(transcriptions) < consensus_num:
+    if len(texts) < consensus_num:
         return False
-    
-    # Count occurrences of each transcription
-    counter = Counter(transcriptions)
-    # Check if any transcription appears at least consensus_num times
-    return max(counter.values()) >= consensus_num
+    return max(Counter(texts).values()) >= consensus_num
 
 
-def get_valid_audio_paths(src_path: str, model_name_for_output: str, processed_models: List[str], consensus_num: int) -> List[Path]:
-    all_audio_paths = get_audio_paths(src_path)
-    if not all_audio_paths:
+def get_valid_paths(src_path: str, output_suffix: str,
+                    processed: List[str], consensus_num: int) -> List[str]:
+    all_paths = get_audio_paths(src_path)
+    if not all_paths:
         return []
 
-    # Filter out files that already have transcription for this model
-    valid_paths = [
-        p for p in all_audio_paths 
-        if not p.with_name(f"{p.stem}_{model_name_for_output}.txt").exists()
-    ]
-    
-    # Filter out files that already reached consensus
-    if consensus_num > 0 and len(processed_models) >= consensus_num:
-        consensus_count = 0
-        filtered_paths = []
-        for p in valid_paths:
-            if check_consensus_reached(p, processed_models, consensus_num):
-                consensus_count += 1
+    valid = [p for p in all_paths if not p.with_name(f"{p.stem}_{output_suffix}.txt").exists()]
+
+    if consensus_num > 0 and len(processed) >= consensus_num:
+        skipped = 0
+        filtered = []
+        for p in valid:
+            if check_consensus(p, processed, consensus_num):
+                skipped += 1
             else:
-                filtered_paths.append(p)
-        
-        if consensus_count > 0:
-            logger.info(f"Skipping {consensus_count} files that already reached consensus ({consensus_num} models agree).")
-        valid_paths = filtered_paths
-    
-    return valid_paths
+                filtered.append(p)
+        if skipped:
+            logger.info(f"Consensus reached for {skipped} files, skipping")
+        valid = filtered
+
+    return [str(p) for p in valid]
 
 
 def main(args):
     config = load_config(args.config_path, 'transcription')
     model_names = config.get('model_names', ['giga_rnnt'])
     src_path = config.get('podcasts_path', '.')
-    consensus_num = config.get('consensus_num', 0)  # 0 means process all models
+    consensus_num = config.get('consensus_num', 0)
 
-    available_gpu_ids = list(range(torch.cuda.device_count()))
-    if not available_gpu_ids:
-        logger.error("No CUDA GPUs detected. This optimized script requires GPU.")
+    num_gpus = get_gpu_count()
+    if num_gpus == 0:
+        logger.error("No CUDA GPUs detected. GPU required for transcription.")
         return
-    
-    num_gpus = len(available_gpu_ids)
-    logger.info(f"Detected {num_gpus} GPUs. Starting processing pipeline.")
-    if consensus_num > 0:
-        logger.info(f"Consensus mode enabled: will skip files where {consensus_num} models agree.")
 
-    for model_idx, model_name in enumerate(model_names):
-        logger.info(f"=== Processing model {model_idx + 1}/{len(model_names)}: {model_name} ===")
-        
-        model_name_for_output = 'vosk' if 'vosk' in model_name else model_name
-        
-        # Get models processed so far (before current model)
-        processed_models = model_names[:model_idx] if consensus_num > 0 else []
-        
-        all_paths = get_valid_audio_paths(src_path, model_name_for_output, processed_models, consensus_num)
-        
-        if not all_paths:
-            logger.info(f"No new files for {model_name}. Skipping.")
+    logger.info(f"{num_gpus} GPU(s) detected. Starting transcription pipeline.")
+    if consensus_num > 0:
+        logger.info(f"Consensus mode: {consensus_num} models must agree")
+
+    for idx, model_name in enumerate(model_names):
+        logger.info(f"=== [{idx + 1}/{len(model_names)}] {model_name} ===")
+
+        output_suffix = 'vosk' if 'vosk' in model_name else model_name
+        processed = model_names[:idx] if consensus_num > 0 else []
+        paths = get_valid_paths(src_path, output_suffix, processed, consensus_num)
+
+        if not paths:
+            logger.info(f"No files to process for {model_name}")
             continue
-            
-        logger.info(f"Total files to process: {len(all_paths)}")
-        
+
+        logger.info(f"{len(paths)} files to process")
+
+        if num_gpus == 1:
+            run_worker(0, 1, model_name, paths, config)
+        else:
+            procs = []
+            for gid in range(num_gpus):
+                p = mp.Process(
+                    target=run_worker,
+                    args=(gid, num_gpus, model_name, paths, config)
+                )
+                p.start()
+                procs.append(p)
+
+            for p in procs:
+                p.join()
+
+            failed = [p.exitcode for p in procs if p.exitcode != 0]
+            if failed:
+                logger.error(f"Workers failed with exit codes: {failed}")
+
+    if config.get('use_rover', False):
+        logger.info("ROVER aggregation...")
         try:
-            mp.spawn(
-                run_inference_on_device,
-                args=(num_gpus, model_name, all_paths, config),
-                nprocs=num_gpus,
-                join=True
-            )
+            from src.transcription.rover import ROVERWrapper
+            ROVERWrapper(podcasts_path=src_path, model_names=model_names).aggregate_and_save()
+            logger.info("ROVER done.")
+        except ImportError:
+            logger.warning("ROVER module not available, skipping")
         except Exception as e:
-            logger.error(f"Multiprocessing error: {e}")
-            
-    logger.info("Starting ROVER processing...")
-    try:
-        rover_wrapper = ROVERWrapper(podcasts_path=src_path, model_names=model_names)
-        rover_wrapper.aggregate_and_save()
-        logger.info("ROVER processing finished.")
-    except Exception as e:
-        logger.error(f"ROVER failed: {e}")
+            logger.error(f"ROVER failed: {e}")
+
+    logger.info("Transcription pipeline complete!")
+
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
-    
-    parser = argparse.ArgumentParser(description="Optimized GPU Audio Transcription")
-    parser.add_argument("--config_path", type=str, required=True, help="Path to config.yaml")
-    args = parser.parse_args()
-    
-    main(args)
+
+    parser = argparse.ArgumentParser(description="ASR Transcription (onnx-asr)")
+    parser.add_argument("--config_path", type=str, required=True)
+    main(parser.parse_args())

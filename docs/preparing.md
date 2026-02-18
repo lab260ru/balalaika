@@ -12,7 +12,7 @@ This guide explains how to set up the pipeline and prepare your own audio datase
 4. [Models Setup](#models-setup)
 5. [Configuration](#configuration)
 6. [Preparing Your Own Dataset](#preparing-your-own-dataset)
-7. [Additional Requirements for Vosk](#additional-requirements-for-vosk)
+7. [ASR Inference (onnx-asr)](#asr-inference-onnx-asr)
 
 ---
 
@@ -72,15 +72,47 @@ YANDEX_KEY=<your_yandex_music_token>
 
 ## Models Setup
 
-Place all required models under the `models/` directory:
+### Preprocessing & Separation Models
 
-- **Vosk Model**: `./models/vosk-model-ru` (directory with Vosk model files)
+Place the following models under the `models/` directory:
+
 - **Smart VAD Model**: `./models/smart-turn-v3.0.onnx`
 - **Music Detection Model**: `./models/music_detection.safetensors`
-- **KenLM Language Model**: `./models/kenlm.bin` (for Giga CTC model)
 - **NISQA Config**: `./configs/nisqa_b.yaml`
 
-**Note**: Some models are downloaded automatically from Hugging Face (RUPunct, ruAccent). Make sure your `HF_TOKEN` is set correctly.
+### ASR Models (onnx-asr)
+
+ASR-модели загружаются **автоматически** из Hugging Face при первом запуске через библиотеку [onnx-asr](https://github.com/istupakov/onnx-asr). Ручная установка не требуется.
+
+Поддерживаемые модели:
+
+| Имя в конфиге    | onnx-asr модель                          | Язык         |
+|------------------|------------------------------------------|--------------|
+| `giga_ctc`       | `gigaam-v3-ctc`                          | Русский      |
+| `giga_rnnt`      | `gigaam-v3-rnnt`                         | Русский      |
+| `vosk`           | `alphacep/vosk-model-ru`                 | Русский      |
+| `tone`           | `t-tech/t-one`                           | Русский      |
+| `parakeet_v3`    | `nemo-parakeet-tdt-0.6b-v3`             | Multilingual |
+| `canary`         | `nemo-canary-1b-v2`                      | Multilingual |
+| `whisper_turbo`  | `onnx-community/whisper-large-v3-turbo`  | Multilingual |
+
+Инференс выполняется на GPU через ONNX Runtime с поддержкой CUDA и TensorRT execution providers. Батчевая обработка включена по умолчанию для максимальной утилизации GPU.
+
+**Конфигурация GPU-инференса** (`configs/config.yaml`):
+
+```yaml
+transcription:
+  use_tensorrt: True   # TensorRT EP — fp16, максимальная скорость на NVIDIA GPU
+  model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
+
+  giga:
+    batch_size: 16       # размер батча (подбирается под объем VRAM)
+    quantization: int8   # опционально: int8 квантизация
+```
+
+При включённом `use_tensorrt: True` используется TensorRT execution provider с fp16 для максимальной производительности. При нескольких GPU файлы автоматически распределяются между картами.
+
+**Note**: Some models (RUPunct, ruAccent) are downloaded automatically from Hugging Face. Make sure your `HF_TOKEN` is set correctly.
 
 ---
 
@@ -247,18 +279,78 @@ Let's say you have a dataset of Russian speech recordings organized like this:
 
 ---
 
-## Additional Requirements for Vosk
+## ASR Inference (onnx-asr)
 
-If you plan to use Vosk models for transcription, install additional dependencies:
+Транскрипция реализована через [onnx-asr](https://github.com/istupakov/onnx-asr) — лёгкую Python-библиотеку для ASR на базе ONNX Runtime. Основные преимущества:
+
+- **Единый интерфейс** для всех моделей (GigaAM, Vosk, Parakeet, Whisper, T-one)
+- **GPU-инференс** через CUDA / TensorRT execution providers
+- **Батчевая обработка** для максимальной утилизации GPU
+- **Мульти-GPU** — файлы автоматически распределяются между всеми доступными GPU
+- **Автоматическая загрузка** моделей из Hugging Face
+- **Минимум зависимостей** — не требуется PyTorch, Transformers или FFmpeg для ASR
+
+### Установка
 
 ```bash
-python -m pip install git+https://github.com/lhotse-speech/lhotse
-python -m pip install https://huggingface.co/csukuangfj/k2/resolve/main/ubuntu-cuda/k2-1.24.4.dev20250807+cuda12.8.torch2.8.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-python -m pip install https://huggingface.co/csukuangfj/kaldifeat/resolve/main/cuda/1.25.5.dev20241029/linux/kaldifeat-1.25.5.dev20250807+cuda12.8.torch2.8.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-python3 -m pip install git+https://github.com/k2-fsa/icefall
+pip install onnx-asr[gpu,hub]
 ```
 
-**Note**: These dependencies are only needed if you enable Vosk in the transcription configuration.
+Для TensorRT (опционально, максимальная скорость):
+
+```bash
+pip install onnxruntime-gpu[cuda,cudnn] tensorrt-cu12-libs
+```
+
+### Пример использования
+
+```python
+import onnx_asr
+
+# Загрузка модели с TensorRT на конкретной GPU
+providers = [
+    ("TensorrtExecutionProvider", {
+        "device_id": 0,
+        "trt_fp16_enable": True,
+        "trt_max_workspace_size": 6 * 1024**3,
+    }),
+    ("CUDAExecutionProvider", {"device_id": 0}),
+]
+
+model = onnx_asr.load_model("gigaam-v3-rnnt", providers=providers)
+
+# Батчевое распознавание — максимальная утилизация GPU
+results = model.recognize(["audio1.wav", "audio2.wav", "audio3.wav"])
+
+# С таймстемпами
+model_ts = onnx_asr.load_model("gigaam-v3-ctc", providers=providers).with_timestamps()
+result = model_ts.recognize("audio.wav")
+```
+
+### Конфигурация
+
+В `configs/config.yaml` секция `transcription`:
+
+```yaml
+transcription:
+  podcasts_path: /path/to/dataset
+  consensus_num: 3        # пропуск файлов при совпадении N моделей
+  with_timestamps: True
+  use_tensorrt: True      # TensorRT EP (fp16, максимальная скорость)
+  use_vad: False          # Silero VAD для длинных аудио (>30с)
+  model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
+
+  giga:
+    batch_size: 16        # подбирается под VRAM (16 для 24GB, 8 для 12GB)
+
+  vosk:
+    batch_size: 16
+
+  tone:
+    batch_size: 16
+```
+
+**Примечание**: дополнительные зависимости для Vosk (k2, kaldifeat, icefall) **больше не требуются** — onnx-asr включает всё необходимое.
 
 ---
 

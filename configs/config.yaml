@@ -44,24 +44,23 @@ transcription:
   podcasts_path: /mnt/drive2_8tb/shkolkovo-bobr # full path to the folder where the chopped podcasts are located 
   consensus_num: 3 # number of models to use for consensus transcription
   with_timestamps: True
-  model_names:  ['giga_ctc', 'giga_rnnt', 'giga_ctc_lm', 'vosk', 'tone',] #  ['vosk', 'tone','giga_ctc', 'giga_rnnt', 'giga_ctc_lm']
+  use_tensorrt: False  # enable TensorRT execution provider (requires CUDA + TensorRT installed)
+  use_vad: False  # enable Silero VAD for long-form audio (>30s)
+  use_rover: False  # enable ROVER consensus aggregation (requires rover module)
+  # All models are loaded via onnx-asr from HuggingFace (or local path).
+  # Supported: giga_ctc, giga_rnnt, vosk, vosk_small, tone, parakeet_v2, parakeet_v3, canary, whisper_base, whisper_turbo
+  model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
 
-  giga: 
-    num_workers: 1 
-    batch_size: 16 # if supported
-    lm_path: './models/kenlm.bin' # path to lm.bin for giga ctc model
+  giga:
+    batch_size: 16
+    # quantization: int8  # optional: int8 quantization for faster CPU/GPU inference
 
   vosk:
-    vosk_path: ./models/vosk-model-ru
-    num_workers: 1 
-    batch_size: 16 # if supported
-    beam_size: 4
-    lm_scale: 0.2 
-    ngram_lm_scale: -0.1
+    batch_size: 16
+    # vosk_path: ./models/vosk-model-ru  # optional: local model directory (otherwise downloaded from HF)
 
   tone:
-    num_workers: 1 
-    batch_size: 16 # if supported 
+    batch_size: 16
   
 punctuation:
   podcasts_path: /mnt/drive2_8tb/shkolkovo-bobr # full path to the folder where the chopped podcasts are located 
