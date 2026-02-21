@@ -103,13 +103,46 @@ def load_batch(file_paths: List[str]):
     return waveforms, sr
 
 
+def extract_text(result) -> str:
+    """Extract plain text from onnx-asr result (str or TimestampedResult)."""
+    if hasattr(result, 'text'):
+        return result.text
+    return str(result)
+
+
 def format_timestamps(result) -> str:
-    if hasattr(result, 'tokens') and result.tokens:
-        return '\n'.join(
-            f"{getattr(t, 'start', 0):.3f}\t{getattr(t, 'end', 0):.3f}\t{getattr(t, 'text', '')}"
-            for t in result.tokens
-        )
-    return ''
+    """Format TimestampedResult as word-level TSV: start\\tend\\tword per line.
+
+    onnx-asr TimestampedResult has parallel arrays:
+      .tokens     = ['с', 'п', 'а', 'с', 'и', 'б', 'о', ' ', ...]
+      .timestamps = [0.39, 0.44, 0.51, 0.54, 0.57, 0.63, 0.66, 0.75, ...]
+    We group characters into words and produce word-level timestamps.
+    """
+    tokens = getattr(result, 'tokens', None)
+    timestamps = getattr(result, 'timestamps', None)
+
+    if not tokens or not timestamps or len(tokens) != len(timestamps):
+        return ''
+
+    words = []
+    current_word = ''
+    word_start = None
+
+    for token, ts in zip(tokens, timestamps):
+        if token.strip() == '':
+            if current_word and word_start is not None:
+                words.append((word_start, ts, current_word))
+                current_word = ''
+                word_start = None
+        else:
+            if word_start is None:
+                word_start = ts
+            current_word += token
+
+    if current_word and word_start is not None:
+        words.append((word_start, timestamps[-1], current_word))
+
+    return '\n'.join(f"{start:.3f}\t{end:.3f}\t{word}" for start, end, word in words)
 
 
 def run_worker(cuda_id: int, world_size: int, model_name: str,
@@ -171,7 +204,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
             if not isinstance(results, list):
                 results = [results]
 
-            texts = [str(r) for r in results]
+            texts = [extract_text(r) for r in results]
             ts = [format_timestamps(r) for r in results] if do_timestamps else None
 
             save_results(batch, texts, ts, output_suffix)
