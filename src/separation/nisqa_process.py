@@ -122,7 +122,6 @@ def run_inference_worker(rank: int, world_size: int, file_paths: List[str], conf
                         'MOS': MOS, 'NOI': NOI, 'DISC': DISC, 'COL': COL, 'LOUD': LOUD
                     })
 
-                # Инкрементальное сохранение
                 if len(results_buffer) >= save_every:
                     save_chunk(results_buffer, worker_output_path)
                     results_buffer = []
@@ -135,51 +134,59 @@ def run_inference_worker(rank: int, world_size: int, file_paths: List[str], conf
 
 
 def combine_results(final_output_path: Path, num_parts: int):
-    """Combines partial CSVs into one."""
-    logger.info("Combining partial results...")
-    dfs = []
-    
-    if final_output_path.exists():
-        dfs.append(pd.read_csv(final_output_path))
-    
-    found_parts = False
+    """Merges NISQA partial CSVs into the main balalaika.csv, filling MOS columns."""
+    logger.info("Combining NISQA partial results...")
+
+    nisqa_dfs = []
     for i in range(num_parts):
         part_path = final_output_path.with_name(f"{final_output_path.stem}_part_{i}.csv")
         if part_path.exists():
             try:
-                dfs.append(pd.read_csv(part_path))
-                found_parts = True
-                os.remove(part_path) 
+                nisqa_dfs.append(pd.read_csv(part_path))
+                os.remove(part_path)
             except Exception as e:
                 logger.error(f"Error reading {part_path}: {e}")
-    
-    if not found_parts and not dfs:
-        logger.warning("No results found to combine.")
+
+    if not nisqa_dfs:
+        logger.warning("No NISQA results found to combine.")
         return
 
-    if dfs:
-        full_df = pd.concat(dfs, ignore_index=True)
-        full_df = full_df.drop_duplicates(subset=['filepath'])
-        full_df.to_csv(final_output_path, index=False)
-        logger.success(f"Combined results saved to {final_output_path}. Total rows: {len(full_df)}")
+    nisqa_df = pd.concat(nisqa_dfs, ignore_index=True).drop_duplicates(subset=['filepath'])
+    nisqa_df = nisqa_df.set_index('filepath')
+
+    if final_output_path.exists():
+        main_df = pd.read_csv(final_output_path).set_index('filepath')
+        main_df = main_df.combine_first(nisqa_df)
+        main_df = main_df.reset_index()
+    else:
+        main_df = nisqa_df.reset_index()
+
+    main_df.to_csv(final_output_path, index=False)
+    mos_filled = main_df['MOS'].notna().sum() if 'MOS' in main_df.columns else 0
+    logger.success(f"Combined results saved to {final_output_path}. Total: {len(main_df)}, with MOS: {mos_filled}")
 
 
 def get_unprocessed_audio_paths(podcasts_path: Path, result_csv_path: Path) -> List[str]:
-    """Get list of paths that are not in the result CSV yet."""
+    """Get list of audio paths that don't have MOS scores in the result CSV yet."""
     all_audio_paths = get_audio_paths(str(podcasts_path))
     all_paths_str = [str(p.resolve()) for p in all_audio_paths]
-    
+
     if not result_csv_path.exists():
         return all_paths_str
 
     logger.info(f"Filtering existing results from: {result_csv_path}")
     try:
         df = pd.read_csv(result_csv_path)
-        if 'filepath' not in df.columns:
+        if 'filepath' not in df.columns or 'MOS' not in df.columns:
             return all_paths_str
-        processed = set(df['filepath'].astype(str).to_list())
-        
-        return [p for p in all_paths_str if p not in processed]
+
+        processed = set(
+            df.loc[df['MOS'].notna(), 'filepath'].astype(str).tolist()
+        )
+
+        unprocessed = [p for p in all_paths_str if p not in processed]
+        logger.info(f"Already processed (have MOS): {len(processed)}, remaining: {len(unprocessed)}")
+        return unprocessed
     except Exception as e:
         logger.warning(f"Could not read existing CSV ({e}), processing all files.")
         return all_paths_str

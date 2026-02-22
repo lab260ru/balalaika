@@ -42,7 +42,9 @@ def load_model(model_path: str, base_model: str, device: torch.device):
     model = WavLMForMusicDetection(base_model_name=base_model)
     with safe_open(model_path, framework="pt", device="cpu") as f:
         model.load_state_dict({k: f.get_tensor(k) for k in f.keys()})
-    return model.to(device).eval()
+    model = model.to(device).eval()
+    model.device = device
+    return model
 
 def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
     my_paths = all_paths[rank::world_size]
@@ -75,27 +77,19 @@ def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
             device
         )
 
-        # 2. Inference Loop
+        # 2. Inference — predict_proba expects a DataLoader, not a single batch
+        probs, paths = model.predict_proba(dataloader)
+
+        # 3. Filter and delete files detected as music
         deleted_count = 0
-        with torch.inference_mode():
-            for batch in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
-                if batch is None:
-                     continue
-
-                # Forward pass
-                probs, paths = model.predict_proba(batch)
-                
-                # Zip paths with probabilities -> Tuple(path, prob)[[]]
-                predictions = zip(paths, probs.detach().flatten())
-
-                # Filter and Delete
-                for path, prob in predictions:
-                    if prob > threshold:
-                        try:
-                            os.remove(path)
-                            deleted_count += 1
-                        except OSError:
-                            pass
+        for path, prob in zip(paths, probs.detach().flatten()):
+            # print(prob)
+            if prob > threshold:
+                try:
+                    os.remove(path)
+                    deleted_count += 1
+                except OSError:
+                    pass
 
         logger.success(f"[{device}] Done. Deleted {deleted_count} files.")
 

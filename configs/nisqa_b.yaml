@@ -69,7 +69,7 @@ td_lstm_dropout: 0
 td_lstm_bidirectional: true  # use bidirectional LSTM -> hidden units x 2
 
 # Arguments for inference
-ckp: /home/nikita/yapoddataset/models/nisqa.tar # checkpoint that will be used for inference
+ckp: weights/nisqa.tar # checkpoint that will be used for inference
 sample: src/sample/gt.wav # path to file to run on
 inf_device: cuda # device for inference runs
 warmup: False # warmup run before inference; usually is not needed on CPU runs

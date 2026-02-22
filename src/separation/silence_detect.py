@@ -1,4 +1,5 @@
 import argparse
+from importlib import reload
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
@@ -33,7 +34,12 @@ def init_worker(device_str: str):
     try:
         if 'cuda' in device_str:
             torch.cuda.set_device(device_str)
-        silence_detect_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad')
+        silence_detect_model, utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad', 
+            model='silero_vad',
+            onnx=False,
+            force_reload=True
+            )
         silence_detect_model.to(device_str)
         vad_device = torch.device(device_str)
         logger.info(f"Worker initialized successfully for silence detection on {device_str}.")

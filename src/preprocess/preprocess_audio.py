@@ -65,20 +65,29 @@ def process_audio_file(
         block_size: Block size for loudness measurement in seconds
     """
     try:
-        # Read audio file using torchaudio
         audio, sample_rate = torchaudio.load(audio_path)
-        
-        # Normalize loudness (pyloudnorm supports both mono and stereo)
+        audio_np = audio.numpy()
+
+        # torchaudio returns (channels, samples), pyloudnorm expects (samples,) or (samples, channels≤5)
+        if audio_np.shape[0] == 1:
+            audio_np = audio_np.squeeze(0)
+        else:
+            audio_np = audio_np.T
+
         normalized_audio = normalize_audio_loudness(
-            audio.numpy(), 
-            sample_rate, 
-            peak=peak, 
-            loudness=loudness, 
+            audio_np,
+            sample_rate,
+            peak=peak,
+            loudness=loudness,
             block_size=block_size
         )
-    
-        
-        # Overwrite the original file (preserves original format and channels)
+
+        # Convert back to torchaudio format (channels, samples)
+        if normalized_audio.ndim == 1:
+            normalized_audio = normalized_audio[np.newaxis, :]
+        else:
+            normalized_audio = normalized_audio.T
+
         torchaudio.save(audio_path, torch.from_numpy(normalized_audio), sample_rate)
         
         logger.debug(f"Normalized: {audio_path}")
