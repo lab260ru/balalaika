@@ -1,7 +1,7 @@
-
 ## Usage/Examples  
-Running the Code via Command-Line Arguments
-You can modify the parameters directly in the shell script (download_args.sh) and then run it.
+
+### Running the Code via Command-Line Arguments
+You can modify the parameters directly in the shell script (`download_args.sh`) and then run it.
 ~~~ 
 bash download/download_args.sh
 ~~~  
@@ -18,11 +18,11 @@ bash download/download_yaml.sh config_path
 - `--episodes_limit`: Maximum number of episodes to download per podcast.
 - `--num_workers`: Number of parallel threads for downloading.
 
-
 ## Output Structure
 ~~~ 
 podcasts/
 └── {podcast_id}/
-    ├── {segment_id}/
+    ├── {episode_id}/
+    │   └── episode_audio.mp3
     └──...
 ~~~ 

@@ -19,6 +19,13 @@ create_venv_env() {
         fi
         
         uv pip install -r "$requirements_file"
+        
+        echo "Installing ONNX Runtime GPU (CUDA 13 nightly)..."
+        uv pip install coloredlogs flatbuffers numpy packaging protobuf sympy
+        uv pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
+        uv pip install tensorrt-cu13
+        uv pip install onnx-asr[gpu,hub]
+        
         deactivate
     else
         echo "Environment $env_name already exists"

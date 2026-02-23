@@ -15,27 +15,27 @@ bash phonemizer/phonemizer_yaml.sh config_path
 ## Explanation of Parameters
 
 - `--config_path`: Path to the YAML configuration file.
-- `--podcasts_path`: Root directory containing the text files for phoneme conversion (default: "../../../podcasts").
-- `--num_workers`: Number of worker processes per GPU for parallel processing (default: 8).
+- `--podcasts_path`: Root directory containing the text files for phoneme conversion.
+- `--num_workers`: Number of worker processes for parallel processing.
 
 ## Output Structure
 
-For each text file ending with `_giga.txt`, a corresponding `_phonemes.txt` file will be created:
+For each consensus transcription, a corresponding phoneme file will be created:
 
 ~~~
 podcasts/
 └── {album_id}/
     └── {episode_id}/
         ├── {start_time}_{end_time}_{album_id}_{episode_id}.mp3
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_giga.txt
+        ├── {start_time}_{end_time}_{album_id}_{episode_id}_rover.txt
         ├── {start_time}_{end_time}_{album_id}_{episode_id}_punct.txt
         ├── {start_time}_{end_time}_{album_id}_{episode_id}_accent.txt
-        └── {start_time}_{end_time}_{album_id}_{episode_id}_giga_phonemes.txt
+        └── {start_time}_{end_time}_{album_id}_{episode_id}_rover_phonemes.txt
 ~~~
 
 ### File Descriptions
-- `.mp3`: Original audio file
-- `_giga.txt`: Initial transcription without punctuation
+- `.mp3`: Audio segment
+- `_rover.txt`: Consensus transcription
 - `_punct.txt`: Text with restored punctuation
 - `_accent.txt`: Text with restored accents
-- `_giga_phonemes.txt`: Text converted to phonemes
+- `_rover_phonemes.txt`: Text converted to phonemes

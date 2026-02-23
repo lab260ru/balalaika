@@ -44,7 +44,7 @@ transcription:
   podcasts_path: /root/datasets/50 # full path to the folder where the chopped podcasts are located 
   consensus_num: 3 # number of models to use for consensus transcription
   with_timestamps: True
-  use_tensorrt: False  # enable TensorRT execution provider (requires CUDA + TensorRT installed)
+  use_tensorrt: True  # enable TensorRT execution provider (requires CUDA + TensorRT installed)
   use_vad: False  # enable Silero VAD for long-form audio (>30s)
   use_rover: True  # enable ROVER consensus aggregation (requires rover module)
   # All models are loaded via onnx-asr from HuggingFace (or local path).

@@ -36,7 +36,7 @@ git clone https://github.com/mtuciru/balalaika
 cd balalaika
 ```
 
-Choose the appropriate environment:
+Choose the appropriate environment. **Note**: For ASR with CUDA 13.1 support, the installation scripts now automatically set up the nightly ONNX Runtime and TensorRT 10.
 
 - **For development/annotation/modification**: 
   ```bash
@@ -61,12 +61,12 @@ HF_TOKEN=<your_huggingface_token>
 YANDEX_KEY=<your_yandex_music_token>
 ```
 
-- `HF_TOKEN`: Required for speaker diarization and accessing Hugging Face models
-- `YANDEX_KEY`: Required only if downloading podcasts from Yandex Music (optional if using your own data)
+- `HF_TOKEN`: Required for speaker diarization and accessing Hugging Face models (like GigaAM, Canary).
+- `YANDEX_KEY`: Required only if downloading podcasts from Yandex Music.
 
 **How to get tokens:**
-- **Hugging Face Token**: Create an account at [huggingface.co](https://huggingface.co) and generate a token in your account settings
-- **Yandex Music Token**: Follow the guide at [yandex-music.readthedocs.io](https://yandex-music.readthedocs.io/en/main/token.html)
+- **Hugging Face Token**: Create an account at [huggingface.co](https://huggingface.co) and generate a token in your account settings.
+- **Yandex Music Token**: Follow the guide at [yandex-music.readthedocs.io](https://yandex-music.readthedocs.io/en/main/token.html).
 
 ---
 
@@ -82,35 +82,35 @@ Place the following models under the `models/` directory:
 
 ### ASR Models (onnx-asr)
 
-ASR-модели загружаются **автоматически** из Hugging Face при первом запуске через библиотеку [onnx-asr](https://github.com/istupakov/onnx-asr). Ручная установка не требуется.
+ASR models are downloaded **automatically** from Hugging Face upon first run using the [onnx-asr](https://github.com/istupakov/onnx-asr) library. Manual installation or complex wrappers are no longer required.
 
-Поддерживаемые модели:
+Supported models:
 
-| Имя в конфиге    | onnx-asr модель                          | Язык         |
+| Config Name      | onnx-asr model                           | Language     |
 |------------------|------------------------------------------|--------------|
-| `giga_ctc`       | `gigaam-v3-ctc`                          | Русский      |
-| `giga_rnnt`      | `gigaam-v3-rnnt`                         | Русский      |
-| `vosk`           | `alphacep/vosk-model-ru`                 | Русский      |
-| `tone`           | `t-tech/t-one`                           | Русский      |
+| `giga_ctc`       | `gigaam-v3-ctc`                          | Russian      |
+| `giga_rnnt`      | `gigaam-v3-rnnt`                         | Russian      |
+| `vosk`           | `alphacep/vosk-model-ru`                 | Russian      |
+| `tone`           | `t-tech/t-one`                           | Russian      |
 | `parakeet_v3`    | `nemo-parakeet-tdt-0.6b-v3`             | Multilingual |
 | `canary`         | `nemo-canary-1b-v2`                      | Multilingual |
 | `whisper_turbo`  | `onnx-community/whisper-large-v3-turbo`  | Multilingual |
 
-Инференс выполняется на GPU через ONNX Runtime с поддержкой CUDA и TensorRT execution providers. Батчевая обработка включена по умолчанию для максимальной утилизации GPU.
+Inference is performed on GPU via **ONNX Runtime (GPU)** with CUDA and **TensorRT 10** support. You no longer need to write your own dataloaders — `onnx-asr` efficiently handles batching and distributes the workload across all available GPUs.
 
-**Конфигурация GPU-инференса** (`configs/config.yaml`):
+**GPU Inference Configuration** (`configs/config.yaml`):
 
 ```yaml
 transcription:
-  use_tensorrt: True   # TensorRT EP — fp16, максимальная скорость на NVIDIA GPU
+  use_tensorrt: True   # TensorRT EP (fp16) — up to 2x faster on NVIDIA GPUs
   model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
 
   giga:
-    batch_size: 16       # размер батча (подбирается под объем VRAM)
-    quantization: int8   # опционально: int8 квантизация
+    batch_size: 16       # batch size (adjust based on VRAM)
+    quantization: int8   # optional: int8 quantization to save memory
 ```
 
-При включённом `use_tensorrt: True` используется TensorRT execution provider с fp16 для максимальной производительности. При нескольких GPU файлы автоматически распределяются между картами.
+When `use_tensorrt: True` is enabled, the pipeline automatically configures TensorRT with fp16. If multiple GPUs are present, files are automatically distributed across them using `multiprocessing`.
 
 **Note**: Some models (RUPunct, ruAccent) are downloaded automatically from Hugging Face. Make sure your `HF_TOKEN` is set correctly.
 
@@ -257,7 +257,7 @@ Let's say you have a dataset of Russian speech recordings organized like this:
 └── speaker_001/
     ├── recording_001.wav
     ├── recording_002.wav
-    └── recording_003.wav
+    ├── recording_003.wav
 └── speaker_002/
     ├── recording_001.wav
     └── recording_002.wav
@@ -281,33 +281,33 @@ Let's say you have a dataset of Russian speech recordings organized like this:
 
 ## ASR Inference (onnx-asr)
 
-Транскрипция реализована через [onnx-asr](https://github.com/istupakov/onnx-asr) — лёгкую Python-библиотеку для ASR на базе ONNX Runtime. Основные преимущества:
+Transcription is implemented using [onnx-asr](https://github.com/istupakov/onnx-asr) — a lightweight Python library for ASR based on ONNX Runtime. Key benefits:
 
-- **Единый интерфейс** для всех моделей (GigaAM, Vosk, Parakeet, Whisper, T-one)
-- **GPU-инференс** через CUDA / TensorRT execution providers
-- **Батчевая обработка** для максимальной утилизации GPU
-- **Мульти-GPU** — файлы автоматически распределяются между всеми доступными GPU
-- **Автоматическая загрузка** моделей из Hugging Face
-- **Минимум зависимостей** — не требуется PyTorch, Transformers или FFmpeg для ASR
+- **Unified Interface** for all models (GigaAM, Vosk, Parakeet, Canary, Whisper, T-one)
+- **GPU Inference** via CUDA / TensorRT execution providers
+- **Batch Processing** for maximum GPU utilization
+- **Multi-GPU** — files are automatically distributed among all available GPUs
+- **Automatic Download** of models from Hugging Face
+- **Minimal Dependencies** — no PyTorch, Transformers, or FFmpeg required for ASR
 
-### Установка
+### Installation
 
 ```bash
 pip install onnx-asr[gpu,hub]
 ```
 
-Для TensorRT (опционально, максимальная скорость):
+For TensorRT (optional, maximum speed):
 
 ```bash
-pip install onnxruntime-gpu[cuda,cudnn] tensorrt-cu12-libs
+pip install onnxruntime-gpu[cuda,cudnn] tensorrt-cu13-libs
 ```
 
-### Пример использования
+### Usage Example
 
 ```python
 import onnx_asr
 
-# Загрузка модели с TensorRT на конкретной GPU
+# Loading a model with TensorRT on a specific GPU
 providers = [
     ("TensorrtExecutionProvider", {
         "device_id": 0,
@@ -319,29 +319,29 @@ providers = [
 
 model = onnx_asr.load_model("gigaam-v3-rnnt", providers=providers)
 
-# Батчевое распознавание — максимальная утилизация GPU
+# Batch recognition — maximum GPU utilization
 results = model.recognize(["audio1.wav", "audio2.wav", "audio3.wav"])
 
-# С таймстемпами
+# With timestamps
 model_ts = onnx_asr.load_model("gigaam-v3-ctc", providers=providers).with_timestamps()
 result = model_ts.recognize("audio.wav")
 ```
 
-### Конфигурация
+### Configuration
 
-В `configs/config.yaml` секция `transcription`:
+In `configs/config.yaml`, the `transcription` section:
 
 ```yaml
 transcription:
   podcasts_path: /path/to/dataset
-  consensus_num: 3        # пропуск файлов при совпадении N моделей
+  consensus_num: 3        # skip files if N models agree
   with_timestamps: True
-  use_tensorrt: True      # TensorRT EP (fp16, максимальная скорость)
-  use_vad: False          # Silero VAD для длинных аудио (>30с)
+  use_tensorrt: True      # TensorRT EP (fp16, maximum speed)
+  use_vad: False          # Silero VAD for long audio (>30s)
   model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
 
   giga:
-    batch_size: 16        # подбирается под VRAM (16 для 24GB, 8 для 12GB)
+    batch_size: 16        # adjust to VRAM (16 for 24GB, 8 for 12GB)
 
   vosk:
     batch_size: 16
@@ -350,7 +350,7 @@ transcription:
     batch_size: 16
 ```
 
-**Примечание**: дополнительные зависимости для Vosk (k2, kaldifeat, icefall) **больше не требуются** — onnx-asr включает всё необходимое.
+**Note**: Additional dependencies for Vosk (k2, kaldifeat, icefall) are **no longer required** — onnx-asr includes everything needed.
 
 ---
 

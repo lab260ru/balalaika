@@ -15,31 +15,20 @@ bash separation/separation_yaml.sh config_path
 ## Explanation of Parameters
 
 - `--config_path`: Path to the YAML configuration file.
-- `--podcasts_path`: Root directory containing podcast audio files for processing.
-- `--one_speaker`: Boolean flag to indicate if only one speaker is expected per audio file (default: True).
-- `--num_workers`: Number of parallel processes for audio processing (default: 4).
+- `--podcasts_path`: Root directory containing audio files for processing.
+- `--one_speaker`: Boolean flag to indicate if only one speaker is expected per audio file.
+- `--num_workers`: Number of parallel processes for audio processing.
 
 ## Output Structure
 
-After running the script, a results.csv file will be created in the specified `podcasts_path` directory:
+After running the script, a `balalaika.csv` file will be created in the specified `podcasts_path` directory:
 
 ~~~ 
 podcasts/
 └── {album_id}/
-|   └── {episode_id}/
-|   ....
-└── results.csv
+    └── {episode_id}/
+    ....
+└── balalaika.csv
 ~~~
 
-The `results.csv` file contains the following information for each processed audio file:
-- `audio_path`: Path to the audio file relative to the podcasts directory
-- `is_mono`: Boolean indicating if the file contains a single speaker
-- `NOI`: Noise metric score
-- `COL`: Coloration metric score
-- `DISC`: Discontinuity metric score
-- `LOUD`: Loudness metric score
-- `MOS`: Mean Opinion Score
-- `playlist_id`: ID of the playlist
-- `podcast_id`: ID of the podcast
-- `start`: Start time of the segment
-- `end`: End time of the segment
+The `balalaika.csv` file contains metadata for each processed audio segment, including speaker diarization flags, NISQA quality metrics, and silence analysis.

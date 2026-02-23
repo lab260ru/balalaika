@@ -106,27 +106,26 @@ Performs four types of analysis:
 ---
 
 ### 4. Transcription (`src/transcription/`)
-Transcribes audio using multiple ASR models in parallel. Each model creates its own transcription file, then all transcriptions are aggregated using ROVER (Recognizer Output Voting Error Reduction) consensus algorithm.
+Transcribes audio using multiple ASR models in parallel. This stage is now powered by **onnx-asr**, which provides a unified, high-performance interface for all supported models without requiring manual dataloaders or complex PyTorch code.
 
-**Optimization**: If `consensus_num` is set, the pipeline will automatically skip processing remaining models for files where the specified number of models have already produced identical transcriptions. This significantly speeds up processing when models agree.
+**Key Features**:
+- **Consensus Processing**: If `consensus_num` is set, the pipeline will automatically skip processing remaining models for files where the specified number of models have already produced identical transcriptions.
+- **Direct GPU Inference**: Uses `onnxruntime-gpu` and `tensorrt-cu13` for native GPU acceleration.
+- **Multiprocessing**: Automatically distributes workload across all available GPUs.
+- **Word-Level Timestamps**: Supports extracting word-level timestamps for multiple models.
 
 **Input**: Audio files (`.mp3`)  
 **Output**: 
 - Individual model transcriptions: `{filename}_{model_name}.txt`
-  - `{filename}_giga_ctc.txt`
-  - `{filename}_giga_rnnt.txt`
-  - `{filename}_giga_ctc_lm.txt`
-  - `{filename}_vosk.txt`
-  - `{filename}_tone.txt`
-- Timestamp files (if enabled): `{filename}_{model_name}.tst`
-- **Consensus transcription**: `{filename}_rover.txt` (aggregated from all models)
+- Timestamp files: `{filename}_{model_name}.tst` (available for supported models if enabled)
+- **Consensus transcription**: `{filename}_rover.txt` (aggregated from all models using the ROVER consensus algorithm)
 
 **Configuration**: `config.yaml` → `transcription` section
 - `model_names`: List of models to use
-- `consensus_num`: Number of models that need to agree before skipping remaining models (e.g., `3` means if 3 models produce the same transcription, remaining models won't process that file). Set to `0` to process all models for all files.
-- `with_timestamps`: Enable timestamp generation (works with `giga_ctc_lm` and `tone`)
-
-**Example**: With `consensus_num: 3` and 5 models, if the first 3 models produce identical transcriptions for a file, the remaining 2 models will skip that file, saving processing time.
+- `consensus_num`: Number of models that need to agree before skipping remaining models.
+- `with_timestamps`: Enable word-level timestamp generation.
+- `use_tensorrt`: Enable TensorRT 10 for maximum performance.
+- `use_vad`: Use Silero VAD to process long audio files in chunks.
 
 ---
 
@@ -215,10 +214,9 @@ For each audio segment, the pipeline generates:
 # Individual model transcriptions (if enabled)
 {start_time}_{end_time}_{album_id}_{episode_id}_giga_ctc.txt
 {start_time}_{end_time}_{album_id}_{episode_id}_giga_rnnt.txt
-{start_time}_{end_time}_{album_id}_{episode_id}_giga_ctc_lm.txt
 {start_time}_{end_time}_{album_id}_{episode_id}_vosk.txt
 {start_time}_{end_time}_{album_id}_{episode_id}_tone.txt
-{start_time}_{end_time}_{album_id}_{episode_id}_giga_ctc_lm.tst  # Timestamps (if enabled)
+{start_time}_{end_time}_{album_id}_{episode_id}_giga_ctc.tst  # Timestamps (if enabled)
 
 # Consensus and processed text files
 {start_time}_{end_time}_{album_id}_{episode_id}_rover.txt         # Consensus transcription

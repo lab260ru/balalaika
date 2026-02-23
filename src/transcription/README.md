@@ -1,84 +1,65 @@
 ## Transcription (onnx-asr)
 
-ASR-транскрипция реализована через [onnx-asr](https://github.com/istupakov/onnx-asr) — единый интерфейс для множества ASR-моделей на базе ONNX Runtime.
+ASR transcription is implemented using [onnx-asr](https://github.com/istupakov/onnx-asr) — a library providing a unified interface for multiple ASR models (GigaAM, Vosk, Parakeet, Canary, Whisper, T-one) based on **ONNX Runtime (GPU)** and **TensorRT 10**.
 
-### Поддерживаемые модели
+### Benefits
+- **No PyTorch/Dataloaders**: All batching and audio preprocessing occur inside `onnx-asr`, reducing overhead.
+- **TensorRT 10**: Direct acceleration via TensorRT with automatic fp16 conversion.
+- **Multi-GPU**: Tasks are automatically distributed across all available GPUs using `multiprocessing`.
+- **Auto-download**: Models are downloaded directly from Hugging Face on the first call.
 
-| Имя в конфиге    | onnx-asr модель                          | Язык         |
+### Supported Models
+
+| Config Name      | onnx-asr model                           | Language     |
 |------------------|------------------------------------------|--------------|
-| `giga_ctc`       | `gigaam-v3-ctc`                          | Русский      |
-| `giga_rnnt`      | `gigaam-v3-rnnt`                         | Русский      |
-| `vosk`           | `alphacep/vosk-model-ru`                 | Русский      |
-| `vosk_small`     | `alphacep/vosk-model-small-ru`           | Русский      |
-| `tone`           | `t-tech/t-one`                           | Русский      |
-| `parakeet_v2`    | `nemo-parakeet-tdt-0.6b-v2`             | English      |
+| `giga_ctc`       | `gigaam-v3-ctc`                          | Russian      |
+| `giga_rnnt`      | `gigaam-v3-rnnt`                         | Russian      |
+| `vosk`           | `alphacep/vosk-model-ru`                 | Russian      |
+| `tone`           | `t-tech/t-one`                           | Russian      |
 | `parakeet_v3`    | `nemo-parakeet-tdt-0.6b-v3`             | Multilingual |
 | `canary`         | `nemo-canary-1b-v2`                      | Multilingual |
-| `whisper_base`   | `whisper-base`                           | Multilingual |
 | `whisper_turbo`  | `onnx-community/whisper-large-v3-turbo`  | Multilingual |
 
-Модели загружаются автоматически из Hugging Face при первом запуске.
-
-### Запуск
+### Running
 
 ```bash
-sh src/transcription/transcription_yaml.sh configs/config.yaml
+bash src/transcription/transcription_yaml.sh configs/config.yaml
 ```
 
-### Конфигурация (`configs/config.yaml`)
+### Configuration (`configs/config.yaml`)
 
 ```yaml
 transcription:
   podcasts_path: /path/to/dataset
-  consensus_num: 3        # пропуск файлов при совпадении N моделей
-  with_timestamps: True
-  use_tensorrt: False     # TensorRT EP (fp16, максимальная скорость)
-  use_vad: False          # Silero VAD для длинных аудио
+  consensus_num: 3        # skip files if N models agree
+  with_timestamps: True   # generate word-level timestamps (.tst)
+  use_tensorrt: True      # TensorRT EP (fp16, maximum speed)
+  use_vad: False          # Silero VAD for processing long audio in chunks
   model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
 
   giga:
-    batch_size: 16        # размер батча (подбирается под VRAM)
-    # quantization: int8  # опциональная квантизация
-
-  vosk:
-    batch_size: 16
-    # vosk_path: ./models/vosk-model-ru  # локальная модель (иначе скачивается из HF)
-
-  tone:
-    batch_size: 16
+    batch_size: 16        # adjust based on VRAM (16 for 24GB)
+    # quantization: int8  # optional quantization
 ```
 
-### GPU-инференс
+### Output Structure
 
-- **CUDA**: используется по умолчанию (`CUDAExecutionProvider`)
-- **TensorRT**: `use_tensorrt: True` — fp16, максимальная скорость на NVIDIA GPU
-- **Мульти-GPU**: файлы автоматически распределяются между всеми доступными GPU
-- **Батчи**: `batch_size` контролирует количество файлов в одном батче
+For each audio file, the following are created:
+- `{filename}_{model_name}.txt` — transcription text.
+- `{filename}_{model_name}.tst` — timestamps in TSV format (if `with_timestamps: True`).
+- `{filename}_rover.txt` — final transcription obtained by voting (ROVER) of all selected models.
 
-### Выходная структура
+### Installation (Automated in create_dev_env.sh)
 
-Для каждого аудиофайла создаётся файл с транскрипцией:
-
-```
-dataset/
-└── {album_id}/
-    └── {episode_id}/
-        ├── audio.wav
-        ├── audio_giga_ctc.txt      # транскрипция GigaAM CTC
-        ├── audio_giga_ctc.tst      # таймстемпы (если with_timestamps: True)
-        ├── audio_giga_rnnt.txt     # транскрипция GigaAM RNN-T
-        ├── audio_vosk.txt          # транскрипция Vosk
-        └── audio_tone.txt          # транскрипция T-one
-```
-
-### Зависимости
+The pipeline uses nightly builds of **ONNX Runtime** to support **CUDA 13.1** and **TensorRT 10**.
 
 ```bash
-pip install onnx-asr[gpu,hub] soundfile
-```
+# Nightly ORT for CUDA 13
+pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
 
-Для TensorRT (опционально):
+# TensorRT 10 libraries
+pip install tensorrt-cu13
 
-```bash
-pip install onnxruntime-gpu[cuda,cudnn] tensorrt-cu12-libs
+# ASR library itself
+pip install onnx-asr[gpu,hub]
 ```
