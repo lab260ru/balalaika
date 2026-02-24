@@ -14,20 +14,16 @@ torch==2.8.0
 torchcodec==0.7
 pyannote.audio>=4.0.0
 librosa
-miniaudio
-# onnx-asr[gpu,hub] moved to script
+distillmos
 pytest>=7.0.0
 black>=24.0.0
 flake8>=6.0.0
-
-# === ONNX Runtime GPU (CUDA 13 nightly) installed in script ===
 coloredlogs
 flatbuffers
 numpy
 packaging
 protobuf
 sympy
-# onnxruntime-gpu moved to script
 pyloudnorm
 silero-vad
 git+https://github.com/Den4ikAI/ruaccent.git

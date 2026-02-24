@@ -22,5 +22,6 @@ SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
 python3 -m src.separation.music_detect --config_path "$CONFIG_PATH"
 python3 -m src.separation.nisqa_process --config_path "$CONFIG_PATH"
+python3 -m src.separation.distillmos_procrss --config_path "$CONFIG_PATH"
 python3 -m src.separation.diarization --config_path "$CONFIG_PATH"
 python3 -m src.separation.silence_detect --config_path "$CONFIG_PATH"

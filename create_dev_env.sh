@@ -7,7 +7,7 @@ create_venv_env() {
     
     if [ ! -d "$env_name" ]; then
         echo "Creating $env_name environment..."
-        uv venv "$env_name"
+        uv venv "$env_name" --python 3.12
     
         if [ -f "$env_name/Scripts/activate" ]; then
             source "$env_name/Scripts/activate"

@@ -109,9 +109,15 @@ def run_inference_worker(rank: int, world_size: int, file_paths: List[str], conf
             for batch in tqdm(dataloader, desc=f"NISQA-{rank}", position=rank):
                 x_batch = batch['x_spec_seg'].to(device, dtype=dtype)
                 n_wins_batch = batch['n_wins'].to(device)
-                
-                with torch.amp.autocast(device_type="cuda", dtype=dtype):
-                    outputs = model(x_batch, n_wins_batch)
+
+                try:
+                    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                        outputs = model(x_batch, n_wins_batch)
+                except Exception  as e:
+                    logger.ERROR(f"Error in NISQA inference: {e}")
+                    outputs = torch.zerros([len(batch['file_paths']), 5]) 
+                    
+
                 
                 outputs_cpu = outputs.float().cpu() 
                 
