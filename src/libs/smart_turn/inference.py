@@ -2,8 +2,6 @@ import torch
 from transformers import WhisperFeatureExtractor
 import onnxruntime as ort
 
-# MODEL_PATH = "path/to/your/trained/model"
-# MODEL_PATH = "pipecat-ai/smart-turn-v2"
 ONNX_MODEL_PATH = "smart-turn-v3.0.onnx"
 
 # Load model and processor

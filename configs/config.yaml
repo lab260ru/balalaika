@@ -1,28 +1,27 @@
 cache_path: ./cache
 
 download:
-  podcasts_path: /mnt/drive2_8tb/RuDevicesAudiobooks
+  podcasts_path: /home/nikita/balalaika/datkamatka
   episodes_limit: 100 # limit on downloading episodes from one playlist
   num_workers: 4
   podcasts_urls_file: '' # pkl with urls
   
 preprocess:
-  podcasts_path: /mnt/drive2_8tb/RuDevicesAudiobooks # full path to the folder where the podcasts are located 
+  podcasts_path: /home/nikita/balalaika/datkamatka # full path to the folder where the podcasts are located 
   duration: 15 # in seconds (each sample will be no longer than this time.)
-  num_workers: 1
+  num_workers: 1 # per GPU; keep at 1 — Sortformer is a large model
   crest_treshold: 10 # in dB
+  peak: -1.0 # peak normalization level in dB
+  loudness: -23.0 # target loudness level in LUFS
+  block_size: 0.400 # block size for loudness measurement in seconds
+  chunk_duration: 900 # max chunk duration for Sortformer (seconds). Audio >15 min is split.
+  sortformer_model: nvidia/diar_streaming_sortformer_4spk-v2 # HF model ID or path to .nemo file
   vad_args:
     smart_vad_model: ./models/smart-turn-v3.0.onnx
-    silero_vad_threshold:  0.4
-    smart_vad_threshold: 0.4 
+    smart_vad_threshold: 0.4
 
-    
 separation:
-  podcasts_path: /mnt/drive2_8tb/RuDevicesAudiobooks # full path to the folder where the chopped podcasts are located
-
-  diarization:
-    num_workers: 1 # per gpu
-    one_speaker: False # When this option is enabled, only single-speaker audio recordings are downloaded.
+  podcasts_path: /home/nikita/balalaika/datkamatka # full path to the folder where the chopped podcasts are located
 
   nisqa:
     bs: 32
@@ -35,13 +34,8 @@ separation:
     music_detect_model: ./models/music_detection.safetensors
     threshold: 0.6
 
-  silence_detect:
-    num_workers: 1 # per gpu
-    vad_threshold: 0.5
-    max_silence_duration: 1.0 # maximum duration of silence to be marked
-
 transcription:
-  podcasts_path: /mnt/drive2_8tb/RuDevicesAudiobooks # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika/datkamatka # full path to the folder where the chopped podcasts are located 
   consensus_num: 3 # number of models to use for consensus transcription
   with_timestamps: True
   use_tensorrt: True  # enable TensorRT execution provider (requires CUDA + TensorRT installed)
@@ -63,15 +57,15 @@ transcription:
     batch_size: 16
   
 punctuation:
-  podcasts_path: /mnt/drive2_8tb/RuDevicesAudiobooks # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika/datkamatka # full path to the folder where the chopped podcasts are located 
   model_name: "RUPunct/RUPunct_big" # RUPunct model name 
   num_workers: 1 # per one gpu
 
 accent:
-  podcasts_path: /mnt/drive2_8tb/RuDevicesAudiobooks # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika/datkamatka # full path to the folder where the chopped podcasts are located 
   num_workers: 1 # per one gpu
   model_name: turbo3.1 # ruAccent model name 
   
 phonemizer:
-  podcasts_path: /mnt/drive2_8tb/RuDevicesAudiobooks # full path to the folder where the text files are located
+  podcasts_path: /home/nikita/balalaika/datkamatka # full path to the folder where the text files are located
   num_workers: 1 # per one gpu
