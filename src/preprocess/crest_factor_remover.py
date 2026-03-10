@@ -174,7 +174,6 @@ def main(args):
 
 
 if __name__ == "__main__":
-    torchaudio.set_audio_backend('soundfile')
     mp.set_start_method('spawn', force=True)
     
     parser = argparse.ArgumentParser(

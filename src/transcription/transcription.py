@@ -60,6 +60,8 @@ def get_providers(cuda_id: int, use_tensorrt: bool = False) -> list:
                 "device_id": cuda_id,
                 "trt_max_workspace_size": 6 * 1024**3,
                 "trt_fp16_enable": True,
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": f"./trt_cache_{cuda_id}",  
             }),
             ("CUDAExecutionProvider", {"device_id": cuda_id}),
         ]

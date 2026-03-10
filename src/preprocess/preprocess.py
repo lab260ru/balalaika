@@ -1,14 +1,13 @@
 import argparse
 import os
 import multiprocessing
-import tempfile
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
 import torch
 import torchaudio
-import numpy as np
 import pandas as pd
 from loguru import logger
 from tqdm import tqdm
@@ -18,60 +17,34 @@ from huggingface_hub import login
 from src.utils.utils import load_config, get_audio_paths
 from src.libs.smart_turn.offline_svad import SmartVAD
 
-from dotenv import load_dotenv
-
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
 
-load_dotenv()
-
-CHUNK_DURATION_S = 15 * 60  # 15 minutes — Sortformer OOM limit on 48GB
+CHUNK_DURATION_S = 15 * 60  # 15 минут — лимит Sortformer для избежания OOM
 
 sortformer_model = None
 smart_vad = None
-
 
 def initializer_wrapper(config: Dict[str, Any], gpus_count: int):
     worker_id = multiprocessing.current_process()._identity[0] - 1
     gpu_id = worker_id % gpus_count if gpus_count > 0 else 0
     init_models(gpu_id, config)
 
-
 def init_models(gpu_id: int, config: Dict[str, Any]):
     global sortformer_model, smart_vad
-
     device = f"cuda:{gpu_id}" 
-    providers = [
-        ("TensorrtExecutionProvider", {
-            "trt_max_workspace_size": 6 * 1024**3, 
-            "trt_fp16_enable": True,
-            "trt_engine_cache_enable": True,
-            "trt_engine_cache_path": "./trt_cache",  
-        }),
-        ("CUDAExecutionProvider",
-            {
-                "device_id": gpu_id
-            }
-        ),
-        "CPUExecutionProvider"
-    ]
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
+    providers = [("CUDAExecutionProvider", {"device_id": gpu_id}), "CPUExecutionProvider"]
 
     try:
-        from src.preprocess.sortformer_onnx import Sortformer
-        from src.preprocess.sortformer_onnx import DiarizationConfig
+        from src.preprocess.sortformer_onnx import Sortformer, DiarizationConfig
     except ImportError:
         logger.error("Sortformer model not found")
         raise
 
-    config = DiarizationConfig()
-    sortformer_model = Sortformer(model_path=config.get('sortformer_model'), config=config, providers=providers)
-
-    sortformer_model = sortformer_model.to(device)
-    sortformer_model.eval()
+    model_config = DiarizationConfig()
+    sortformer_model = Sortformer(model_path=config.get('sortformer_model'), config=model_config, providers=providers)
 
     vad_args = config.get('vad_args', {})
     smart_vad = SmartVAD(
@@ -79,239 +52,168 @@ def init_models(gpu_id: int, config: Dict[str, Any]):
         smart_vad_threshold=vad_args.get('smart_vad_threshold', 0.4),
         device=device
     )
-
-    logger.info(f"Sortformer + SmartVAD initialized on {device}")
+    logger.info(f"Models initialized on {device}")
 
 
 # ---------------------------------------------------------------------------
-#  Sortformer diarization
+#  1. Диаризация большого файла (1 раз)
 # ---------------------------------------------------------------------------
 
 def parse_diarization_output(raw_results) -> List[Tuple[float, float, int]]:
-    """Parse Sortformer diarize() output into (start, end, speaker_id) tuples."""
     segments = []
-    if not raw_results or len(raw_results) == 0:
-        return segments
-
-    file_results = raw_results[0] if raw_results else []
-    for seg in file_results:
+    if not raw_results or len(raw_results) == 0: return segments
+    for seg in (raw_results[0] if raw_results else []):
         try:
             if isinstance(seg, str):
-                cleaned = seg.strip('[] \n')
-                parts = [p.strip() for p in cleaned.split(',')]
+                parts = seg.strip().split()
                 if len(parts) >= 3:
-                    segments.append((float(parts[0]), float(parts[1]), int(float(parts[2]))))
+                    segments.append((float(parts[0]), float(parts[1]), int(parts[2].replace('speaker_', ''))))
             elif isinstance(seg, (list, tuple)) and len(seg) >= 3:
                 segments.append((float(seg[0]), float(seg[1]), int(seg[2])))
-        except (ValueError, IndexError) as e:
-            logger.warning(f"Failed to parse segment {seg}: {e}")
+        except (ValueError, IndexError):
+            pass
     return sorted(segments, key=lambda x: x[0])
 
-
-def _diarize_chunk(
-    chunk_audio: torch.Tensor,
-    sr: int,
-    offset: float
-) -> List[Tuple[float, float, int]]:
-    """Diarize a single audio chunk via Sortformer temp-file interface."""
+def diarize_audio(audio: torch.Tensor, sr: int, chunk_duration: float = CHUNK_DURATION_S) -> List[Tuple[float, float, int]]:
     global sortformer_model
-
-    fd, temp_path = tempfile.mkstemp(suffix='.wav')
-    os.close(fd)
-
-    try:
-        torchaudio.save(temp_path, chunk_audio, sr)
-        raw = sortformer_model.diarize(audio=temp_path, batch_size=1, verbose=False)
-        logger.debug(f"Raw diarization output: {raw}")
-        segments = parse_diarization_output(raw)
-        return [(s + offset, e + offset, spk) for s, e, spk in segments]
-    except Exception as e:
-        logger.error(f"Diarization chunk failed: {e}")
-        return []
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-
-def diarize_audio(
-    audio: torch.Tensor,
-    sr: int,
-    chunk_duration: float = CHUNK_DURATION_S
-) -> List[Tuple[float, float, int]]:
-    """Run Sortformer diarization; split into <=chunk_duration pieces if needed.
-    For each chunk the first and last segments are discarded (edge artefacts).
-    """
     total_samples = audio.shape[-1]
-    total_duration = total_samples / sr
-
-    if total_duration <= chunk_duration:
-        return _diarize_chunk(audio, sr, offset=0.0)
-
-    logger.info(f"Audio {total_duration:.0f}s > {chunk_duration:.0f}s, splitting into chunks")
     chunk_samples = int(chunk_duration * sr)
-    all_segments: List[Tuple[float, float, int]] = []
-    offset = 0
+    all_segments, offset = [], 0
 
+    # Обрабатываем большой файл чанками чисто для избежания OOM,
+    # логически это 1 прогон на весь файл.
     while offset < total_samples:
         end = min(offset + chunk_samples, total_samples)
         chunk = audio[:, offset:end]
+        
+        audio_np = chunk.squeeze(0).numpy() if chunk.dim() > 1 else chunk.numpy()
+        raw = sortformer_model.diarize(audio=audio_np, sample_rate=sr, include_tensor_outputs=False)
+        segs = parse_diarization_output(raw)
+        
         offset_sec = offset / sr
-
-        segments = _diarize_chunk(chunk, sr, offset_sec)
-
-        if len(segments) > 2:
-            segments = segments[1:-1]
-        else:
-            offset = end
-            continue
-
-        all_segments.extend(segments)
+        segs = [(s + offset_sec, e + offset_sec, spk) for s, e, spk in segs]
+        
+        if len(segs) > 2 and total_samples > chunk_samples:
+            segs = segs[1:-1] # Убираем артефакты склейки
+            
+        all_segments.extend(segs)
         offset = end
 
     return sorted(all_segments, key=lambda x: x[0])
 
 
 # ---------------------------------------------------------------------------
-#  Filtering & EOS classification
+#  2. Фильтрация и EOS (получаем границы мелких файлов)
 # ---------------------------------------------------------------------------
 
-def filter_single_speaker_segments(
-    segments: List[Tuple[float, float, int]],
-    min_duration: float = 1.0,
-    max_duration: float = 15.0
-) -> List[Tuple[float, float, int]]:
-    """Keep only non-overlapping segments within duration limits."""
-    if not segments:
-        return []
-
-    segments = sorted(segments, key=lambda x: x[0])
+def filter_single_speaker_segments(segments: List[Tuple[float, float, int]], min_duration: float = 1.0, max_duration: float = 15.0) -> List[Tuple[float, float, int]]:
     filtered = []
-
+    segments = sorted(segments, key=lambda x: x[0])
     for i, (start, end, spk) in enumerate(segments):
-        dur = end - start
-        if dur < min_duration or dur > max_duration:
-            continue
-
-        has_overlap = any(
-            j != i and start < e2 and end > s2
-            for j, (s2, e2, _) in enumerate(segments)
-        )
-        if not has_overlap:
+        if not (min_duration <= end - start <= max_duration): continue
+        # Проверка на пересечение спикеров
+        if not any(j != i and start < e2 and end > s2 for j, (s2, e2, _) in enumerate(segments)):
             filtered.append((start, end, spk))
-
     return filtered
 
-
-def apply_eos_classification(
-    audio: torch.Tensor,
-    sr: int,
-    segments: List[Tuple[float, float, int]],
-    max_duration: float = 15.0
-) -> List[Tuple[float, float, int]]:
-    """Run EOS classification; merge incomplete segments with the next
-    same-speaker segment when possible (respecting *max_duration*)."""
+def apply_eos_classification(audio: torch.Tensor, sr: int, segments: List[Tuple[float, float, int]], max_duration: float = 15.0) -> List[Tuple[float, float, int]]:
     global smart_vad
-    if not smart_vad or not segments:
-        return segments
+    if not smart_vad or not segments: return segments
 
     audio_np = audio.squeeze(0).numpy() if audio.dim() > 1 else audio.numpy()
-
     classified = []
-    for start, end, spk in segments:
-        s_sample = int(start * sr)
-        e_sample = min(int(end * sr), len(audio_np))
-        seg_audio = audio_np[s_sample:e_sample]
-        result = smart_vad.predict_endpoint(seg_audio)
-        classified.append((start, end, spk, result['prediction']))
+    for s, e, spk in segments:
+        pred = smart_vad.predict_endpoint(audio_np[int(s * sr):min(int(e * sr), len(audio_np))])['prediction']
+        classified.append((s, e, spk, pred))
 
-    merged: List[Tuple[float, float, int]] = []
+    merged = []
     i = 0
     while i < len(classified):
         start, end, spk, pred = classified[i]
-
         if pred == 1:
             merged.append((start, end, spk))
             i += 1
             continue
-
+        
         j = i + 1
         while j < len(classified):
             ns, ne, nspk, npred = classified[j]
-            if nspk != spk or ne - start > max_duration:
-                break
+            if nspk != spk or ne - start > max_duration: break
             end = ne
             j += 1
-            if npred == 1:
-                break
+            if npred == 1: break
 
         if end - start >= 1.0:
             merged.append((start, end, spk))
         i = max(j, i + 1)
-
     return merged
 
 
 # ---------------------------------------------------------------------------
-#  Silence metrics
+#  3. Вычисление тишины КОНКРЕТНО для мелкого куска (математически)
 # ---------------------------------------------------------------------------
 
-def calculate_silence_metrics(
-    segments: List[Tuple[float, float, int]],
-    total_duration: float
-) -> Tuple[float, float]:
-    """Derive silence percentage and max silence duration from diarization segments."""
-    if not segments:
-        return 100.0, total_duration
+def get_chunk_silence_metrics(c_start: float, c_end: float, raw_segments: List[Tuple[float, float, int]]) -> Tuple[float, float]:
+    """Считает тишину внутри конкретного куска, используя сырые метки 1 прогона диаризатора"""
+    chunk_dur = c_end - c_start
+    if chunk_dur <= 0: return 0.0, 0.0
 
-    sorted_segs = sorted(segments, key=lambda x: x[0])
-    total_speech = sum(e - s for s, e, _ in sorted_segs)
-    silence_pct = ((total_duration - total_speech) / total_duration * 100) if total_duration > 0 else 0
+    # 1. Находим все сырые куски речи, которые попали в наш финальный чанк
+    intervals = []
+    for rs, re, _ in raw_segments:
+        overlap_s = max(c_start, rs)
+        overlap_e = min(c_end, re)
+        if overlap_s < overlap_e:
+            intervals.append([overlap_s, overlap_e])
 
-    gaps = [sorted_segs[0][0]]
-    for i in range(len(sorted_segs) - 1):
-        gaps.append(sorted_segs[i + 1][0] - sorted_segs[i][1])
-    gaps.append(total_duration - sorted_segs[-1][1])
-    max_silence = max(gaps)
+    # 2. Склеиваем пересекающиеся интервалы речи (на всякий случай)
+    intervals.sort(key=lambda x: x[0])
+    merged_speech = []
+    for interval in intervals:
+        if not merged_speech:
+            merged_speech.append(interval)
+        else:
+            prev = merged_speech[-1]
+            if interval[0] <= prev[1]:
+                prev[1] = max(prev[1], interval[1])
+            else:
+                merged_speech.append(interval)
 
-    return round(silence_pct, 2), round(max_silence, 2)
+    # 3. Считаем длину речи и тишины в чанке
+    speech_dur = sum(e - s for s, e in merged_speech)
+    silence_dur = max(0.0, chunk_dur - speech_dur)
+    silence_pct = (silence_dur / chunk_dur) * 100
+
+    # 4. Считаем максимальную непрерывную паузу внутри чанка
+    if not merged_speech:
+        max_gap = chunk_dur
+    else:
+        gaps = [merged_speech[0][0] - c_start]  # от начала до первой речи
+        for i in range(len(merged_speech) - 1):
+            gaps.append(merged_speech[i+1][0] - merged_speech[i][1]) # между репликами
+        gaps.append(c_end - merged_speech[-1][1]) # от последней речи до конца
+        max_gap = max(gaps)
+
+    return round(silence_pct, 2), round(max_gap, 2)
 
 
 # ---------------------------------------------------------------------------
-#  RTTM & audio cutting
+#  4. Нарезка файлов
 # ---------------------------------------------------------------------------
 
-def save_rttm(segments: List[Tuple[float, float, int]], audio_path: str):
-    rttm_path = str(Path(audio_path).with_suffix('.rttm'))
-    file_id = Path(audio_path).stem
-    with open(rttm_path, 'w') as f:
-        for start, end, spk in segments:
-            f.write(
-                f"SPEAKER {file_id} 1 {start:.3f} {end - start:.3f} "
-                f"<NA> <NA> speaker_{spk} <NA> <NA>\n"
-            )
-
-
-def cut_audio(
-    audio: torch.Tensor,
-    sr: int,
-    segments: List[Tuple[float, float, int]],
-    output_folder: str,
-    album_id: str,
-    episode_id: str,
-    fmt: str = 'mp3',
-    max_duration: float = 15.0
-) -> List[Dict]:
+def cut_audio(audio: torch.Tensor, sr: int, final_segments: List[Tuple[float, float, int]], raw_segments: List[Tuple[float, float, int]], output_folder: str, album_id: str, episode_id: str, fmt: str = 'mp3', max_duration: float = 15.0) -> List[Dict]:
     os.makedirs(output_folder, exist_ok=True)
     results = []
 
-    for start, end, spk in segments:
-        if end - start <= max_duration / 5:
-            continue
+    for start, end, spk in final_segments:
+        dur = end - start
+        if dur <= max_duration / 5: continue
+        
+        s_sample, e_sample = int(start * sr), min(int(end * sr), audio.shape[-1])
+        if e_sample <= s_sample: continue
 
-        s_sample = int(start * sr)
-        e_sample = min(int(end * sr), audio.shape[-1])
-        if e_sample <= s_sample:
-            continue
+        # Вытаскиваем тишину ИМЕННО для этого куска из сырых меток:
+        sil_pct, max_sil = get_chunk_silence_metrics(start, end, raw_segments)
 
         segment = audio[:, s_sample:e_sample]
         fname = f"{start:.2f}_{end:.2f}_{album_id}_{episode_id}.{fmt}"
@@ -320,15 +222,15 @@ def cut_audio(
 
         results.append({
             'filepath': os.path.abspath(out_path),
-            'is_single_speaker': True,
             'speaker_id': spk,
-            'start': f"{start:.2f}",
-            'end': f"{end:.2f}",
-            'total_duration': round(end - start, 2),
+            'start': round(start, 2),
+            'end': round(end, 2),
+            'total_duration': round(dur, 2),
             'playlist_id': album_id,
             'podcast_id': episode_id,
+            'silence_percent': sil_pct,
+            'max_silence_duration': max_sil
         })
-
     return results
 
 
@@ -337,90 +239,51 @@ def cut_audio(
 # ---------------------------------------------------------------------------
 
 def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
-    """Process a single audio file: Sortformer diarization -> EOS check -> cut."""
-    global sortformer_model, smart_vad
-
     duration = config.get('duration', 15)
     chunk_duration = config.get('chunk_duration', CHUNK_DURATION_S)
 
-    album_id = os.path.basename(os.path.dirname(path_audio))
-    episode_id = os.path.splitext(os.path.basename(path_audio))[0]
-    episode_folder = os.path.join(os.path.dirname(path_audio), episode_id)
+    p_audio = Path(path_audio)
+    album_id, episode_id = p_audio.parent.name, p_audio.stem
+    episode_folder = p_audio.parent / episode_id
 
     try:
         audio, sr = torchaudio.load(path_audio)
     except Exception as e:
         logger.error(f"Broken file {path_audio}: {e}")
-        if os.path.exists(path_audio):
-            os.remove(path_audio)
         return []
 
-    total_duration = audio.shape[-1] / sr
-    if total_duration <= duration:
+    if (audio.shape[-1] / sr) <= duration:
         return []
 
     try:
-        if audio.shape[0] > 1:
-            audio = torch.mean(audio, dim=0, keepdim=True)
+        if audio.shape[0] > 1: audio = torch.mean(audio, dim=0, keepdim=True)
 
-        # 1. Sortformer diarization
-        all_segments = diarize_audio(audio, sr, chunk_duration)
+        # 1. Один прогон диаризатора на всё большое аудио
+        raw_segments = diarize_audio(audio, sr, chunk_duration)
+        if not raw_segments: return []
 
-        if not all_segments:
-            logger.warning(f"No speech segments in {path_audio}, removing")
-            os.remove(path_audio)
-            return []
+        # 2. Фильтрация и склейка коротких пауз (определяем границы нарезки)
+        clean_segments = filter_single_speaker_segments(raw_segments, min_duration=1.0, max_duration=duration)
+        final_segments = apply_eos_classification(audio, sr, clean_segments, max_duration=duration)
+        if not final_segments: return []
 
-        save_rttm(all_segments, path_audio)
+        # 3. Нарезка и формирование словарей (с вычислением тишины по каждому куску)
+        seg_results = cut_audio(audio, sr, final_segments, raw_segments, str(episode_folder), album_id, episode_id, max_duration=duration)
 
-        # 2. Filter: single-speaker, no overlap, duration bounds
-        filtered = filter_single_speaker_segments(
-            all_segments, min_duration=1.0, max_duration=duration
-        )
+        logger.success(f"Processed {len(seg_results)} chunks from: {path_audio}")
 
-        if not filtered:
-            logger.warning(f"No clean single-speaker segments in {path_audio}, removing")
-            os.remove(path_audio)
-            return []
-        
-        logger.debug(f"Filtered segments: {filtered}")
-        # 3. EOS semantic classification + merging incomplete segments
-        filtered = apply_eos_classification(audio, sr, filtered, max_duration=duration)
-
-        if not filtered:
-            logger.warning(f"No segments after EOS filtering in {path_audio}, removing")
-            # os.remove(path_audio)
-            return []
-
-        # 4. Silence metrics (derived from full diarization output)
-        silence_pct, max_sil = calculate_silence_metrics(all_segments, total_duration)
-
-        # 5. Cut audio
-        seg_results = cut_audio(
-            audio=audio, sr=sr, segments=filtered,
-            output_folder=episode_folder, album_id=album_id,
-            episode_id=episode_id, fmt='mp3', max_duration=duration
-        )
-
-        for r in seg_results:
-            r['silence_percent'] = silence_pct
-            r['max_silence_duration'] = max_sil
-
-        logger.success(f"Processed {len(seg_results)} segments: {path_audio}")
+        # 4. Удаляем большой файл в конце
+        if seg_results and p_audio.exists():
+            os.remove(p_audio)
+            logger.info(f"Original large file deleted: {path_audio}")
 
     except Exception as e:
         logger.error(f"Processing error {path_audio}: {e}")
         return []
     finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    if os.path.exists(episode_folder) and os.listdir(episode_folder):
-        os.remove(path_audio)
-        logger.info(f"Original file deleted: {path_audio}")
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     return seg_results
-
 
 # ---------------------------------------------------------------------------
 #  Main entry
@@ -428,85 +291,74 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
 
 def main(args):
     load_dotenv()
-    hf_key = os.environ.get('HF_TOKEN')
-    if hf_key:
-        login(token=hf_key)
-    else:
-        logger.warning("HF_TOKEN not found in environment.")
+    if hf_key := os.environ.get('HF_TOKEN'): login(token=hf_key)
 
     config = load_config(args.config_path, 'preprocess')
-
-    podcasts_path = config.get('podcasts_path', '../../../podcasts')
-    duration = config.get('duration', 15)
+    podcasts_path = Path(config.get('podcasts_path', '../../../podcasts'))
+    
     num_gpus = torch.cuda.device_count()
     workers_per_gpu = config.get('num_workers', 1)
+    total_workers = max(1, num_gpus * workers_per_gpu)
 
-    if num_gpus > 0:
-        total_workers = num_gpus * workers_per_gpu
-        logger.info(
-            f"Found {num_gpus} GPU(s), {workers_per_gpu} worker(s)/GPU, "
-            f"total: {total_workers}"
-        )
-    else:
-        total_workers = workers_per_gpu
-        logger.warning("No GPUs available, using CPU")
+    # Загружаем существующий CSV (в нем могут быть DistillMOS для УЖЕ нарезанных файлов)
+    csv_path = podcasts_path / 'balalaika.csv'
+    existing_df = pd.DataFrame()
+    if csv_path.exists():
+        existing_df = pd.read_csv(csv_path)
 
-    audio_paths = get_audio_paths(podcasts_path)
-    if not audio_paths:
-        logger.info("No audio files found for processing.")
+    # Собираем файлы и ОТСЕИВАЕМ мелкие куски, если вдруг они попали в поиск
+    raw_audio_paths = get_audio_paths(str(podcasts_path))
+    paths_to_process = []
+    chunk_pattern = re.compile(r'^\d+\.\d+_\d+\.\d+_') # Паттерн: 29.04_37.92_...
+
+    for p_str in raw_audio_paths:
+        p = Path(p_str)
+        # Если это УЖЕ нарезанный мелкий файл — пропускаем его
+        if chunk_pattern.match(p.name):
+            continue
+        paths_to_process.append(p)
+
+    if not paths_to_process:
+        logger.info("No new large files to process.")
         return
 
-    logger.info(f"""
-        Running Sortformer segmentation pipeline:
-        Podcasts path: {podcasts_path}
-        Max segment duration: {duration}s
-        Total workers: {total_workers}
-        Files to process: {len(audio_paths)}
-    """)
+    logger.info(f"Large files to process: {len(paths_to_process)} / Total workers: {total_workers}")
 
     all_results: List[Dict] = []
-
-    with ProcessPoolExecutor(
-        max_workers=total_workers,
-        initializer=initializer_wrapper,
-        initargs=(config, num_gpus)
-    ) as executor:
-        futures = [
-            executor.submit(process_audio_file, str(p), config)
-            for p in audio_paths
-        ]
-
-        for future in tqdm(as_completed(futures), total=len(audio_paths),
-                           desc="Sortformer Processing"):
+    with ProcessPoolExecutor(max_workers=total_workers, initializer=initializer_wrapper, initargs=(config, num_gpus)) as executor:
+        futures = [executor.submit(process_audio_file, str(p), config) for p in paths_to_process]
+        for future in tqdm(as_completed(futures), total=len(paths_to_process), desc="Processing"):
             try:
-                results = future.result()
-                if results:
-                    all_results.extend(results)
+                if results := future.result(): all_results.extend(results)
             except Exception as e:
                 logger.error(f"Task error: {e}")
 
+    # БЕЗОПАСНОЕ слияние Датафреймов (не затираем DistillMOS)
     if all_results:
-        csv_path = Path(podcasts_path) / 'balalaika.csv'
-        df = pd.DataFrame(all_results)
+        new_df = pd.DataFrame(all_results)
+        
+        if not existing_df.empty:
+            # Устанавливаем filepath как индекс, чтобы merge прошел четко по файлу
+            existing_df.set_index('filepath', inplace=True)
+            new_df.set_index('filepath', inplace=True)
+            
+            # combine_first заполнит пустые метрики (start, end, тишина) у строк,
+            # где был только DistillMOS, и добавит новые строки!
+            df = existing_df.combine_first(new_df).reset_index()
+        else:
+            df = new_df
 
-        if csv_path.exists():
-            existing = pd.read_csv(csv_path)
-            df = pd.concat([existing, df], ignore_index=True)
-            df = df.drop_duplicates(subset=['filepath'], keep='last')
 
+        base_cols = ['filepath', 'speaker_id', 'start', 'end', 'total_duration', 
+                     'playlist_id', 'podcast_id', 'silence_percent', 'max_silence_duration', 'DistillMOS']
+        final_cols = [c for c in base_cols if c in df.columns] + [c for c in df.columns if c not in base_cols]
+        
+        df = df[final_cols]
         df.to_csv(csv_path, index=False)
-        logger.success(f"Saved metadata for {len(all_results)} segments to {csv_path}")
-
-    logger.info("All files have been processed.")
-
+        logger.success(f"Saved metadata for {len(all_results)} new chunks to {csv_path}")
 
 if __name__ == "__main__":
-    torchaudio.set_audio_backend('soundfile')
     multiprocessing.set_start_method('spawn', force=True)
-
-    parser = argparse.ArgumentParser(
-        description="Audio segmentation using Sortformer diarization + Smart VAD EOS"
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, help="Path to YAML config file")
-    args = parser.parse_args()
-    main(args)
+    main(parser.parse_args())

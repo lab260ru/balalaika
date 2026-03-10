@@ -1,9 +1,9 @@
 import argparse
 import os
+import re
 import torch
 import torch.multiprocessing as mp
 import pandas as pd
-import yaml
 import torchaudio
 from pathlib import Path
 from typing import List, Dict
@@ -84,7 +84,7 @@ def run_inference_worker(rank: int, world_size: int, file_paths: List[str], conf
     logger.success(f"[cuda:{rank}] Finished.")
 
 def combine_results(final_output_path: Path, num_parts: int):
-    """Merges partial CSVs into the main balalaika.csv."""
+    """Merges partial CSVs into the main balalaika.csv securely."""
     logger.info("Combining DistillMOS results...")
     dfs = []
     for i in range(num_parts):
@@ -97,40 +97,62 @@ def combine_results(final_output_path: Path, num_parts: int):
                 logger.error(f"Error reading {part_path}: {e}")
 
     if not dfs:
-        logger.warning("No DistillMOS results found.")
+        logger.warning("No DistillMOS results found to merge.")
         return
 
-    new_df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=['filepath'], keep='last')
+    # Это DataFrame только с результатами воркеров (filepath и DistillMOS)
+    new_df = pd.concat(dfs, ignore_index=True)
 
     if final_output_path.exists():
-        logger.info(f"Merging with existing CSV: {final_output_path}")
+        logger.info(f"Safely merging with existing CSV: {final_output_path}")
         main_df = pd.read_csv(final_output_path)
         
-        # Обновляем существующий DF новыми результатами
-        main_df = pd.concat([main_df, new_df], ignore_index=True)
-        main_df = main_df.drop_duplicates(subset=['filepath'], keep='last')
+        # Устанавливаем filepath как индекс для точного слияния
+        main_df.set_index('filepath', inplace=True)
+        new_df.set_index('filepath', inplace=True)
+        
+        # combine_first заполняет пустые ячейки (NaN) в main_df данными из new_df
+        # При этом он НЕ удаляет другие колонки (start, silence_percent и т.д.)
+        main_df = main_df.combine_first(new_df).reset_index()
     else:
         main_df = new_df
 
-    main_df.to_csv(final_output_path, index=False)
-    logger.success(f"Combined. Total rows: {len(main_df)}")
+    # Чистим старый флаг is_single_speaker, если он остался в старых файлах
+    if 'is_single_speaker' in main_df.columns:
+        main_df.drop(columns=['is_single_speaker'], inplace=True)
+
+    # Красиво сортируем колонки
+    base_cols = ['filepath', 'speaker_id', 'start', 'end', 'total_duration', 
+                 'playlist_id', 'podcast_id', 'silence_percent', 'max_silence_duration', 'DistillMOS']
+    final_cols = [c for c in base_cols if c in main_df.columns] + [c for c in main_df.columns if c not in base_cols]
+    
+    main_df[final_cols].to_csv(final_output_path, index=False)
+    logger.success(f"Combined successfully. Total rows: {len(main_df)}")
 
 def get_unprocessed_paths(podcasts_path: Path, result_csv_path: Path) -> List[str]:
+    """Finds all chunks that haven't been processed by DistillMOS yet."""
     all_audio_paths = get_audio_paths(str(podcasts_path))
-    all_paths_str = [str(p.resolve()) for p in all_audio_paths]
+    
+    # Паттерн для поиска только нарезанных мелких чанков
+    chunk_pattern = re.compile(r'^\d+\.\d+_\d+\.\d+_')
+    all_chunks = [str(Path(p).resolve()) for p in all_audio_paths if chunk_pattern.match(Path(p).name)]
 
     if not result_csv_path.exists():
-        return all_paths_str
+        return all_chunks
 
     try:
         df = pd.read_csv(result_csv_path)
         if 'DistillMOS' not in df.columns:
-            return all_paths_str
+            return all_chunks
         
-        processed = set(df.loc[df['DistillMOS'].notna(), 'filepath'].astype(str).tolist())
-        return [p for p in all_paths_str if p not in processed]
-    except:
-        return all_paths_str
+        # Ищем файлы, у которых УЖЕ ЕСТЬ не пустая оценка DistillMOS
+        processed = set(df.dropna(subset=['DistillMOS'])['filepath'].astype(str).tolist())
+        
+        # Возвращаем только те чанки, которых еще нет в списке обработанных
+        return [p for p in all_chunks if p not in processed]
+    except Exception as e:
+        logger.warning(f"Could not read CSV to filter paths: {e}. Processing all chunks.")
+        return all_chunks
 
 def main():
     mp.set_start_method('spawn', force=True)
@@ -149,7 +171,7 @@ def main():
     
     unprocessed = get_unprocessed_paths(podcasts_path, final_output_path)
     if not unprocessed:
-        logger.success("All files already have DistillMOS. Exiting.")
+        logger.success("All small audio files already have a DistillMOS score. Exiting.")
         return
 
     logger.info(f"Processing {len(unprocessed)} files on {available_gpus} GPUs.")

@@ -1,5 +1,4 @@
 import argparse
-import os
 import torch
 import torch.multiprocessing as mp
 import torchaudio
@@ -10,6 +9,8 @@ import numpy as np
 import pyloudnorm as pyln
 from loguru import logger
 from tqdm import tqdm
+
+import soundfile as sf
 
 from src.utils.utils import load_config, get_audio_paths
 
@@ -198,7 +199,6 @@ def main(args):
 
 
 if __name__ == "__main__":
-    torchaudio.set_audio_backend('soundfile')
     mp.set_start_method('spawn', force=True)
     
     parser = argparse.ArgumentParser(

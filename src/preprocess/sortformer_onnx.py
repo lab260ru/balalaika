@@ -54,15 +54,15 @@ class Sortformer:
 
         if providers is None:
             providers = [
-                (
-                    "TensorrtExecutionProvider",
-                    {
-                        "trt_max_workspace_size": 6 * 1024**3, 
-                        "trt_fp16_enable": True,
-                        "trt_engine_cache_enable": True,
-                        "trt_engine_cache_path": "./trt_cache",  
-                    }
-                ),
+                # (
+                #     "TensorrtExecutionProvider",
+                #     {
+                #         "trt_max_workspace_size": 6 * 1024**3, 
+                #         "trt_fp16_enable": True,
+                #         "trt_engine_cache_enable": True,
+                #         "trt_engine_cache_path": "./trt_cache",  
+                #     }
+                # ),
                 "CUDAExecutionProvider",
                 "CPUExecutionProvider"
             ]
@@ -376,8 +376,8 @@ class Sortformer:
 
 
 if __name__ == "__main__":
-    model_path = "model.onnx"
-    audio_path = "audio.wav"
+    model_path = "/home/nikita/balalaika/models/diar_streaming_sortformer_4spk-v2.1.onnx"
+    audio_path = "/home/nikita/balalaika/datkamatka/12.mp3"
     
     audio, sr = librosa.load(audio_path, sr=16000, mono=True)
     
@@ -385,7 +385,9 @@ if __name__ == "__main__":
     diarizer = Sortformer(model_path, config=config)
     
     start_time = time.time()
+    # print(audio.shape)
     results = diarizer.diarize(audio, sample_rate=16000, include_tensor_outputs=False)
     end_time = time.time()
     
     print(f"RTF: {(end_time - start_time) / (audio.shape[-1] / 16_000):.3f}")
+    print(results)

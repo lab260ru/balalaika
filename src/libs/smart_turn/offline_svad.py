@@ -102,5 +102,3 @@ class SmartVAD:
             return np.pad(audio_array, (padding, 0), mode='constant', constant_values=0)
         return audio_array
 
-
-OfflineVAD = SmartVAD
