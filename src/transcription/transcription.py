@@ -153,8 +153,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
     my_files = all_files[cuda_id::world_size]
     if not my_files:
         return
-
-    model_cfg = config.get('giga', {}) if 'giga' in model_name else config.get(model_name, {})
+        
     if not isinstance(model_cfg, dict):
         model_cfg = {}
     batch_size = model_cfg.get('batch_size', 16)

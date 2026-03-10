@@ -23,11 +23,6 @@ preprocess:
 separation:
   podcasts_path: /home/nikita/balalaika/datkamatka # full path to the folder where the chopped podcasts are located
 
-  nisqa:
-    bs: 32
-    num_workers: 12
-    nisqa_config_path: ./configs/nisqa_b.yaml
-
   music_detect:
     bs: 32
     num_workers: 1 # per gpu
@@ -44,17 +39,7 @@ transcription:
   # All models are loaded via onnx-asr from HuggingFace (or local path).
   # Supported: giga_ctc, giga_rnnt, vosk, vosk_small, tone, parakeet_v2, parakeet_v3, canary, whisper_base, whisper_turbo
   model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
-
-  giga:
-    batch_size: 16
-    # quantization: int8  # optional: int8 quantization for faster CPU/GPU inference
-
-  vosk:
-    batch_size: 16
-    # vosk_path: ./models/vosk-model-ru  # optional: local model directory (otherwise downloaded from HF)
-
-  tone:
-    batch_size: 16
+  batch_size: 16 # batch size for the model
   
 punctuation:
   podcasts_path: /home/nikita/balalaika/datkamatka # full path to the folder where the chopped podcasts are located 
