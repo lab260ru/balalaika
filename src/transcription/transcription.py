@@ -61,7 +61,7 @@ def get_providers(cuda_id: int, use_tensorrt: bool = False) -> list:
                 "trt_max_workspace_size": 6 * 1024**3,
                 "trt_fp16_enable": True,
                 "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": f"./trt_cache_{cuda_id}",  
+                "trt_engine_cache_path": f".cache/trt_cache_{cuda_id}",  
             }),
             ("CUDAExecutionProvider", {"device_id": cuda_id}),
         ]
@@ -153,18 +153,16 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
     my_files = all_files[cuda_id::world_size]
     if not my_files:
         return
-        
-    if not isinstance(model_cfg, dict):
-        model_cfg = {}
-    batch_size = model_cfg.get('batch_size', 16)
+    
+    batch_size = config.get('batch_size', 16)
     use_trt = config.get('use_tensorrt', False)
-    quantization = model_cfg.get('quantization')
+    quantization = config.get('quantization')
 
     onnx_name = MODEL_MAP.get(model_name, model_name)
     output_suffix = 'vosk' if 'vosk' in model_name else model_name
     do_timestamps = config.get('with_timestamps', False) and model_name in SUPPORTED_TIMESTAMPS
 
-    local_path = model_cfg.get('vosk_path') if 'vosk' in model_name else model_cfg.get('model_path')
+    local_path = config.get('vosk_path') if 'vosk' in model_name else config.get('model_path')
 
     logger.info(f"Worker {cuda_id}/{world_size}: {onnx_name} on cuda:{cuda_id}, {len(my_files)} files, batch={batch_size}")
 
