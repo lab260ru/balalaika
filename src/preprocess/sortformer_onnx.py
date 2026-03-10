@@ -3,6 +3,8 @@ import onnxruntime as ort
 import librosa
 from typing import List, Tuple, Union
 import time
+import os
+import huggingface_hub
 
 # Model constants
 N_FFT = 512
@@ -51,6 +53,9 @@ class Sortformer:
             self.config = DiarizationConfig()
         else:
             self.config = config
+
+        if not os.path.exists(model_path):
+            model_path = huggingface_hub.hf_hub_download(repo_id="altunenes/parakeet-rs", filename="diar_streaming_sortformer_4spk-v2.1.onnx", local_dir="./models")
 
         if providers is None:
             providers = [

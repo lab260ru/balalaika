@@ -15,7 +15,7 @@ preprocess:
   loudness: -23.0 # target loudness level in LUFS
   block_size: 0.400 # block size for loudness measurement in seconds
   chunk_duration: 900 # max chunk duration for Sortformer (seconds). Audio >15 min is split.
-  sortformer_model: nvidia/diar_streaming_sortformer_4spk-v2 # HF model ID or path to .nemo file
+  sortformer_model: ./models/diar_streaming_sortformer_4spk-v2.1.onnx
   vad_args:
     smart_vad_model: ./models/smart-turn-v3.0.onnx
     smart_vad_threshold: 0.4
