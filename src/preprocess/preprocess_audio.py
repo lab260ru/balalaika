@@ -66,7 +66,7 @@ def process_audio_file(
         block_size: Block size for loudness measurement in seconds
     """
     try:
-        audio, sample_rate = torchaudio.load(audio_path)
+        audio, sample_rate = torchaudio.load_with_torchcodec(audio_path)
         audio_np = audio.numpy()
 
         # torchaudio returns (channels, samples), pyloudnorm expects (samples,) or (samples, channels≤5)

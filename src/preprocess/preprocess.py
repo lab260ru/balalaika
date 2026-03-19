@@ -222,7 +222,7 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
     episode_folder = p_audio.parent / episode_id
 
     try:
-        audio, sr = torchaudio.load(path_audio)
+        audio, sr = torchaudio.load_with_torchcodec(path_audio)
     except Exception as e:
         logger.error(f"Broken file {path_audio}: {e}")
         return []

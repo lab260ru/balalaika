@@ -26,14 +26,9 @@ def init_process(
     ) -> None:
     global accentizer
 
-    device = 'CUDA' if ('cuda' in device) else 'CPU' # RUAccent is waiting for CUDA without the cuda ID
+    providers = ['TensorrtExecutionProvider','CUDAExecutionProvider','CPUExecutionProvider']
     accentizer = RUAccent()
-    accentizer.load(
-        omograph_model_size=model_name,
-        use_dictionary=True,
-        tiny_mode=False,
-        device=device
-    )
+    accentizer.load(omograph_model_size=model_name, use_dictionary=True, tiny_mode=False, providers=providers)
 
 
 def process_file(path: Path):    
