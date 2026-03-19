@@ -55,3 +55,9 @@ accent:
 phonemizer:
   podcasts_path: /home/nikita/balalaika/balalaika_data # full path to the folder where the text files are located
   num_workers: 1 # per one gpu
+
+export:
+  podcasts_path: /home/nikita/balalaika/balalaika_data # full path to the folder where the chopped podcasts are located
+  num_workers: 1
+  max_shard_size: 536870912  # 512MB in bytes
+  max_shard_count: 10000

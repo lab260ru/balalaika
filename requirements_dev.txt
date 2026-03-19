@@ -23,6 +23,8 @@ numpy
 packaging
 protobuf
 sympy
+webdataset
+
 pyloudnorm
 git+https://github.com/Den4ikAI/ruaccent.git
 git+https://github.com/mtuciru/TryIPaG2P.git
