@@ -22,7 +22,7 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
 
-CHUNK_DURATION_S = 15 * 60  # 15 минут — лимит Sortformer для избежания OOM
+CHUNK_DURATION_S = 15 * 60  
 
 sortformer_model = None
 smart_vad = None
@@ -55,10 +55,6 @@ def init_models(gpu_id: int, config: Dict[str, Any]):
     logger.info(f"Models initialized on {device}")
 
 
-# ---------------------------------------------------------------------------
-#  1. Диаризация большого файла (1 раз)
-# ---------------------------------------------------------------------------
-
 def parse_diarization_output(raw_results) -> List[Tuple[float, float, int]]:
     segments = []
     if not raw_results or len(raw_results) == 0: return segments
@@ -80,8 +76,6 @@ def diarize_audio(audio: torch.Tensor, sr: int, chunk_duration: float = CHUNK_DU
     chunk_samples = int(chunk_duration * sr)
     all_segments, offset = [], 0
 
-    # Обрабатываем большой файл чанками чисто для избежания OOM,
-    # логически это 1 прогон на весь файл.
     while offset < total_samples:
         end = min(offset + chunk_samples, total_samples)
         chunk = audio[:, offset:end]
@@ -94,7 +88,7 @@ def diarize_audio(audio: torch.Tensor, sr: int, chunk_duration: float = CHUNK_DU
         segs = [(s + offset_sec, e + offset_sec, spk) for s, e, spk in segs]
         
         if len(segs) > 2 and total_samples > chunk_samples:
-            segs = segs[1:-1] # Убираем артефакты склейки
+            segs = segs[1:-1]
             
         all_segments.extend(segs)
         offset = end
@@ -102,16 +96,11 @@ def diarize_audio(audio: torch.Tensor, sr: int, chunk_duration: float = CHUNK_DU
     return sorted(all_segments, key=lambda x: x[0])
 
 
-# ---------------------------------------------------------------------------
-#  2. Фильтрация и EOS (получаем границы мелких файлов)
-# ---------------------------------------------------------------------------
-
 def filter_single_speaker_segments(segments: List[Tuple[float, float, int]], min_duration: float = 1.0, max_duration: float = 15.0) -> List[Tuple[float, float, int]]:
     filtered = []
     segments = sorted(segments, key=lambda x: x[0])
     for i, (start, end, spk) in enumerate(segments):
         if not (min_duration <= end - start <= max_duration): continue
-        # Проверка на пересечение спикеров
         if not any(j != i and start < e2 and end > s2 for j, (s2, e2, _) in enumerate(segments)):
             filtered.append((start, end, spk))
     return filtered
@@ -149,24 +138,20 @@ def apply_eos_classification(audio: torch.Tensor, sr: int, segments: List[Tuple[
     return merged
 
 
-# ---------------------------------------------------------------------------
-#  3. Вычисление тишины КОНКРЕТНО для мелкого куска (математически)
-# ---------------------------------------------------------------------------
-
-def get_chunk_silence_metrics(c_start: float, c_end: float, raw_segments: List[Tuple[float, float, int]]) -> Tuple[float, float]:
-    """Считает тишину внутри конкретного куска, используя сырые метки 1 прогона диаризатора"""
+def get_chunk_metrics(c_start: float, c_end: float, raw_segments: List[Tuple[float, float, int]]) -> Tuple[float, float, int]:
     chunk_dur = c_end - c_start
-    if chunk_dur <= 0: return 0.0, 0.0
+    if chunk_dur <= 0: return 0.0, 0.0, 0
 
-    # 1. Находим все сырые куски речи, которые попали в наш финальный чанк
     intervals = []
-    for rs, re, _ in raw_segments:
+    speakers_in_chunk = set()
+    
+    for rs, re, spk in raw_segments:
         overlap_s = max(c_start, rs)
         overlap_e = min(c_end, re)
         if overlap_s < overlap_e:
             intervals.append([overlap_s, overlap_e])
+            speakers_in_chunk.add(spk)
 
-    # 2. Склеиваем пересекающиеся интервалы речи (на всякий случай)
     intervals.sort(key=lambda x: x[0])
     merged_speech = []
     for interval in intervals:
@@ -179,27 +164,21 @@ def get_chunk_silence_metrics(c_start: float, c_end: float, raw_segments: List[T
             else:
                 merged_speech.append(interval)
 
-    # 3. Считаем длину речи и тишины в чанке
     speech_dur = sum(e - s for s, e in merged_speech)
     silence_dur = max(0.0, chunk_dur - speech_dur)
     silence_pct = (silence_dur / chunk_dur) * 100
 
-    # 4. Считаем максимальную непрерывную паузу внутри чанка
     if not merged_speech:
         max_gap = chunk_dur
     else:
-        gaps = [merged_speech[0][0] - c_start]  # от начала до первой речи
+        gaps = [merged_speech[0][0] - c_start]
         for i in range(len(merged_speech) - 1):
-            gaps.append(merged_speech[i+1][0] - merged_speech[i][1]) # между репликами
-        gaps.append(c_end - merged_speech[-1][1]) # от последней речи до конца
+            gaps.append(merged_speech[i+1][0] - merged_speech[i][1])
+        gaps.append(c_end - merged_speech[-1][1])
         max_gap = max(gaps)
 
-    return round(silence_pct, 2), round(max_gap, 2)
+    return round(silence_pct, 2), round(max_gap, 2), len(speakers_in_chunk)
 
-
-# ---------------------------------------------------------------------------
-#  4. Нарезка файлов
-# ---------------------------------------------------------------------------
 
 def cut_audio(audio: torch.Tensor, sr: int, final_segments: List[Tuple[float, float, int]], raw_segments: List[Tuple[float, float, int]], output_folder: str, album_id: str, episode_id: str, fmt: str = 'mp3', max_duration: float = 15.0) -> List[Dict]:
     os.makedirs(output_folder, exist_ok=True)
@@ -212,8 +191,7 @@ def cut_audio(audio: torch.Tensor, sr: int, final_segments: List[Tuple[float, fl
         s_sample, e_sample = int(start * sr), min(int(end * sr), audio.shape[-1])
         if e_sample <= s_sample: continue
 
-        # Вытаскиваем тишину ИМЕННО для этого куска из сырых меток:
-        sil_pct, max_sil = get_chunk_silence_metrics(start, end, raw_segments)
+        sil_pct, max_sil, unique_spk = get_chunk_metrics(start, end, raw_segments)
 
         segment = audio[:, s_sample:e_sample]
         fname = f"{start:.2f}_{end:.2f}_{album_id}_{episode_id}.{fmt}"
@@ -229,14 +207,11 @@ def cut_audio(audio: torch.Tensor, sr: int, final_segments: List[Tuple[float, fl
             'playlist_id': album_id,
             'podcast_id': episode_id,
             'silence_percent': sil_pct,
-            'max_silence_duration': max_sil
+            'max_silence_duration': max_sil,
+            'is_single_speaker': unique_spk == 1
         })
     return results
 
-
-# ---------------------------------------------------------------------------
-#  Per-file processing
-# ---------------------------------------------------------------------------
 
 def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
     duration = config.get('duration', 15)
@@ -252,27 +227,41 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
         logger.error(f"Broken file {path_audio}: {e}")
         return []
 
-    if (audio.shape[-1] / sr) <= duration:
-        return []
+    total_audio_duration = audio.shape[-1] / sr
 
     try:
         if audio.shape[0] > 1: audio = torch.mean(audio, dim=0, keepdim=True)
 
-        # 1. Один прогон диаризатора на всё большое аудио
         raw_segments = diarize_audio(audio, sr, chunk_duration)
         if not raw_segments: return []
 
-        # 2. Фильтрация и склейка коротких пауз (определяем границы нарезки)
+        if total_audio_duration <= duration:
+            sil_pct, max_sil, unique_spk = get_chunk_metrics(0.0, total_audio_duration, raw_segments)
+            main_spk = raw_segments[0][2] if raw_segments else -1
+            
+            logger.success(f"Processed short file | Spk: {unique_spk} | Sil: {sil_pct}% -> {path_audio}")
+            
+            return [{
+                'filepath': os.path.abspath(path_audio),
+                'speaker_id': main_spk,
+                'start': 0.0,
+                'end': round(total_audio_duration, 2),
+                'total_duration': round(total_audio_duration, 2),
+                'playlist_id': album_id,
+                'podcast_id': episode_id,
+                'silence_percent': sil_pct,
+                'max_silence_duration': max_sil,
+                'is_single_speaker': unique_spk == 1
+            }]
+
         clean_segments = filter_single_speaker_segments(raw_segments, min_duration=1.0, max_duration=duration)
         final_segments = apply_eos_classification(audio, sr, clean_segments, max_duration=duration)
         if not final_segments: return []
 
-        # 3. Нарезка и формирование словарей (с вычислением тишины по каждому куску)
         seg_results = cut_audio(audio, sr, final_segments, raw_segments, str(episode_folder), album_id, episode_id, max_duration=duration)
 
         logger.success(f"Processed {len(seg_results)} chunks from: {path_audio}")
 
-        # 4. Удаляем большой файл в конце
         if seg_results and p_audio.exists():
             os.remove(p_audio)
             logger.info(f"Original large file deleted: {path_audio}")
@@ -285,10 +274,6 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
 
     return seg_results
 
-# ---------------------------------------------------------------------------
-#  Main entry
-# ---------------------------------------------------------------------------
-
 def main(args):
     load_dotenv()
     if hf_key := os.environ.get('HF_TOKEN'): login(token=hf_key)
@@ -300,29 +285,27 @@ def main(args):
     workers_per_gpu = config.get('num_workers', 1)
     total_workers = max(1, num_gpus * workers_per_gpu)
 
-    # Загружаем существующий CSV (в нем могут быть DistillMOS для УЖЕ нарезанных файлов)
     csv_path = podcasts_path / 'balalaika.csv'
     existing_df = pd.DataFrame()
     if csv_path.exists():
         existing_df = pd.read_csv(csv_path)
 
-    # Собираем файлы и ОТСЕИВАЕМ мелкие куски, если вдруг они попали в поиск
     raw_audio_paths = get_audio_paths(str(podcasts_path))
     paths_to_process = []
-    chunk_pattern = re.compile(r'^\d+\.\d+_\d+\.\d+_') # Паттерн: 29.04_37.92_...
+    
+    chunk_pattern = re.compile(r'^\d+\.\d+_\d+\.\d+_') 
 
     for p_str in raw_audio_paths:
         p = Path(p_str)
-        # Если это УЖЕ нарезанный мелкий файл — пропускаем его
         if chunk_pattern.match(p.name):
             continue
         paths_to_process.append(p)
 
     if not paths_to_process:
-        logger.info("No new large files to process.")
+        logger.info("No new files to process.")
         return
 
-    logger.info(f"Large files to process: {len(paths_to_process)} / Total workers: {total_workers}")
+    logger.info(f"Files to process: {len(paths_to_process)} / Total workers: {total_workers}")
 
     all_results: List[Dict] = []
     with ProcessPoolExecutor(max_workers=total_workers, initializer=initializer_wrapper, initargs=(config, num_gpus)) as executor:
@@ -333,29 +316,24 @@ def main(args):
             except Exception as e:
                 logger.error(f"Task error: {e}")
 
-    # БЕЗОПАСНОЕ слияние Датафреймов (не затираем DistillMOS)
     if all_results:
         new_df = pd.DataFrame(all_results)
         
         if not existing_df.empty:
-            # Устанавливаем filepath как индекс, чтобы merge прошел четко по файлу
             existing_df.set_index('filepath', inplace=True)
             new_df.set_index('filepath', inplace=True)
-            
-            # combine_first заполнит пустые метрики (start, end, тишина) у строк,
-            # где был только DistillMOS, и добавит новые строки!
             df = existing_df.combine_first(new_df).reset_index()
         else:
             df = new_df
 
-
         base_cols = ['filepath', 'speaker_id', 'start', 'end', 'total_duration', 
-                     'playlist_id', 'podcast_id', 'silence_percent', 'max_silence_duration', 'DistillMOS']
+                     'playlist_id', 'podcast_id', 'silence_percent', 'max_silence_duration', 
+                     'is_single_speaker', 'DistillMOS']
         final_cols = [c for c in base_cols if c in df.columns] + [c for c in df.columns if c not in base_cols]
         
         df = df[final_cols]
         df.to_csv(csv_path, index=False)
-        logger.success(f"Saved metadata for {len(all_results)} new chunks to {csv_path}")
+        logger.success(f"Saved metadata for {len(all_results)} files to {csv_path}")
 
 if __name__ == "__main__":
     multiprocessing.set_start_method('spawn', force=True)
