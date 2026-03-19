@@ -1,13 +1,13 @@
 cache_path: ./cache
 
 download:
-  podcasts_path: /home/nikita/balalaika/balalaika_data
+  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset
   episodes_limit: 100 # limit on downloading episodes from one playlist
   num_workers: 4
   podcasts_urls_file: '' # pkl with urls
   
 preprocess:
-  podcasts_path: /home/nikita/balalaika/balalaika_data # full path to the folder where the podcasts are located 
+  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the podcasts are located 
   duration: 15 # in seconds (each sample will be no longer than this time.)
   num_workers: 1 # per GPU; keep at 1 — Sortformer is a large model
   crest_treshold: 10 # in dB
@@ -22,7 +22,7 @@ preprocess:
     smart_vad_threshold: 0.4 # threshold for the smart-turn-v3.0 model
 
 separation:
-  podcasts_path: /home/nikita/balalaika/balalaika_data # full path to the folder where the chopped podcasts are located
+  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located
 
   music_detect:
     bs: 32
@@ -31,7 +31,7 @@ separation:
     threshold: 0.6 # threshold for the music_detection.safetensors model
 
 transcription:
-  podcasts_path: /home/nikita/balalaika/balalaika_data # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located 
   consensus_num: 3 # number of models to use for consensus transcription
   with_timestamps: True
   use_tensorrt: True  # enable TensorRT execution provider (requires CUDA + TensorRT installed)
@@ -43,21 +43,22 @@ transcription:
   batch_size: 16 # batch size for the model
   
 punctuation:
-  podcasts_path: /home/nikita/balalaika/balalaika_data # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located 
   model_name: "RUPunct/RUPunct_big" # RUPunct model name 
   num_workers: 1 # per one gpu
 
 accent:
-  podcasts_path: /home/nikita/balalaika/balalaika_data # full path to the folder where the chopped podcasts are located 
+  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located 
   num_workers: 1 # per one gpu
   model_name: turbo3.1 # ruAccent model name 
+  use_tensorrt: True # enable TensorRT execution provider (requires CUDA + TensorRT installed)
   
 phonemizer:
-  podcasts_path: /home/nikita/balalaika/balalaika_data # full path to the folder where the text files are located
+  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the text files are located
   num_workers: 1 # per one gpu
 
 export:
-  podcasts_path: /home/nikita/balalaika/balalaika_data # full path to the folder where the chopped podcasts are located
+  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located
   num_workers: 1
   max_shard_size: 536870912  # 512MB in bytes
   max_shard_count: 10000
