@@ -1,40 +1,28 @@
-## Usage/Examples
+## Punctuation (RUPunct)
 
-### Running the Code via Command-Line Arguments
-You can modify the parameters directly in the shell script (`punctuation/punctuation_args.sh`) and then run it:
-```sh
-sh punctuation/punctuation_args.sh
+Restores punctuation and capitalization from **`{stem}_rover.txt`**.
+
+## Run
+
+```bash
+bash src/punctuation/punctuation_yaml.sh configs/config.yaml
 ```
 
-### Running the Code via Config File
-Example:
-```sh
-bash punctuation/punctuation_yaml.sh config_path
+## Parameters
+
+See **`punctuation`** in `configs/config.yaml` (`podcasts_path`, `model_name`, `num_workers`).
+
+## Output
+
+For each `{stem}_rover.txt`, writes **`{stem}_punct.txt`**.
+
+```text
+{podcasts_path}/
+└── {playlist_id}/
+    └── {podcast_id}/
+        ├── {stem}.mp3
+        ├── {stem}_rover.txt   # input
+        └── {stem}_punct.txt   # output
 ```
 
-## Explanation of Parameters
-
-- `--config_path`: Path to the YAML configuration file.
-- `--podcasts_path`: Root directory containing text files for processing.
-- `--model_name`: Name of the punctuation model (e.g., "RUPunct/RUPunct_big").
-- `--num_workers`: Number of worker processes for parallel processing.
-
-## Output Structure
-
-For each consensus transcription, a new file with restored punctuation will be created:
-
-```
-podcasts/
-└── {album_id}/
-    └── {episode_id}/
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}.mp3
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_rover.txt
-        └── {start_time}_{end_time}_{album_id}_{episode_id}_punct.txt
-```
-
-### File Descriptions
-- `.mp3`: Audio segment
-- `_rover.txt`: Consensus transcription without punctuation (input file)
-- `_punct.txt`: Text with restored punctuation using the RUPunct model
-
-The script processes all `_rover.txt` files and creates corresponding `_punct.txt` files.
+WebDataset packs this as `punct.txt` inside `json` (`src/to_webdataset.py`).

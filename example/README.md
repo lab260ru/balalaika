@@ -1,87 +1,68 @@
-# Balalaika WebDataset (Hugging Face Compatible)
+# Balalaika WebDataset (Hugging Face)
 
-This repository contains the **Balalaika Dataset** packed into the [WebDataset](https://github.com/webdataset/webdataset) format. It is specifically optimized for use with the Hugging Face `datasets` library, allowing for high-performance streaming directly from disk or remote storage.
+Pipeline export is packed as [WebDataset](https://github.com/webdataset/webdataset) `.tar` shards. Load with Hugging Face [`datasets`](https://huggingface.co/docs/datasets) and `streaming=True` to avoid holding the full corpus in RAM.
 
-## Features
-
-- **Efficient I/O**: Data is stored in `.tar` shards, reducing metadata overhead on the file system.
-- **Streaming Support**: Load massive datasets without filling up your RAM.
-- **Auto-Decoding**: Hugging Face automatically decodes audio into NumPy arrays and parses JSON metadata.
-
-## Installation
-
-You will need the `datasets` and `webdataset` libraries:
+## Install
 
 ```bash
-pip install datasets webdataset torchaudio
+pip install datasets webdataset
+```
 
-Usage Example
+You may also need `torchaudio` (or another backend) depending on your `datasets` version for decoding `mp3` / `wav` columns.
 
-The following script demonstrates how to load the dataset using the Hugging Face load_dataset interface with streaming enabled.
-code Python
+## Loading
 
+After `src/collate_yamls.sh`, shards are written to  
+`{parent of podcasts_path}/{dataset_folder_name}_webdataset/train/`  
+(see `src/to_webdataset.py`). Point `data_dir` at that `train` folder.
+
+[`example.py`](example.py) shows a minimal loop.
+
+```python
 from datasets import load_dataset
-import time
 
-if __name__ == "__main__":
-    # Hugging Face scans the folder for .tar archives and collects them
-    dataset = load_dataset(
-        "webdataset", 
-        data_dir="/path/to/balalaika_data_webdataset/train", 
-        split="train",
-        streaming=True  # Enables streaming for low memory usage
-    )
+dataset = load_dataset(
+    "webdataset",
+    data_dir="/path/to/your_dataset_webdataset/train",
+    split="train",
+    streaming=True,
+)
 
-    for item in dataset:
-        print(f"=== Sample ID: {item['__key__']} ===")
-        
-        # Audio is automatically loaded as a dictionary (array and sampling_rate)
-        # The key matches the file extension (mp3, wav, flac, etc.)
-        audio_key = next((k for k in item.keys() if k in ['mp3', 'wav', 'flac', 'ogg']), None)
-        
-        if audio_key:
-            audio_data = item[audio_key]
-            print(f"Audio Shape: {audio_data['array'].shape}")
-            print(f"Sampling Rate: {audio_data['sampling_rate']} Hz")
-        
-        # JSON metadata and transcriptions are automatically parsed into a dictionary
-        metadata = item['json']
-        print(f"Transcription: {metadata.get('whisper')}")
-        print(f"Quality Score (MOS): {metadata.get('DistillMOS')}")
-        
-        print("-" * 50)
-        time.sleep(1) # Just for demonstration purposes
+for item in dataset:
+    print(item["__key__"])
+    audio_key = next(k for k in item if k in ("mp3", "wav", "flac", "ogg"))
+    audio = item[audio_key]
+    print(audio["array"].shape, audio["sampling_rate"])
+    print(item["json"])  # dict: CSV metadata + all sidecar texts
+```
 
-Dataset Structure
+## Sample layout
 
-When using load_dataset, each sample is a dictionary with columns mapped from the file extensions inside the .tar shards:
-Column	Type	Description
-__key__	string	Unique sample identifier (dots replaced with underscores).
-mp3 / wav	dict	Audio data containing array and sampling_rate.
-json	dict	Metadata including metrics and transcriptions.
-Metadata (JSON) Fields
+| Field | Type | Description |
+|--------|------|-------------|
+| `__key__` | `str` | Sample id; dots in the stem are replaced with `_` for HF / WebDataset parsing. |
+| `mp3` / `wav` / … | `dict` | Audio: NumPy `array`, `sampling_rate`. Extension matches the chunk on disk. |
+| `json` | `dict` | Merged metadata from `balalaika.csv` plus every sidecar file next to the chunk. |
 
-The json column consolidates all textual information:
+## Typical `json` keys (full run)
 
-    DistillMOS: Predicted Mean Opinion Score for speech quality.
+Keys mirror CSV columns and filenames `{stem}_{postfix}` → JSON key `postfix`.
 
-    whisper / giga / punct: Transcriptions from various ASR models.
+**From `balalaika.csv`:** e.g. `start`, `end`, `total_duration`, `speaker_id`, `playlist_id`, `podcast_id`, `silence_percent`, `max_silence_duration`, `DistillMOS`, and optionally `is_single_speaker`, etc.
 
-    accent: Text with stress markers.
+**Text sidecars** (depend on `transcription.model_names` and which stages you ran):
 
-    phonemes: Phonetic representation of the audio.
+| Key | Content |
+|-----|---------|
+| `giga_ctc.txt`, `giga_rnnt.txt`, `vosk.txt`, `tone.txt`, … | Raw ASR text per model. |
+| `giga_ctc.tst`, `tone.tst`, … | Word-level TSV: `start_sec\tend_sec\tword` per line if timestamps enabled. |
+| `rover.txt` | Multi-model consensus (ROVER). |
+| `punct.txt` | Punctuation restoration (RUPunct). |
+| `accent.txt` | Stress marks + normalized text (ruAccent). |
+| `rover_phonemes.txt` | IPA string from consensus text (TryIParu `G2PModel`). |
 
-    speaker: Speaker identification ID.
+## Why WebDataset
 
-    fullness: Ratio of active speech in the segment.
-
-Advantages of this Format
-
-    Zero Bottleneck: Optimized for training on fast GPUs where reading individual small files is usually the bottleneck.
-
-    Easy Integration: Works out-of-the-box with DataCollator and standard Hugging Face training pipelines.
-
-    Flexible Storage: The dataset can be stored locally, on an S3 bucket, or on the Hugging Face Hub without changing the loading logic.
-    """
-
-print(readme_content)
+- **Throughput**: sequential read of large `.tar` files instead of millions of tiny files.
+- **Streaming**: train without fully unpacking to disk.
+- **HF-friendly**: same loader pattern for local folders or Hub-hosted shards.

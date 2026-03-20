@@ -1,8 +1,10 @@
 # Balalaika Pipeline
 
-A complete production-ready pipeline for processing audio data, from download to feature extraction. This pipeline handles audio preprocessing, speaker diarization, transcription, punctuation restoration, accent restoration, and phonemization.
+End-to-end speech data processing: ingest, segmentation, quality filtering, multi-model ASR with ROVER, punctuation, lexical stress, G2P, and export to Parquet / WebDataset.
 
-The pipeline is designed to work with podcasts from Yandex Music, but **can also process your own audio datasets** by organizing them in the expected format (see [Preparing Your Dataset](docs/preparing.md)).
+Works with Yandex Music podcasts out of the box, or **your own corpus** if you follow the expected layout (see [Preparing your dataset](docs/preparing.md)).
+
+**Pre-built processed datasets** (segmented, filtered, annotated) are published on Hugging Face: **[Balalaika Dataset — MTUCI collection](https://huggingface.co/collections/MTUCI/balalaika-dataset)**.
 
 ---
 
@@ -20,63 +22,56 @@ wget -qO- https://astral.sh/uv/install.sh | sh
 ```bash
 git clone https://github.com/mtuciru/balalaika
 cd balalaika
-bash create_dev_env.sh  # For development/annotation
+bash create_dev_env.sh   # full stack for running the pipeline
 # or
-bash create_user_env.sh  # For using pre-annotated dataset only
+bash create_user_env.sh  # consume pre-built datasets only
 ```
 
-### Basic Setup
+### Basic setup
 
-1. Create `.env` file:
+1. Create `.env`:
+
 ```ini
 HF_TOKEN=<your_huggingface_token>
 YANDEX_KEY=<your_yandex_music_token>
 ```
 
-2. Configure `configs/config.yaml`:
-```yaml
-podcasts_path: /absolute/path/to/your/data
-```
+2. Edit `configs/config.yaml`: set absolute paths (`podcasts_path`, model files under `models/`, etc.).
 
-3. Place required models in `models/` directory (see [Preparing Your Dataset](docs/preparing.md))
+3. Run stages (see [Usage Guide](docs/guide.md)). Sequential wrapper:
 
-4. Run the pipeline:
 ```bash
 bash base.sh configs/config.yaml
 ```
+
+Note: `base.sh` may have early stages commented out—uncomment what you need.
 
 ---
 
 ## Documentation
 
-- **[Usage Guide](docs/guide.md)**: Detailed guide on how to use the pipeline, what files are created, and how to run individual stages
-- **[Preparing Your Dataset](docs/preparing.md)**: Setup instructions and how to prepare your own datasets for processing
+- **[Preparing your dataset](docs/preparing.md)** — HF collection vs. local pipeline, folder layout, models, config.
+- **[Usage Guide](docs/guide.md)** — stages, artifacts, per-step commands.
+- **[example/README.md](example/README.md)** — loading the WebDataset with Hugging Face `datasets`.
+
+Per-module notes live under `src/*/README.md` (aligned with `configs/config.yaml`).
 
 ---
 
-## Pipeline Overview
+## Pipeline overview
 
-The pipeline consists of the following stages:
-
-1. **Download** - Downloads podcast episodes (optional, if using your own data)
-2. **Preprocess** - Audio quality filtering and normalization:
-   - **Crest Factor Removal** - Removes files with excessive peak-to-RMS ratio
-   - **Loudness Normalization** - Normalizes audio loudness (ITU-R BS.1770-4)
-   - **Audio Segmentation** - Segments audio into chunks using VAD
-3. **Separation** - Speaker diarization, quality assessment, music detection, silence analysis
-4. **Transcription** - Multi-model ASR with ROVER consensus (optimized with early stopping when models agree)
-5. **Punctuation** - Punctuation restoration
-6. **Accents** - Accent restoration
-7. **Phonemization** - Text-to-phoneme conversion
-8. **Collate** - Aggregates metadata into Parquet
-
-For detailed information about each stage, see [Usage Guide](docs/guide.md).
+1. **Download** — optional episode fetch.
+2. **Preprocess** — crest-factor pruning, **Sortformer (ONNX)** diarization, single-speaker selection, **Smart Turn** boundary refinement, chunking + `balalaika.csv`; long source files are removed after successful chunking; **EBU R128-style** loudness normalization (see `preprocess_yaml.sh` order).
+3. **Separation** — **music detection** (WavLM-based weights in `music_detection.safetensors`), **DistillMOS** → column in `balalaika.csv`.
+4. **Transcription** — **[onnx-asr](https://github.com/istupakov/onnx-asr)** (ONNX Runtime / optional TensorRT), **ROVER** consensus, optional word-level `.tst`.
+5. **Punctuation** — RUPunct.
+6. **Accents** — ruAccent (e.g. `turbo3.1`).
+7. **Phonemization** — **TryIParu** `G2PModel` → `*_rover_phonemes.txt`.
+8. **Collate / export** — `balalaika.parquet` and WebDataset shards via `src/collate_yamls.sh`.
 
 ---
 
 ## Citation
-
-If you use this pipeline or the Balalaika dataset in your research, please cite:
 
 ```bibtex
 @article{borodin2025datacentric,
@@ -92,28 +87,21 @@ If you use this pipeline or the Balalaika dataset in your research, please cite:
 
 ---
 
-## Models
+## Models & tooling
 
-The pipeline integrates the following models and tools:
-
-- **[NISQA](https://github.com/gabrielmittag/NISQA)**: Audio quality assessment
-- **[GigaAM](https://github.com/salute-developers/GigaAM)**: ASR models (CTC, RNNT, CTC+LM)
-- **[ruAccent](https://github.com/Den4ikAI/ruaccent)**: Accent restoration
-- **[RUPunct](https://huggingface.co/RUPunct/RUPunct_big)**: Punctuation restoration
-- **[Vosk](https://alphacephei.com/vosk/)**: ASR model
-- **[T-one](https://github.com/voicekit-team/T-one)**: ASR model
-- **[TryIPaG2P](https://github.com/mtuciru/IpaG2p)**: Phonemization
-- **[Speaker Diarization](https://github.com/pyannote/pyannote-audio)**: Speaker diarization
-- **[Smart Turn VAD](https://github.com/pipecat-ai/smart-turn)**: Voice Activity Detection
+| Piece | Role |
+|--------|------|
+| **Sortformer** (ONNX) | streaming diarization, single-speaker slices |
+| **[Smart Turn](https://github.com/pipecat-ai/smart-turn)** (`smart-turn-v3.0.onnx`) | end-of-speech / turn boundaries |
+| **Music detector** (`music_detection.safetensors`) | drop music-heavy chunks |
+| **DistillMOS** | predicted MOS in `balalaika.csv` |
+| **[onnx-asr](https://github.com/istupakov/onnx-asr)** | GigaAM v3 CTC/RNNT, Vosk, T-one, Parakeet, Canary, Whisper, … |
+| **[RUPunct](https://huggingface.co/RUPunct/RUPunct_big)** | punctuation |
+| **[ruAccent](https://github.com/Den4ikAI/ruaccent)** | stress marks |
+| **TryIParu** (`tryiparu`) | grapheme → IPA |
 
 ---
 
 ## License
 
-See [LICENSE](LICENSE) file for details.
-
----
-
-## Acknowledgments
-
-Thanks to all the developers and contributors who made this project possible, including the teams behind GigaAM, ruAccent, RUPunct, Vosk, and other integrated tools.
+See [LICENSE](LICENSE).

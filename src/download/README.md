@@ -1,28 +1,26 @@
-## Usage/Examples  
+## Download (Yandex Music)
 
-### Running the Code via Command-Line Arguments
-You can modify the parameters directly in the shell script (`download_args.sh`) and then run it.
-~~~ 
-bash download/download_args.sh
-~~~  
+Downloads episodes from URLs / playlists configured for the downloader.
 
-### Running the Code via Config File
-Example:
-~~~ 
-bash download/download_yaml.sh config_path
-~~~  
+## Run
 
-## Explanation of Parameters
-- `--config_path`: Path to the YAML configuration file.
-- `--podcasts_path`: Directory to save downloaded podcasts. 
-- `--episodes_limit`: Maximum number of episodes to download per podcast.
-- `--num_workers`: Number of parallel threads for downloading.
+```bash
+bash src/download/download_yaml.sh configs/config.yaml
+```
 
-## Output Structure
-~~~ 
-podcasts/
+## Parameters
+
+See **`download`** in `configs/config.yaml` (`podcasts_path`, `episodes_limit`, `num_workers`, `podcasts_urls_file`).
+
+**Note:** `src/collate.py` also reads the **`download`** section for `podcasts_path` and `num_workers` when building `balalaika.parquet`. Keep that path aligned with the rest of the pipeline.
+
+## Output
+
+```text
+{podcasts_path}/
 └── {podcast_id}/
-    ├── {episode_id}/
-    │   └── episode_audio.mp3
-    └──...
-~~~ 
+    └── {episode_id}/
+        └── *.mp3
+```
+
+Next step: **preprocess** (Sortformer, Smart VAD, chunking).

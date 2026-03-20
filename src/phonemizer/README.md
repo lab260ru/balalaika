@@ -1,41 +1,21 @@
-## Usage/Examples
+## Phonemizer (TryIParu)
 
-### Running the Code via Command-Line Arguments
-You can modify the parameters directly in the shell script (`phonemizer/phonemizer_args.sh`) and then run it:
-~~~sh
-sh phonemizer/phonemizer_args.sh
-~~~
+Grapheme → IPA from **`{stem}_rover.txt`** using **`tryiparu.G2PModel`** (workers call `load_dataset=True` at init).
 
-### Running the Code via Config File
-Example:
-~~~sh
-bash phonemizer/phonemizer_yaml.sh config_path
-~~~
+## Run
 
-## Explanation of Parameters
+```bash
+bash src/phonemizer/phonemizer_yaml.sh configs/config.yaml
+```
 
-- `--config_path`: Path to the YAML configuration file.
-- `--podcasts_path`: Root directory containing the text files for phoneme conversion.
-- `--num_workers`: Number of worker processes for parallel processing.
+## Parameters
 
-## Output Structure
+See **`phonemizer`** in `configs/config.yaml` (`podcasts_path`, `num_workers`).
 
-For each consensus transcription, a corresponding phoneme file will be created:
+## Output
 
-~~~
-podcasts/
-└── {album_id}/
-    └── {episode_id}/
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}.mp3
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_rover.txt
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_punct.txt
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_accent.txt
-        └── {start_time}_{end_time}_{album_id}_{episode_id}_rover_phonemes.txt
-~~~
+For each `{stem}_rover.txt`:
 
-### File Descriptions
-- `.mp3`: Audio segment
-- `_rover.txt`: Consensus transcription
-- `_punct.txt`: Text with restored punctuation
-- `_accent.txt`: Text with restored accents
-- `_rover_phonemes.txt`: Text converted to phonemes
+- **`{stem}_rover_phonemes.txt`** — space-separated IPA symbols.
+
+WebDataset key: **`rover_phonemes.txt`**.

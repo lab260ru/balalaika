@@ -1,64 +1,146 @@
+# =============================================================================
+# Balalaika — config reference (configs/config.yaml)
+# =============================================================================
+# How it is loaded: each stage calls load_config(config_path, SECTION) and only
+# sees that SECTION's mapping. Keys at the root that are not a section name are
+# ignored by load_config (except you may read the full file elsewhere).
+#
+# podcasts_path — use the SAME dataset root in every section that processes
+#   on-disk chunks under playlist_id/podcast_id/, unless you know you need
+#   different trees.
+#
+# cache_path (top-level) — not read by load_config-based stages; reserved /
+#   used by some benchmarks. Music detection uses separation.music_detect.cache_path
+#   if you add it (default ./cache inside that subsection in code).
+#
+# download — Yandex Music downloader (src/download).
+#   NOTE: src/collate.py also loads the "download" section for podcasts_path
+#   and num_workers when merging text sidecars into balalaika.parquet. Keep
+#   download.podcasts_path aligned with the rest of the pipeline.
+#
+# preprocess — Sortformer diarization, Smart Turn VAD, chunking, crest filter,
+#   loudness normalization (see src/preprocess/preprocess_yaml.sh order).
+#
+# separation — music detection (deletes clips) + DistillMOS → balalaika.csv.
+#
+# transcription — onnx-asr multi-model ASR, optional ROVER (src/transcription).
+#
+# punctuation — RUPunct on *_rover.txt files.
+#
+# accent — ruAccent on *_punct.txt (YAML key is accent, not accents).
+#
+# phonemizer — TryIParu G2P on *_rover.txt → *_rover_phonemes.txt.
+#
+# export — WebDataset tar shards (src/to_webdataset.py); collate parquet uses
+#   download section as noted above.
+#
+# Optional transcription keys (not set below; see src/transcription/transcription.py):
+#   model_path, vosk_path — local override paths for onnx-asr load_model.
+#   quantization — passed to onnx-asr when set.
+#   vad_params — Silero VAD kwargs when use_vad: True.
+# =============================================================================
+
 cache_path: ./cache
 
 download:
-  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset
-  episodes_limit: 100 # limit on downloading episodes from one playlist
+  # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
+  podcasts_path: /home/nikita/balalaika/dataset
+  # Max episodes fetched per playlist when using the downloader.
+  episodes_limit: 100
+  # Parallel download threads.
   num_workers: 4
-  podcasts_urls_file: '' # pkl with urls
-  
+  # Optional pickle path with podcast / episode URLs (see download module).
+  podcasts_urls_file: ''
+
 preprocess:
-  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the podcasts are located 
-  duration: 15 # in seconds (each sample will be no longer than this time.)
-  num_workers: 1 # per GPU; keep at 1 — Sortformer is a large model
-  crest_treshold: 10 # in dB
-  peak: -1.0 # peak normalization level in dB
-  loudness: -23.0 # target loudness level in LUFS
-  block_size: 0.400 # block size for loudness measurement in seconds
-  chunk_duration: 900 # max chunk duration for Sortformer (seconds). Audio >15 min is split.
+  # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
+  podcasts_path: /home/nikita/balalaika/dataset
+  # Maximum duration of each output segment in seconds.
+  duration: 15
+  # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
+  num_workers: 1
+  # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
+  crest_treshold: 10
+  # True peak ceiling in dBFS before/after loudness step (see preprocess_audio).
+  peak: -1.0
+  # Target integrated loudness in LUFS (ITU-R BS.1770-4 meter in code).
+  loudness: -23.0
+  # Block size in seconds for loudness measurement windows.
+  block_size: 0.400
+  # Max audio length in seconds fed to Sortformer at once; longer files are windowed.
+  chunk_duration: 900
+  # ONNX Sortformer weights for streaming diarization.
   sortformer_model: ./models/diar_streaming_sortformer_4spk-v2.1.onnx
-  use_tensorrt: True # enable TensorRT execution provider (requires CUDA + TensorRT installed)
+  # Use TensorRT execution provider for Sortformer ONNX Runtime session (needs CUDA+TensorRT).
+  use_tensorrt: True
   vad_args:
-    smart_vad_model: ./models/smart-turn-v3.0.onnx # path to the smart-turn-v3.0.onnx model
-    smart_vad_threshold: 0.4 # threshold for the smart-turn-v3.0 model
+    # Smart Turn end-of-turn ONNX model path.
+    smart_vad_model: ./models/smart-turn-v3.0.onnx
+    # Smart Turn probability threshold for cutting/refining segment ends.
+    smart_vad_threshold: 0.4
 
 separation:
-  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located
+  # Root containing chunked audio and balalaika.csv.
+  podcasts_path: /home/nikita/balalaika/dataset
 
   music_detect:
+    # Inference batch size for music classifier.
     bs: 32
-    num_workers: 1 # per gpu
-    music_detect_model: ./models/music_detection.safetensors # path to the music_detection.safetensors model
-    threshold: 0.6 # threshold for the music_detection.safetensors model
+    # DataLoader worker processes per GPU worker (see music_detect.py).
+    num_workers: 1
+    # Fine-tuned WavLM music-detector weights (safetensors).
+    music_detect_model: ./models/music_detection.safetensors
+    # If P(music) > threshold, the audio file is deleted.
+    threshold: 0.6
+    # Optional: HF model id for WavLM backbone (default microsoft/wavlm-base-plus in code).
+    # base_model: microsoft/wavlm-base-plus
+    # Optional: directory for per-worker audio length cache (default ./cache).
+    # cache_path: ./cache
 
 transcription:
-  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located 
-  consensus_num: 3 # number of models to use for consensus transcription
+  podcasts_path: /home/nikita/balalaika/dataset
+  # If >0: before running model K, skip files where at least this many *earlier*
+  # models in model_names already wrote identical normalized transcripts (early exit).
+  consensus_num: 3
+  # Request word-level timestamps where the model supports it (.tst TSV sidecars).
   with_timestamps: True
-  use_tensorrt: True  # enable TensorRT execution provider (requires CUDA + TensorRT installed)
-  use_vad: False  # enable Silero VAD for long-form audio (>30s)
-  use_rover: True  # enable ROVER consensus aggregation (requires rover module)
-  # All models are loaded via onnx-asr from HuggingFace (or local path).
-  # Supported: giga_ctc, giga_rnnt, vosk, vosk_small, tone, parakeet_v2, parakeet_v3, canary, whisper_base, whisper_turbo
+  # TensorRT EP for onnx-asr ORT sessions (requires compatible CUDA/TensorRT).
+  use_tensorrt: True
+  # Chunk long audio with Silero VAD inside onnx-asr (e.g. >30s).
+  use_vad: False
+  # After all models, run ROVER to write {stem}_rover.txt.
+  use_rover: True
+  # Logical names → HF/onnx-asr models (see MODEL_MAP in transcription.py).
+  # Supported: giga_ctc, giga_rnnt, vosk, vosk_small, tone, parakeet_v2, parakeet_v3,
+  # canary, whisper_base, whisper_turbo, giga_ctc_lm, ...
   model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
-  batch_size: 16 # batch size for the model
-  
+  # Batch size passed to recognize() loops in onnx-asr.
+  batch_size: 16
+
 punctuation:
-  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located 
-  model_name: "RUPunct/RUPunct_big" # RUPunct model name 
-  num_workers: 1 # per one gpu
+  podcasts_path: /home/nikita/balalaika/dataset
+  # Hugging Face model id for RUPunct.
+  model_name: "RUPunct/RUPunct_big"
+  # Parallel worker count for punctuation jobs (see punctuation.py).
+  num_workers: 1
 
 accent:
-  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located 
-  num_workers: 1 # per one gpu
-  model_name: turbo3.1 # ruAccent model name 
-  use_tensorrt: True # enable TensorRT execution provider (requires CUDA + TensorRT installed)
-  
+  podcasts_path: /home/nikita/balalaika/dataset
+  num_workers: 1
+  # ruAccent package model tag (e.g. turbo3.1).
+  model_name: turbo3.1
+  # TensorRT EP for ruAccent ONNX path when supported.
+  use_tensorrt: False
+
 phonemizer:
-  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the text files are located
-  num_workers: 1 # per one gpu
+  podcasts_path: /home/nikita/balalaika/dataset
+  num_workers: 1
 
 export:
-  podcasts_path: /home/nikita/balalaika/balalaika_data_webdataset # full path to the folder where the chopped podcasts are located
+  podcasts_path: /home/nikita/balalaika/dataset
+  # Parallel processes writing WebDataset shards.
   num_workers: 1
-  max_shard_size: 536870912  # 512MB in bytes
+  # Approximate max uncompressed bytes per .tar shard before rolling to next file.
+  max_shard_size: 536870912
+  # Max samples per shard file.
   max_shard_count: 10000

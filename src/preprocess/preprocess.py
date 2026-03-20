@@ -27,24 +27,32 @@ CHUNK_DURATION_S = 15 * 60
 sortformer_model = None
 smart_vad = None
 
-def initializer_wrapper(config: Dict[str, Any], gpus_count: int):
-    worker_id = multiprocessing.current_process()._identity[0] - 1
-    gpu_id = worker_id % gpus_count if gpus_count > 0 else 0
-    init_models(gpu_id, config)
+def get_providers(cuda_id: int) -> list:
+    return [
+        ("CUDAExecutionProvider", {
+            "device_id": cuda_id,
+            "gpu_mem_limit": 2 * 1024 * 1024 * 1024,
+        }),
+        "CPUExecutionProvider"
+    ]
 
 def init_models(gpu_id: int, config: Dict[str, Any]):
     global sortformer_model, smart_vad
     device = f"cuda:{gpu_id}" 
-    providers = [("CUDAExecutionProvider", {"device_id": gpu_id}), "CPUExecutionProvider"]
+    providers = get_providers(gpu_id)
 
     try:
         from src.preprocess.sortformer_onnx import Sortformer, DiarizationConfig
     except ImportError:
-        logger.error("Sortformer model not found")
+        logger.error("Sortformer module or Sortformer class not found in src.preprocess.sortformer_onnx")
         raise
 
     model_config = DiarizationConfig()
-    sortformer_model = Sortformer(model_path=config.get('sortformer_model'), config=model_config, providers=providers)
+    sortformer_model = Sortformer(
+        model_path=config.get('sortformer_model'), 
+        config=model_config, 
+        providers=providers
+    )
 
     vad_args = config.get('vad_args', {})
     smart_vad = SmartVAD(
@@ -58,7 +66,8 @@ def init_models(gpu_id: int, config: Dict[str, Any]):
 def parse_diarization_output(raw_results) -> List[Tuple[float, float, int]]:
     segments = []
     if not raw_results or len(raw_results) == 0: return segments
-    for seg in (raw_results[0] if raw_results else []):
+    inner_results = raw_results[0] if isinstance(raw_results[0], list) else raw_results
+    for seg in inner_results:
         try:
             if isinstance(seg, str):
                 parts = seg.strip().split()
@@ -100,8 +109,14 @@ def filter_single_speaker_segments(segments: List[Tuple[float, float, int]], min
     filtered = []
     segments = sorted(segments, key=lambda x: x[0])
     for i, (start, end, spk) in enumerate(segments):
-        if not (min_duration <= end - start <= max_duration): continue
-        if not any(j != i and start < e2 and end > s2 for j, (s2, e2, _) in enumerate(segments)):
+        dur = end - start
+        if not (min_duration <= dur <= max_duration): continue
+        overlap = False
+        for j, (s2, e2, _) in enumerate(segments):
+            if i != j and start < e2 and end > s2:
+                overlap = True
+                break
+        if not overlap:
             filtered.append((start, end, spk))
     return filtered
 
@@ -112,14 +127,16 @@ def apply_eos_classification(audio: torch.Tensor, sr: int, segments: List[Tuple[
     audio_np = audio.squeeze(0).numpy() if audio.dim() > 1 else audio.numpy()
     classified = []
     for s, e, spk in segments:
-        pred = smart_vad.predict_endpoint(audio_np[int(s * sr):min(int(e * sr), len(audio_np))])['prediction']
+        segment_audio = audio_np[int(s * sr):min(int(e * sr), len(audio_np))]
+        if len(segment_audio) == 0: continue
+        pred = smart_vad.predict_endpoint(segment_audio)['prediction']
         classified.append((s, e, spk, pred))
 
     merged = []
     i = 0
     while i < len(classified):
         start, end, spk, pred = classified[i]
-        if pred == 1:
+        if pred == 1: # EOS detected
             merged.append((start, end, spk))
             i += 1
             continue
@@ -153,6 +170,9 @@ def get_chunk_metrics(c_start: float, c_end: float, raw_segments: List[Tuple[flo
             speakers_in_chunk.add(spk)
 
     intervals.sort(key=lambda x: x[0])
+    if not intervals:
+        return 100.0, round(chunk_dur, 2), 0
+
     merged_speech = []
     for interval in intervals:
         if not merged_speech:
@@ -168,14 +188,11 @@ def get_chunk_metrics(c_start: float, c_end: float, raw_segments: List[Tuple[flo
     silence_dur = max(0.0, chunk_dur - speech_dur)
     silence_pct = (silence_dur / chunk_dur) * 100
 
-    if not merged_speech:
-        max_gap = chunk_dur
-    else:
-        gaps = [merged_speech[0][0] - c_start]
-        for i in range(len(merged_speech) - 1):
-            gaps.append(merged_speech[i+1][0] - merged_speech[i][1])
-        gaps.append(c_end - merged_speech[-1][1])
-        max_gap = max(gaps)
+    gaps = [merged_speech[0][0] - c_start]
+    for i in range(len(merged_speech) - 1):
+        gaps.append(merged_speech[i+1][0] - merged_speech[i][1])
+    gaps.append(c_end - merged_speech[-1][1])
+    max_gap = max(gaps)
 
     return round(silence_pct, 2), round(max_gap, 2), len(speakers_in_chunk)
 
@@ -186,7 +203,7 @@ def cut_audio(audio: torch.Tensor, sr: int, final_segments: List[Tuple[float, fl
 
     for start, end, spk in final_segments:
         dur = end - start
-        if dur <= max_duration / 5: continue
+        if dur <= 0.5: continue
         
         s_sample, e_sample = int(start * sr), min(int(end * sr), audio.shape[-1])
         if e_sample <= s_sample: continue
@@ -214,7 +231,7 @@ def cut_audio(audio: torch.Tensor, sr: int, final_segments: List[Tuple[float, fl
 
 
 def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
-    duration = config.get('duration', 15)
+    limit_dur = config.get('duration', 15)
     chunk_duration = config.get('chunk_duration', CHUNK_DURATION_S)
 
     p_audio = Path(path_audio)
@@ -222,7 +239,7 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
     episode_folder = p_audio.parent / episode_id
 
     try:
-        audio, sr = torchaudio.load_with_torchcodec(path_audio)
+        audio, sr = torchaudio.load(path_audio)
     except Exception as e:
         logger.error(f"Broken file {path_audio}: {e}")
         return []
@@ -230,16 +247,15 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
     total_audio_duration = audio.shape[-1] / sr
 
     try:
-        if audio.shape[0] > 1: audio = torch.mean(audio, dim=0, keepdim=True)
+        if audio.shape[0] > 1: 
+            audio = torch.mean(audio, dim=0, keepdim=True)
 
         raw_segments = diarize_audio(audio, sr, chunk_duration)
         if not raw_segments: return []
 
-        if total_audio_duration <= duration:
+        if total_audio_duration <= limit_dur:
             sil_pct, max_sil, unique_spk = get_chunk_metrics(0.0, total_audio_duration, raw_segments)
             main_spk = raw_segments[0][2] if raw_segments else -1
-            
-            logger.success(f"Processed short file | Spk: {unique_spk} | Sil: {sil_pct}% -> {path_audio}")
             
             return [{
                 'filepath': os.path.abspath(path_audio),
@@ -254,17 +270,19 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
                 'is_single_speaker': unique_spk == 1
             }]
 
-        clean_segments = filter_single_speaker_segments(raw_segments, min_duration=1.0, max_duration=duration)
-        final_segments = apply_eos_classification(audio, sr, clean_segments, max_duration=duration)
+        clean_segments = filter_single_speaker_segments(raw_segments, min_duration=1.0, max_duration=limit_dur)
+        final_segments = apply_eos_classification(audio, sr, clean_segments, max_duration=limit_dur)
+        
         if not final_segments: return []
 
-        seg_results = cut_audio(audio, sr, final_segments, raw_segments, str(episode_folder), album_id, episode_id, max_duration=duration)
+        seg_results = cut_audio(audio, sr, final_segments, raw_segments, str(episode_folder), album_id, episode_id, max_duration=limit_dur)
 
-        logger.success(f"Processed {len(seg_results)} chunks from: {path_audio}")
-
-        if seg_results and p_audio.exists():
-            os.remove(p_audio)
-            logger.info(f"Original large file deleted: {path_audio}")
+        if seg_results:
+            logger.success(f"Processed {len(seg_results)} chunks from: {p_audio.name}")
+            if p_audio.exists():
+                os.remove(p_audio)
+        
+        return seg_results
 
     except Exception as e:
         logger.error(f"Processing error {path_audio}: {e}")
@@ -272,7 +290,6 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> List[Dict]:
     finally:
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    return seg_results
 
 def main(args):
     load_dotenv()
@@ -280,15 +297,13 @@ def main(args):
 
     config = load_config(args.config_path, 'preprocess')
     podcasts_path = Path(config.get('podcasts_path', '../../../podcasts'))
+    num_workers_per_gpu = config.get('num_workers', 1)
     
     num_gpus = torch.cuda.device_count()
-    workers_per_gpu = config.get('num_workers', 1)
-    total_workers = max(1, num_gpus * workers_per_gpu)
+    total_workers = max(1, num_gpus * num_workers_per_gpu)
 
     csv_path = podcasts_path / 'balalaika.csv'
-    existing_df = pd.DataFrame()
-    if csv_path.exists():
-        existing_df = pd.read_csv(csv_path)
+    existing_df = pd.read_csv(csv_path) if csv_path.exists() else pd.DataFrame()
 
     raw_audio_paths = get_audio_paths(str(podcasts_path))
     paths_to_process = []
@@ -297,46 +312,63 @@ def main(args):
 
     for p_str in raw_audio_paths:
         p = Path(p_str)
-        if chunk_pattern.match(p.name):
-            continue
+        if chunk_pattern.match(p.name): continue
         paths_to_process.append(p)
 
     if not paths_to_process:
         logger.info("No new files to process.")
         return
 
-    logger.info(f"Files to process: {len(paths_to_process)} / Total workers: {total_workers}")
+    logger.info(f"Files to process: {len(paths_to_process)} on {num_gpus} GPU(s)")
 
-    all_results: List[Dict] = []
-    with ProcessPoolExecutor(max_workers=total_workers, initializer=initializer_wrapper, initargs=(config, num_gpus)) as executor:
-        futures = [executor.submit(process_audio_file, str(p), config) for p in paths_to_process]
-        for future in tqdm(as_completed(futures), total=len(paths_to_process), desc="Processing"):
-            try:
-                if results := future.result(): all_results.extend(results)
-            except Exception as e:
-                logger.error(f"Task error: {e}")
+    all_results = []
+    files_per_gpu = [[] for _ in range(num_gpus)] if num_gpus > 0 else [paths_to_process]
+    
+    if num_gpus > 0:
+        for i, p in enumerate(paths_to_process):
+            files_per_gpu[i % num_gpus].append(p)
+
+    for gpu_id in range(max(1, num_gpus)):
+        gpu_files = files_per_gpu[gpu_id]
+        if not gpu_files: continue
+
+        logger.info(f"GPU:{gpu_id} processing {len(gpu_files)} files...")
+        
+        with ProcessPoolExecutor(
+            max_workers=num_workers_per_gpu, 
+            initializer=init_models, 
+            initargs=(gpu_id, config)
+        ) as executor:
+            futures = [executor.submit(process_audio_file, str(p), config) for p in gpu_files]
+            for future in tqdm(as_completed(futures), total=len(gpu_files), desc=f"GPU {gpu_id}"):
+                try:
+                    res = future.result()
+                    if res: all_results.extend(res)
+                except Exception as e:
+                    logger.error(f"Task error: {e}")
 
     if all_results:
         new_df = pd.DataFrame(all_results)
         
         if not existing_df.empty:
-            existing_df.set_index('filepath', inplace=True)
-            new_df.set_index('filepath', inplace=True)
-            df = existing_df.combine_first(new_df).reset_index()
+            df = pd.concat([existing_df, new_df], ignore_index=True).drop_duplicates(subset=['filepath'], keep='last')
         else:
             df = new_df
 
-        base_cols = ['filepath', 'speaker_id', 'start', 'end', 'total_duration', 
-                     'playlist_id', 'podcast_id', 'silence_percent', 'max_silence_duration', 
-                     'is_single_speaker', 'DistillMOS']
-        final_cols = [c for c in base_cols if c in df.columns] + [c for c in df.columns if c not in base_cols]
+        base_cols = [
+            'filepath', 'speaker_id', 'start', 'end', 'total_duration', 
+            'playlist_id', 'podcast_id', 'silence_percent', 
+            'max_silence_duration', 'is_single_speaker'
+        ]
         
-        df = df[final_cols]
+        cols = [c for c in base_cols if c in df.columns] + [c for c in df.columns if c not in base_cols]
+        df = df[cols]
+        
         df.to_csv(csv_path, index=False)
-        logger.success(f"Saved metadata for {len(all_results)} files to {csv_path}")
+        logger.success(f"Successfully processed {len(all_results)} samples. Metadata saved to {csv_path}")
 
 if __name__ == "__main__":
     multiprocessing.set_start_method('spawn', force=True)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_path", type=str, help="Path to YAML config file")
+    parser.add_argument("--config_path", type=str, required=True, help="Path to YAML config file")
     main(parser.parse_args())
