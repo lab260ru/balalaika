@@ -29,12 +29,15 @@ smart_vad = None
 
 def get_providers(cuda_id: int) -> list:
     return [
-        ("CUDAExecutionProvider", {
-            "device_id": cuda_id,
-            "gpu_mem_limit": 2 * 1024 * 1024 * 1024,
-        }),
-        "CPUExecutionProvider"
-    ]
+            ("TensorrtExecutionProvider", {
+                "device_id": cuda_id,
+                "trt_max_workspace_size": 4 * 1024**3,
+                "trt_fp16_enable": True,
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": f".cache/trt_cache_{cuda_id}",  
+            }),
+            ("CUDAExecutionProvider", {"device_id": cuda_id}),
+        ]
 
 def init_models(gpu_id: int, config: Dict[str, Any]):
     global sortformer_model, smart_vad

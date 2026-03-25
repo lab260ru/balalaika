@@ -48,7 +48,7 @@ for item in dataset:
 
 Keys mirror CSV columns and filenames `{stem}_{postfix}` → JSON key `postfix`.
 
-**From `balalaika.csv`:** e.g. `start`, `end`, `total_duration`, `speaker_id`, `playlist_id`, `podcast_id`, `silence_percent`, `max_silence_duration`, `DistillMOS`, and optionally `is_single_speaker`, etc.
+**From `balalaika.csv`:** e.g. `start`, `end`, `total_duration`, `speaker_id`, `playlist_id`, `podcast_id`, `silence_percent`, `max_silence_duration`, `crest_factor`, `music_prob`, `DistillMOS`, and optionally `is_single_speaker`, etc. Only files that passed all filters are in the dataset.
 
 **Text sidecars** (depend on `transcription.model_names` and which stages you ran):
 

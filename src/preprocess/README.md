@@ -5,7 +5,7 @@ Prepares long recordings for ASR/TTS: **Sortformer (ONNX)** diarization, **singl
 ### Stage order (`preprocess_yaml.sh`)
 
 1. **`src.preprocess.preprocess`** — Sortformer in windows up to `chunk_duration`, overlap filtering, Smart VAD, writes `{start}_{end}_{playlist}_{podcast}.mp3`, appends `balalaika.csv`; **deletes the original long file** after successful chunking.
-2. **`crest_factor_remover`** — removes files with excessive peak/RMS ratio.
+2. **`crest_factor_remover`** — computes crest factor (peak/RMS) for every chunk, writes it to `balalaika.csv` as `crest_factor`, then deletes files that exceed the threshold and removes their rows from the CSV.
 3. **`preprocess_audio`** — peak + target LUFS, overwrites audio.
 
 ### Parameters (`configs/config.yaml` → `preprocess`)
@@ -35,4 +35,9 @@ Filename times are seconds in the **source** episode.
 
 ## `balalaika.csv` columns after preprocess
 
-Includes `filepath`, `speaker_id`, `start`, `end`, `total_duration`, `playlist_id`, `podcast_id`, `silence_percent`, `max_silence_duration`, `is_single_speaker`. **DistillMOS** and later fields are added in **separation** / downstream stages.
+| Column | Added by |
+|--------|----------|
+| `filepath`, `speaker_id`, `start`, `end`, `total_duration`, `playlist_id`, `podcast_id`, `silence_percent`, `max_silence_duration`, `is_single_speaker` | `preprocess.py` |
+| `crest_factor` | `crest_factor_remover.py` (files above threshold are deleted and their rows removed) |
+
+`DistillMOS`, `music_prob`, and transcription fields are added in **separation** / downstream stages.

@@ -61,8 +61,8 @@ Per-module notes live under `src/*/README.md` (aligned with `configs/config.yaml
 ## Pipeline overview
 
 1. **Download** — optional episode fetch.
-2. **Preprocess** — crest-factor pruning, **Sortformer (ONNX)** diarization, single-speaker selection, **Smart Turn** boundary refinement, chunking + `balalaika.csv`; long source files are removed after successful chunking; **EBU R128-style** loudness normalization (see `preprocess_yaml.sh` order).
-3. **Separation** — **music detection** (WavLM-based weights in `music_detection.safetensors`), **DistillMOS** → column in `balalaika.csv`.
+2. **Preprocess** — **Sortformer (ONNX)** diarization, single-speaker selection, **Smart Turn** boundary refinement, chunking + `balalaika.csv`; long source files removed after chunking; **crest-factor** filtering (`crest_factor` written to CSV, bad files deleted and their CSV rows removed); **EBU R128-style** loudness normalization (see `preprocess_yaml.sh` order).
+3. **Separation** — **music detection** (WavLM-based): `music_prob` written to CSV, clips above threshold deleted and their CSV rows removed; **DistillMOS** → `DistillMOS` column in `balalaika.csv`.
 4. **Transcription** — **[onnx-asr](https://github.com/istupakov/onnx-asr)** (ONNX Runtime / optional TensorRT), **ROVER** consensus, optional word-level `.tst`.
 5. **Punctuation** — RUPunct.
 6. **Accents** — ruAccent (e.g. `turbo3.1`).

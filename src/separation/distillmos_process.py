@@ -124,26 +124,27 @@ def combine_results(final_output_path: Path, num_parts: int):
     logger.success(f"Combined successfully. Total rows: {len(main_df)}")
 
 def get_unprocessed_paths(podcasts_path: Path, result_csv_path: Path) -> List[str]:
-    """Finds all chunks that haven't been processed by DistillMOS yet."""
-    all_audio_paths = get_audio_paths(str(podcasts_path))
-    
-    chunk_pattern = re.compile(r'^\d+\.\d+_\d+\.\d+_')
-    all_chunks = [str(Path(p).resolve()) for p in all_audio_paths if chunk_pattern.match(Path(p).name)]
+    """Finds all audio files that haven't been processed by DistillMOS yet."""
+    all_audio_paths = [str(Path(p).resolve()) for p in get_audio_paths(str(podcasts_path))]
 
     if not result_csv_path.exists():
-        return all_chunks
+        return all_audio_paths
 
     try:
         df = pd.read_csv(result_csv_path)
         if 'DistillMOS' not in df.columns:
-            return all_chunks
-        
-        processed = set(df.dropna(subset=['DistillMOS'])['filepath'].astype(str).tolist())
-        
-        return [p for p in all_chunks if p not in processed]
+            return all_audio_paths
+
+        processed = set(
+            df.dropna(subset=['DistillMOS'])['filepath']
+            .apply(lambda p: str(Path(p).resolve()))
+            .tolist()
+        )
+
+        return [p for p in all_audio_paths if p not in processed]
     except Exception as e:
         logger.warning(f"Could not read CSV to filter paths: {e}. Processing all chunks.")
-        return all_chunks
+        return all_audio_paths
 
 def main():
     mp.set_start_method('spawn', force=True)

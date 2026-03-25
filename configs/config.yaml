@@ -44,7 +44,7 @@ cache_path: ./cache
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /home/nikita/balalaika/dataset
+  podcasts_path: /mnt/drive2_8tb/ruslan
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -54,12 +54,13 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /home/nikita/balalaika/dataset
+  podcasts_path: /mnt/drive2_8tb/ruslan
   # Maximum duration of each output segment in seconds.
   duration: 15
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
   num_workers: 1
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
+  # crest_factor is saved to balalaika.csv for all files; deleted files also have their CSV row removed.
   crest_treshold: 10
   # True peak ceiling in dBFS before/after loudness step (see preprocess_audio).
   peak: -1.0
@@ -81,7 +82,7 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /home/nikita/balalaika/dataset
+  podcasts_path: /mnt/drive2_8tb/ruslan
 
   music_detect:
     # Inference batch size for music classifier.
@@ -90,7 +91,8 @@ separation:
     num_workers: 1
     # Fine-tuned WavLM music-detector weights (safetensors).
     music_detect_model: ./models/music_detection.safetensors
-    # If P(music) > threshold, the audio file is deleted.
+    # If P(music) > threshold, the file is deleted and its CSV row removed.
+  # music_prob is saved to balalaika.csv for all processed files.
     threshold: 0.6
     # Optional: HF model id for WavLM backbone (default microsoft/wavlm-base-plus in code).
     # base_model: microsoft/wavlm-base-plus
@@ -98,7 +100,7 @@ separation:
     # cache_path: ./cache
 
 transcription:
-  podcasts_path: /home/nikita/balalaika/dataset
+  podcasts_path: /mnt/drive2_8tb/ruslan
   # If >0: before running model K, skip files where at least this many *earlier*
   # models in model_names already wrote identical normalized transcripts (early exit).
   consensus_num: 3
@@ -118,14 +120,14 @@ transcription:
   batch_size: 16
 
 punctuation:
-  podcasts_path: /home/nikita/balalaika/dataset
+  podcasts_path: /mnt/drive2_8tb/ruslan
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /home/nikita/balalaika/dataset
+  podcasts_path: /mnt/drive2_8tb/ruslan
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -133,11 +135,11 @@ accent:
   use_tensorrt: False
 
 phonemizer:
-  podcasts_path: /home/nikita/balalaika/dataset
+  podcasts_path: /mnt/drive2_8tb/ruslan
   num_workers: 1
 
 export:
-  podcasts_path: /home/nikita/balalaika/dataset
+  podcasts_path: /mnt/drive2_8tb/ruslan
   # Parallel processes writing WebDataset shards.
   num_workers: 1
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.
