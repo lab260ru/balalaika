@@ -129,7 +129,7 @@ separation:
   music_detect:
     # Inference batch size for music classifier.
     bs: 32
-    # DataLoader worker processes per GPU worker (see music_detect.py).
+    # DataLoader worker processes per GPU worker.
     num_workers: 1
     # Fine-tuned WavLM music-detector weights (safetensors).
     music_detect_model: ./models/music_detection.safetensors

@@ -5,16 +5,16 @@ import re
 from pathlib import Path
 import pickle
 
-import music_tag
-import requests
 from dotenv import load_dotenv
 from loguru import logger
-from yandex_music import Client
 
+from src.utils.logging_setup import setup_logging
 from src.utils.utils import load_config
 
 def init_client(client_key):
     try:
+        from yandex_music import Client
+
         client = Client(client_key).init()
         return client
     except Exception as e:
@@ -30,6 +30,9 @@ def extract_podcast_id(url):
 
 
 def download_episode(client, part, info_podcast, folder_podcast):
+    import music_tag
+    import requests
+
     track_info = client.tracks_download_info(
         track_id=part['id'], 
         get_direct_links=True
@@ -137,6 +140,7 @@ def download_podcast(client, url, podcasts_path, episodes_limit=None, num_worker
 
 
 def main(args):
+    setup_logging("download", log_dir=args.log_dir)
     load_dotenv()
     
     client_key = os.getenv("YANDEX_KEY")
@@ -196,6 +200,8 @@ if __name__ == "__main__":
         default="./configs/config.yaml",
         help="Path to the configuration file"
     )
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
+    parser.add_argument("--num_workers", type=int, default=None, help="Override download worker count")
 
     args = parser.parse_args()
     main(args)
