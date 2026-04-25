@@ -6,7 +6,8 @@ from typing import Dict, Optional
 import concurrent.futures
 from loguru import logger
 
-from src.utils.utils import load_config, read_file_content, get_audio_paths
+from src.utils.logging_setup import setup_logging
+from src.utils.utils import get_audio_paths, load_config, read_file_content
 
 def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Optional[str]]:
 
@@ -30,6 +31,7 @@ def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Option
 
 
 def main(args):
+    setup_logging("collate", log_dir=args.log_dir)
     config = load_config(args.config_path, 'download')
     base_path = Path(config.get('podcasts_path', '../../balalaika'))
     num_workers = config.get('num_workers', 32)
@@ -79,8 +81,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config_path",
         type=str,
-        help="Path to config file"
+        help="Path to config file",
     )
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
 
     args = parser.parse_args()
     main(args)

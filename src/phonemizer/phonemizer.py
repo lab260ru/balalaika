@@ -9,6 +9,7 @@ from loguru import logger
 from tryiparu import G2PModel
 from tqdm import tqdm
 
+from src.utils.logging_setup import setup_logging
 from src.utils.utils import get_txt_paths, load_config, read_file_content
 
 torch.backends.cuda.matmul.allow_tf32 = True 
@@ -52,6 +53,7 @@ def get_valid_text_paths(src_path: str) -> List[Path]:
     return valid_paths
 
 def main(args):
+    setup_logging("phonemizer", log_dir=args.log_dir)
     config = load_config(args.config_path, 'phonemizer')
     num_workers = config.get('num_workers', 4)
     src_path_str = config.get('podcasts_path', '../../../podcasts')
@@ -120,8 +122,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config_path",
         type=str,
-        help="Path to the configuration YAML file."
+        help="Path to the configuration YAML file.",
     )
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
 
     args = parser.parse_args()
     main(args)

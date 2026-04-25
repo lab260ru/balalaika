@@ -10,7 +10,9 @@ from loguru import logger
 from ruaccent import RUAccent
 from tqdm import tqdm
 
-from src.utils.utils import load_config, get_txt_paths, read_file_content
+from src.utils.logging_setup import setup_logging
+from src.utils.runtime_env import runtime_cfg
+from src.utils.utils import get_txt_paths, load_config, read_file_content
 
 torch.backends.cuda.matmul.allow_tf32 = True 
 torch.backends.cuda.enable_flash_sdp(True)
@@ -19,27 +21,28 @@ torch.backends.cuda.enable_math_sdp(False)
 
 accentizer = None
 
-def get_providers(cuda_id: int, use_tensorrt: bool = False) -> list:
+def get_providers(cuda_id: int, use_tensorrt: bool = False, config_path=None) -> list:
     if use_tensorrt:
-        cache_path = f".cache/trt_cache_{cuda_id}"
+        rt = runtime_cfg(config_path)
+        cache_path = os.path.join(str(rt["trt_cache_path"]), f"trt_cache_{cuda_id}")
         os.makedirs(cache_path, exist_ok=True)
         return [
             ("TensorrtExecutionProvider", {
                 "device_id": cuda_id,
-                "trt_max_workspace_size": 4 * 1024**3,
-                "trt_fp16_enable": True,
+                "trt_max_workspace_size": int(rt["trt_workspace_bytes"]),
+                "trt_fp16_enable": bool(rt["trt_fp16"]),
                 "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": cache_path,  
+                "trt_engine_cache_path": cache_path,
             }),
             ("CUDAExecutionProvider", {"device_id": cuda_id}),
         ]
     return [("CUDAExecutionProvider", {"device_id": cuda_id})]
 
 
-def init_process(model_name: str, cuda_id: int, use_tensorrt: bool) -> None:
+def init_process(model_name: str, cuda_id: int, use_tensorrt: bool, config_path=None) -> None:
     global accentizer
-    
-    providers = get_providers(cuda_id, use_tensorrt)
+
+    providers = get_providers(cuda_id, use_tensorrt, config_path)
     
     logger.info(f"Initializing worker on GPU:{cuda_id} (TRT={use_tensorrt})")
     
@@ -83,6 +86,7 @@ def get_valid_txt_paths(path: str) -> List[Path]:
     return valid_paths
 
 def main(args):
+    setup_logging("accents", log_dir=args.log_dir)
     config = load_config(args.config_path, 'accent')
     
     num_workers_per_gpu = config.get('num_workers', 1)
@@ -123,7 +127,7 @@ def main(args):
         executor = ProcessPoolExecutor(
             max_workers=num_workers_per_gpu,
             initializer=init_process,
-            initargs=(model_name, gpu_id, use_tensorrt)
+            initargs=(model_name, gpu_id, use_tensorrt, args.config_path),
         )
         executors.append(executor)
 
@@ -150,6 +154,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Multi-GPU Accent Restoration")
     parser.add_argument("--config_path", type=str, required=True, help="Path to YAML config")
-    
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
+
     args = parser.parse_args()
     main(args)

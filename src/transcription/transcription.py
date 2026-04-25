@@ -1,8 +1,9 @@
 import argparse
 import multiprocessing as mp
+from collections import Counter
 from pathlib import Path
 from typing import List, Optional
-from collections import Counter
+
 from loguru import logger
 from tqdm import tqdm
 
@@ -14,6 +15,10 @@ try:
 except ImportError:
     HAS_SOUNDFILE = False
 
+import os
+
+from src.utils.logging_setup import setup_logging
+from src.utils.runtime_env import runtime_cfg
 from src.utils.utils import get_audio_paths, load_config, read_file_content
 
 MODEL_MAP = {
@@ -53,15 +58,18 @@ def get_gpu_count() -> int:
     return 1
 
 
-def get_providers(cuda_id: int, use_tensorrt: bool = False) -> list:
+def get_providers(cuda_id: int, use_tensorrt: bool = False, config_path=None) -> list:
     if use_tensorrt:
+        rt = runtime_cfg(config_path)
+        cache_path = os.path.join(str(rt["trt_cache_path"]), f"trt_cache_{cuda_id}")
+        os.makedirs(cache_path, exist_ok=True)
         return [
             ("TensorrtExecutionProvider", {
                 "device_id": cuda_id,
-                "trt_max_workspace_size": 6 * 1024**3,
-                "trt_fp16_enable": True,
+                "trt_max_workspace_size": int(rt["trt_workspace_bytes"]),
+                "trt_fp16_enable": bool(rt["trt_fp16"]),
                 "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": f".cache/trt_cache_{cuda_id}",  
+                "trt_engine_cache_path": cache_path,
             }),
             ("CUDAExecutionProvider", {"device_id": cuda_id}),
         ]
@@ -148,12 +156,12 @@ def format_timestamps(result) -> str:
 
 
 def run_worker(cuda_id: int, world_size: int, model_name: str,
-               all_files: List[str], config: dict):
+               all_files: List[str], config: dict, config_path: Optional[str] = None):
     """Inference worker: loads onnx-asr model on a single GPU and processes its shard."""
     my_files = all_files[cuda_id::world_size]
     if not my_files:
         return
-    
+
     batch_size = config.get('batch_size', 16)
     use_trt = config.get('use_tensorrt', False)
     quantization = config.get('quantization')
@@ -167,7 +175,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
     logger.info(f"Worker {cuda_id}/{world_size}: {onnx_name} on cuda:{cuda_id}, {len(my_files)} files, batch={batch_size}")
 
     try:
-        providers = get_providers(cuda_id, use_trt)
+        providers = get_providers(cuda_id, use_trt, config_path)
         load_args = [onnx_name] + ([local_path] if local_path else [])
         load_kwargs = {"providers": providers}
         if quantization:
@@ -253,6 +261,7 @@ def get_valid_paths(src_path: str, output_suffix: str,
 
 
 def main(args):
+    setup_logging("transcription", log_dir=args.log_dir)
     config = load_config(args.config_path, 'transcription')
     model_names = config.get('model_names', ['giga_rnnt'])
     src_path = config.get('podcasts_path', '.')
@@ -281,13 +290,13 @@ def main(args):
         logger.info(f"{len(paths)} files to process")
 
         if num_gpus == 1:
-            run_worker(0, 1, model_name, paths, config)
+            run_worker(0, 1, model_name, paths, config, args.config_path)
         else:
             procs = []
             for gid in range(num_gpus):
                 p = mp.Process(
                     target=run_worker,
-                    args=(gid, num_gpus, model_name, paths, config)
+                    args=(gid, num_gpus, model_name, paths, config, args.config_path),
                 )
                 p.start()
                 procs.append(p)
@@ -318,4 +327,5 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="ASR Transcription (onnx-asr)")
     parser.add_argument("--config_path", type=str, required=True)
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
     main(parser.parse_args())

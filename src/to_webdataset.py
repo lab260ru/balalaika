@@ -11,7 +11,8 @@ import webdataset as wds
 from tqdm import tqdm
 from loguru import logger
 
-from src.utils.utils import load_config, get_audio_paths
+from src.utils.logging_setup import setup_logging
+from src.utils.utils import get_audio_paths, load_config
 
 def load_metadata(csv_path: Path) -> Dict[str, dict]:
     """Загружает balalaika.csv и делает словарь с ключом по базовому имени файла."""
@@ -167,7 +168,9 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, required=True, help="Path to YAML config")
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
     args = parser.parse_args()
 
+    setup_logging("to_webdataset", log_dir=args.log_dir)
     config = load_config(args.config_path, process_name='export')
     main(config)

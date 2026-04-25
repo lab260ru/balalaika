@@ -1,15 +1,16 @@
 import argparse
 import os
-import re
+from pathlib import Path
+from typing import Dict, List
+
+import pandas as pd
 import torch
 import torch.multiprocessing as mp
-import pandas as pd
 import torchaudio
-from pathlib import Path
-from typing import List, Dict
 from loguru import logger
 from tqdm import tqdm
 
+from src.utils.logging_setup import setup_logging
 from src.utils.utils import get_audio_paths, load_config
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -46,7 +47,7 @@ def run_inference_worker(rank: int, world_size: int, file_paths: List[str], conf
         return
 
     results_buffer = []
-    save_every = 500
+    save_every = int(config.get('distillmos', {}).get('save_every', 500))
 
     logger.info(f"[cuda:{rank}] Starting inference for {len(my_files)} files.")
 
@@ -150,9 +151,12 @@ def main():
     mp.set_start_method('spawn', force=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, required=True)
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
     args = parser.parse_args()
 
-    config = load_config(args.config_path, 'separation') 
+    setup_logging("distillmos", log_dir=args.log_dir)
+
+    config = load_config(args.config_path, 'separation')
     podcasts_path = Path(config.get('podcasts_path', '.'))
     final_output_path = podcasts_path / 'balalaika.csv'
 

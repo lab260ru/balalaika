@@ -10,7 +10,8 @@ from loguru import logger
 from tqdm import tqdm
 from transformers import pipeline, AutoTokenizer
 
-from src.utils.utils import load_config, get_audio_paths, process_token, read_file_content
+from src.utils.logging_setup import setup_logging
+from src.utils.utils import get_audio_paths, load_config, process_token, read_file_content
 
 torch.backends.cuda.matmul.allow_tf32 = True 
 torch.backends.cuda.enable_flash_sdp(True)
@@ -76,6 +77,7 @@ def get_valid_txt_paths(src_path: str) -> List[str]:
 
 
 def main(args):
+    setup_logging("punctuation", log_dir=args.log_dir)
     config = load_config(args.config_path, 'punctuation')
     num_workers_per_gpu = config.get('num_workers', 4)
     model_name = config.get('model_name', 'RUPunct/RUPunct_big')
@@ -144,8 +146,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config_path",
         type=str,
-        help="Path to the configuration file"
-        )
+        help="Path to the configuration file",
+    )
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
 
     args = parser.parse_args()
     main(args)
