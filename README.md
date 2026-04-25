@@ -61,13 +61,25 @@ Per-module notes live under `src/*/README.md` (aligned with `configs/config.yaml
 ## Pipeline overview
 
 1. **Download** — optional episode fetch.
-2. **Preprocess** — **Sortformer (ONNX)** diarization, single-speaker selection, **Smart Turn** boundary refinement, chunking + `balalaika.csv`; long source files removed after chunking; **crest-factor** filtering (`crest_factor` written to CSV, bad files deleted and their CSV rows removed); **EBU R128-style** loudness normalization (see `preprocess_yaml.sh` order).
+2. **Preprocess** — **Sortformer (ONNX)** diarization, single-speaker selection, **Smart Turn** boundary refinement, chunking + `balalaika.csv`; long source files removed after chunking; **crest-factor** filtering (`crest_factor` written to CSV, bad files deleted and their CSV rows removed); **EBU R128-style** loudness normalization (see `preprocess_yaml.sh` order). Chunks **preserve the source container** by default (FLAC stays FLAC) — see `preprocess.chunk_format`.
 3. **Separation** — **music detection** (WavLM-based): `music_prob` written to CSV, clips above threshold deleted and their CSV rows removed; **DistillMOS** → `DistillMOS` column in `balalaika.csv`.
 4. **Transcription** — **[onnx-asr](https://github.com/istupakov/onnx-asr)** (ONNX Runtime / optional TensorRT), **ROVER** consensus, optional word-level `.tst`.
 5. **Punctuation** — RUPunct.
 6. **Accents** — ruAccent (e.g. `turbo3.1`).
 7. **Phonemization** — **TryIParu** `G2PModel` → `*_rover_phonemes.txt`.
 8. **Collate / export** — `balalaika.parquet` and WebDataset shards via `src/collate_yamls.sh`.
+9. **Report** — `src/report.py` reads `filter_summary.csv` and writes `filter_report.md` with hours kept vs. removed at every filter stage.
+
+### Logging & audit
+
+- Every stage writes a rotating, timestamped log file under `BALALAIKA_LOG_DIR` (default `./logs`); each stage also accepts `--log_dir <path>` on the CLI.
+- Filter stages append a row to `<podcasts_path>/filter_summary.csv` (files in/out, hours in/out, params).
+- The final report stage renders `<podcasts_path>/filter_report.md` so you can see per-stage filtering at a glance.
+
+### Orchestration
+
+- `base.sh` is now a Kaldi/CosyVoice-style runner with `--stage` / `--stop_stage` flags (12 numbered stages). Run subsets like `bash base.sh --config_path configs/config.yaml --stage 6 --stop_stage 7`.
+- Runtime parameters (venv path, CPU affinity for `taskset`, log dir, TensorRT cache and workspace) live in the `runtime:` block of the YAML, not in shell scripts.
 
 ---
 
