@@ -64,7 +64,7 @@ runtime:
   # Python virtualenv that base.sh / *_yaml.sh activate.
   venv_path: .dev_venv
   # CPU range passed to `taskset -c` for CPU-bound stages. Empty to disable.
-  cpu_affinity: "0-24"
+  cpu_affinity: "0-32"
   # Default directory for per-stage rotating log files. CLIs accept --log_dir.
   log_dir: ./logs
   # Root for TensorRT engine cache. Each session appends /trt_cache_<gpu_id>.
@@ -76,7 +76,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /mnt/drive2_8tb/ruslan
+  podcasts_path: /mnt/ssd_1tb_2/youtube_data
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -86,7 +86,7 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /mnt/drive2_8tb/ruslan
+  podcasts_path: /mnt/ssd_1tb_2/youtube_data
   # Maximum duration of each output segment in seconds.
   duration: 15
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
@@ -112,23 +112,27 @@ preprocess:
   # Hard floor for a chunk to actually be written to disk (seconds). Below this
   # value the chunk is silently skipped (e.g. 100 ms artefacts from VAD).
   min_save_duration: 0.5
+  # Maximum silence gap allowed when merging same-speaker pieces before an EOS
+  # boundary is reached. Low EOU is buffered, but only chunks ending with good
+  # EOU are saved; overflow before the final good EOU is discarded.
+  max_merge_gap: 0.5
   # ONNX Sortformer weights for streaming diarization.
   sortformer_model: ./models/diar_streaming_sortformer_4spk-v2.1.onnx
   # Use TensorRT execution provider for Sortformer ONNX Runtime session (needs CUDA+TensorRT).
   use_tensorrt: True
   vad_args:
     # Smart Turn end-of-turn ONNX model path.
-    smart_vad_model: ./models/smart-turn-v3.0.onnx
+    smart_vad_model: ./models/smart-turn-v3.2-gpu.onnx
     # Smart Turn probability threshold for cutting/refining segment ends.
     smart_vad_threshold: 0.4
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/drive2_8tb/ruslan
+  podcasts_path: /mnt/ssd_1tb_2/youtube_data
 
   music_detect:
     # Inference batch size for music classifier.
-    bs: 32
+    bs: 16
     # DataLoader worker processes per GPU worker.
     num_workers: 1
     # Fine-tuned WavLM music-detector weights (safetensors).
@@ -146,7 +150,7 @@ separation:
     save_every: 500
 
 transcription:
-  podcasts_path: /mnt/drive2_8tb/ruslan
+  podcasts_path: /mnt/ssd_1tb_2/youtube_data
   # If >0: before running model K, skip files where at least this many *earlier*
   # models in model_names already wrote identical normalized transcripts (early exit).
   consensus_num: 3
@@ -166,14 +170,14 @@ transcription:
   batch_size: 16
 
 punctuation:
-  podcasts_path: /mnt/drive2_8tb/ruslan
+  podcasts_path: /mnt/ssd_1tb_2/youtube_data
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /mnt/drive2_8tb/ruslan
+  podcasts_path: /mnt/ssd_1tb_2/youtube_data
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -181,11 +185,11 @@ accent:
   use_tensorrt: False
 
 phonemizer:
-  podcasts_path: /mnt/drive2_8tb/ruslan
+  podcasts_path: /mnt/ssd_1tb_2/youtube_data
   num_workers: 1
 
 export:
-  podcasts_path: /mnt/drive2_8tb/ruslan
+  podcasts_path: /mnt/ssd_1tb_2/youtube_data
   # Parallel processes writing WebDataset shards.
   num_workers: 1
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.

@@ -18,7 +18,7 @@ import argparse
 import multiprocessing
 import os
 import re
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,7 +34,7 @@ from src.libs.smart_turn.offline_svad import SmartVAD
 from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.logging_setup import setup_logging
 from src.utils.runtime_env import runtime_cfg
-from src.utils.utils import get_audio_paths, load_config
+from src.utils.utils import get_audio_paths, load_config, load_audio
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cuda.enable_flash_sdp(True)
@@ -44,6 +44,7 @@ torch.backends.cuda.enable_math_sdp(False)
 DEFAULT_CHUNK_DURATION_S = 15 * 60
 DEFAULT_MIN_SEGMENT_DURATION_S = 1.0
 DEFAULT_MIN_SAVE_DURATION_S = 0.5
+DEFAULT_MAX_MERGE_GAP_S = 0.5
 
 LOSSLESS_EXTENSIONS = {".flac", ".wav"}
 SUPPORTED_CHUNK_EXTS = {"flac", "wav", "mp3", "ogg", "opus"}
@@ -147,25 +148,54 @@ def diarize_audio(audio: torch.Tensor, sr: int, chunk_duration: float = DEFAULT_
     return sorted(all_segments, key=lambda x: x[0])
 
 
-def filter_single_speaker_segments(
+def build_single_speaker_timeline(
     segments: List[Tuple[float, float, int]],
-    min_duration: float = DEFAULT_MIN_SEGMENT_DURATION_S,
     max_duration: float = 15.0,
 ) -> List[Tuple[float, float, int]]:
-    filtered = []
-    segments = sorted(segments, key=lambda x: x[0])
-    for i, (start, end, spk) in enumerate(segments):
-        dur = end - start
-        if not (min_duration <= dur <= max_duration):
-            continue
-        overlap = False
-        for j, (s2, e2, _) in enumerate(segments):
-            if i != j and start < e2 and end > s2:
-                overlap = True
-                break
-        if not overlap:
-            filtered.append((start, end, spk))
-    return filtered
+    """Build a non-overlapping speaker timeline without throwing away long turns.
+
+    Sortformer can emit overlaps and very long same-speaker turns. The old
+    path dropped those chunks before EOS refinement, which removed useful
+    speech. Here overlaps between different speakers are trimmed at the
+    midpoint, same-speaker overlaps are merged, and long turns are split into
+    saveable windows.
+    """
+    timeline: List[Tuple[float, float, int]] = []
+    valid_segments = sorted(
+        ((float(s), float(e), int(spk)) for s, e, spk in segments if e > s),
+        key=lambda x: (x[0], x[1]),
+    )
+
+    for start, end, spk in valid_segments:
+        if timeline:
+            prev_start, prev_end, prev_spk = timeline[-1]
+            if spk == prev_spk and start <= prev_end:
+                timeline[-1] = (prev_start, max(prev_end, end), prev_spk)
+                continue
+            if start < prev_end:
+                split_at = (start + prev_end) / 2.0
+                if split_at > prev_start:
+                    timeline[-1] = (prev_start, split_at, prev_spk)
+                else:
+                    timeline.pop()
+                start = split_at
+
+        if end > start:
+            timeline.append((start, end, spk))
+
+    if max_duration <= 0:
+        return timeline
+
+    split_timeline: List[Tuple[float, float, int]] = []
+    for start, end, spk in timeline:
+        cursor = start
+        while end - cursor > max_duration:
+            split_timeline.append((cursor, cursor + max_duration, spk))
+            cursor += max_duration
+        if end > cursor:
+            split_timeline.append((cursor, end, spk))
+
+    return split_timeline
 
 
 def apply_eos_classification(
@@ -174,9 +204,10 @@ def apply_eos_classification(
     segments: List[Tuple[float, float, int]],
     max_duration: float = 15.0,
     min_duration: float = DEFAULT_MIN_SEGMENT_DURATION_S,
+    max_merge_gap: float = DEFAULT_MAX_MERGE_GAP_S,
 ) -> List[Tuple[float, float, int]]:
     global smart_vad
-    if not smart_vad or not segments:
+    if not segments:
         return segments
 
     audio_np = audio.squeeze(0).numpy() if audio.dim() > 1 else audio.numpy()
@@ -185,31 +216,37 @@ def apply_eos_classification(
         segment_audio = audio_np[int(s * sr):min(int(e * sr), len(audio_np))]
         if len(segment_audio) == 0:
             continue
-        pred = smart_vad.predict_endpoint(segment_audio)['prediction']
+        pred = smart_vad.predict_endpoint(segment_audio)['prediction'] if smart_vad else 1
         classified.append((s, e, spk, pred))
 
-    merged = []
-    i = 0
-    while i < len(classified):
-        start, end, spk, pred = classified[i]
-        if pred == 1:  # EOS detected
-            merged.append((start, end, spk))
-            i += 1
-            continue
+    merged: List[Tuple[float, float, int]] = []
 
-        j = i + 1
-        while j < len(classified):
-            ns, ne, nspk, npred = classified[j]
-            if nspk != spk or ne - start > max_duration:
-                break
-            end = ne
-            j += 1
-            if npred == 1:
-                break
-
+    def save_eou_chunk(start: float, end: float, spk: int) -> None:
+        if end - start > max_duration:
+            start = end - max_duration
         if end - start >= min_duration:
             merged.append((start, end, spk))
-        i = max(j, i + 1)
+
+    cur_start: Optional[float] = None
+    cur_end: Optional[float] = None
+    cur_spk: Optional[int] = None
+
+    for start, end, spk, pred in classified:
+        if cur_start is None or cur_end is None or cur_spk is None:
+            cur_start, cur_end, cur_spk = start, end, spk
+        else:
+            gap = start - cur_end
+            can_merge = spk == cur_spk and gap <= max_merge_gap
+
+            if not can_merge:
+                cur_start, cur_end, cur_spk = start, end, spk
+            else:
+                cur_end = end
+
+        if pred == 1 and cur_start is not None and cur_end is not None and cur_spk is not None:
+            save_eou_chunk(cur_start, cur_end, cur_spk)
+            cur_start = cur_end = cur_spk = None
+
     return merged
 
 
@@ -352,6 +389,7 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> Dict[str, Any
     chunk_format_cfg = config.get('chunk_format', 'auto')
     min_segment_dur = float(config.get('min_segment_duration', DEFAULT_MIN_SEGMENT_DURATION_S))
     min_save_dur = float(config.get('min_save_duration', DEFAULT_MIN_SAVE_DURATION_S))
+    max_merge_gap = float(config.get('max_merge_gap', DEFAULT_MAX_MERGE_GAP_S))
 
     p_audio = Path(path_audio)
     album_id, episode_id = p_audio.parent.name, p_audio.stem
@@ -360,7 +398,7 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> Dict[str, Any
     chunk_fmt = resolve_chunk_format(p_audio, chunk_format_cfg)
 
     try:
-        audio, sr = torchaudio.load(path_audio)
+        audio, sr = load_audio(path_audio)
     except Exception as e:
         logger.error(f"Broken file {path_audio}: {e}")
         return {"segments": [], "source_duration_s": 0.0}
@@ -395,12 +433,12 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> Dict[str, Any
                 "source_duration_s": total_audio_duration,
             }
 
-        clean_segments = filter_single_speaker_segments(
-            raw_segments, min_duration=min_segment_dur, max_duration=limit_dur
+        clean_segments = build_single_speaker_timeline(
+            raw_segments, max_duration=limit_dur
         )
         final_segments = apply_eos_classification(
             audio, sr, clean_segments, max_duration=limit_dur,
-            min_duration=min_segment_dur,
+            min_duration=min_segment_dur, max_merge_gap=max_merge_gap,
         )
 
         if not final_segments:
@@ -436,13 +474,43 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> Dict[str, Any
             torch.cuda.empty_cache()
 
 
-def _measure_source_hours(paths: List[Path]) -> float:
-    """Pre-flight scan to estimate hours available before processing."""
-    total = 0.0
-    for p in paths:
-        total += safe_audio_duration(p)
-    return total / 3600.0
+def _measure_source_hours(paths: List[Path], max_workers: int = None) -> float:
+    """Pre-flight scan to estimate hours available before processing (multiprocessing)."""
+    if not paths:
+        return 0.0
 
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        total_seconds = sum(
+            tqdm(
+                executor.map(safe_audio_duration, paths),
+                total=len(paths),
+                desc="Scanning audio",
+                unit="file"
+            )
+        )
+
+    return total_seconds / 3600.0
+
+def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any], config_path: str, num_workers_per_gpu: int) -> List[Dict[str, Any]]:
+    results = []
+    logger.info(f"GPU:{gpu_id} processing {len(gpu_files)} files...")
+    
+    with ProcessPoolExecutor(
+        max_workers=num_workers_per_gpu,
+        initializer=init_models,
+        initargs=(gpu_id, config, config_path),
+    ) as executor:
+        futures = [executor.submit(process_audio_file, str(p), config) for p in gpu_files]
+        
+        for future in tqdm(as_completed(futures), total=len(gpu_files), desc=f"GPU {gpu_id}", position=gpu_id):
+            try:
+                res = future.result()
+                if res and res.get("segments"):
+                    results.extend(res["segments"])
+            except Exception as e:
+                logger.error(f"Task error on GPU {gpu_id}: {e}")
+                
+    return results
 
 def main(args):
     setup_logging("preprocess", log_dir=args.log_dir)
@@ -481,7 +549,8 @@ def main(args):
 
     logger.info(f"Files to process: {len(paths_to_process)} on {num_gpus} GPU(s)")
 
-    hours_in = _measure_source_hours(paths_to_process)
+    hours_in = _measure_source_hours(paths_to_process, max_workers=4)
+    # hours_in = 0.0
     logger.info(f"Source audio total: {hours_in:.2f}h across {len(paths_to_process)} files")
 
     all_results: List[Dict[str, Any]] = []
@@ -493,26 +562,29 @@ def main(args):
         for i, p in enumerate(paths_to_process):
             files_per_gpu[i % num_gpus].append(p)
 
-    for gpu_id in range(max(1, num_gpus)):
-        gpu_files = files_per_gpu[gpu_id]
-        if not gpu_files:
-            continue
+    with ThreadPoolExecutor(max_workers=max(1, num_gpus)) as thread_executor:
+        gpu_futures = []
+        for gpu_id in range(max(1, num_gpus)):
+            gpu_files = files_per_gpu[gpu_id]
+            if not gpu_files:
+                continue
+                
+            gpu_futures.append(
+                thread_executor.submit(
+                    process_gpu_batch,
+                    gpu_id,
+                    gpu_files,
+                    config,
+                    args.config_path,
+                    num_workers_per_gpu
+                )
+            )
 
-        logger.info(f"GPU:{gpu_id} processing {len(gpu_files)} files...")
-
-        with ProcessPoolExecutor(
-            max_workers=num_workers_per_gpu,
-            initializer=init_models,
-            initargs=(gpu_id, config, args.config_path),
-        ) as executor:
-            futures = [executor.submit(process_audio_file, str(p), config) for p in gpu_files]
-            for future in tqdm(as_completed(futures), total=len(gpu_files), desc=f"GPU {gpu_id}"):
-                try:
-                    res = future.result()
-                    if res and res.get("segments"):
-                        all_results.extend(res["segments"])
-                except Exception as e:
-                    logger.error(f"Task error: {e}")
+        for future in as_completed(gpu_futures):
+            try:
+                all_results.extend(future.result())
+            except Exception as e:
+                logger.error(f"Failed to aggregate results from a GPU batch: {e}")
 
     hours_out = sum(float(r.get('total_duration', 0.0)) for r in all_results) / 3600.0
 
@@ -557,6 +629,7 @@ def main(args):
             "min_save_duration": config.get(
                 "min_save_duration", DEFAULT_MIN_SAVE_DURATION_S
             ),
+            "max_merge_gap": config.get("max_merge_gap", DEFAULT_MAX_MERGE_GAP_S),
         },
     )
 

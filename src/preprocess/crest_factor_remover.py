@@ -25,7 +25,7 @@ from tqdm import tqdm
 
 from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.logging_setup import setup_logging
-from src.utils.utils import get_audio_paths, load_config
+from src.utils.utils import get_audio_paths, load_config, load_audio
 
 
 def calculate_crest_factor(audio: np.ndarray) -> float:
@@ -35,15 +35,6 @@ def calculate_crest_factor(audio: np.ndarray) -> float:
         return float('inf')
     return peak / rms
 
-
-def _load_audio_tensor(path_str: str):
-    """Decode audio falling back from torchcodec to torchaudio.load."""
-    if hasattr(torchaudio, "load_with_torchcodec"):
-        try:
-            return torchaudio.load_with_torchcodec(path_str)
-        except Exception:
-            pass
-    return torchaudio.load(path_str)
 
 
 def run_worker(
@@ -62,7 +53,7 @@ def run_worker(
 
     for path_str in tqdm(my_files, desc=f"Worker-{rank}", position=rank):
         try:
-            audio_tensor, sr = _load_audio_tensor(path_str)
+            audio_tensor, sr = load_audio(path_str)
             if audio_tensor.shape[0] > 1:
                 audio = audio_tensor.mean(dim=0).numpy()
             else:

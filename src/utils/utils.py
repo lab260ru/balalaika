@@ -1,8 +1,11 @@
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
+
+import torch
+
+import re
 import yaml
 from loguru import logger
-import re
 
 def load_config(config_path: str, process_name: str):
     config = {}
@@ -114,3 +117,23 @@ def normalize_text(text: str) -> str:
     text = re.sub(r'[^\w\s]', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text
+
+
+def load_audio(audio_path: str) -> Tuple[torch.Tensor, int]:
+    """Decode an audio file as ``(channels, samples)`` plus its sample rate.
+
+    Prefers ``torchaudio.load_with_torchcodec`` (the original code path) and
+    falls back to plain ``torchaudio.load`` when torchcodec isn't bundled.
+    """
+    try:
+        import torchaudio 
+    except ImportError:
+        logger.error("torchaudio is not installed")
+        return None, None
+        
+    if hasattr(torchaudio, "load_with_torchcodec"):
+        try:
+            return torchaudio.load_with_torchcodec(audio_path)
+        except Exception as exc:
+            logger.debug(f"torchcodec failed for {audio_path}: {exc}; falling back to torchaudio.load")
+    return torchaudio.load(audio_path)
