@@ -19,15 +19,12 @@ Resume behaviour:
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import List, Set
 
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
-import torchaudio
 from loguru import logger
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from src.utils.csv_manager import (
@@ -38,6 +35,7 @@ from src.utils.csv_manager import (
     resolve_path,
     unprocessed_paths,
 )
+from src.utils.datasets.separation import create_distillmos_dataloader
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.utils import load_config
@@ -45,52 +43,9 @@ from src.utils.utils import load_config
 apply_torch_perf_defaults(disable_math_sdp=False)
 
 
-TARGET_SAMPLE_RATE = 16_000
 PARTIAL_PREFIX = "distillmos"
 PARTIAL_FIELDS = ("filepath", "DistillMOS")
 COLUMN = "DistillMOS"
-
-
-class DistillMOSDataset(Dataset):
-    def __init__(self, file_paths: List[str]):
-        self.file_paths = file_paths
-
-    def __len__(self) -> int:
-        return len(self.file_paths)
-
-    def __getitem__(self, idx: int) -> Tuple[str, torch.Tensor]:
-        path_str = self.file_paths[idx]
-        x, sr = torchaudio.load_with_torchcodec(path_str)
-        if x.shape[0] > 1:
-            x = x[:1]
-        if sr != TARGET_SAMPLE_RATE:
-            x = torchaudio.functional.resample(x, sr, TARGET_SAMPLE_RATE)
-        return path_str, x.squeeze(0).contiguous()
-
-
-def distillmos_collate(batch: List[Tuple[str, torch.Tensor]]) -> Tuple[List[str], torch.Tensor]:
-    paths, waves = zip(*batch)
-    padded = pad_sequence(waves, batch_first=True)
-    return list(paths), padded
-
-
-def estimate_audio_lengths(file_paths: List[str]) -> Dict[str, float]:
-    lengths = {}
-    for path_str in file_paths:
-        try:
-            info = torchaudio.info(path_str)
-            if info.sample_rate and info.num_frames:
-                lengths[path_str] = float(info.num_frames) / float(info.sample_rate)
-            else:
-                lengths[path_str] = 0.0
-        except Exception:
-            lengths[path_str] = 0.0
-    return lengths
-
-
-def sort_by_length(file_paths: List[str]) -> List[str]:
-    lengths = estimate_audio_lengths(file_paths)
-    return sorted(file_paths, key=lambda p: lengths.get(p, 0.0))
 
 
 def run_inference_worker(
@@ -124,18 +79,12 @@ def run_inference_worker(
     logger.info(f"[cuda:{rank}] Starting inference for {len(my_files)} files.")
     started_at = time.perf_counter()
 
-    dataset = DistillMOSDataset(sort_by_length(my_files))
-    loader_kwargs = {
-        "batch_size": batch_size,
-        "shuffle": False,
-        "num_workers": num_loader_workers,
-        "pin_memory": True,
-        "collate_fn": distillmos_collate,
-        "persistent_workers": num_loader_workers > 0,
-    }
-    if num_loader_workers > 0:
-        loader_kwargs["prefetch_factor"] = prefetch_factor
-    dataloader = DataLoader(dataset, **loader_kwargs)
+    dataloader = create_distillmos_dataloader(
+        my_files,
+        batch_size=batch_size,
+        num_workers=num_loader_workers,
+        prefetch_factor=prefetch_factor,
+    )
 
     with PartialCsvWriter(
         podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
