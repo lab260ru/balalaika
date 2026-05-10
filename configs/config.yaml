@@ -91,8 +91,20 @@ preprocess:
   duration: 15
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
   num_workers: 1
+  # DataLoader batch size for Sortformer diarization source loading.
+  diarization_batch_size: 1
+  # DataLoader workers per GPU process for Sortformer diarization source loading.
+  diarization_loader_workers: 2
+  # Number of prefetched batches per diarization DataLoader worker.
+  diarization_prefetch_factor: 2
   # Worker processes per GPU for crest factor removal.
   num_workers_crest_factor: 8
+  # Crest-factor DataLoader batch size per worker.
+  crest_factor_batch_size: 256
+  # Crest-factor DataLoader workers inside each process.
+  crest_factor_loader_workers: 2
+  # Number of prefetched batches per crest-factor DataLoader worker.
+  crest_factor_prefetch_factor: 2
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
   # crest_factor is saved to balalaika.csv for all files; deleted files also have their CSV row removed.
   crest_treshold: 10
@@ -102,6 +114,14 @@ preprocess:
   loudness: -23.0
   # Block size in seconds for loudness measurement windows.
   block_size: 0.400
+  # Worker processes for loudness normalization.
+  loudness_num_workers: 16
+  # Loudness-normalization DataLoader batch size per process.
+  loudness_batch_size: 8
+  # Loudness-normalization DataLoader workers inside each process.
+  loudness_loader_workers: 2
+  # Number of prefetched batches per loudness-normalization DataLoader worker.
+  loudness_prefetch_factor: 2
   # Max audio length in seconds fed to Sortformer at once; longer files are windowed.
   chunk_duration: 900
   # Output container for chunked segments. 'auto' preserves the source extension
@@ -177,7 +197,7 @@ transcription:
   # canary, whisper_base, whisper_turbo, giga_ctc_lm, ...
   model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
   # DataLoader batch size passed directly to onnx-asr recognize_batch().
-  batch_size: 16
+  batch_size: 4
   # DataLoader workers per GPU worker for decoding/resampling audio.
   num_workers: 4
   # Number of prefetched batches per DataLoader worker.

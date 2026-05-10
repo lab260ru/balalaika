@@ -30,7 +30,6 @@ import os
 from pathlib import Path
 from typing import List, Set
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
@@ -47,20 +46,22 @@ from src.utils.csv_manager import (
     resolve_path,
     unprocessed_paths,
 )
+from src.utils.datasets.preprocess import create_crest_factor_dataloader
 from src.utils.logging_setup import setup_logging
-from src.utils.utils import load_config, load_audio
+from src.utils.utils import load_config
 
 PARTIAL_PREFIX = "crest"
 PARTIAL_FIELDS = ("filepath", "crest_factor", "duration_s", "deleted")
 COLUMN = "crest_factor"
 
 
-def calculate_crest_factor(audio: np.ndarray) -> float:
-    peak = np.max(np.abs(audio))
-    rms = np.sqrt(np.mean(audio ** 2))
-    if rms == 0:
-        return float("inf")
-    return peak / rms
+def calculate_crest_factors(waveforms: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    mask = torch.arange(waveforms.shape[1], device=waveforms.device)[None, :] < lengths[:, None]
+    masked = waveforms.masked_fill(~mask, 0.0)
+    peak = masked.abs().amax(dim=1)
+    power = masked.square().sum(dim=1) / lengths.clamp_min(1).to(dtype=waveforms.dtype)
+    rms = power.sqrt()
+    return torch.where(rms > 0, peak / rms, torch.full_like(rms, float("inf")))
 
 
 def run_worker(
@@ -69,12 +70,18 @@ def run_worker(
     all_file_paths: List[str],
     crest_threshold: float,
     output_dir: str,
+    batch_size: int,
+    loader_workers: int,
+    prefetch_factor: int,
 ):
     my_files = all_file_paths[rank::world_size]
     if not my_files:
         return
 
-    logger.info(f"Worker {rank}/{world_size} processing {len(my_files)} files")
+    logger.info(
+        f"Worker {rank}/{world_size} processing {len(my_files)} files "
+        f"(batch={batch_size}, loader_workers={loader_workers})"
+    )
 
     with PartialCsvWriter(output_dir, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS) as writer:
         already_done: Set[str] = writer.already_done()
@@ -83,43 +90,56 @@ def run_worker(
                 f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping."
             )
 
-        for path_str in tqdm(my_files, desc=f"Worker-{rank}", position=rank):
-            resolved = resolve_path(path_str)
-            if resolved in already_done:
-                continue
+        pending_files = [p for p in my_files if resolve_path(p) not in already_done]
+        dataloader = create_crest_factor_dataloader(
+            pending_files,
+            batch_size=batch_size,
+            num_workers=loader_workers,
+            prefetch_factor=prefetch_factor,
+        )
 
-            try:
-                audio_tensor, sr = load_audio(path_str)
-                if audio_tensor.shape[0] > 1:
-                    audio = audio_tensor.mean(dim=0).numpy()
+        for paths, waveforms, lengths, sample_rates, errors in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
+            valid_indices = []
+            for idx, (path_str, error) in enumerate(zip(paths, errors)):
+                if error:
+                    logger.error(f"Error loading {path_str}: {error}")
                 else:
-                    audio = audio_tensor.squeeze(0).numpy()
-                cf = calculate_crest_factor(audio)
-                duration_s = float(audio.shape[-1]) / float(sr) if sr else 0.0
-            except Exception as exc:
-                logger.error(f"Error processing {path_str}: {exc}")
+                    valid_indices.append(idx)
+            if not valid_indices:
                 continue
-            finally:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
-            deleted = False
-            if cf > crest_threshold:
-                try:
-                    os.remove(path_str)
-                    deleted = True
-                    logger.debug(f"Deleted {path_str} (crest_factor={cf:.2f})")
-                except OSError as exc:
-                    logger.error(f"Could not delete {path_str}: {exc}")
+            valid = torch.tensor(valid_indices, dtype=torch.long)
+            try:
+                batch_waveforms = waveforms.index_select(0, valid)
+                batch_lengths = lengths.index_select(0, valid)
+                batch_sample_rates = sample_rates.index_select(0, valid)
+                crest_factors = calculate_crest_factors(batch_waveforms, batch_lengths).tolist()
+                durations = (
+                    batch_lengths.to(torch.float64) / batch_sample_rates.clamp_min(1).to(torch.float64)
+                ).tolist()
+            except Exception as exc:
+                logger.error(f"Error processing batch on worker {rank}: {exc}")
+                continue
 
-            writer.write(
-                {
-                    "filepath": resolved,
-                    "crest_factor": round(cf, 4),
-                    "duration_s": round(duration_s, 4),
-                    "deleted": deleted,
-                }
-            )
+            valid_paths = [paths[i] for i in valid_indices]
+            for path_str, cf, duration_s in zip(valid_paths, crest_factors, durations):
+                deleted = False
+                if cf > crest_threshold:
+                    try:
+                        os.remove(path_str)
+                        deleted = True
+                        logger.debug(f"Deleted {path_str} (crest_factor={cf:.2f})")
+                    except OSError as exc:
+                        logger.error(f"Could not delete {path_str}: {exc}")
+
+                writer.write(
+                    {
+                        "filepath": resolve_path(path_str),
+                        "crest_factor": round(cf, 4),
+                        "duration_s": round(duration_s, 4),
+                        "deleted": deleted,
+                    }
+                )
 
     logger.info(f"Worker {rank} finished its shard.")
 
@@ -137,6 +157,9 @@ def main(args):
 
     crest_threshold = config.get("crest_treshold", 10.0)
     num_workers = config.get("num_workers_crest_factor", 4)
+    crest_batch_size = int(config.get("crest_factor_batch_size", 256))
+    crest_loader_workers = int(config.get("crest_factor_loader_workers", 2))
+    crest_prefetch_factor = int(config.get("crest_factor_prefetch_factor", 2))
 
     logger.info(
         f"Running crest factor removal: path={podcasts_path}, "
@@ -195,12 +218,29 @@ def main(args):
         if num_workers > 1:
             mp.spawn(
                 run_worker,
-                args=(num_workers, pending, crest_threshold, str(podcasts_path)),
+                args=(
+                    num_workers,
+                    pending,
+                    crest_threshold,
+                    str(podcasts_path),
+                    crest_batch_size,
+                    crest_loader_workers,
+                    crest_prefetch_factor,
+                ),
                 nprocs=num_workers,
                 join=True,
             )
         else:
-            run_worker(0, 1, pending, crest_threshold, str(podcasts_path))
+            run_worker(
+                0,
+                1,
+                pending,
+                crest_threshold,
+                str(podcasts_path),
+                crest_batch_size,
+                crest_loader_workers,
+                crest_prefetch_factor,
+            )
     except KeyboardInterrupt:
         logger.warning("Crest factor stage interrupted; merging whatever partials are on disk.")
 

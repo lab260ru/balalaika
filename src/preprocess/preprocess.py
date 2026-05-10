@@ -33,9 +33,10 @@ from tqdm import tqdm
 from src.libs.smart_turn.offline_svad import SmartVAD
 from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.csv_manager import upsert_columns
+from src.utils.datasets.preprocess import create_diarization_dataloader
 from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
-from src.utils.utils import get_audio_paths, load_config, load_audio
+from src.utils.utils import get_audio_paths, load_config
 
 apply_torch_perf_defaults()
 
@@ -368,7 +369,7 @@ def cut_audio(
     return results
 
 
-def process_audio_file(path_audio: str, config: Dict[str, Any]) -> Dict[str, Any]:
+def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Dict[str, Any]) -> Dict[str, Any]:
     """Process a single source recording.
 
     Returns a dict with ``segments`` (list of metadata dicts for each chunk
@@ -387,12 +388,6 @@ def process_audio_file(path_audio: str, config: Dict[str, Any]) -> Dict[str, Any
     episode_folder = p_audio.parent / episode_id
 
     chunk_fmt = resolve_chunk_format(p_audio, chunk_format_cfg)
-
-    try:
-        audio, sr = load_audio(path_audio)
-    except Exception as e:
-        logger.error(f"Broken file {path_audio}: {e}")
-        return {"segments": [], "source_duration_s": 0.0}
 
     total_audio_duration = audio.shape[-1] / sr
 
@@ -482,25 +477,51 @@ def _measure_source_hours(paths: List[Path], max_workers: int = None) -> float:
 
     return total_seconds / 3600.0
 
-def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any], config_path: str, num_workers_per_gpu: int) -> List[Dict[str, Any]]:
+def _run_diarization_shard(
+    gpu_id: int,
+    gpu_files: List[str],
+    config: Dict[str, Any],
+    num_loader_workers: int,
+) -> List[Dict[str, Any]]:
     results = []
-    logger.info(f"GPU:{gpu_id} processing {len(gpu_files)} files...")
-    
-    with ProcessPoolExecutor(
-        max_workers=num_workers_per_gpu,
-        initializer=init_models,
-        initargs=(gpu_id, config, config_path),
-    ) as executor:
-        futures = [executor.submit(process_audio_file, str(p), config) for p in gpu_files]
-        
-        for future in tqdm(as_completed(futures), total=len(gpu_files), desc=f"GPU {gpu_id}", position=gpu_id):
+    dataloader = create_diarization_dataloader(
+        gpu_files,
+        batch_size=int(config.get("diarization_batch_size", 1)),
+        num_workers=int(config.get("diarization_loader_workers", num_loader_workers)),
+        prefetch_factor=int(config.get("diarization_prefetch_factor", 2)),
+    )
+
+    for batch in tqdm(dataloader, total=len(dataloader), desc=f"GPU {gpu_id}", position=gpu_id):
+        for path_audio, audio, sr, error in batch:
+            if error:
+                logger.error(f"Broken file {path_audio}: {error}")
+                continue
             try:
-                res = future.result()
+                res = process_audio_file(str(path_audio), audio, sr, config)
                 if res and res.get("segments"):
                     results.extend(res["segments"])
             except Exception as e:
                 logger.error(f"Task error on GPU {gpu_id}: {e}")
-                
+
+    return results
+
+
+def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any], config_path: str, num_workers_per_gpu: int) -> List[Dict[str, Any]]:
+    logger.info(f"GPU:{gpu_id} processing {len(gpu_files)} files...")
+    with ProcessPoolExecutor(
+        max_workers=1,
+        initializer=init_models,
+        initargs=(gpu_id, config, config_path),
+    ) as executor:
+        future = executor.submit(
+            _run_diarization_shard,
+            gpu_id,
+            [str(p) for p in gpu_files],
+            config,
+            num_workers_per_gpu,
+        )
+        results = future.result()
+
     return results
 
 def main(args):

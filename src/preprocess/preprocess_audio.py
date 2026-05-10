@@ -1,16 +1,11 @@
-"""ITU-R BS.1770-4 loudness normalization that **preserves the source format**.
+"""ITU-R BS.1770-4 loudness normalization.
 
 The original implementation re-encoded everything through ``torchaudio.save``,
 which silently degraded MP3 files and made the FLAC → ``.mp3`` mismatch
 operators reported. This rewrite:
 
-* Reads samples through ``torchaudio.load_with_torchcodec`` (or torchaudio as a
-  fallback) so we don't drop torchcodec's sample-perfect decoding.
-* Uses ``soundfile`` to write **lossless containers (FLAC/WAV)** at native
-  precision (PCM_16/24 floats become FLAC PCM_24 / WAV FLOAT) which is
-  bit-equivalent within the encoder's quantization budget.
-* Falls back to ``torchaudio.save`` for lossy containers (MP3/OGG/OPUS) so we
-  don't break inputs that aren't covered by libsndfile.
+* Reads samples through a torch DataLoader backed by ``torchaudio``.
+* Writes samples back with ``torchaudio.save``.
 * Sets up a per-stage log file via :func:`setup_logging`.
 
 CSV resilience:
@@ -33,7 +28,6 @@ from typing import List, Set
 import numpy as np
 import pandas as pd
 import pyloudnorm as pyln
-import soundfile as sf
 import torch
 import torch.multiprocessing as mp
 import torchaudio
@@ -48,21 +42,17 @@ from src.utils.csv_manager import (
     resolve_path,
     unprocessed_paths,
 )
+from src.utils.datasets.preprocess import create_loudness_normalize_dataloader
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
-from src.utils.utils import load_config, load_audio
+from src.utils.utils import load_config
 
 apply_torch_perf_defaults()
 
 
-LOSSLESS_EXTS = {".flac", ".wav"}
 NORMALIZED_COLUMN = "loudness_normalized"
 PARTIAL_PREFIX = "loudness"
 PARTIAL_FIELDS = ("filepath", NORMALIZED_COLUMN)
-SOUNDFILE_FORMAT = {
-    ".flac": ("FLAC", "PCM_24"),
-    ".wav": ("WAV", "FLOAT"),
-}
 
 
 def normalize_audio_loudness(
@@ -80,40 +70,21 @@ def normalize_audio_loudness(
 
 
 def _write_audio(audio_path: str, samples: np.ndarray, sample_rate: int) -> None:
-    """Write back samples preserving the original format losslessly when we can.
-
-    ``samples`` is shaped ``(channels, frames)`` (torchaudio convention).
-    """
-    suffix = Path(audio_path).suffix.lower()
-    if samples.ndim == 1:
-        write_arr = samples
-    else:
-        write_arr = samples.T  # soundfile expects (frames, channels)
-
-    if suffix in SOUNDFILE_FORMAT:
-        fmt, subtype = SOUNDFILE_FORMAT[suffix]
-        sf.write(
-            audio_path,
-            write_arr.astype(np.float32, copy=False),
-            sample_rate,
-            format=fmt,
-            subtype=subtype,
-        )
-        return
-
+    """Write samples shaped ``(channels, frames)`` using torchaudio."""
     tensor = torch.from_numpy(samples if samples.ndim == 2 else samples[np.newaxis, :])
     torchaudio.save(audio_path, tensor, sample_rate)
 
 
 def process_audio_file(
     audio_path: str,
+    audio: torch.Tensor,
+    sample_rate: int,
     peak: float,
     loudness: float,
     block_size: float,
 ) -> bool:
     """Normalize loudness for a single file in-place."""
     try:
-        audio, sample_rate = load_audio(audio_path)
         audio_np = audio.numpy()
 
         if audio_np.shape[0] == 1:
@@ -136,9 +107,6 @@ def process_audio_file(
     except Exception as exc:
         logger.error(f"Error processing {audio_path}: {exc}")
         return False
-    finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 
 def run_worker(
@@ -149,6 +117,9 @@ def run_worker(
     loudness: float,
     block_size: float,
     output_dir: str,
+    batch_size: int,
+    loader_workers: int,
+    prefetch_factor: int,
 ):
     """Worker that processes a sharded subset of files."""
     if not all_file_paths:
@@ -158,7 +129,10 @@ def run_worker(
     if not my_files:
         return
 
-    logger.info(f"Worker {rank}/{world_size} processing {len(my_files)} files")
+    logger.info(
+        f"Worker {rank}/{world_size} processing {len(my_files)} files "
+        f"(batch={batch_size}, loader_workers={loader_workers})"
+    )
 
     with PartialCsvWriter(output_dir, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS) as writer:
         already_done: Set[str] = writer.already_done()
@@ -167,13 +141,22 @@ def run_worker(
                 f"Worker {rank}: {len(already_done)} files already in this partial; skipping."
             )
 
-        for file_path in tqdm(my_files, desc=f"Worker-{rank}", position=rank):
-            resolved = resolve_path(file_path)
-            if resolved in already_done:
-                continue
-            ok = process_audio_file(str(file_path), peak, loudness, block_size)
-            if ok:
-                writer.write({"filepath": resolved, NORMALIZED_COLUMN: True})
+        pending_files = [p for p in my_files if resolve_path(p) not in already_done]
+        dataloader = create_loudness_normalize_dataloader(
+            pending_files,
+            batch_size=batch_size,
+            num_workers=loader_workers,
+            prefetch_factor=prefetch_factor,
+        )
+
+        for batch in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
+            for file_path, audio, sample_rate, error in batch:
+                if error:
+                    logger.error(f"Error loading {file_path}: {error}")
+                    continue
+                ok = process_audio_file(str(file_path), audio, sample_rate, peak, loudness, block_size)
+                if ok:
+                    writer.write({"filepath": resolve_path(file_path), NORMALIZED_COLUMN: True})
 
 
 def main(args):
@@ -190,14 +173,16 @@ def main(args):
     peak = config.get("peak", -1.0)
     loudness = config.get("loudness", -23.0)
     block_size = config.get("block_size", 0.400)
-    num_workers = config.get("num_workers", 4)
-    num_workers = 16
+    num_workers = int(config.get("loudness_num_workers", config.get("num_workers", 4)))
+    loudness_batch_size = int(config.get("loudness_batch_size", 8))
+    loudness_loader_workers = int(config.get("loudness_loader_workers", 2))
+    loudness_prefetch_factor = int(config.get("loudness_prefetch_factor", 2))
 
     num_processes = num_workers
 
     logger.info(
         f"""
-        Running loudness normalization (format-preserving):
+        Running loudness normalization:
         Podcasts path: {podcasts_path}
         Peak normalization: {peak} dB
         Target loudness: {loudness} LUFS
@@ -244,12 +229,33 @@ def main(args):
         if num_processes > 1:
             mp.spawn(
                 run_worker,
-                args=(num_processes, paths_to_process, peak, loudness, block_size, str(podcasts_path)),
+                args=(
+                    num_processes,
+                    paths_to_process,
+                    peak,
+                    loudness,
+                    block_size,
+                    str(podcasts_path),
+                    loudness_batch_size,
+                    loudness_loader_workers,
+                    loudness_prefetch_factor,
+                ),
                 nprocs=num_processes,
                 join=True,
             )
         else:
-            run_worker(0, 1, paths_to_process, peak, loudness, block_size, str(podcasts_path))
+            run_worker(
+                0,
+                1,
+                paths_to_process,
+                peak,
+                loudness,
+                block_size,
+                str(podcasts_path),
+                loudness_batch_size,
+                loudness_loader_workers,
+                loudness_prefetch_factor,
+            )
     except KeyboardInterrupt:
         logger.warning("Loudness normalization interrupted; merging partials before exit.")
 
