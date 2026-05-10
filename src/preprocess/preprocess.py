@@ -72,6 +72,8 @@ def get_providers(cuda_id: int, config_path: Optional[str] = None) -> list:
 def init_models(gpu_id: int, config: Dict[str, Any], config_path: Optional[str] = None):
     global sortformer_model, smart_vad
     device = f"cuda:{gpu_id}"
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
     providers = get_providers(gpu_id, config_path)
 
     try:
@@ -85,6 +87,7 @@ def init_models(gpu_id: int, config: Dict[str, Any], config_path: Optional[str] 
         model_path=config.get('sortformer_model'),
         config=model_config,
         providers=providers,
+        device=device,
     )
 
     vad_args = config.get('vad_args', {})
@@ -133,8 +136,7 @@ def diarize_audio(audio: torch.Tensor, sr: int, chunk_duration: float = DEFAULT_
         end = min(offset + chunk_samples, total_samples)
         chunk = audio[:, offset:end]
 
-        audio_np = chunk.squeeze(0).numpy() if chunk.dim() > 1 else chunk.numpy()
-        raw = sortformer_model.diarize(audio=audio_np, sample_rate=sr, include_tensor_outputs=False)
+        raw = sortformer_model.diarize(audio=chunk, sample_rate=sr, include_tensor_outputs=False)
         segs = parse_diarization_output(raw)
 
         offset_sec = offset / sr
@@ -212,7 +214,11 @@ def apply_eos_classification(
         return segments
 
     vad_sr = int(getattr(smart_vad, "sample_rate", sr)) if smart_vad else sr
-    vad_audio = torchaudio.functional.resample(audio, sr, vad_sr) if sr != vad_sr else audio
+    if sr != vad_sr:
+        vad_device = getattr(smart_vad, "device", "cpu") if smart_vad else "cpu"
+        vad_audio = torchaudio.functional.resample(audio.to(vad_device), sr, vad_sr).cpu()
+    else:
+        vad_audio = audio
     audio_np = vad_audio.squeeze(0).numpy() if vad_audio.dim() > 1 else vad_audio.numpy()
     classified = []
     for s, e, spk in segments:

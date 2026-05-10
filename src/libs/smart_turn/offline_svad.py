@@ -25,6 +25,9 @@ class SmartVAD:
         self.smart_vad_model = smart_vad_model
         self.device = device
         self.device_id = int(device.split(':')[1]) if ':' in device else 0
+        self.torch_device = torch.device(
+            device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
+        )
 
         if not os.path.exists(self.smart_vad_model):
             self._load_from_hf()
@@ -48,6 +51,13 @@ class SmartVAD:
                 ),
                 "CPUExecutionProvider",
             ]
+        )
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        self._use_cuda_dlpack = (
+            self.torch_device.type == "cuda"
+            and "CUDAExecutionProvider" in self.session.get_providers()
+            and hasattr(ort.OrtValue, "from_dlpack")
         )
         logger.info('Smart VAD (EOS classifier) initialized.')
 
@@ -98,17 +108,46 @@ class SmartVAD:
             device=self.device,
         )
 
-        input_features = inputs.input_features.squeeze(0).numpy().astype(np.float32)
-        input_features = np.expand_dims(input_features, axis=0)
+        input_features = inputs.input_features.contiguous().to(
+            device=self.torch_device,
+            dtype=torch.float32,
+        )
 
-        outputs = self.session.run(None, {"input_features": input_features})
-        probability = outputs[0][0].item()
+        probability = self._run_session(input_features)
         prediction = 1 if probability > self.smart_vad_threshold else 0
 
         return {
             "prediction": prediction,
             "probability": round(probability, 4),
         }
+
+    def _run_session(self, input_features: torch.Tensor) -> float:
+        if self._use_cuda_dlpack:
+            try:
+                output = torch.empty(
+                    (input_features.shape[0], 1),
+                    device=self.torch_device,
+                    dtype=torch.float32,
+                )
+                io_binding = self.session.io_binding()
+                io_binding.bind_ortvalue_input(
+                    self.input_name,
+                    ort.OrtValue.from_dlpack(input_features),
+                )
+                io_binding.bind_ortvalue_output(
+                    self.output_name,
+                    ort.OrtValue.from_dlpack(output),
+                )
+                self.session.run_with_iobinding(io_binding)
+                torch.cuda.synchronize(self.torch_device)
+                return float(output[0, 0].item())
+            except Exception as exc:
+                logger.warning(f"Smart VAD DLPack IOBinding failed, falling back to session.run: {exc}")
+                self._use_cuda_dlpack = False
+
+        input_np = input_features.cpu().numpy()
+        outputs = self.session.run(None, {self.input_name: input_np})
+        return float(outputs[0][0].item())
 
     @staticmethod
     def _truncate_audio(audio_array: np.ndarray, n_seconds: int = 8, sample_rate: int = 16000) -> np.ndarray:

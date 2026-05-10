@@ -49,11 +49,18 @@ class DiarizationConfig:
 
 
 class Sortformer:
-    def __init__(self, model_path: str, config: DiarizationConfig = None, providers: List[str] = None):
+    def __init__(
+        self,
+        model_path: str,
+        config: DiarizationConfig = None,
+        providers: List[str] = None,
+        device: str = "cpu",
+    ):
         if config is None:
             self.config = DiarizationConfig()
         else:
             self.config = config
+        self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
 
         if not os.path.exists(model_path):
             model_path = huggingface_hub.hf_hub_download(repo_id="altunenes/parakeet-rs", filename="diar_streaming_sortformer_4spk-v2.1.onnx", local_dir="./models")
@@ -87,8 +94,8 @@ class Sortformer:
             n_stft=N_FFT // 2 + 1,
             norm="slaney",
             mel_scale="slaney",
-        )
-        self.window = torch.hann_window(WIN_LENGTH)
+        ).to(self.device)
+        self.window = torch.hann_window(WIN_LENGTH, device=self.device)
         
         self.reset_state()
 
@@ -100,8 +107,13 @@ class Sortformer:
         self.mean_sil_emb = np.zeros((1, EMB_DIM), dtype=np.float32)
         self.n_sil_frames = 0
 
-    def extract_mel_features(self, audio: np.ndarray) -> np.ndarray:
-        audio_tensor = torch.from_numpy(np.asarray(audio, dtype=np.float32))
+    def extract_mel_features(self, audio: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+        if isinstance(audio, torch.Tensor):
+            audio_tensor = audio.to(device=self.device, dtype=torch.float32)
+        else:
+            audio_tensor = torch.from_numpy(np.asarray(audio, dtype=np.float32)).to(self.device)
+        if audio_tensor.dim() > 1:
+            audio_tensor = audio_tensor.mean(dim=0)
         preemphasized = torch.empty_like(audio_tensor)
         preemphasized[0] = audio_tensor[0]
         preemphasized[1:] = audio_tensor[1:] - PREEMPH * audio_tensor[:-1]
@@ -118,22 +130,25 @@ class Sortformer:
         power_spec = spec.abs().pow(2)
         mel_spec = self.mel_scale(power_spec)
         log_mel_spec = torch.log(mel_spec + LOG_ZERO_GUARD)
-        return log_mel_spec.transpose(0, 1).unsqueeze(0).numpy().astype(np.float32)
+        return log_mel_spec.transpose(0, 1).unsqueeze(0).cpu().numpy().astype(np.float32)
 
-    def diarize(self, audio: np.ndarray, sample_rate: int = 16000, include_tensor_outputs: bool = False) -> Union[List[List[str]], Tuple[List[List[str]], np.ndarray]]:
+    def diarize(self, audio: Union[np.ndarray, torch.Tensor], sample_rate: int = 16000, include_tensor_outputs: bool = False) -> Union[List[List[str]], Tuple[List[List[str]], np.ndarray]]:
+        if isinstance(audio, torch.Tensor):
+            audio_tensor = audio.to(device=self.device, dtype=torch.float32)
+        else:
+            audio_tensor = torch.from_numpy(np.asarray(audio, dtype=np.float32)).to(self.device)
+        if audio_tensor.dim() > 1:
+            audio_tensor = audio_tensor.mean(dim=0)
         if sample_rate != SAMPLE_RATE:
-            audio = torchaudio.functional.resample(
-                torch.from_numpy(np.asarray(audio, dtype=np.float32)),
+            audio_tensor = torchaudio.functional.resample(
+                audio_tensor,
                 sample_rate,
                 SAMPLE_RATE,
-            ).numpy()
-            
-        if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=0)
+            )
 
         self.reset_state()
         
-        features = self.extract_mel_features(audio)
+        features = self.extract_mel_features(audio_tensor)
         full_preds = self._process_features(features)
         
         if self.config.median_window > 1:
@@ -142,7 +157,7 @@ class Sortformer:
         else:
             filtered_preds = full_preds
 
-        audio_duration_sec = len(audio) / SAMPLE_RATE
+        audio_duration_sec = audio_tensor.numel() / SAMPLE_RATE
         segments = self._binarize(filtered_preds, audio_duration_sec)
         
         formatted_result = [segments]
