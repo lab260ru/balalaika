@@ -32,6 +32,7 @@ from tqdm import tqdm
 
 from src.libs.smart_turn.offline_svad import SmartVAD
 from src.utils.audit import record_stage_summary, safe_audio_duration
+from src.utils.csv_manager import upsert_columns
 from src.utils.logging_setup import setup_logging
 from src.utils.runtime_env import runtime_cfg
 from src.utils.utils import get_audio_paths, load_config, load_audio
@@ -538,9 +539,6 @@ def main(args):
     total_workers = max(1, num_gpus * num_workers_per_gpu)
     logger.info(f"GPUs: {num_gpus}, workers/GPU: {num_workers_per_gpu}, total workers: {total_workers}")
 
-    csv_path = podcasts_path / 'balalaika.csv'
-    existing_df = pd.read_csv(csv_path) if csv_path.exists() else pd.DataFrame()
-
     raw_audio_paths = get_audio_paths(str(podcasts_path))
     paths_to_process: List[Path] = []
 
@@ -599,26 +597,15 @@ def main(args):
 
     if all_results:
         new_df = pd.DataFrame(all_results)
-
-        if not existing_df.empty:
-            df = pd.concat([existing_df, new_df], ignore_index=True).drop_duplicates(
-                subset=['filepath'], keep='last'
-            )
-        else:
-            df = new_df
-
-        base_cols = [
-            'filepath', 'speaker_id', 'start', 'end', 'total_duration',
-            'playlist_id', 'podcast_id', 'silence_percent',
-            'max_silence_duration', 'is_single_speaker',
-        ]
-
-        cols = [c for c in base_cols if c in df.columns] + [c for c in df.columns if c not in base_cols]
-        df = df[cols]
-
-        df.to_csv(csv_path, index=False)
+        chunk_value_columns = [c for c in new_df.columns if c != 'filepath']
+        df = upsert_columns(
+            podcasts_path,
+            new_df,
+            value_columns=chunk_value_columns,
+        )
         logger.success(
-            f"Successfully processed {len(all_results)} samples. Metadata saved to {csv_path}"
+            f"Successfully processed {len(all_results)} samples. "
+            f"Metadata atomically written to {podcasts_path / 'balalaika.csv'} ({len(df)} total rows)."
         )
 
     record_stage_summary(

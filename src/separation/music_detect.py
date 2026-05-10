@@ -3,14 +3,29 @@
 In addition to scoring each chunk and deleting clips above the threshold, the
 worker now records per-file durations into the partial CSV. That lets the
 rank-0 process emit a stage row in ``filter_summary.csv`` capturing the actual
-hours of audio dropped, even though the files themselves are gone. A per-stage
-log file is initialised at startup for offline debugging.
+hours of audio dropped, even though the files themselves are gone.
+
+CSV resilience:
+
+* The shared :mod:`src.utils.csv_manager` handles bootstrapping
+  ``balalaika.csv`` (creating it from the audio tree when absent) and atomic
+  rewrites.
+* Each worker streams rows to ``music_part_<rank>.csv`` via
+  :class:`PartialCsvWriter` (``flush()`` after every row), so a forced stop
+  preserves whatever rows were already produced.
+* On startup any leftover ``music_part_*.csv`` from a prior interrupted run
+  is absorbed into the main CSV before scheduling new work — re-running this
+  stage simply *resumes* scoring.
+* Files already scored (``music_prob`` populated in ``balalaika.csv``) are
+  skipped automatically.
+
+A per-stage log file is initialised at startup for offline debugging.
 """
 
 import argparse
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Set
 
 import pandas as pd
 import torch
@@ -25,11 +40,24 @@ from torch.utils.data import DataLoader
 from transformers import AutoFeatureExtractor
 
 from src.utils.audit import record_stage_summary, safe_audio_duration
+from src.utils.csv_manager import (
+    PartialCsvWriter,
+    absorb_partial_csvs,
+    discover_audio_paths,
+    ensure_main_csv,
+    resolve_path,
+    unprocessed_paths,
+)
 from src.utils.logging_setup import setup_logging
-from src.utils.utils import get_audio_paths, load_config
+from src.utils.utils import load_config
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cuda.enable_flash_sdp(True)
+
+
+PARTIAL_PREFIX = "music"
+PARTIAL_FIELDS = ("filepath", "music_prob", "duration_s", "deleted")
+COLUMN = "music_prob"
 
 
 def create_loader(paths: List[str], model_name: str, batch_size: int, num_workers: int, cache_file: Path):
@@ -64,11 +92,11 @@ def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
         return
 
     device = torch.device(f"cuda:{rank}")
-    cfg = config.get('music_detect', {})
-    podcasts_path = Path(config.get('podcasts_path', '.'))
+    cfg = config.get("music_detect", {})
+    podcasts_path = Path(config.get("podcasts_path", "."))
 
-    threshold = cfg.get('threshold', 0.5)
-    cache_dir = Path(cfg.get('cache_path', './cache')) / f'nisqa_temp_worker_{rank}'
+    threshold = cfg.get("threshold", 0.5)
+    cache_dir = Path(cfg.get("cache_path", "./cache")) / f"nisqa_temp_worker_{rank}"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"[{device}] Processing {len(my_paths)} files...")
@@ -76,57 +104,65 @@ def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
     try:
         dataloader, audio_lengths = create_loader(
             my_paths,
-            cfg.get('base_model', 'microsoft/wavlm-base-plus'),
-            cfg.get('bs', 32),
-            cfg.get('num_workers', 4),
-            cache_dir / 'audio_lengths.json',
+            cfg.get("base_model", "microsoft/wavlm-base-plus"),
+            cfg.get("bs", 32),
+            cfg.get("num_workers", 4),
+            cache_dir / "audio_lengths.json",
         )
 
         model = load_model(
-            cfg.get('music_detect_model'),
-            cfg.get('base_model', 'microsoft/wavlm-base-plus'),
+            cfg.get("music_detect_model"),
+            cfg.get("base_model", "microsoft/wavlm-base-plus"),
             device,
         )
 
         probs, paths = model.predict_proba(dataloader)
 
-        results = []
         deleted_count = 0
-        for path, prob in zip(paths, probs.detach().flatten()):
-            prob_val = round(float(prob), 6)
-            duration_s = float(audio_lengths.get(str(path), 0.0))
-            if duration_s <= 0:
-                duration_s = safe_audio_duration(path)
-            entry = {
-                'filepath': str(Path(path).resolve()),
-                'music_prob': prob_val,
-                'duration_s': round(duration_s, 4),
-                'deleted': False,
-            }
-            if prob_val > threshold:
-                try:
-                    os.remove(path)
-                    deleted_count += 1
-                    entry['deleted'] = True
-                except OSError as e:
-                    logger.warning(f"Could not delete {path}: {e}")
-            results.append(entry)
+        with PartialCsvWriter(
+            podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
+        ) as writer:
+            already_done: Set[str] = writer.already_done()
+            if already_done:
+                logger.info(
+                    f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping."
+                )
 
-        if results:
-            part_path = podcasts_path / f'music_part_{rank}.csv'
-            pd.DataFrame(results).to_csv(part_path, index=False)
+            for path, prob in zip(paths, probs.detach().flatten()):
+                resolved = resolve_path(path)
+                if resolved in already_done:
+                    continue
+
+                prob_val = round(float(prob), 6)
+                duration_s = float(audio_lengths.get(str(path), 0.0))
+                if duration_s <= 0:
+                    duration_s = safe_audio_duration(path)
+
+                deleted = False
+                if prob_val > threshold:
+                    try:
+                        os.remove(path)
+                        deleted_count += 1
+                        deleted = True
+                    except OSError as exc:
+                        logger.warning(f"Could not delete {path}: {exc}")
+
+                writer.write(
+                    {
+                        "filepath": resolved,
+                        "music_prob": prob_val,
+                        "duration_s": round(duration_s, 4),
+                        "deleted": deleted,
+                    }
+                )
 
         logger.success(f"[{device}] Done. Deleted {deleted_count}/{len(my_paths)} files.")
 
-    except Exception as e:
-        logger.exception(f"Worker {rank} error: {e}")
+    except Exception as exc:
+        logger.exception(f"Worker {rank} error: {exc}")
 
 
-def update_csv(podcasts_path: Path, n_gpus: int) -> dict:
-    csv_path = podcasts_path / 'balalaika.csv'
-    parts = [podcasts_path / f'music_part_{i}.csv' for i in range(n_gpus)]
-    existing_parts = [p for p in parts if p.exists()]
-
+def _audit_from_partials(partials_df: pd.DataFrame) -> dict:
     audit = {
         "files_in": 0,
         "files_out": 0,
@@ -134,67 +170,42 @@ def update_csv(podcasts_path: Path, n_gpus: int) -> dict:
         "hours_out": 0.0,
         "files_deleted": 0,
     }
-
-    if not existing_parts:
-        logger.warning("No music_part_*.csv files found; skipping CSV update.")
-        if csv_path.exists():
-            df = pd.read_csv(csv_path)
-            before = len(df)
-            df = df[df['filepath'].apply(lambda p: Path(p).exists())]
-            if before != len(df):
-                df.to_csv(csv_path, index=False)
-                logger.info(f"Removed {before - len(df)} missing rows from CSV.")
+    if partials_df is None or partials_df.empty:
         return audit
 
-    results_df = pd.concat([pd.read_csv(p) for p in existing_parts], ignore_index=True)
-    for p in existing_parts:
-        p.unlink()
+    audit["files_in"] = int(len(partials_df))
+    if "duration_s" in partials_df.columns:
+        audit["hours_in"] = float(partials_df["duration_s"].fillna(0.0).sum() / 3600.0)
+    if "deleted" in partials_df.columns:
+        deleted_mask = partials_df["deleted"].astype(str).str.lower().isin(
+            {"true", "1", "yes"}
+        ) | (partials_df["deleted"] == True)  # noqa: E712
+        audit["files_deleted"] = int(deleted_mask.sum())
+        survived = partials_df[~deleted_mask]
+    else:
+        survived = partials_df
 
-    audit["files_in"] = int(len(results_df))
-    if 'duration_s' in results_df.columns:
-        audit["hours_in"] = float(results_df['duration_s'].sum() / 3600.0)
-    audit["files_deleted"] = int(results_df['deleted'].sum()) if 'deleted' in results_df.columns else 0
-    survived = results_df[~results_df.get('deleted', pd.Series([False] * len(results_df)))]
     audit["files_out"] = int(len(survived))
-    if 'duration_s' in survived.columns:
-        audit["hours_out"] = float(survived['duration_s'].sum() / 3600.0)
-
-    if not csv_path.exists():
-        logger.warning(f"balalaika.csv not found at {csv_path}; skipping CSV update.")
-        return audit
-
-    df = pd.read_csv(csv_path)
-    df['filepath'] = df['filepath'].apply(lambda p: str(Path(p).resolve()))
-    results_df['filepath'] = results_df['filepath'].apply(lambda p: str(Path(p).resolve()))
-
-    if 'music_prob' in df.columns:
-        df = df.drop(columns=['music_prob'])
-    df = df.merge(results_df[['filepath', 'music_prob']], on='filepath', how='left')
-
-    before = len(df)
-    df = df[df['filepath'].apply(lambda p: Path(p).exists())]
-    removed = before - len(df)
-    logger.info(f"Music detection: removed {removed} rows from CSV (files deleted).")
-
-    df.to_csv(csv_path, index=False)
-    logger.success(f"CSV updated: {len(df)} rows remain.")
+    if "duration_s" in survived.columns:
+        audit["hours_out"] = float(survived["duration_s"].fillna(0.0).sum() / 3600.0)
     return audit
 
 
 def main(args):
     setup_logging("music_detect", log_dir=args.log_dir)
-    mp.set_start_method('spawn', force=True)
-    config = load_config(args.config_path, 'separation')
-    podcasts_path = config.get('podcasts_path')
+    mp.set_start_method("spawn", force=True)
+    config = load_config(args.config_path, "separation")
+    podcasts_path = config.get("podcasts_path")
 
     if not podcasts_path:
         logger.error("No podcasts_path in config")
         return
 
-    all_paths = list(get_audio_paths(podcasts_path))
+    podcasts_path = Path(podcasts_path)
+    audio_paths = discover_audio_paths(podcasts_path)
     n_gpus = torch.cuda.device_count()
 
-    if not all_paths:
+    if not audio_paths:
         logger.warning("No audio files found.")
         return
 
@@ -202,18 +213,75 @@ def main(args):
         logger.error("No GPU found.")
         return
 
-    mp.spawn(run_worker, args=(n_gpus, all_paths, config), nprocs=n_gpus, join=True)
-    audit = update_csv(Path(podcasts_path), n_gpus)
+    # 1) Make sure balalaika.csv exists; bootstrap from the audio tree if not.
+    ensure_main_csv(podcasts_path, audio_paths=audio_paths)
 
-    cfg = config.get('music_detect', {})
+    # 2) Absorb any leftover partials from a previous interrupted run into the
+    #    main CSV before scheduling new work, so resume is automatic.
+    leftover_partials, absorbed = absorb_partial_csvs(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        value_columns=[COLUMN],
+        drop_missing_files=True,
+        bootstrap_audio_paths=audio_paths,
+    )
+    if absorbed:
+        logger.info(
+            f"Absorbed {absorbed} rows from leftover {PARTIAL_PREFIX}_part_*.csv "
+            "into balalaika.csv before scheduling new work."
+        )
+
+    # 3) Determine work: any file without a music_prob value yet.
+    pending = unprocessed_paths(podcasts_path, COLUMN, audio_paths)
+    if not pending:
+        logger.success("All audio files already have a music_prob entry. Skipping computation.")
+        audit = _audit_from_partials(leftover_partials)
+        if audit["files_in"] == 0:
+            audit["files_in"] = len(audio_paths)
+            audit["files_out"] = len(audio_paths)
+        cfg = config.get("music_detect", {})
+        record_stage_summary(
+            podcasts_path=podcasts_path,
+            stage="music_detect",
+            files_in=audit["files_in"],
+            files_out=audit["files_out"],
+            hours_in=audit["hours_in"],
+            hours_out=audit["hours_out"],
+            params={"threshold": cfg.get("threshold", 0.5), "deleted": audit["files_deleted"]},
+        )
+        return
+
+    logger.info(f"{len(pending)} files still need a music_prob; starting workers on {n_gpus} GPUs.")
+
+    try:
+        mp.spawn(run_worker, args=(n_gpus, pending, config), nprocs=n_gpus, join=True)
+    except KeyboardInterrupt:
+        logger.warning("Music detection stage interrupted; merging partials before exit.")
+
+    # 4) Merge whatever the workers managed to produce.
+    new_partials, _ = absorb_partial_csvs(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        value_columns=[COLUMN],
+        drop_missing_files=True,
+    )
+
+    combined = pd.concat(
+        [df for df in (leftover_partials, new_partials) if df is not None and not df.empty],
+        ignore_index=True,
+    ) if (leftover_partials is not None or new_partials is not None) else pd.DataFrame()
+
+    audit = _audit_from_partials(combined)
+
+    cfg = config.get("music_detect", {})
     record_stage_summary(
-        podcasts_path=Path(podcasts_path),
+        podcasts_path=podcasts_path,
         stage="music_detect",
         files_in=audit["files_in"],
         files_out=audit["files_out"],
         hours_in=audit["hours_in"],
         hours_out=audit["hours_out"],
-        params={"threshold": cfg.get('threshold', 0.5), "deleted": audit["files_deleted"]},
+        params={"threshold": cfg.get("threshold", 0.5), "deleted": audit["files_deleted"]},
     )
 
 

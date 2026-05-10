@@ -91,6 +91,8 @@ preprocess:
   duration: 15
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
   num_workers: 1
+  # Worker processes per GPU for crest factor removal.
+  num_workers_crest_factor: 8
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
   # crest_factor is saved to balalaika.csv for all files; deleted files also have their CSV row removed.
   crest_treshold: 10
@@ -149,7 +151,13 @@ separation:
 
   distillmos:
     # Number of buffered rows before flushing per-worker partial CSV.
-    save_every: 500
+    save_every: 10000
+    # DistillMOS inference batch size per GPU worker.
+    batch_size: 16
+    # DataLoader workers per GPU worker for decoding/resampling audio.
+    num_workers: 4
+    # Number of prefetched batches per DataLoader worker.
+    prefetch_factor: 2
 
 transcription:
   podcasts_path: /mnt/ssd_1tb_2/youtube_data

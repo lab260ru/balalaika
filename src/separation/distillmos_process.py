@@ -1,40 +1,110 @@
+"""DistillMOS scoring of audio chunks with crash-safe CSV state.
+
+Each GPU worker runs DistillMOS over its shard, batching with a sample-length
+sorted dataloader for throughput. Results are streamed to a worker-local
+``distillmos_part_<rank>.csv`` via :class:`PartialCsvWriter` (``flush()``
+after every row), so a forced stop preserves whatever rows were already
+produced.
+
+Resume behaviour:
+
+* ``balalaika.csv`` is bootstrapped from the audio tree if it does not yet
+  exist (so this stage can be the *first* to write a CSV when running out of
+  order).
+* Any leftover ``distillmos_part_*.csv`` from a previously interrupted run is
+  absorbed into the main CSV before scheduling new work.
+* Files already scored (non-null ``DistillMOS`` in ``balalaika.csv``) are
+  skipped automatically.
+"""
 import argparse
-import os
+import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set, Tuple
 
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
 import torchaudio
 from loguru import logger
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from src.utils.csv_manager import (
+    PartialCsvWriter,
+    absorb_partial_csvs,
+    discover_audio_paths,
+    ensure_main_csv,
+    resolve_path,
+    unprocessed_paths,
+)
 from src.utils.logging_setup import setup_logging
-from src.utils.utils import get_audio_paths, load_config
+from src.utils.utils import load_config
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
-def save_chunk(results: List[Dict], output_path: Path):
-    """Saves a chunk of results to CSV, appending if exists."""
-    if not results:
-        return
-    df = pd.DataFrame(results)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    header = not output_path.exists()
-    df.to_csv(output_path, mode='a', header=header, index=False)
 
-def run_inference_worker(rank: int, world_size: int, file_paths: List[str], config: dict, final_output_path: Path):
-    """
-    Worker function running on a dedicated GPU for DistillMOS.
-    """
+TARGET_SAMPLE_RATE = 16_000
+PARTIAL_PREFIX = "distillmos"
+PARTIAL_FIELDS = ("filepath", "DistillMOS")
+COLUMN = "DistillMOS"
+
+
+class DistillMOSDataset(Dataset):
+    def __init__(self, file_paths: List[str]):
+        self.file_paths = file_paths
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+    def __getitem__(self, idx: int) -> Tuple[str, torch.Tensor]:
+        path_str = self.file_paths[idx]
+        x, sr = torchaudio.load_with_torchcodec(path_str)
+        if x.shape[0] > 1:
+            x = x[:1]
+        if sr != TARGET_SAMPLE_RATE:
+            x = torchaudio.functional.resample(x, sr, TARGET_SAMPLE_RATE)
+        return path_str, x.squeeze(0).contiguous()
+
+
+def distillmos_collate(batch: List[Tuple[str, torch.Tensor]]) -> Tuple[List[str], torch.Tensor]:
+    paths, waves = zip(*batch)
+    padded = pad_sequence(waves, batch_first=True)
+    return list(paths), padded
+
+
+def estimate_audio_lengths(file_paths: List[str]) -> Dict[str, float]:
+    lengths = {}
+    for path_str in file_paths:
+        try:
+            info = torchaudio.info(path_str)
+            if info.sample_rate and info.num_frames:
+                lengths[path_str] = float(info.num_frames) / float(info.sample_rate)
+            else:
+                lengths[path_str] = 0.0
+        except Exception:
+            lengths[path_str] = 0.0
+    return lengths
+
+
+def sort_by_length(file_paths: List[str]) -> List[str]:
+    lengths = estimate_audio_lengths(file_paths)
+    return sorted(file_paths, key=lambda p: lengths.get(p, 0.0))
+
+
+def run_inference_worker(
+    rank: int,
+    world_size: int,
+    file_paths: List[str],
+    config: dict,
+    podcasts_path: Path,
+):
     my_files = file_paths[rank::world_size]
     if not my_files:
         logger.info(f"Worker {rank}: No files to process.")
         return
 
     device = torch.device(f"cuda:{rank}")
-    worker_output_path = final_output_path.with_name(f"distillmos_part_{rank}.csv")
 
     logger.info(f"[cuda:{rank}] Loading DistillMOS model...")
     try:
@@ -42,132 +112,116 @@ def run_inference_worker(rank: int, world_size: int, file_paths: List[str], conf
         sqa_model = distillmos.ConvTransformerSQAModel()
         sqa_model.to(device)
         sqa_model.eval()
-    except Exception as e:
-        logger.error(f"Failed to load distillmos model on worker {rank}: {e}")
+    except Exception as exc:
+        logger.error(f"Failed to load distillmos model on worker {rank}: {exc}")
         return
 
-    results_buffer = []
-    save_every = int(config.get('distillmos', {}).get('save_every', 500))
+    batch_size = int(config.get("distillmos", {}).get("batch_size", 16))
+    num_loader_workers = int(config.get("distillmos", {}).get("num_workers", 2))
+    prefetch_factor = int(config.get("distillmos", {}).get("prefetch_factor", 2))
 
     logger.info(f"[cuda:{rank}] Starting inference for {len(my_files)} files.")
+    started_at = time.perf_counter()
 
-    for path_str in tqdm(my_files, desc=f"DistillMOS-{rank}", position=rank):
-        try:
-            x, sr = torchaudio.load(path_str)
+    dataset = DistillMOSDataset(sort_by_length(my_files))
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_loader_workers,
+        "pin_memory": True,
+        "collate_fn": distillmos_collate,
+        "persistent_workers": num_loader_workers > 0,
+    }
+    if num_loader_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    dataloader = DataLoader(dataset, **loader_kwargs)
 
-            if x.shape[0] > 1:
-                x = x[0, None, :]
-            
-            if sr != 16000:
-                resampler = torchaudio.transforms.Resample(sr, 16000).to(device)
-                x = resampler(x.to(device))
-            else:
-                x = x.to(device)
+    with PartialCsvWriter(
+        podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
+    ) as writer:
+        already_done: Set[str] = writer.already_done()
+        if already_done:
+            logger.info(
+                f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping."
+            )
 
-            with torch.no_grad():
-                mos = sqa_model(x)
-                mos_val = mos[0].item()
+        with torch.inference_mode():
+            for paths, batch in tqdm(dataloader, desc=f"DistillMOS-{rank}", position=rank):
+                try:
+                    batch = batch.to(device, non_blocking=True)
+                    mos = sqa_model(batch).detach().flatten().cpu()
+                    for path_str, mos_val in zip(paths, mos.tolist()):
+                        resolved = resolve_path(path_str)
+                        if resolved in already_done:
+                            continue
+                        writer.write(
+                            {
+                                "filepath": resolved,
+                                COLUMN: float(mos_val),
+                            }
+                        )
+                except Exception as exc:
+                    logger.warning(f"Error processing batch on worker {rank}: {exc}")
+                    continue
 
-            results_buffer.append({
-                'filepath': path_str,
-                'DistillMOS': mos_val
-            })
+    elapsed = time.perf_counter() - started_at
+    logger.success(
+        f"[cuda:{rank}] Finished {len(my_files)} files in {elapsed:.2f}s "
+        f"({len(my_files) / max(elapsed, 1e-6):.2f} files/s)."
+    )
 
-        except Exception as e:
-            logger.warning(f"Error processing {path_str}: {e}")
-            continue
-
-        if len(results_buffer) >= save_every:
-            save_chunk(results_buffer, worker_output_path)
-            results_buffer = []
-
-    save_chunk(results_buffer, worker_output_path)
-    logger.success(f"[cuda:{rank}] Finished.")
-
-def combine_results(final_output_path: Path, num_parts: int):
-    """Merges partial CSVs into the main balalaika.csv securely."""
-    logger.info("Combining DistillMOS results...")
-    dfs = []
-    for i in range(num_parts):
-        part_path = final_output_path.with_name(f"distillmos_part_{i}.csv")
-        if part_path.exists():
-            try:
-                dfs.append(pd.read_csv(part_path))
-                os.remove(part_path)
-            except Exception as e:
-                logger.error(f"Error reading {part_path}: {e}")
-
-    if not dfs:
-        logger.warning("No DistillMOS results found to merge.")
-        return
-
-    new_df = pd.concat(dfs, ignore_index=True)
-
-    if final_output_path.exists():
-        logger.info(f"Safely merging with existing CSV: {final_output_path}")
-        main_df = pd.read_csv(final_output_path)
-        
-        main_df.set_index('filepath', inplace=True)
-        new_df.set_index('filepath', inplace=True)
-        
-        main_df = main_df.combine_first(new_df).reset_index()
-    else:
-        main_df = new_df
-
-    if 'is_single_speaker' in main_df.columns:
-        main_df.drop(columns=['is_single_speaker'], inplace=True)
-
-    base_cols = ['filepath', 'speaker_id', 'start', 'end', 'total_duration', 
-                 'playlist_id', 'podcast_id', 'silence_percent', 'max_silence_duration', 'DistillMOS']
-    final_cols = [c for c in base_cols if c in main_df.columns] + [c for c in main_df.columns if c not in base_cols]
-    
-    main_df[final_cols].to_csv(final_output_path, index=False)
-    logger.success(f"Combined successfully. Total rows: {len(main_df)}")
-
-def get_unprocessed_paths(podcasts_path: Path, result_csv_path: Path) -> List[str]:
-    """Finds all audio files that haven't been processed by DistillMOS yet."""
-    all_audio_paths = [str(Path(p).resolve()) for p in get_audio_paths(str(podcasts_path))]
-
-    if not result_csv_path.exists():
-        return all_audio_paths
-
-    try:
-        df = pd.read_csv(result_csv_path)
-        if 'DistillMOS' not in df.columns:
-            return all_audio_paths
-
-        processed = set(
-            df.dropna(subset=['DistillMOS'])['filepath']
-            .apply(lambda p: str(Path(p).resolve()))
-            .tolist()
-        )
-
-        return [p for p in all_audio_paths if p not in processed]
-    except Exception as e:
-        logger.warning(f"Could not read CSV to filter paths: {e}. Processing all chunks.")
-        return all_audio_paths
 
 def main():
-    mp.set_start_method('spawn', force=True)
+    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, required=True)
     parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process only the first N unprocessed files",
+    )
     args = parser.parse_args()
 
     setup_logging("distillmos", log_dir=args.log_dir)
 
-    config = load_config(args.config_path, 'separation')
-    podcasts_path = Path(config.get('podcasts_path', '.'))
-    final_output_path = podcasts_path / 'balalaika.csv'
+    config = load_config(args.config_path, "separation")
+    podcasts_path = Path(config.get("podcasts_path", "."))
 
     available_gpus = torch.cuda.device_count()
     if available_gpus == 0:
         logger.error("No GPU detected.")
         return
-    
-    unprocessed = get_unprocessed_paths(podcasts_path, final_output_path)
+
+    audio_paths = discover_audio_paths(podcasts_path)
+    if not audio_paths:
+        logger.warning("No audio files found.")
+        return
+
+    # 1) Make sure balalaika.csv exists; bootstrap from the audio tree if not.
+    ensure_main_csv(podcasts_path, audio_paths=audio_paths)
+
+    # 2) Absorb leftover partials from a previous interrupted run.
+    _, absorbed = absorb_partial_csvs(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        value_columns=[COLUMN],
+        bootstrap_audio_paths=audio_paths,
+    )
+    if absorbed:
+        logger.info(
+            f"Absorbed {absorbed} rows from leftover {PARTIAL_PREFIX}_part_*.csv "
+            "into balalaika.csv before scheduling new work."
+        )
+
+    # 3) Determine work: any file without a DistillMOS score yet.
+    unprocessed = unprocessed_paths(podcasts_path, COLUMN, audio_paths)
+    if args.limit is not None:
+        unprocessed = unprocessed[: args.limit]
+
     if not unprocessed:
-        logger.success("All small audio files already have a DistillMOS score. Exiting.")
+        logger.success("All audio files already have a DistillMOS score. Exiting.")
         return
 
     logger.info(f"Processing {len(unprocessed)} files on {available_gpus} GPUs.")
@@ -175,14 +229,22 @@ def main():
     try:
         mp.spawn(
             run_inference_worker,
-            args=(available_gpus, unprocessed, config, final_output_path),
+            args=(available_gpus, unprocessed, config, podcasts_path),
             nprocs=available_gpus,
-            join=True
+            join=True,
         )
-    except Exception as e:
-        logger.critical(f"Multiprocessing failed: {e}")
-    
-    combine_results(final_output_path, available_gpus)
+    except KeyboardInterrupt:
+        logger.warning("DistillMOS stage interrupted; merging partials before exit.")
+    except Exception as exc:
+        logger.critical(f"Multiprocessing failed: {exc}")
+
+    # 4) Merge whatever the workers managed to produce (always; even on Ctrl+C).
+    absorb_partial_csvs(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        value_columns=[COLUMN],
+    )
+
 
 if __name__ == "__main__":
     main()
