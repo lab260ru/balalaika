@@ -5,15 +5,11 @@ from pathlib import Path
 from typing import List, Optional
 
 import onnx_asr
+import torch
 from loguru import logger
 from tqdm import tqdm
 
-try:
-    import soundfile as sf
-    HAS_SOUNDFILE = True
-except ImportError:
-    HAS_SOUNDFILE = False
-
+from src.utils.datasets.transcription import create_transcription_dataloader, recognize_batch
 from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_processes
@@ -34,27 +30,7 @@ MODEL_MAP = {
 }
 
 SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
-
-
-def get_gpu_count() -> int:
-    """ASR-flavoured GPU detection: requires onnxruntime CUDA EP + nvidia-smi."""
-    try:
-        import onnxruntime as ort
-        if 'CUDAExecutionProvider' not in ort.get_available_providers():
-            return 0
-    except ImportError:
-        return 0
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            return len([line for line in result.stdout.strip().split('\n') if line.strip()])
-    except Exception:
-        pass
-    return 1
+TARGET_SAMPLE_RATE = 16_000
 
 
 def save_results(paths: List[str], texts: List[str], timestamps: Optional[List[str]], model_suffix: str):
@@ -76,23 +52,6 @@ def save_results(paths: List[str], texts: List[str], timestamps: Optional[List[s
                     f.write(ts)
             except Exception as e:
                 logger.error(f"Write TST failed {path.name}: {e}")
-
-
-def load_batch(file_paths: List[str]):
-    """Read batch — pass WAV paths directly to onnx-asr; non-WAV read via soundfile."""
-    all_wav = all(Path(f).suffix.lower() == '.wav' for f in file_paths)
-    if all_wav or not HAS_SOUNDFILE:
-        return file_paths, None
-
-    waveforms, sr = [], None
-    for f in file_paths:
-        wf, file_sr = sf.read(f, dtype='float32')
-        if wf.ndim > 1:
-            wf = wf.mean(axis=1)
-        waveforms.append(wf)
-        sr = file_sr
-    return waveforms, sr
-
 
 def extract_text(result) -> str:
     """Extract plain text from onnx-asr result (str or TimestampedResult)."""
@@ -142,8 +101,11 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
     my_files = all_files[cuda_id::world_size]
     if not my_files:
         return
+    torch.cuda.set_device(cuda_id)
 
     batch_size = config.get('batch_size', 16)
+    num_loader_workers = int(config.get('num_workers', 4))
+    prefetch_factor = int(config.get('prefetch_factor', 2))
     use_trt = config.get('use_tensorrt', False)
     quantization = config.get('quantization')
 
@@ -172,21 +134,26 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
             vad = onnx_asr.load_vad("silero", **vad_params)
             model = model.with_vad(vad)
 
-        for i in tqdm(range(0, len(my_files), batch_size), desc=f"ASR-{cuda_id}", position=cuda_id):
-            batch = my_files[i:i + batch_size]
+        target_sample_rate = int(model.asr._get_sample_rate()) if hasattr(model, "asr") else TARGET_SAMPLE_RATE
+        dataloader = create_transcription_dataloader(
+            my_files,
+            sample_rate=target_sample_rate,
+            batch_size=batch_size,
+            num_workers=num_loader_workers,
+            prefetch_factor=prefetch_factor,
+        )
 
+        for paths, waveforms, lengths in tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id):
             try:
-                data, sr = load_batch(batch)
-                kw = {"sample_rate": sr} if sr else {}
-                results = model.recognize(data, **kw)
+                results = recognize_batch(model, waveforms, lengths)
             except Exception as e:
                 logger.error(f"Batch failed: {e}. Falling back to single-file mode.")
                 results = []
-                for f in batch:
+                for path_str, waveform, length in zip(paths, waveforms, lengths):
                     try:
-                        results.append(model.recognize(f))
+                        results.extend(recognize_batch(model, waveform[:length].unsqueeze(0).contiguous(), length.unsqueeze(0)))
                     except Exception as e2:
-                        logger.error(f"File failed {f}: {e2}")
+                        logger.error(f"File failed {path_str}: {e2}")
                         results.append("")
 
             if not isinstance(results, list):
@@ -195,7 +162,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
             texts = [extract_text(r) for r in results]
             ts = [format_timestamps(r) for r in results] if do_timestamps else None
 
-            save_results(batch, texts, ts, output_suffix)
+            save_results(paths, texts, ts, output_suffix)
 
     except Exception as e:
         logger.exception(f"Worker {cuda_id} fatal error ({model_name}): {e}")
@@ -248,10 +215,7 @@ def main(args):
     src_path = config.get('podcasts_path', '.')
     consensus_num = config.get('consensus_num', 0)
 
-    num_gpus = get_gpu_count()
-    if num_gpus == 0:
-        logger.error("No CUDA GPUs detected. GPU required for transcription.")
-        return
+    num_gpus = torch.cuda.device_count()
 
     logger.info(f"{num_gpus} GPU(s) detected. Starting transcription pipeline.")
     if consensus_num > 0:

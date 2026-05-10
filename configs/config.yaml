@@ -176,8 +176,12 @@ transcription:
   # Supported: giga_ctc, giga_rnnt, vosk, vosk_small, tone, parakeet_v2, parakeet_v3,
   # canary, whisper_base, whisper_turbo, giga_ctc_lm, ...
   model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
-  # Batch size passed to recognize() loops in onnx-asr.
+  # DataLoader batch size passed directly to onnx-asr recognize_batch().
   batch_size: 16
+  # DataLoader workers per GPU worker for decoding/resampling audio.
+  num_workers: 4
+  # Number of prefetched batches per DataLoader worker.
+  prefetch_factor: 2
 
 punctuation:
   podcasts_path: /mnt/ssd_1tb_2/youtube_data

@@ -27,11 +27,7 @@ def apply_torch_perf_defaults(*, disable_math_sdp: bool = True) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
-    if disable_math_sdp:
-        try:
-            torch.backends.cuda.enable_math_sdp(False)
-        except (RuntimeError, AttributeError):
-            pass
+    torch.backends.cuda.enable_math_sdp(False)
 
 
 def gpu_count() -> int:
