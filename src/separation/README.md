@@ -45,6 +45,23 @@ Documented under **`separation`** and **`separation.music_detect`** in
 |---------|-------|
 | `music_detect` | Files / hours kept vs. dropped at `music_detect.threshold`. |
 
+## Resume / interrupt safety
+
+Both sub-stages funnel CSV state through `src.utils.csv_manager`:
+
+* **Atomic writes** of `balalaika.csv` (tmp file + rename).
+* **Auto-bootstrap** of `balalaika.csv` from the audio tree if missing — so
+  this folder can run as the *first* CSV-touching stage if needed.
+* **Incremental partial CSVs.** Workers stream rows to
+  `music_part_<rank>.csv` and `distillmos_part_<rank>.csv` (one flush per
+  row), so a forced stop preserves whatever was already scored.
+* **Resume on next run.** At startup each sub-stage absorbs any leftover
+  partials into `balalaika.csv` and schedules only the files that are still
+  missing the relevant column (`music_prob` / `DistillMOS`). Files deleted
+  by `music_detect` are pruned from `balalaika.csv` during the merge.
+
+Re-running these scripts after a successful run is a no-op.
+
 ## Result
 
 - Music-heavy chunks removed; CSV rows for deleted files are also removed.

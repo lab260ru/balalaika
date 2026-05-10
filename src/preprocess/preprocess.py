@@ -33,14 +33,11 @@ from tqdm import tqdm
 from src.libs.smart_turn.offline_svad import SmartVAD
 from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.csv_manager import upsert_columns
+from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
-from src.utils.runtime_env import runtime_cfg
 from src.utils.utils import get_audio_paths, load_config, load_audio
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-torch.backends.cuda.enable_math_sdp(False)
+apply_torch_perf_defaults()
 
 DEFAULT_CHUNK_DURATION_S = 15 * 60
 DEFAULT_MIN_SEGMENT_DURATION_S = 1.0
@@ -54,28 +51,12 @@ sortformer_model = None
 smart_vad = None
 
 
-def get_providers(cuda_id: int, config_path: Optional[str] = None) -> list:
-    rt = runtime_cfg(config_path)
-    cache_root = Path(str(rt["trt_cache_path"])) / f"trt_cache_{cuda_id}"
-    cache_root.mkdir(parents=True, exist_ok=True)
-    return [
-        ("TensorrtExecutionProvider", {
-            "device_id": cuda_id,
-            "trt_max_workspace_size": int(rt["trt_workspace_bytes"]),
-            "trt_fp16_enable": bool(rt["trt_fp16"]),
-            "trt_engine_cache_enable": True,
-            "trt_engine_cache_path": str(cache_root),
-        }),
-        ("CUDAExecutionProvider", {"device_id": cuda_id}),
-    ]
-
-
 def init_models(gpu_id: int, config: Dict[str, Any], config_path: Optional[str] = None):
     global sortformer_model, smart_vad
     device = f"cuda:{gpu_id}"
     if torch.cuda.is_available():
         torch.cuda.set_device(gpu_id)
-    providers = get_providers(gpu_id, config_path)
+    providers = get_onnx_providers(gpu_id, use_tensorrt=True, config_path=config_path)
 
     try:
         from src.preprocess.sortformer_onnx import DiarizationConfig, Sortformer

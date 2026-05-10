@@ -1,123 +1,71 @@
+"""Stage 9 — TryIParu G2P phonemization on ``*_rover.txt`` sidecars."""
 import argparse
-from pathlib import Path
-from typing import Any, List
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+from pathlib import Path
 
-import torch
 from loguru import logger
 from tryiparu import G2PModel
-from tqdm import tqdm
 
+from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
-from src.utils.utils import get_txt_paths, load_config, read_file_content
+from src.utils.parallel import run_per_gpu_pool
+from src.utils.sidecars import pending_sidecar_chain
+from src.utils.utils import load_config, read_file_content
 
-torch.backends.cuda.matmul.allow_tf32 = True 
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-torch.backends.cuda.enable_math_sdp(False)
+apply_torch_perf_defaults()
+
+g2p_model = None
 
 
-g2p_model: Any = None
-
-def init_process(device_str: str):
+def init_process(device_str: str) -> None:
     global g2p_model
-    g2p_model = G2PModel(
-        load_dataset=True,
-        device=device_str
-    )
+    g2p_model = G2PModel(load_dataset=True, device=device_str)
 
-def process_text(text_path: Path):
+
+def process_text(text_path: Path) -> None:
+    text_path = Path(text_path)
     output_path = text_path.with_name(f"{text_path.stem}_phonemes.txt")
-    
     if output_path.exists():
         return
 
-    text = read_file_content(text_path)   
+    text = read_file_content(text_path)
     phonemes = g2p_model(text)
+    output_path.write_text(" ".join(phonemes), encoding="utf-8")
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(" ".join(phonemes))
-
-def get_valid_text_paths(src_path: str) -> List[Path]:
-    all_paths = get_txt_paths(src_path, '_rover.txt')
-    valid_paths = []
-    
-    for giga_path in all_paths:
-        giga_path = Path(giga_path)
-        phonemes_path = giga_path.with_name(f"{giga_path.stem}_phonemes.txt")
-        
-        if not phonemes_path.exists():
-            valid_paths.append(giga_path.absolute())
-
-    return valid_paths
 
 def main(args):
     setup_logging("phonemizer", log_dir=args.log_dir)
-    config = load_config(args.config_path, 'phonemizer')
-    num_workers = config.get('num_workers', 4)
-    src_path_str = config.get('podcasts_path', '../../../podcasts')
-    
-    all_text_paths = get_valid_text_paths(src_path_str)
-    logger.info(f"Found {len(all_text_paths)} text files to process")
-    
-    available_gpu_ids = list(range(torch.cuda.device_count()))
-    num_gpus = len(available_gpu_ids)
-    
-    if num_gpus == 0:
-        logger.error("No GPUs available. Exiting.")
-        return
-    
-    logger.info(
-        f"""
-        Starting phoneme conversion with parameters:
-        Source Path: {src_path_str}
-        Number of GPUs: {num_gpus} (IDs: {available_gpu_ids})
-        Workers per GPU: {num_workers}
-        Total Worker Processes: {num_gpus * num_workers}
-        """
-    )
-    
-    files_for_each_gpu = [[] for _ in range(num_gpus)]
-    for i, path in enumerate(all_text_paths):
-        gpu_assignment_index = i % num_gpus
-        files_for_each_gpu[gpu_assignment_index].append(path)
+    config = load_config(args.config_path, "phonemizer")
 
-    all_futures = []
-    executors = []
-    
-    for i, gpu_id in enumerate(available_gpu_ids):
-        device_str = f'cuda:{gpu_id}'
-        files_for_this_gpu = files_for_each_gpu[i]
-        
-        if not files_for_this_gpu:
-            continue
-            
-        logger.info(f"Creating ProcessPoolExecutor for {device_str} with {num_workers} workers for {len(files_for_this_gpu)} files.")
-        
-        executor = ProcessPoolExecutor(
-            max_workers=num_workers,
-            initializer=init_process,
-            initargs=(device_str,)
-        )
-        executors.append(executor)
-        
-        for path in files_for_this_gpu:
-            future = executor.submit(process_text, path)
-            all_futures.append(future)
-    
-    for future in tqdm(as_completed(all_futures), total=len(all_futures), desc="Overall Progress"):
-        try:
-            future.result()
-        except Exception as e:
-            logger.error(f"A task processing encountered an error: {e}")
-            break
+    num_workers_per_gpu = config.get("num_workers", 4)
+    src_path = config.get("podcasts_path", "../../../podcasts")
+
+    pending_files = pending_sidecar_chain(
+        src_path,
+        in_suffix="_rover.txt",
+        out_derive=lambda p: p.with_name(f"{p.stem}_phonemes.txt"),
+    )
+    if not pending_files:
+        logger.success("No pending _rover.txt files; phonemes already up to date.")
+        return
+
+    logger.info(f"Found {len(pending_files)} text files to process.")
+
+    run_per_gpu_pool(
+        pending_files,
+        work_fn=process_text,
+        initializer=init_process,
+        init_args_factory=lambda gpu_id: (f"cuda:{gpu_id}",),
+        num_workers_per_gpu=num_workers_per_gpu,
+        desc="Phonemizer",
+    )
+
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn")
-    
+
     parser = argparse.ArgumentParser(
-        description="Parallel Text-to-Phoneme Conversion with Multi-GPU Support"
+        description="Parallel text→phoneme conversion (multi-GPU)."
     )
     parser.add_argument(
         "--config_path",
@@ -125,6 +73,4 @@ if __name__ == "__main__":
         help="Path to the configuration YAML file.",
     )
     parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
-
-    args = parser.parse_args()
-    main(args)
+    main(parser.parse_args())

@@ -478,6 +478,54 @@ def partial_writer(
 
 
 # ---------------------------------------------------------------------------
+# Filter-stage audit summary
+# ---------------------------------------------------------------------------
+
+def audit_from_filter_partials(
+    partials_df: pd.DataFrame,
+    *,
+    deleted_column: str = "deleted",
+    duration_column: str = "duration_s",
+) -> Dict[str, float]:
+    """Compute a stage audit dict from concatenated filter partial CSVs.
+
+    Returns the keys consumed by :func:`src.utils.audit.record_stage_summary`
+    plus ``files_deleted``.
+    """
+    audit: Dict[str, float] = {
+        "files_in": 0,
+        "files_out": 0,
+        "hours_in": 0.0,
+        "hours_out": 0.0,
+        "files_deleted": 0,
+    }
+    if partials_df is None or partials_df.empty:
+        return audit
+
+    audit["files_in"] = int(len(partials_df))
+    if duration_column in partials_df.columns:
+        audit["hours_in"] = float(
+            partials_df[duration_column].fillna(0.0).sum() / 3600.0
+        )
+
+    if deleted_column in partials_df.columns:
+        deleted_mask = partials_df[deleted_column].astype(str).str.lower().isin(
+            {"true", "1", "yes"}
+        ) | (partials_df[deleted_column] == True)  # noqa: E712
+        audit["files_deleted"] = int(deleted_mask.sum())
+        survived = partials_df[~deleted_mask]
+    else:
+        survived = partials_df
+
+    audit["files_out"] = int(len(survived))
+    if duration_column in survived.columns:
+        audit["hours_out"] = float(
+            survived[duration_column].fillna(0.0).sum() / 3600.0
+        )
+    return audit
+
+
+# ---------------------------------------------------------------------------
 # Misc helpers
 # ---------------------------------------------------------------------------
 

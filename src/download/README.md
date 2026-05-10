@@ -24,3 +24,10 @@ See **`download`** in `configs/config.yaml` (`podcasts_path`, `episodes_limit`, 
 ```
 
 Next step: **preprocess** (Sortformer, Smart VAD, chunking).
+
+## Resume
+
+The downloader skips episodes whose target file already exists on disk, so a
+forced stop simply resumes on the next run. There is no CSV state at this
+stage; `balalaika.csv` is bootstrapped by **preprocess** (or any later
+CSV-touching stage) when needed.

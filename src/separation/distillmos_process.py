@@ -38,10 +38,11 @@ from src.utils.csv_manager import (
     resolve_path,
     unprocessed_paths,
 )
+from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.utils import load_config
 
-torch.backends.cuda.matmul.allow_tf32 = True
+apply_torch_perf_defaults(disable_math_sdp=False)
 
 
 TARGET_SAMPLE_RATE = 16_000

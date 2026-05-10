@@ -7,7 +7,8 @@ ASR via **[onnx-asr](https://github.com/istupakov/onnx-asr)** on **ONNX Runtime*
 - Run multiple models sequentially with **early skip** when `consensus_num` earlier models agree on normalized text.
 - **ROVER** → `{stem}_rover.txt` when `use_rover: True`.
 - **Word-level timestamps** → `{stem}_{model}.tst` (TSV) when `with_timestamps: True` and the model is in the supported set.
-- **Multi-GPU** via multiprocessing.
+- **Multi-GPU** via `src.utils.parallel.run_per_gpu_processes` (one process per GPU; the model is loaded once per process).
+- **TensorRT providers** built by `src.utils.gpu.get_onnx_providers`, sharing the engine cache root with every other ONNX-RT stage.
 
 ### Typical `model_names` (Russian)
 
@@ -37,6 +38,16 @@ For chunk `{stem}.mp3`:
 - `{stem}_{model}.txt` — hypothesis.
 - `{stem}_{model}.tst` — timestamps when enabled.
 - `{stem}_rover.txt` — ROVER consensus.
+
+## Resume / interrupt safety
+
+Transcription does **not** touch `balalaika.csv`; per-file results live in the
+`.txt` / `.tst` sidecars next to the audio:
+
+* The shared `pending_*` helpers in `src.utils.sidecars` skip any chunk that
+  already has a `{stem}_{model}.txt` (or matches the `consensus_num` early
+  skip rule) so a forced stop simply resumes on the next run.
+* `run_per_gpu_processes` cleanly terminates child processes on `Ctrl+C`.
 
 ## Dependencies
 

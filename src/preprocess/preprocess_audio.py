@@ -48,13 +48,11 @@ from src.utils.csv_manager import (
     resolve_path,
     unprocessed_paths,
 )
+from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.utils import load_config, load_audio
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-torch.backends.cuda.enable_math_sdp(False)
+apply_torch_perf_defaults()
 
 
 LOSSLESS_EXTS = {".flac", ".wav"}

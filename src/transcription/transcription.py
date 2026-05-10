@@ -4,10 +4,9 @@ from collections import Counter
 from pathlib import Path
 from typing import List, Optional
 
+import onnx_asr
 from loguru import logger
 from tqdm import tqdm
-
-import onnx_asr
 
 try:
     import soundfile as sf
@@ -15,10 +14,9 @@ try:
 except ImportError:
     HAS_SOUNDFILE = False
 
-import os
-
+from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
-from src.utils.runtime_env import runtime_cfg
+from src.utils.parallel import run_per_gpu_processes
 from src.utils.utils import get_audio_paths, load_config, read_file_content
 
 MODEL_MAP = {
@@ -39,6 +37,7 @@ SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parak
 
 
 def get_gpu_count() -> int:
+    """ASR-flavoured GPU detection: requires onnxruntime CUDA EP + nvidia-smi."""
     try:
         import onnxruntime as ort
         if 'CUDAExecutionProvider' not in ort.get_available_providers():
@@ -56,24 +55,6 @@ def get_gpu_count() -> int:
     except Exception:
         pass
     return 1
-
-
-def get_providers(cuda_id: int, use_tensorrt: bool = False, config_path=None) -> list:
-    if use_tensorrt:
-        rt = runtime_cfg(config_path)
-        cache_path = os.path.join(str(rt["trt_cache_path"]), f"trt_cache_{cuda_id}")
-        os.makedirs(cache_path, exist_ok=True)
-        return [
-            ("TensorrtExecutionProvider", {
-                "device_id": cuda_id,
-                "trt_max_workspace_size": int(rt["trt_workspace_bytes"]),
-                "trt_fp16_enable": bool(rt["trt_fp16"]),
-                "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": cache_path,
-            }),
-            ("CUDAExecutionProvider", {"device_id": cuda_id}),
-        ]
-    return [("CUDAExecutionProvider", {"device_id": cuda_id})]
 
 
 def save_results(paths: List[str], texts: List[str], timestamps: Optional[List[str]], model_suffix: str):
@@ -175,7 +156,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
     logger.info(f"Worker {cuda_id}/{world_size}: {onnx_name} on cuda:{cuda_id}, {len(my_files)} files, batch={batch_size}")
 
     try:
-        providers = get_providers(cuda_id, use_trt, config_path)
+        providers = get_onnx_providers(cuda_id, use_tensorrt=use_trt, config_path=config_path)
         load_args = [onnx_name] + ([local_path] if local_path else [])
         load_kwargs = {"providers": providers}
         if quantization:
@@ -289,24 +270,11 @@ def main(args):
 
         logger.info(f"{len(paths)} files to process")
 
-        if num_gpus == 1:
-            run_worker(0, 1, model_name, paths, config, args.config_path)
-        else:
-            procs = []
-            for gid in range(num_gpus):
-                p = mp.Process(
-                    target=run_worker,
-                    args=(gid, num_gpus, model_name, paths, config, args.config_path),
-                )
-                p.start()
-                procs.append(p)
-
-            for p in procs:
-                p.join()
-
-            failed = [p.exitcode for p in procs if p.exitcode != 0]
-            if failed:
-                logger.error(f"Workers failed with exit codes: {failed}")
+        run_per_gpu_processes(
+            run_worker,
+            num_gpus=num_gpus,
+            args=(model_name, paths, config, args.config_path),
+        )
 
     if config.get('use_rover', False):
         logger.info("ROVER aggregation...")

@@ -41,7 +41,7 @@ from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.csv_manager import (
     PartialCsvWriter,
     absorb_partial_csvs,
-    delete_partial_csvs,
+    audit_from_filter_partials,
     discover_audio_paths,
     ensure_main_csv,
     resolve_path,
@@ -124,35 +124,6 @@ def run_worker(
     logger.info(f"Worker {rank} finished its shard.")
 
 
-def _audit_from_partials(partials_df: pd.DataFrame) -> dict:
-    audit = {
-        "files_in": 0,
-        "files_out": 0,
-        "hours_in": 0.0,
-        "hours_out": 0.0,
-        "files_deleted": 0,
-    }
-    if partials_df is None or partials_df.empty:
-        return audit
-
-    audit["files_in"] = int(len(partials_df))
-    if "duration_s" in partials_df.columns:
-        audit["hours_in"] = float(partials_df["duration_s"].fillna(0.0).sum() / 3600.0)
-    if "deleted" in partials_df.columns:
-        deleted_mask = partials_df["deleted"].astype(str).str.lower().isin(
-            {"true", "1", "yes"}
-        ) | (partials_df["deleted"] == True)  # noqa: E712
-        audit["files_deleted"] = int(deleted_mask.sum())
-        survived = partials_df[~deleted_mask]
-    else:
-        survived = partials_df
-
-    audit["files_out"] = int(len(survived))
-    if "duration_s" in survived.columns:
-        audit["hours_out"] = float(survived["duration_s"].fillna(0.0).sum() / 3600.0)
-    return audit
-
-
 def main(args):
     setup_logging("crest_factor", log_dir=args.log_dir)
 
@@ -203,7 +174,7 @@ def main(args):
     if not pending:
         logger.success("All audio files already have a crest_factor entry. Skipping computation.")
         # Still emit an audit row reflecting the state of the dataset.
-        audit = _audit_from_partials(leftover_partials)
+        audit = audit_from_filter_partials(leftover_partials)
         if audit["files_in"] == 0:
             audit["files_in"] = len(audio_paths)
             audit["files_out"] = len(audio_paths)
@@ -247,7 +218,7 @@ def main(args):
         ignore_index=True,
     ) if (leftover_partials is not None or new_partials is not None) else pd.DataFrame()
 
-    audit = _audit_from_partials(combined)
+    audit = audit_from_filter_partials(combined)
 
     if audit["files_in"] == 0 and audio_paths:
         # Fallback: workers wrote nothing (e.g. all read failures).
