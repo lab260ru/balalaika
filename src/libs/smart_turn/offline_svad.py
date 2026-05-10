@@ -2,6 +2,8 @@ import os
 from loguru import logger
 import numpy as np
 import onnxruntime as ort
+import torch
+import torchaudio
 from transformers import WhisperFeatureExtractor
 from huggingface_hub import hf_hub_download
 
@@ -57,26 +59,43 @@ class SmartVAD:
             local_dir_use_symlinks=False
         )
 
-    def predict_endpoint(self, audio_array: np.ndarray) -> dict:
+    def predict_endpoint(self, audio_array: np.ndarray, sample_rate: int | None = None) -> dict:
         """
         Predict whether an audio segment is complete (turn ended) or incomplete.
 
         Args:
-            audio_array: Numpy array containing audio samples at 16kHz
+            audio_array: Numpy array containing audio samples.
+            sample_rate: Sampling rate of audio_array. Defaults to SmartVAD's
+                expected sample rate for backwards-compatible callers.
 
         Returns:
             Dictionary with 'prediction' (1=complete, 0=incomplete) and 'probability'
         """
-        audio_array = self._truncate_audio(audio_array, n_seconds=8)
+        source_rate = sample_rate or self.sample_rate
+        if source_rate != self.sample_rate:
+            audio_tensor = torch.from_numpy(
+                np.asarray(audio_array, dtype=np.float32)
+            )
+            audio_array = torchaudio.functional.resample(
+                audio_tensor,
+                source_rate,
+                self.sample_rate,
+            ).numpy()
+        audio_array = self._truncate_audio(
+            audio_array,
+            n_seconds=8,
+            sample_rate=self.sample_rate,
+        )
 
         inputs = self.feature_extractor(
             audio_array,
-            sampling_rate=16000,
+            sampling_rate=self.sample_rate,
             return_tensors="pt",
             padding="max_length",
-            max_length=8 * 16000,
+            max_length=8 * self.sample_rate,
             truncation=True,
-            do_normalize=True
+            do_normalize=True,
+            device=self.device,
         )
 
         input_features = inputs.input_features.squeeze(0).numpy().astype(np.float32)

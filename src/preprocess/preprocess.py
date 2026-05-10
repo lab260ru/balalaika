@@ -97,6 +97,7 @@ def init_models(gpu_id: int, config: Dict[str, Any], config_path: Optional[str] 
     smart_vad = SmartVAD(
         smart_vad_model=smart_vad_model,
         smart_vad_threshold=vad_args.get('smart_vad_threshold', 0.4),
+        resample_rate=int(vad_args.get('smart_vad_sample_rate', 16_000)),
         device=device,
     )
     logger.info(f"Models initialized on {device}")
@@ -210,13 +211,15 @@ def apply_eos_classification(
     if not segments:
         return segments
 
-    audio_np = audio.squeeze(0).numpy() if audio.dim() > 1 else audio.numpy()
+    vad_sr = int(getattr(smart_vad, "sample_rate", sr)) if smart_vad else sr
+    vad_audio = torchaudio.functional.resample(audio, sr, vad_sr) if sr != vad_sr else audio
+    audio_np = vad_audio.squeeze(0).numpy() if vad_audio.dim() > 1 else vad_audio.numpy()
     classified = []
     for s, e, spk in segments:
-        segment_audio = audio_np[int(s * sr):min(int(e * sr), len(audio_np))]
+        segment_audio = audio_np[int(s * vad_sr):min(int(e * vad_sr), len(audio_np))]
         if len(segment_audio) == 0:
             continue
-        pred = smart_vad.predict_endpoint(segment_audio)['prediction'] if smart_vad else 1
+        pred = smart_vad.predict_endpoint(segment_audio, sample_rate=vad_sr)['prediction'] if smart_vad else 1
         classified.append((s, e, spk, pred))
 
     merged: List[Tuple[float, float, int]] = []
@@ -549,8 +552,8 @@ def main(args):
 
     logger.info(f"Files to process: {len(paths_to_process)} on {num_gpus} GPU(s)")
 
-    hours_in = _measure_source_hours(paths_to_process, max_workers=4)
-    # hours_in = 0.0
+    # hours_in = _measure_source_hours(paths_to_process, max_workers=4)
+    hours_in = 0.0
     logger.info(f"Source audio total: {hours_in:.2f}h across {len(paths_to_process)} files")
 
     all_results: List[Dict[str, Any]] = []

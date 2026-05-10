@@ -125,6 +125,8 @@ preprocess:
     smart_vad_model: ./models/smart-turn-v3.2-gpu.onnx
     # Smart Turn probability threshold for cutting/refining segment ends.
     smart_vad_threshold: 0.4
+    # Audio sample rate expected by Smart Turn / Whisper feature extraction.
+    smart_vad_sample_rate: 16000
 
 separation:
   # Root containing chunked audio and balalaika.csv.

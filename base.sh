@@ -28,7 +28,7 @@ set -euo pipefail
 # ---- defaults ---------------------------------------------------------------
 config_path="configs/config.yaml"
 stage=1
-stop_stage=12
+stop_stage=9
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

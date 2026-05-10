@@ -1,6 +1,7 @@
 setuptools<82
 python-dotenv==1.0.1
 pandas==2.2.3
+matplotlib
 loguru==0.7.3
 PyYAML==6.0.2
 soundfile==0.13.1

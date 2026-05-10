@@ -1,6 +1,7 @@
 import numpy as np
 import onnxruntime as ort
-import librosa
+import torch
+import torchaudio
 from typing import List, Tuple, Union
 import time
 import os
@@ -80,7 +81,14 @@ class Sortformer:
         self.spkcache_len = int(meta.get("spkcache_len", SPKCACHE_LEN))
         self.right_context = int(meta.get("right_context", RIGHT_CONTEXT))
 
-        self.mel_basis = librosa.filters.mel(sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS, norm='slaney')
+        self.mel_scale = torchaudio.transforms.MelScale(
+            n_mels=N_MELS,
+            sample_rate=SAMPLE_RATE,
+            n_stft=N_FFT // 2 + 1,
+            norm="slaney",
+            mel_scale="slaney",
+        )
+        self.window = torch.hann_window(WIN_LENGTH)
         
         self.reset_state()
 
@@ -93,17 +101,32 @@ class Sortformer:
         self.n_sil_frames = 0
 
     def extract_mel_features(self, audio: np.ndarray) -> np.ndarray:
-        preemphasized = np.append(audio[0], audio[1:] - PREEMPH * audio[:-1])
-        S = librosa.stft(preemphasized, n_fft=N_FFT, hop_length=HOP_LENGTH, 
-                         win_length=WIN_LENGTH, window='hann', center=True)
-        power_spec = np.abs(S) ** 2
-        mel_spec = np.dot(self.mel_basis, power_spec)
-        log_mel_spec = np.log(mel_spec + LOG_ZERO_GUARD)
-        return log_mel_spec.T[np.newaxis, :, :].astype(np.float32)
+        audio_tensor = torch.from_numpy(np.asarray(audio, dtype=np.float32))
+        preemphasized = torch.empty_like(audio_tensor)
+        preemphasized[0] = audio_tensor[0]
+        preemphasized[1:] = audio_tensor[1:] - PREEMPH * audio_tensor[:-1]
+        spec = torch.stft(
+            preemphasized,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH,
+            win_length=WIN_LENGTH,
+            window=self.window,
+            center=True,
+            pad_mode="constant",
+            return_complex=True,
+        )
+        power_spec = spec.abs().pow(2)
+        mel_spec = self.mel_scale(power_spec)
+        log_mel_spec = torch.log(mel_spec + LOG_ZERO_GUARD)
+        return log_mel_spec.transpose(0, 1).unsqueeze(0).numpy().astype(np.float32)
 
     def diarize(self, audio: np.ndarray, sample_rate: int = 16000, include_tensor_outputs: bool = False) -> Union[List[List[str]], Tuple[List[List[str]], np.ndarray]]:
         if sample_rate != SAMPLE_RATE:
-            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=SAMPLE_RATE)
+            audio = torchaudio.functional.resample(
+                torch.from_numpy(np.asarray(audio, dtype=np.float32)),
+                sample_rate,
+                SAMPLE_RATE,
+            ).numpy()
             
         if len(audio.shape) > 1:
             audio = np.mean(audio, axis=0)
@@ -384,7 +407,13 @@ if __name__ == "__main__":
     model_path = "/home/nikita/balalaika/models/diar_streaming_sortformer_4spk-v2.1.onnx"
     audio_path = "/home/nikita/balalaika/datkamatka/12.mp3"
     
-    audio, sr = librosa.load(audio_path, sr=16000, mono=True)
+    waveform, sr = torchaudio.load(audio_path)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sr != SAMPLE_RATE:
+        waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
+        sr = SAMPLE_RATE
+    audio = waveform.squeeze(0).numpy()
     
     config = DiarizationConfig()
     diarizer = Sortformer(model_path, config=config)
