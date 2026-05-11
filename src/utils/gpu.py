@@ -29,16 +29,6 @@ def apply_torch_perf_defaults(*, disable_math_sdp: bool = True) -> None:
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(False)
 
-
-def gpu_count() -> int:
-    """Return ``torch.cuda.device_count()`` (or 0 when torch is unavailable)."""
-    try:
-        import torch
-    except ImportError:
-        return 0
-    return int(torch.cuda.device_count())
-
-
 def get_onnx_providers(
     cuda_id: int,
     *,

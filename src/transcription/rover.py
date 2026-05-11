@@ -62,7 +62,7 @@ class ROVERWrapper:
         result = self.rover_aggregator.fit_predict(df)
         
         logger.info("Saving aggregated results...")
-        for task_path, agg_text in result.items():
+        for task_path, agg_text in tqdm(result.items(), desc="Saving aggregated results"):
             audio_path = Path(task_path)
             output_path = audio_path.with_name(f"{audio_path.stem}_rover.txt")
             

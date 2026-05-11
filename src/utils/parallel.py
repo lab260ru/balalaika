@@ -23,7 +23,6 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 from loguru import logger
 from tqdm import tqdm
 
-from src.utils.gpu import gpu_count
 
 
 def shard_round_robin(items: Sequence[Any], num_shards: int) -> List[List[Any]]:
@@ -56,14 +55,14 @@ def run_per_gpu_pool(
             ``initargs`` for the pool bound to that GPU.
         num_workers_per_gpu: Number of worker processes inside each per-GPU
             pool.
-        gpu_ids: Explicit GPU index list; defaults to ``range(gpu_count())``.
+        gpu_ids: Explicit GPU index list; defaults to ``range(torch.cuda.device_count())``.
         desc: Tqdm description.
 
     Returns:
         Number of items that completed successfully.
     """
     if gpu_ids is None:
-        gpu_ids = list(range(gpu_count()))
+        gpu_ids = list(range(torch.cuda.device_count()))
     gpu_ids = list(gpu_ids)
     if not gpu_ids:
         raise RuntimeError("No GPUs available; refusing to run a per-GPU pool.")
