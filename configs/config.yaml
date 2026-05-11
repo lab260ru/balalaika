@@ -94,9 +94,9 @@ preprocess:
   # DataLoader batch size for Sortformer diarization source loading.
   diarization_batch_size: 1
   # DataLoader workers per GPU process for Sortformer diarization source loading.
-  diarization_loader_workers: 2
+  diarization_loader_workers: 0
   # Number of prefetched batches per diarization DataLoader worker.
-  diarization_prefetch_factor: 2
+  diarization_prefetch_factor: 0
   # Worker processes per GPU for crest factor removal.
   num_workers_crest_factor: 8
   # Crest-factor DataLoader batch size per worker.
