@@ -45,7 +45,7 @@ def create_transcription_dataloader(
         "batch_size": batch_size,
         "shuffle": False,
         "num_workers": num_workers,
-        "pin_memory": True,
+        "pin_memory": False,
         "collate_fn": transcription_collate,
         "persistent_workers": num_workers > 0,
     }

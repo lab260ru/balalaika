@@ -72,7 +72,7 @@ def create_loader(paths: List[str], model_name: str, batch_size: int, num_worker
             batch_sampler=sampler,
             collate_fn=AudioCollate(processor),
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=False,
         ),
         audio_lengths,
     )

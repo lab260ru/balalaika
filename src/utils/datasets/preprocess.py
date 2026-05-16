@@ -45,7 +45,7 @@ def create_crest_factor_dataloader(
         "batch_size": batch_size,
         "shuffle": False,
         "num_workers": num_workers,
-        "pin_memory": True,
+        "pin_memory": False,
         "collate_fn": crest_factor_collate,
         "persistent_workers": num_workers > 0,
     }

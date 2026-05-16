@@ -17,6 +17,7 @@ stage can finalize state (merge partials, etc.).
 from __future__ import annotations
 
 import multiprocessing as mp
+import torch
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 

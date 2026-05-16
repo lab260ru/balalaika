@@ -22,6 +22,7 @@ CSV resilience:
 """
 
 import argparse
+import warnings
 from pathlib import Path
 from typing import List, Set
 
@@ -72,7 +73,18 @@ def normalize_audio_loudness(
 def _write_audio(audio_path: str, samples: np.ndarray, sample_rate: int) -> None:
     """Write samples shaped ``(channels, frames)`` using torchaudio."""
     tensor = torch.from_numpy(samples if samples.ndim == 2 else samples[np.newaxis, :])
-    torchaudio.save(audio_path, tensor, sample_rate)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*save_with_torchcodec.*",
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*StreamingMediaEncoder has been deprecated.*",
+            category=UserWarning,
+        )
+        torchaudio.save(audio_path, tensor, sample_rate)
 
 
 def process_audio_file(
@@ -102,7 +114,6 @@ def process_audio_file(
 
         _write_audio(audio_path, normalized_2d, sample_rate)
 
-        logger.debug(f"Normalized: {audio_path}")
         return True
     except Exception as exc:
         logger.error(f"Error processing {audio_path}: {exc}")

@@ -76,7 +76,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /mnt/ssd_1tb_2/youtube_data
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -86,7 +86,7 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /mnt/ssd_1tb_2/youtube_data
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts
   # Maximum duration of each output segment in seconds.
   duration: 15
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
@@ -98,13 +98,13 @@ preprocess:
   # Number of prefetched batches per diarization DataLoader worker.
   diarization_prefetch_factor: 0
   # Worker processes per GPU for crest factor removal.
-  num_workers_crest_factor: 8
+  num_workers_crest_factor: 1
   # Crest-factor DataLoader batch size per worker.
-  crest_factor_batch_size: 256
+  crest_factor_batch_size: 1
   # Crest-factor DataLoader workers inside each process.
-  crest_factor_loader_workers: 2
+  crest_factor_loader_workers: 0
   # Number of prefetched batches per crest-factor DataLoader worker.
-  crest_factor_prefetch_factor: 2
+  crest_factor_prefetch_factor: 0
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
   # crest_factor is saved to balalaika.csv for all files; deleted files also have their CSV row removed.
   crest_treshold: 10
@@ -115,11 +115,11 @@ preprocess:
   # Block size in seconds for loudness measurement windows.
   block_size: 0.400
   # Worker processes for loudness normalization.
-  loudness_num_workers: 16
+  loudness_num_workers: 4
   # Loudness-normalization DataLoader batch size per process.
   loudness_batch_size: 8
   # Loudness-normalization DataLoader workers inside each process.
-  loudness_loader_workers: 2
+  loudness_loader_workers: 1
   # Number of prefetched batches per loudness-normalization DataLoader worker.
   loudness_prefetch_factor: 2
   # Max audio length in seconds fed to Sortformer at once; longer files are windowed.
@@ -152,11 +152,11 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/ssd_1tb_2/youtube_data
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts
 
   music_detect:
     # Inference batch size for music classifier.
-    bs: 16
+    bs: 8
     # DataLoader worker processes per GPU worker.
     num_workers: 1
     # Fine-tuned WavLM music-detector weights (safetensors).
@@ -173,57 +173,33 @@ separation:
     # Number of buffered rows before flushing per-worker partial CSV.
     save_every: 10000
     # DistillMOS inference batch size per GPU worker.
-    batch_size: 16
+    batch_size: 32
     # DataLoader workers per GPU worker for decoding/resampling audio.
-    num_workers: 4
+    num_workers: 8
     # Number of prefetched batches per DataLoader worker.
-    prefetch_factor: 2
-
-transcription:
-  podcasts_path: /mnt/ssd_1tb_2/youtube_data
-  # If >0: before running model K, skip files where at least this many *earlier*
-  # models in model_names already wrote identical normalized transcripts (early exit).
-  consensus_num: 3
-  # Request word-level timestamps where the model supports it (.tst TSV sidecars).
-  with_timestamps: True
-  # TensorRT EP for onnx-asr ORT sessions (requires compatible CUDA/TensorRT).
-  use_tensorrt: True
-  # Chunk long audio with Silero VAD inside onnx-asr (e.g. >30s).
-  use_vad: False
-  # After all models, run ROVER to write {stem}_rover.txt.
-  use_rover: True
-  # Logical names → HF/onnx-asr models (see MODEL_MAP in transcription.py).
-  # Supported: giga_ctc, giga_rnnt, vosk, vosk_small, tone, parakeet_v2, parakeet_v3,
-  # canary, whisper_base, whisper_turbo, giga_ctc_lm, ...
-  model_names: ['giga_ctc', 'giga_rnnt', 'vosk', 'tone']
-  # DataLoader batch size passed directly to onnx-asr recognize_batch().
-  batch_size: 4
-  # DataLoader workers per GPU worker for decoding/resampling audio.
-  num_workers: 4
-  # Number of prefetched batches per DataLoader worker.
-  prefetch_factor: 2
+    prefetch_factor: 4
 
 punctuation:
-  podcasts_path: /mnt/ssd_1tb_2/youtube_data
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /mnt/ssd_1tb_2/youtube_data
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
   # TensorRT EP for ruAccent ONNX path when supported.
-  use_tensorrt: False
+  use_tensorrt: True
 
 phonemizer:
-  podcasts_path: /mnt/ssd_1tb_2/youtube_data
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts
   num_workers: 1
 
 export:
-  podcasts_path: /mnt/ssd_1tb_2/youtube_data
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts
   # Parallel processes writing WebDataset shards.
   num_workers: 1
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.

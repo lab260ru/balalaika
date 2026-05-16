@@ -84,6 +84,7 @@ def run_inference_worker(
         batch_size=batch_size,
         num_workers=num_loader_workers,
         prefetch_factor=prefetch_factor,
+        cache_dir=str(podcasts_path),
     )
 
     with PartialCsvWriter(
