@@ -64,23 +64,28 @@ def sort_by_length(file_paths: List[str], cache_dir: str = "") -> List[str]:
     cache_file = Path(cache_dir) / "distillmos_sorted_files.json" if cache_dir else None
 
     if cache_file and cache_file.exists():
-        logger.info("Loading cached sorted file list from %s", cache_file)
         with open(cache_file) as f:
             cached = json.load(f)
-        cached_set = set(cached)
         current_set = set(file_paths)
-        if cached_set == current_set:
-            logger.info("Cache matches current files (%d files), using cached order", len(cached))
-            return cached
-        elif cached_set.issubset(current_set):
+        cached_set = set(cached)
+
+        if current_set.issubset(cached_set):
+            filtered = [p for p in cached if p in current_set]
+            if len(filtered) == len(current_set):
+                logger.info("Cache hit: using cached order for %d files", len(filtered))
+                return filtered
+
+        if cached_set.issubset(current_set):
             new_files = sorted(current_set - cached_set)
-            logger.info("Cache contains %d files, appending %d new files", len(cached), len(new_files))
-            result = cached + new_files
+            logger.info("Cache partial hit: %d cached + %d new files", len(cached), len(new_files))
+            lengths = estimate_audio_lengths(new_files)
+            new_sorted = sorted(new_files, key=lambda p: lengths.get(p, 0.0))
+            result = cached + new_sorted
             with open(cache_file, "w") as f:
                 json.dump(result, f)
             return result
-        else:
-            logger.info("Cache is stale (%d cached vs %d current), rebuilding", len(cached), len(file_paths))
+
+        logger.info("Cache stale (%d cached vs %d current), rebuilding", len(cached), len(file_paths))
 
     logger.info("Scanning %d audio files for length sorting...", len(file_paths))
     lengths = estimate_audio_lengths(file_paths)
@@ -90,7 +95,7 @@ def sort_by_length(file_paths: List[str], cache_dir: str = "") -> List[str]:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, "w") as f:
             json.dump(sorted_paths, f)
-        logger.info("Saved sorted file list to %s", cache_file)
+        logger.info("Saved sorted file list (%d files) to %s", len(sorted_paths), cache_file)
 
     return sorted_paths
 

@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from src.utils.logging_setup import setup_logging
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 
 def init_client(client_key):
@@ -175,6 +176,10 @@ def main(args):
     num_workers:{num_workers}
     """)
 
+    processed = 0
+    errors = 0
+    error_details: list[dict] = []
+
     for url in podcasts_urls:
         try:
             result = download_podcast(
@@ -185,10 +190,27 @@ def main(args):
                 num_workers=num_workers
             )
             logger.info(result)
+            processed += 1
         except Exception as e:
             logger.error(f"Error when downloading a podcast {url}: {e}")
+            errors += 1
+            error_details.append({"podcast": str(url), "reason": str(e)})
+
+    write_stage_status(
+        stage=0,
+        stage_name="download",
+        log_dir=args.log_dir or "./logs",
+        processed=processed,
+        skipped=0,
+        errors=errors,
+        error_details=error_details,
+    )
 
     
+
+
+    
+
 
 
 if __name__ == "__main__":

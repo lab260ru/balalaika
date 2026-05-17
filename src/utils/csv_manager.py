@@ -101,6 +101,8 @@ def atomic_write_csv(df: pd.DataFrame, path: os.PathLike | str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     df.to_csv(tmp, index=False)
+    if not tmp.exists():
+        df.to_csv(tmp, index=False)
     try:
         with open(tmp, "rb") as f:
             os.fsync(f.fileno())

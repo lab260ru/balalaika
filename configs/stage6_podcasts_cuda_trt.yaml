@@ -1,0 +1,23 @@
+runtime:
+  venv_path: .dev_venv
+  cpu_affinity: "0-32"
+  log_dir: ./logs
+  trt_cache_path: ./cache/trt
+  trt_workspace_bytes: 4294967296
+  trt_fp16: True
+
+transcription:
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts
+  model_names:
+    - giga_ctc
+    - giga_rnnt
+    - vosk
+    - tone
+  consensus_num: 3
+  with_timestamps: False
+  use_tensorrt: True
+  use_vad: False
+  use_rover: True
+  batch_size: 16
+  num_workers: 6
+  prefetch_factor: 2

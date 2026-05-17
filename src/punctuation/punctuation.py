@@ -10,6 +10,7 @@ from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_pool
 from src.utils.sidecars import pending_audio_to_sidecar
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config, process_token, read_file_content
 
 apply_torch_perf_defaults()
@@ -69,13 +70,22 @@ def main(args):
 
     logger.info(f"Found {len(pending_files)} _rover.txt files needing punctuation.")
 
-    run_per_gpu_pool(
+    error_count, error_details = run_per_gpu_pool(
         pending_files,
         work_fn=make_punct_txt,
         initializer=init_process,
         init_args_factory=lambda gpu_id: (model_name, f"cuda:{gpu_id}"),
         num_workers_per_gpu=num_workers_per_gpu,
         desc="Punctuation",
+    )
+    write_stage_status(
+        stage=7,
+        stage_name="punctuation",
+        log_dir=args.log_dir or "./logs",
+        processed=len(pending_files) - error_count,
+        skipped=0,
+        errors=error_count,
+        error_details=error_details,
     )
 
 

@@ -23,6 +23,7 @@ from loguru import logger
 
 from src.utils.audit import audit_path
 from src.utils.logging_setup import setup_logging
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 
 # Stages emit rows in this canonical order; unknown stages are appended after.
@@ -192,6 +193,24 @@ def main(args):
 
     if not args.quiet:
         print(report_md)
+
+    write_stage_status(
+        stage=12,
+        stage_name="report",
+        log_dir=args.log_dir or "./logs",
+        processed=1,
+        skipped=0,
+        errors=0,
+    )
+
+    write_stage_status(
+        stage=12,
+        stage_name="report",
+        log_dir=args.log_dir or "./logs",
+        processed=1,
+        skipped=0,
+        errors=0,
+    )
 
 
 if __name__ == "__main__":

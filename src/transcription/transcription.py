@@ -1,4 +1,5 @@
 import argparse
+import errno
 import multiprocessing as mp
 from collections import Counter
 from pathlib import Path
@@ -13,6 +14,7 @@ from src.utils.datasets.transcription import create_transcription_dataloader, re
 from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_processes
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import get_audio_paths, load_config, read_file_content
 
 MODEL_MAP = {
@@ -31,6 +33,16 @@ MODEL_MAP = {
 
 SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
 TARGET_SAMPLE_RATE = 16_000
+
+
+def sidecar_exists_or_unwritable(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            logger.error(f"Sidecar path is too long, skipping: {path}")
+            return True
+        raise
 
 
 def save_results(paths: List[str], texts: List[str], timestamps: Optional[List[str]], model_suffix: str):
@@ -96,7 +108,8 @@ def format_timestamps(result) -> str:
 
 
 def run_worker(cuda_id: int, world_size: int, model_name: str,
-               all_files: List[str], config: dict, config_path: Optional[str] = None):
+               all_files: List[str], config: dict, config_path: Optional[str] = None,
+               processed_counter=None, errors_counter=None, error_details=None):
     """Inference worker: loads onnx-asr model on a single GPU and processes its shard."""
     my_files = all_files[cuda_id::world_size]
     if not my_files:
@@ -143,7 +156,17 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
             prefetch_factor=prefetch_factor,
         )
 
-        for paths, waveforms, lengths in tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id):
+        for paths, waveforms, lengths, load_errors in tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id):
+            for path_str, reason in load_errors:
+                logger.error(f"Audio load failed {path_str}: {reason}")
+                if errors_counter is not None:
+                    errors_counter.value += 1
+                if error_details is not None:
+                    error_details.append({"file": path_str, "model": model_name, "reason": reason})
+
+            if not paths:
+                continue
+
             try:
                 results = recognize_batch(model, waveforms, lengths)
             except Exception as e:
@@ -155,6 +178,10 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
                     except Exception as e2:
                         logger.error(f"File failed {path_str}: {e2}")
                         results.append("")
+                        if errors_counter is not None:
+                            errors_counter.value += 1
+                        if error_details is not None:
+                            error_details.append({"file": path_str, "model": model_name, "reason": str(e2)})
 
             if not isinstance(results, list):
                 results = [results]
@@ -164,8 +191,15 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
 
             save_results(paths, texts, ts, output_suffix)
 
+            if processed_counter is not None:
+                processed_counter.value += len(paths)
+
     except Exception as e:
         logger.exception(f"Worker {cuda_id} fatal error ({model_name}): {e}")
+        if errors_counter is not None:
+            errors_counter.value += 1
+        if error_details is not None:
+            error_details.append({"worker": cuda_id, "model": model_name, "reason": str(e)})
 
 
 def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int) -> bool:
@@ -173,7 +207,7 @@ def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int
     for mn in model_names:
         suffix = 'vosk' if 'vosk' in mn else mn
         tp = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
-        if tp.exists():
+        if sidecar_exists_or_unwritable(tp):
             try:
                 t = read_file_content(tp)
                 if t:
@@ -191,7 +225,10 @@ def get_valid_paths(src_path: str, output_suffix: str,
     if not all_paths:
         return []
 
-    valid = [p for p in all_paths if not p.with_name(f"{p.stem}_{output_suffix}.txt").exists()]
+    valid = [
+        p for p in all_paths
+        if not sidecar_exists_or_unwritable(p.with_name(f"{p.stem}_{output_suffix}.txt"))
+    ]
 
     if consensus_num > 0 and len(processed) >= consensus_num:
         skipped = 0
@@ -215,6 +252,10 @@ def main(args):
     src_path = config.get('podcasts_path', '.')
     consensus_num = config.get('consensus_num', 0)
 
+    processed = mp.Value('i', 0)
+    errors = mp.Value('i', 0)
+    error_details_list = mp.Manager().list()
+
     num_gpus = torch.cuda.device_count()
 
     logger.info(f"{num_gpus} GPU(s) detected. Starting transcription pipeline.")
@@ -225,8 +266,8 @@ def main(args):
         logger.info(f"=== [{idx + 1}/{len(model_names)}] {model_name} ===")
 
         output_suffix = 'vosk' if 'vosk' in model_name else model_name
-        processed = model_names[:idx] if consensus_num > 0 else []
-        paths = get_valid_paths(src_path, output_suffix, processed, consensus_num)
+        processed_names = model_names[:idx] if consensus_num > 0 else []
+        paths = get_valid_paths(src_path, output_suffix, processed_names, consensus_num)
 
         if not paths:
             logger.info(f"No files to process for {model_name}")
@@ -237,7 +278,7 @@ def main(args):
         run_per_gpu_processes(
             run_worker,
             num_gpus=num_gpus,
-            args=(model_name, paths, config, args.config_path),
+            args=(model_name, paths, config, args.config_path, processed, errors, error_details_list),
         )
 
     if config.get('use_rover', False):
@@ -252,6 +293,16 @@ def main(args):
             logger.error(f"ROVER failed: {e}")
 
     logger.info("Transcription pipeline complete!")
+
+    write_stage_status(
+        stage=6,
+        stage_name="transcription",
+        log_dir=args.log_dir or "./logs",
+        processed=processed.value,
+        skipped=0,
+        errors=errors.value,
+        error_details=list(error_details_list),
+    )
 
 
 if __name__ == "__main__":

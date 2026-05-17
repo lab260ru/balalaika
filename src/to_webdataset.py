@@ -1,5 +1,5 @@
 import argparse
-import multiprocessing
+import multiprocessing as mp
 import pandas as pd
 import math
 import json
@@ -13,6 +13,7 @@ from loguru import logger
 
 from src.utils.logging_setup import setup_logging
 from src.utils.utils import get_audio_paths, load_config
+from src.utils.stage_status import write_stage_status
 
 def load_metadata(csv_path: Path) -> Dict[str, dict]:
     """Загружает balalaika.csv и делает словарь с ключом по базовому имени файла."""
@@ -32,7 +33,7 @@ def load_metadata(csv_path: Path) -> Dict[str, dict]:
     logger.info(f"Loaded metadata for {len(metadata_dict)} files.")
     return metadata_dict
 
-def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata_dict: Dict[str, dict], max_shard_size: int, max_shard_count: int):
+def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata_dict: Dict[str, dict], max_shard_size: int, max_shard_count: int, processed_counter, errors_counter):
     if not audio_paths:
         return 0
 
@@ -58,6 +59,7 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
                 audio_bytes = audio_path.read_bytes()
             except Exception as e:
                 logger.warning(f"Error reading {audio_path}: {e}")
+                errors_counter.value += 1
                 continue
 
             # --- 2. Formats JSON with texts and metadata ---
@@ -93,12 +95,14 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
                     pass
                 except Exception as e:
                     logger.warning(f"Error reading {sibling}: {e}")
+                    errors_counter.value += 1
 
             # --- 3. MANUAL SERIALIZATION OF JSON ---
             try:
                 json_bytes = json.dumps(json_data, ensure_ascii=False).encode('utf-8')
             except Exception as e:
                 logger.error(f"Failed to serialize JSON for {key}: {e}")
+                errors_counter.value += 1
                 continue
 
             # Uses safe_key, so that the files safe_key.mp3 and safe_key.json are inside the .tar
@@ -111,8 +115,10 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
             try:
                 sink.write(sample)
                 samples_processed += 1
+                processed_counter.value += 1
             except Exception as e:
                 logger.error(f"Failed to write sample {key} to tar: {e}")
+                errors_counter.value += 1
 
     return samples_processed
 
@@ -135,6 +141,9 @@ def main(config):
     num_workers = config.get('num_workers', 4)
     num_workers = max(1, num_workers)
 
+    processed = mp.Value('i', 0)
+    errors = mp.Value('i', 0)
+
     all_audio_paths = get_audio_paths(podcasts_path_str)
     if not all_audio_paths:
         logger.warning("No audio data to process.")
@@ -150,7 +159,7 @@ def main(config):
     total_processed = 0
     with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
         futures = [
-            executor.submit(worker_fn, worker_id, chunk, wds_output_dir, metadata_dict, max_shard_size, max_shard_count )
+            executor.submit(worker_fn, worker_id, chunk, wds_output_dir, metadata_dict, max_shard_size, max_shard_count, processed, errors)
             for worker_id, chunk in enumerate(chunks)
         ]
 
@@ -159,12 +168,22 @@ def main(config):
                 total_processed += future.result()
             except Exception as e:
                 logger.error(f"Worker failed with error: {e}")
+                errors.value += 1
 
     logger.success(f"WebDataset creation completed! Total samples packed: {total_processed}")
     logger.success(f"Output directory: {wds_output_dir}")
 
+    write_stage_status(
+        stage=11,
+        stage_name="to_webdataset",
+        log_dir=config.get("log_dir", "./logs"),
+        processed=processed.value,
+        skipped=0,
+        errors=errors.value,
+    )
+
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn', force=True)
+    mp.set_start_method('spawn', force=True)
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, required=True, help="Path to YAML config")

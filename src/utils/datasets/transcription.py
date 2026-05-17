@@ -17,20 +17,28 @@ class TranscriptionDataset(Dataset):
 
     def __getitem__(self, idx: int):
         path = self.file_paths[idx]
-        waveform, sample_rate = torchaudio.load_with_torchcodec(path)
-        waveform = waveform.to(dtype=torch.float32)
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        if sample_rate != self.sample_rate:
-            waveform = torchaudio.functional.resample(waveform, sample_rate, self.sample_rate)
-        return path, waveform.squeeze(0).contiguous()
+        try:
+            waveform, sample_rate = torchaudio.load_with_torchcodec(path)
+            waveform = waveform.to(dtype=torch.float32)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            if sample_rate != self.sample_rate:
+                waveform = torchaudio.functional.resample(waveform, sample_rate, self.sample_rate)
+            return path, waveform.squeeze(0).contiguous(), None
+        except Exception as exc:
+            return path, None, str(exc)
 
 
 def transcription_collate(batch):
-    paths, waveforms = zip(*batch)
+    errors = [(path, error) for path, waveform, error in batch if error]
+    valid = [(path, waveform) for path, waveform, error in batch if error is None]
+    if not valid:
+        return [], torch.empty(0, 0, dtype=torch.float32), torch.empty(0, dtype=torch.int64), errors
+
+    paths, waveforms = zip(*valid)
     lengths = torch.tensor([w.numel() for w in waveforms], dtype=torch.int64)
     padded = pad_sequence(waveforms, batch_first=True)
-    return list(paths), padded.contiguous(), lengths
+    return list(paths), padded.contiguous(), lengths, errors
 
 
 def create_transcription_dataloader(

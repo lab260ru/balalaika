@@ -173,7 +173,7 @@ separation:
     # Number of buffered rows before flushing per-worker partial CSV.
     save_every: 10000
     # DistillMOS inference batch size per GPU worker.
-    batch_size: 32
+    batch_size: 8
     # DataLoader workers per GPU worker for decoding/resampling audio.
     num_workers: 8
     # Number of prefetched batches per DataLoader worker.

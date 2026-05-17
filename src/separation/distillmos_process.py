@@ -38,6 +38,7 @@ from src.utils.csv_manager import (
 from src.utils.datasets.separation import create_distillmos_dataloader
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 
 apply_torch_perf_defaults(disable_math_sdp=False)
@@ -54,6 +55,9 @@ def run_inference_worker(
     file_paths: List[str],
     config: dict,
     podcasts_path: Path,
+    processed_counter,
+    skipped_counter,
+    errors_counter,
 ):
     my_files = file_paths[rank::world_size]
     if not my_files:
@@ -70,6 +74,7 @@ def run_inference_worker(
         sqa_model.eval()
     except Exception as exc:
         logger.error(f"Failed to load distillmos model on worker {rank}: {exc}")
+        errors_counter.value += 1
         return
 
     batch_size = int(config.get("distillmos", {}).get("batch_size", 16))
@@ -91,6 +96,7 @@ def run_inference_worker(
         podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
     ) as writer:
         already_done: Set[str] = writer.already_done()
+        skipped_counter.value += len(already_done)
         if already_done:
             logger.info(
                 f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping."
@@ -111,8 +117,14 @@ def run_inference_worker(
                                 COLUMN: float(mos_val),
                             }
                         )
+                        processed_counter.value += 1
+                except torch.cuda.OutOfMemoryError:
+                    logger.critical(f"CUDA OOM on worker {rank}, stopping")
+                    errors_counter.value += 1
+                    raise
                 except Exception as exc:
                     logger.warning(f"Error processing batch on worker {rank}: {exc}")
+                    errors_counter.value += 1
                     continue
 
     elapsed = time.perf_counter() - started_at
@@ -158,7 +170,6 @@ def main():
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=[COLUMN],
-        bootstrap_audio_paths=audio_paths,
     )
     if absorbed:
         logger.info(
@@ -177,10 +188,14 @@ def main():
 
     logger.info(f"Processing {len(unprocessed)} files on {available_gpus} GPUs.")
 
+    processed = mp.Value('i', 0)
+    skipped = mp.Value('i', 0)
+    errors = mp.Value('i', 0)
+
     try:
         mp.spawn(
             run_inference_worker,
-            args=(available_gpus, unprocessed, config, podcasts_path),
+            args=(available_gpus, unprocessed, config, podcasts_path, processed, skipped, errors),
             nprocs=available_gpus,
             join=True,
         )
@@ -194,6 +209,15 @@ def main():
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=[COLUMN],
+    )
+
+    write_stage_status(
+        stage=5,
+        stage_name="distillmos_process",
+        log_dir=args.log_dir or "./logs",
+        processed=processed.value,
+        skipped=skipped.value,
+        errors=errors.value,
     )
 
 

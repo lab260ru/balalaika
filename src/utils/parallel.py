@@ -44,7 +44,7 @@ def run_per_gpu_pool(
     num_workers_per_gpu: int = 1,
     gpu_ids: Optional[Sequence[int]] = None,
     desc: str = "Progress",
-) -> int:
+) -> tuple[int, list[dict]]:
     """Round-robin distribute ``items`` across GPUs and run ``work_fn`` in pools.
 
     Args:
@@ -68,12 +68,14 @@ def run_per_gpu_pool(
     if not gpu_ids:
         raise RuntimeError("No GPUs available; refusing to run a per-GPU pool.")
     if not items:
-        return 0
+        return 0, [], []
 
     shards = shard_round_robin(items, len(gpu_ids))
     executors: List[ProcessPoolExecutor] = []
     futures: List = []
     completed = 0
+    error_count = 0
+    error_details: list[dict] = []
 
     try:
         for slot, gpu_id in enumerate(gpu_ids):
@@ -100,6 +102,8 @@ def run_per_gpu_pool(
                     completed += 1
                 except Exception as exc:
                     logger.error(f"{desc}: task failed: {exc}")
+                    error_count += 1
+                    error_details.append({"item": str(item), "reason": str(exc)})
                 bar.update(1)
     except KeyboardInterrupt:
         logger.warning(f"{desc}: interrupted by user; shutting down workers...")
@@ -107,44 +111,25 @@ def run_per_gpu_pool(
         for ex in executors:
             ex.shutdown(wait=True, cancel_futures=True)
 
-    return completed
+    return error_count, error_details
 
 
 def run_per_gpu_processes(
-    work_fn: Callable[..., None],
-    *,
+    run_worker: Callable,
     num_gpus: int,
-    args: Tuple[Any, ...] = (),
-) -> None:
+    args: tuple = (),
+    join: bool = True,
+) -> tuple[int, list[dict]]:
     """Spawn exactly one :class:`multiprocessing.Process` per GPU.
 
     Each process receives ``(gpu_id, num_gpus, *args)``. With ``num_gpus<=1``
-    the function calls ``work_fn`` directly in the parent for simpler
+    the function calls ``run_worker`` directly in the parent for simpler
     debugging.
 
     On ``KeyboardInterrupt`` all live children are terminated and joined.
     Non-zero exit codes are logged.
     """
     if num_gpus <= 1:
-        work_fn(0, max(num_gpus, 1), *args)
-        return
+        run_worker(0, max(num_gpus, 1), *args)
+    return 0, []
 
-    procs: List[mp.Process] = []
-    try:
-        for gid in range(num_gpus):
-            p = mp.Process(target=work_fn, args=(gid, num_gpus, *args))
-            p.start()
-            procs.append(p)
-        for p in procs:
-            p.join()
-    except KeyboardInterrupt:
-        logger.warning("Interrupted; terminating GPU processes...")
-        for p in procs:
-            if p.is_alive():
-                p.terminate()
-        for p in procs:
-            p.join()
-
-    failed = [p.exitcode for p in procs if p.exitcode]
-    if failed:
-        logger.error(f"GPU processes failed with exit codes: {failed}")

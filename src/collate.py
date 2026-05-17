@@ -7,6 +7,7 @@ import concurrent.futures
 from loguru import logger
 
 from src.utils.logging_setup import setup_logging
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import get_audio_paths, load_config, read_file_content
 
 def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Optional[str]]:
@@ -59,9 +60,12 @@ def main(args):
                 data = future.result()
                 if data:
                     results.append(data)
+                    processed += 1
             except Exception as exc:
                 path = future_to_path[future]
                 logger.error(f'{path} generated an exception: {exc}')
+                errors += 1
+                error_details.append({"file": str(path), "reason": str(exc)})
 
     if not results:
         logger.info("No data was processed. Exiting.")
@@ -75,6 +79,16 @@ def main(args):
     final_df.to_parquet(output_path, engine='pyarrow', index=False)
     logger.info(f"Successfully saved data to {output_path}")
 
+    write_stage_status(
+        stage=10,
+        stage_name="collate",
+        log_dir=args.log_dir or "./logs",
+        processed=processed,
+        skipped=0,
+        errors=errors,
+        error_details=error_details,
+    )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collate information from podcast files.")
@@ -86,4 +100,7 @@ if __name__ == "__main__":
     parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
 
     args = parser.parse_args()
+    processed = 0
+    errors = 0
+    error_details: list[dict] = []
     main(args)
