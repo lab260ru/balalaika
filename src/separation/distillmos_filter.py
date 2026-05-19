@@ -10,28 +10,12 @@ Modes:
 """
 
 import argparse
-import math
-import os
-import sys
-from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import pandas as pd
 from loguru import logger
 
-from src.utils.audit import record_stage_summary, safe_audio_duration
-from src.utils.csv_manager import (
-    PartialCsvWriter,
-    absorb_partial_csvs,
-    audit_from_filter_partials,
-    discover_audio_paths,
-    ensure_main_csv,
-    load_main_csv,
-    resolve_path,
-)
-from src.utils.logging_setup import setup_logging
-from src.utils.stage_status import write_stage_status
-from src.utils.utils import load_config
+from src.utils.csv_manager import load_main_csv
 
 PARTIAL_PREFIX = "distillmos_filter"
 PARTIAL_FIELDS = ("filepath", "DistillMOS", "duration_s", "deleted")
@@ -93,7 +77,11 @@ def print_histogram(df: pd.DataFrame, bins: int = 10) -> None:
         return
 
     bin_width = (hi - lo) / bins
-    durations = df["total_duration"].fillna(0) if "total_duration" in df.columns else pd.Series(0, index=df.index)
+    if "total_duration" in df.columns:
+        durations = df["total_duration"].fillna(0)
+    else:
+        logger.warning("'total_duration' column not found in CSV — hour estimates will be 0")
+        durations = pd.Series(0, index=df.index)
 
     print(f"\n  Histogram ({bins} bins, width={bin_width:.4f}):")
     print(f"  {'Range':>20}  {'Files':>10}  {'Hours':>10}")
@@ -119,7 +107,6 @@ def determine_threshold(
 
     Returns:
         float threshold, or None if manual mode was declined.
-        Raises SystemExit if user declines in manual mode.
     """
     # CLI --threshold overrides everything (auto mode)
     if args.threshold is not None:
@@ -141,26 +128,30 @@ def determine_threshold(
             raw = input("\nEnter DistillMOS threshold (files below this will be deleted): ").strip()
             if not raw:
                 print("No threshold provided. Exiting.")
-                sys.exit(0)
+                return None
             t = float(raw)
             if t <= 0:
                 print("Threshold must be positive. Exiting.")
-                sys.exit(0)
+                return None
             return t
         except ValueError:
             print("Invalid number. Try again or Ctrl+C to exit.")
         except (EOFError, KeyboardInterrupt):
             print("\nCancelled.")
-            sys.exit(0)
+            return None
 
 
-def print_preview(df: pd.DataFrame, threshold: float) -> tuple:
+def print_preview(df: pd.DataFrame, threshold: float) -> tuple[int, float, int, float]:
     """Show how many files/hours would be deleted/saved at the given threshold.
 
     Returns (delete_count, delete_hours, save_count, save_hours).
     """
     vals = df[COLUMN].dropna()
-    durations = df["total_duration"].fillna(0) if "total_duration" in df.columns else pd.Series(0, index=df.index)
+    if "total_duration" in df.columns:
+        durations = df["total_duration"].fillna(0)
+    else:
+        logger.warning("'total_duration' column not found in CSV — hour estimates will be 0")
+        durations = pd.Series(0, index=df.index)
 
     mask = vals < threshold
     delete_count = int(mask.sum())
