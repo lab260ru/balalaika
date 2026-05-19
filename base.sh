@@ -12,6 +12,7 @@
 #   3  Preprocess: loudness         (src.preprocess.preprocess_audio)
 #   4  Separation: music detection  (src.separation.music_detect)
 #   5  Separation: DistillMOS       (src.separation.distillmos_process)
+#   5.5 DistillMOS filter            (src.separation.distillmos_filter)
 #   6  Transcription                (src.transcription.transcription)
 #   7  Punctuation                  (src.punctuation.punctuation)
 #   8  Accents                      (src.accents.accents)
@@ -114,7 +115,7 @@ run_python() {
 stage_active() {
     # Returns 0 (true) when the requested stage falls into [stage, stop_stage].
     local s="$1"
-    [[ "$stage" -le "$s" && "$stop_stage" -ge "$s" ]]
+    (( $(echo "$stage <= $s && $stop_stage >= $s" | bc -l) ))
 }
 
 check_stage_status() {
@@ -179,6 +180,12 @@ if stage_active 5; then
     echo "Stage 5: Separation — DistillMOS scoring"
     run_python src.separation.distillmos_process
     check_stage_status 5
+fi
+
+if stage_active 5.5; then
+    echo "Stage 5.5: DistillMOS filter — quality-based deletion"
+    run_python src.separation.distillmos_filter
+    check_stage_status 5.5
 fi
 
 if stage_active 6; then
