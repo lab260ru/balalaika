@@ -1,4 +1,5 @@
 import argparse
+import errno
 import multiprocessing as mp
 from collections import Counter
 from pathlib import Path
@@ -13,6 +14,7 @@ from src.utils.datasets.transcription import create_transcription_dataloader, re
 from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_processes
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import get_audio_paths, load_config, read_file_content
 
 MODEL_MAP = {
@@ -33,9 +35,33 @@ SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parak
 TARGET_SAMPLE_RATE = 16_000
 
 
-def save_results(paths: List[str], texts: List[str], timestamps: Optional[List[str]], model_suffix: str):
+def sidecar_exists_or_unwritable(path: Path, retry_empty: bool = False) -> bool:
+    try:
+        exists = path.exists()
+        if exists and retry_empty and path.suffix == '.txt':
+            return path.stat().st_size != 0
+        return exists
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            logger.error(f"Sidecar path is too long, skipping: {path}")
+            return True
+        raise
+
+
+def format_length_range(lengths: torch.Tensor, sample_rate: int) -> str:
+    if lengths.numel() == 0:
+        return "empty"
+    seconds = lengths.to(dtype=torch.float32) / float(sample_rate)
+    return f"min={seconds.min().item():.2f}s max={seconds.max().item():.2f}s"
+
+
+def save_results(paths: List[str], texts: List[Optional[str]], timestamps: Optional[List[Optional[str]]], model_suffix: str):
     for i, (path_str, text) in enumerate(zip(paths, texts)):
         path = Path(path_str)
+
+        if text is None:
+            logger.debug(f"No transcript result for {path.name}; leaving sidecar unchanged")
+            continue
 
         txt_path = path.with_name(f"{path.stem}_{model_suffix}.txt")
         try:
@@ -96,7 +122,8 @@ def format_timestamps(result) -> str:
 
 
 def run_worker(cuda_id: int, world_size: int, model_name: str,
-               all_files: List[str], config: dict, config_path: Optional[str] = None):
+               all_files: List[str], config: dict, config_path: Optional[str] = None,
+               processed_counter=None, errors_counter=None, error_details=None):
     """Inference worker: loads onnx-asr model on a single GPU and processes its shard."""
     my_files = all_files[cuda_id::world_size]
     if not my_files:
@@ -115,10 +142,14 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
 
     local_path = config.get('vosk_path') if 'vosk' in model_name else config.get('model_path')
 
-    logger.info(f"Worker {cuda_id}/{world_size}: {onnx_name} on cuda:{cuda_id}, {len(my_files)} files, batch={batch_size}")
+    logger.info(
+        f"Worker {cuda_id}/{world_size}: {onnx_name} on cuda:{cuda_id}, "
+        f"{len(my_files)} files, batch={batch_size}, tensorrt={use_trt}"
+    )
 
     try:
         providers = get_onnx_providers(cuda_id, use_tensorrt=use_trt, config_path=config_path)
+        logger.info(f"ONNX providers for {model_name} on cuda:{cuda_id}: {providers}")
         load_args = [onnx_name] + ([local_path] if local_path else [])
         load_kwargs = {"providers": providers}
         if quantization:
@@ -143,29 +174,55 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
             prefetch_factor=prefetch_factor,
         )
 
-        for paths, waveforms, lengths in tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id):
+        for paths, waveforms, lengths, load_errors in tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id):
+            for path_str, reason in load_errors:
+                logger.error(f"Audio load failed {path_str}: {reason}")
+                if errors_counter is not None:
+                    errors_counter.value += 1
+                if error_details is not None:
+                    error_details.append({"file": path_str, "model": model_name, "reason": reason})
+
+            if not paths:
+                continue
+
             try:
                 results = recognize_batch(model, waveforms, lengths)
             except Exception as e:
-                logger.error(f"Batch failed: {e}. Falling back to single-file mode.")
+                logger.error(
+                    f"Batch failed for {model_name}: files={len(paths)}, "
+                    f"lengths=({format_length_range(lengths, target_sample_rate)}): {e}. "
+                    "Falling back to single-file mode."
+                )
                 results = []
                 for path_str, waveform, length in zip(paths, waveforms, lengths):
                     try:
                         results.extend(recognize_batch(model, waveform[:length].unsqueeze(0).contiguous(), length.unsqueeze(0)))
                     except Exception as e2:
-                        logger.error(f"File failed {path_str}: {e2}")
-                        results.append("")
+                        seconds = float(length.item()) / float(target_sample_rate)
+                        logger.error(f"File failed for {model_name}: seconds={seconds:.2f}, file={path_str}: {e2}")
+                        results.append(None)
+                        if errors_counter is not None:
+                            errors_counter.value += 1
+                        if error_details is not None:
+                            error_details.append({"file": path_str, "model": model_name, "seconds": seconds, "reason": str(e2)})
 
             if not isinstance(results, list):
                 results = [results]
 
-            texts = [extract_text(r) for r in results]
-            ts = [format_timestamps(r) for r in results] if do_timestamps else None
+            texts = [None if r is None else extract_text(r) for r in results]
+            ts = [None if r is None else format_timestamps(r) for r in results] if do_timestamps else None
 
             save_results(paths, texts, ts, output_suffix)
 
+            if processed_counter is not None:
+                processed_counter.value += len(paths)
+
     except Exception as e:
         logger.exception(f"Worker {cuda_id} fatal error ({model_name}): {e}")
+        if errors_counter is not None:
+            errors_counter.value += 1
+        if error_details is not None:
+            error_details.append({"worker": cuda_id, "model": model_name, "reason": str(e)})
 
 
 def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int) -> bool:
@@ -173,7 +230,7 @@ def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int
     for mn in model_names:
         suffix = 'vosk' if 'vosk' in mn else mn
         tp = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
-        if tp.exists():
+        if sidecar_exists_or_unwritable(tp):
             try:
                 t = read_file_content(tp)
                 if t:
@@ -186,12 +243,29 @@ def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int
 
 
 def get_valid_paths(src_path: str, output_suffix: str,
-                    processed: List[str], consensus_num: int) -> List[str]:
+                    processed: List[str], consensus_num: int,
+                    retry_empty_outputs: bool = False) -> List[str]:
     all_paths = get_audio_paths(src_path)
     if not all_paths:
         return []
 
-    valid = [p for p in all_paths if not p.with_name(f"{p.stem}_{output_suffix}.txt").exists()]
+    valid = []
+    retry_empty_count = 0
+    for p in all_paths:
+        sidecar = p.with_name(f"{p.stem}_{output_suffix}.txt")
+        if sidecar_exists_or_unwritable(sidecar, retry_empty=retry_empty_outputs):
+            continue
+        if retry_empty_outputs:
+            try:
+                if sidecar.exists() and sidecar.stat().st_size == 0:
+                    retry_empty_count += 1
+            except OSError as exc:
+                if exc.errno != errno.ENAMETOOLONG:
+                    raise
+        valid.append(p)
+
+    if retry_empty_count:
+        logger.info(f"Retrying {retry_empty_count} empty {output_suffix} sidecars")
 
     if consensus_num > 0 and len(processed) >= consensus_num:
         skipped = 0
@@ -214,19 +288,26 @@ def main(args):
     model_names = config.get('model_names', ['giga_rnnt'])
     src_path = config.get('podcasts_path', '.')
     consensus_num = config.get('consensus_num', 0)
+    retry_empty_outputs = bool(config.get('retry_empty_outputs', False))
+
+    processed = mp.Value('i', 0)
+    errors = mp.Value('i', 0)
+    error_details_list = mp.Manager().list()
 
     num_gpus = torch.cuda.device_count()
 
     logger.info(f"{num_gpus} GPU(s) detected. Starting transcription pipeline.")
     if consensus_num > 0:
         logger.info(f"Consensus mode: {consensus_num} models must agree")
+    if retry_empty_outputs:
+        logger.info("Retry-empty mode enabled: zero-byte transcript sidecars will be reprocessed")
 
     for idx, model_name in enumerate(model_names):
         logger.info(f"=== [{idx + 1}/{len(model_names)}] {model_name} ===")
 
         output_suffix = 'vosk' if 'vosk' in model_name else model_name
-        processed = model_names[:idx] if consensus_num > 0 else []
-        paths = get_valid_paths(src_path, output_suffix, processed, consensus_num)
+        processed_names = model_names[:idx] if consensus_num > 0 else []
+        paths = get_valid_paths(src_path, output_suffix, processed_names, consensus_num, retry_empty_outputs)
 
         if not paths:
             logger.info(f"No files to process for {model_name}")
@@ -237,7 +318,7 @@ def main(args):
         run_per_gpu_processes(
             run_worker,
             num_gpus=num_gpus,
-            args=(model_name, paths, config, args.config_path),
+            args=(model_name, paths, config, args.config_path, processed, errors, error_details_list),
         )
 
     if config.get('use_rover', False):
@@ -252,6 +333,16 @@ def main(args):
             logger.error(f"ROVER failed: {e}")
 
     logger.info("Transcription pipeline complete!")
+
+    write_stage_status(
+        stage=6,
+        stage_name="transcription",
+        log_dir=args.log_dir or "./logs",
+        processed=processed.value,
+        skipped=0,
+        errors=errors.value,
+        error_details=list(error_details_list),
+    )
 
 
 if __name__ == "__main__":

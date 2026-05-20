@@ -51,6 +51,7 @@ from src.utils.csv_manager import (
 )
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 
 apply_torch_perf_defaults(disable_math_sdp=False)
@@ -72,7 +73,7 @@ def create_loader(paths: List[str], model_name: str, batch_size: int, num_worker
             batch_sampler=sampler,
             collate_fn=AudioCollate(processor),
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=False,
         ),
         audio_lengths,
     )
@@ -87,7 +88,7 @@ def load_model(model_path: str, base_model: str, device: torch.device):
     return model
 
 
-def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
+def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict, processed_counter, skipped_counter, errors_counter):
     my_paths = all_paths[rank::world_size]
     if not my_paths:
         return
@@ -124,6 +125,7 @@ def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
             podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
         ) as writer:
             already_done: Set[str] = writer.already_done()
+            skipped_counter.value += len(already_done)
             if already_done:
                 logger.info(
                     f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping."
@@ -147,6 +149,7 @@ def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
                         deleted = True
                     except OSError as exc:
                         logger.warning(f"Could not delete {path}: {exc}")
+                        errors_counter.value += 1
 
                 writer.write(
                     {
@@ -156,11 +159,13 @@ def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict):
                         "deleted": deleted,
                     }
                 )
+                processed_counter.value += 1
 
         logger.success(f"[{device}] Done. Deleted {deleted_count}/{len(my_paths)} files.")
 
     except Exception as exc:
         logger.exception(f"Worker {rank} error: {exc}")
+        errors_counter.value += 1
 
 
 def main(args):
@@ -225,8 +230,12 @@ def main(args):
 
     logger.info(f"{len(pending)} files still need a music_prob; starting workers on {n_gpus} GPUs.")
 
+    processed = mp.Value('i', 0)
+    skipped = mp.Value('i', 0)
+    errors = mp.Value('i', 0)
+
     try:
-        mp.spawn(run_worker, args=(n_gpus, pending, config), nprocs=n_gpus, join=True)
+        mp.spawn(run_worker, args=(n_gpus, pending, config, processed, skipped, errors), nprocs=n_gpus, join=True)
     except KeyboardInterrupt:
         logger.warning("Music detection stage interrupted; merging partials before exit.")
 
@@ -254,6 +263,15 @@ def main(args):
         hours_in=audit["hours_in"],
         hours_out=audit["hours_out"],
         params={"threshold": cfg.get("threshold", 0.5), "deleted": audit["files_deleted"]},
+    )
+
+    write_stage_status(
+        stage=4,
+        stage_name="music_detect",
+        log_dir=args.log_dir or "./logs",
+        processed=processed.value,
+        skipped=skipped.value,
+        errors=errors.value,
     )
 
 

@@ -22,6 +22,7 @@ CSV resilience:
 """
 
 import argparse
+import warnings
 from pathlib import Path
 from typing import List, Set
 
@@ -45,6 +46,7 @@ from src.utils.csv_manager import (
 from src.utils.datasets.preprocess import create_loudness_normalize_dataloader
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 
 apply_torch_perf_defaults()
@@ -72,7 +74,18 @@ def normalize_audio_loudness(
 def _write_audio(audio_path: str, samples: np.ndarray, sample_rate: int) -> None:
     """Write samples shaped ``(channels, frames)`` using torchaudio."""
     tensor = torch.from_numpy(samples if samples.ndim == 2 else samples[np.newaxis, :])
-    torchaudio.save(audio_path, tensor, sample_rate)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*save_with_torchcodec.*",
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*StreamingMediaEncoder has been deprecated.*",
+            category=UserWarning,
+        )
+        torchaudio.save(audio_path, tensor, sample_rate)
 
 
 def process_audio_file(
@@ -102,7 +115,6 @@ def process_audio_file(
 
         _write_audio(audio_path, normalized_2d, sample_rate)
 
-        logger.debug(f"Normalized: {audio_path}")
         return True
     except Exception as exc:
         logger.error(f"Error processing {audio_path}: {exc}")
@@ -120,6 +132,9 @@ def run_worker(
     batch_size: int,
     loader_workers: int,
     prefetch_factor: int,
+    processed_counter,
+    skipped_counter,
+    errors_counter,
 ):
     """Worker that processes a sharded subset of files."""
     if not all_file_paths:
@@ -136,6 +151,7 @@ def run_worker(
 
     with PartialCsvWriter(output_dir, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS) as writer:
         already_done: Set[str] = writer.already_done()
+        skipped_counter.value += len(already_done)
         if already_done:
             logger.info(
                 f"Worker {rank}: {len(already_done)} files already in this partial; skipping."
@@ -153,10 +169,12 @@ def run_worker(
             for file_path, audio, sample_rate, error in batch:
                 if error:
                     logger.error(f"Error loading {file_path}: {error}")
+                    errors_counter.value += 1
                     continue
                 ok = process_audio_file(str(file_path), audio, sample_rate, peak, loudness, block_size)
                 if ok:
                     writer.write({"filepath": resolve_path(file_path), NORMALIZED_COLUMN: True})
+                    processed_counter.value += 1
 
 
 def main(args):
@@ -225,6 +243,10 @@ def main(args):
         logger.info("All audio files are already loudness-normalized.")
         return
 
+    processed = mp.Value('i', 0)
+    skipped = mp.Value('i', 0)
+    errors = mp.Value('i', 0)
+
     try:
         if num_processes > 1:
             mp.spawn(
@@ -239,6 +261,9 @@ def main(args):
                     loudness_batch_size,
                     loudness_loader_workers,
                     loudness_prefetch_factor,
+                    processed,
+                    skipped,
+                    errors,
                 ),
                 nprocs=num_processes,
                 join=True,
@@ -255,6 +280,9 @@ def main(args):
                 loudness_batch_size,
                 loudness_loader_workers,
                 loudness_prefetch_factor,
+                processed,
+                skipped,
+                errors,
             )
     except KeyboardInterrupt:
         logger.warning("Loudness normalization interrupted; merging partials before exit.")
@@ -264,6 +292,15 @@ def main(args):
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=[NORMALIZED_COLUMN],
+    )
+
+    write_stage_status(
+        stage=3,
+        stage_name="preprocess_audio",
+        log_dir=args.log_dir or "./logs",
+        processed=processed.value,
+        skipped=skipped.value,
+        errors=errors.value,
     )
 
     logger.info("Loudness normalization stage complete.")

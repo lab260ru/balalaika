@@ -48,6 +48,7 @@ from src.utils.csv_manager import (
 )
 from src.utils.datasets.preprocess import create_crest_factor_dataloader
 from src.utils.logging_setup import setup_logging
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 
 PARTIAL_PREFIX = "crest"
@@ -73,6 +74,9 @@ def run_worker(
     batch_size: int,
     loader_workers: int,
     prefetch_factor: int,
+    processed_counter,
+    skipped_counter,
+    errors_counter,
 ):
     my_files = all_file_paths[rank::world_size]
     if not my_files:
@@ -85,6 +89,7 @@ def run_worker(
 
     with PartialCsvWriter(output_dir, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS) as writer:
         already_done: Set[str] = writer.already_done()
+        skipped_counter.value += len(already_done)
         if already_done:
             logger.info(
                 f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping."
@@ -118,6 +123,7 @@ def run_worker(
                     batch_lengths.to(torch.float64) / batch_sample_rates.clamp_min(1).to(torch.float64)
                 ).tolist()
             except Exception as exc:
+                errors_counter.value += 1
                 logger.error(f"Error processing batch on worker {rank}: {exc}")
                 continue
 
@@ -140,6 +146,8 @@ def run_worker(
                         "deleted": deleted,
                     }
                 )
+
+            processed_counter.value += len(valid_paths)
 
     logger.info(f"Worker {rank} finished its shard.")
 
@@ -214,6 +222,10 @@ def main(args):
 
     logger.info(f"{len(pending)} files still need a crest_factor; starting workers.")
 
+    processed = mp.Value('i', 0)
+    skipped = mp.Value('i', 0)
+    errors = mp.Value('i', 0)
+
     try:
         if num_workers > 1:
             mp.spawn(
@@ -226,6 +238,9 @@ def main(args):
                     crest_batch_size,
                     crest_loader_workers,
                     crest_prefetch_factor,
+                    processed,
+                    skipped,
+                    errors,
                 ),
                 nprocs=num_workers,
                 join=True,
@@ -240,6 +255,9 @@ def main(args):
                 crest_batch_size,
                 crest_loader_workers,
                 crest_prefetch_factor,
+                processed,
+                skipped,
+                errors,
             )
     except KeyboardInterrupt:
         logger.warning("Crest factor stage interrupted; merging whatever partials are on disk.")
@@ -276,6 +294,24 @@ def main(args):
         hours_in=audit["hours_in"],
         hours_out=audit["hours_out"],
         params={"threshold": crest_threshold, "deleted": audit["files_deleted"]},
+    )
+
+    write_stage_status(
+        stage=2,
+        stage_name="crest_factor_remover",
+        log_dir=args.log_dir or "./logs",
+        processed=processed.value,
+        skipped=skipped.value,
+        errors=errors.value,
+    )
+
+    write_stage_status(
+        stage=2,
+        stage_name="crest_factor_remover",
+        log_dir=args.log_dir or "./logs",
+        processed=processed.value,
+        skipped=skipped.value,
+        errors=errors.value,
     )
 
     logger.info("Crest factor check completed.")

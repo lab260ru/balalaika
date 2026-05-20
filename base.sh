@@ -12,6 +12,7 @@
 #   3  Preprocess: loudness         (src.preprocess.preprocess_audio)
 #   4  Separation: music detection  (src.separation.music_detect)
 #   5  Separation: DistillMOS       (src.separation.distillmos_process)
+#   5.5 DistillMOS filter            (src.separation.distillmos_filter)
 #   6  Transcription                (src.transcription.transcription)
 #   7  Punctuation                  (src.punctuation.punctuation)
 #   8  Accents                      (src.accents.accents)
@@ -29,6 +30,7 @@ set -euo pipefail
 config_path="configs/config.yaml"
 stage=1
 stop_stage=9
+strict_mode=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,6 +40,8 @@ while [[ $# -gt 0 ]]; do
             stage="$2"; shift 2 ;;
         --stop_stage)
             stop_stage="$2"; shift 2 ;;
+        --strict)
+            strict_mode=1; shift ;;
         --help|-h)
             sed -n '2,28p' "$0"
             exit 0 ;;
@@ -111,73 +115,119 @@ run_python() {
 stage_active() {
     # Returns 0 (true) when the requested stage falls into [stage, stop_stage].
     local s="$1"
-    [[ "$stage" -le "$s" && "$stop_stage" -ge "$s" ]]
+    (( $(echo "$stage <= $s && $stop_stage >= $s" | bc -l) ))
+}
+
+check_stage_status() {
+    local s="$1"
+    local status_file="${BALALAIKA_LOG_DIR:-./logs}/stage_${s}_status.json"
+
+    if [[ "${strict_mode:-0}" != "1" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "$status_file" ]]; then
+        echo -e "\033[1;31m[FAIL] Stage $s: status file not found (stage did not complete)\033[0m" >&2
+        exit 1
+    fi
+
+    local errors
+    errors=$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+print(data.get("errors", 0))
+' "$status_file")
+    if [[ "$errors" -gt 0 ]]; then
+        echo -e "\033[1;31m[FAIL] Stage $s: $errors error(s). Pipeline aborted.\033[0m" >&2
+        echo "See: $status_file" >&2
+        exit 1
+    fi
 }
 
 # ---- pipeline ---------------------------------------------------------------
 if stage_active 0; then
     echo "Stage 0: Download (Yandex Music)"
     run_python src.download.download
+    check_stage_status 0
 fi
 
 if stage_active 1; then
     echo "Stage 1: Preprocess — Sortformer chunking + Smart Turn refinement"
     run_python src.preprocess.preprocess
+    check_stage_status 1
 fi
 
 if stage_active 2; then
     echo "Stage 2: Preprocess — crest factor filter"
     run_python src.preprocess.crest_factor_remover
+    check_stage_status 2
 fi
 
 if stage_active 3; then
     echo "Stage 3: Preprocess — loudness normalization (BS.1770-4)"
     run_python src.preprocess.preprocess_audio
+    check_stage_status 3
 fi
 
 if stage_active 4; then
     echo "Stage 4: Separation — music detection"
     run_python src.separation.music_detect
+    check_stage_status 4
 fi
 
 if stage_active 5; then
     echo "Stage 5: Separation — DistillMOS scoring"
     run_python src.separation.distillmos_process
+    check_stage_status 5
+fi
+
+if stage_active 5.5; then
+    echo "Stage 5.5: DistillMOS filter — quality-based deletion"
+    run_python src.separation.distillmos_filter
+    check_stage_status 5.5
 fi
 
 if stage_active 6; then
     echo "Stage 6: Transcription — onnx-asr + ROVER"
     run_python src.transcription.transcription
+    check_stage_status 6
 fi
 
 if stage_active 7; then
     echo "Stage 7: Punctuation — RUPunct"
     run_python src.punctuation.punctuation
+    check_stage_status 7
 fi
 
 if stage_active 8; then
     echo "Stage 8: Accents — ruAccent"
     run_python src.accents.accents
+    check_stage_status 8
 fi
 
 if stage_active 9; then
     echo "Stage 9: Phonemizer — TryIParu G2P"
     run_python src.phonemizer.phonemizer
+    check_stage_status 9
 fi
 
 if stage_active 10; then
     echo "Stage 10: Collate — balalaika.parquet"
     run_python src.collate
+    check_stage_status 10
 fi
 
 if stage_active 11; then
     echo "Stage 11: Export — WebDataset shards"
     run_python src.to_webdataset
+    check_stage_status 11
 fi
 
 if stage_active 12; then
     echo "Stage 12: Filter report — filter_report.md"
     run_python src.report --quiet
+    check_stage_status 12
 fi
 
 echo -e "\n\033[1;32mPipeline finished (stages ${stage}..${stop_stage})\033[0m"

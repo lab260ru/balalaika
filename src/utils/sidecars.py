@@ -11,10 +11,23 @@ that lived in each stage with a couple of small composable functions.
 """
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 from typing import Callable, Iterable, List
 
+from loguru import logger
+
 from src.utils.utils import get_audio_paths, get_txt_paths
+
+
+def path_exists(path: Path, *, missing_on_too_long: bool, label: str = "Sidecar") -> bool:
+    try:
+        return path.exists()
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            logger.error(f"{label} path is too long, skipping: {path}")
+            return not missing_on_too_long
+        raise
 
 
 def with_suffix_at_stem(path: Path, suffix: str) -> Path:
@@ -42,9 +55,9 @@ def pending(
     out: List[Path] = []
     for raw in inputs:
         p = Path(raw)
-        if require_input_exists and not p.exists():
+        if require_input_exists and not path_exists(p, missing_on_too_long=True):
             continue
-        if not derive_output(p).exists():
+        if not path_exists(derive_output(p), missing_on_too_long=False):
             out.append(p)
     return out
 
@@ -65,9 +78,9 @@ def pending_audio_to_sidecar(
     for a in audio:
         a = Path(a)
         in_path = with_suffix_at_stem(a, in_suffix)
-        if not in_path.exists():
+        if not path_exists(in_path, missing_on_too_long=True):
             continue
-        if with_suffix_at_stem(a, out_suffix).exists():
+        if path_exists(with_suffix_at_stem(a, out_suffix), missing_on_too_long=False):
             continue
         pendings.append(in_path)
     return pendings

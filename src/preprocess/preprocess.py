@@ -15,6 +15,7 @@ Production notes:
 """
 
 import argparse
+import hashlib
 import multiprocessing
 import os
 import re
@@ -32,6 +33,8 @@ from tqdm import tqdm
 
 from src.libs.smart_turn.offline_svad import SmartVAD
 from src.utils.audit import record_stage_summary, safe_audio_duration
+from src.utils.stage_status import write_stage_status
+from src.utils.stage_status import write_stage_status
 from src.utils.csv_manager import upsert_columns
 from src.utils.datasets.preprocess import create_diarization_dataloader
 from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
@@ -47,6 +50,7 @@ DEFAULT_MAX_MERGE_GAP_S = 0.5
 
 LOSSLESS_EXTENSIONS = {".flac", ".wav"}
 SUPPORTED_CHUNK_EXTS = {"flac", "wav", "mp3", "ogg", "opus"}
+MAX_FILENAME_BYTES = 240
 
 sortformer_model = None
 smart_vad = None
@@ -323,6 +327,38 @@ def _save_audio_chunk(out_path: str, segment: torch.Tensor, sr: int, fmt: str) -
         torchaudio.save(out_path, segment, sr, format=fmt)
 
 
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    clipped = encoded[:max(0, max_bytes)]
+    while clipped:
+        try:
+            return clipped.decode("utf-8")
+        except UnicodeDecodeError:
+            clipped = clipped[:-1]
+    return ""
+
+
+def _chunk_filename(start: float, end: float, album_id: str, episode_id: str, fmt: str) -> str:
+    """Return a chunk filename that fits common 255-byte filesystem limits."""
+    ext = f".{fmt}"
+    prefix = f"{start:.2f}_{end:.2f}_"
+    tail = f"{album_id}_{episode_id}"
+    candidate = f"{prefix}{tail}{ext}"
+    if len(candidate.encode("utf-8")) <= MAX_FILENAME_BYTES:
+        return candidate
+
+    digest = hashlib.sha1(tail.encode("utf-8")).hexdigest()[:10]
+    fixed_bytes = len(prefix.encode("utf-8")) + len(ext.encode("utf-8")) + len(digest) + 2
+    tail_budget = max(0, MAX_FILENAME_BYTES - fixed_bytes)
+    album_budget = min(48, max(0, tail_budget // 3))
+    episode_budget = max(0, tail_budget - album_budget - 1)
+    short_album = _truncate_utf8(album_id, album_budget)
+    short_episode = _truncate_utf8(episode_id, episode_budget)
+    return f"{prefix}{short_album}_{short_episode}_{digest}{ext}"
+
+
 def cut_audio(
     audio: torch.Tensor,
     sr: int,
@@ -350,7 +386,7 @@ def cut_audio(
         sil_pct, max_sil, unique_spk = get_chunk_metrics(start, end, raw_segments)
 
         segment = audio[:, s_sample:e_sample]
-        fname = f"{start:.2f}_{end:.2f}_{album_id}_{episode_id}.{fmt}"
+        fname = _chunk_filename(start, end, album_id, episode_id, fmt)
         out_path = os.path.join(output_folder, fname)
         _save_audio_chunk(out_path, segment, sr, fmt)
 
@@ -537,6 +573,10 @@ def main(args):
     chunk_format_cfg = config.get('chunk_format', 'auto')
     logger.info(f"Chunk format policy: '{chunk_format_cfg}' (lossless input stays lossless).")
 
+    processed = 0
+    errors = 0
+    error_details: list[dict] = []
+
     num_gpus = torch.cuda.device_count()
     total_workers = max(1, num_gpus * num_workers_per_gpu)
     logger.info(f"GPUs: {num_gpus}, workers/GPU: {num_workers_per_gpu}, total workers: {total_workers}")
@@ -592,8 +632,11 @@ def main(args):
         for future in as_completed(gpu_futures):
             try:
                 all_results.extend(future.result())
+                processed += 1
             except Exception as e:
                 logger.error(f"Failed to aggregate results from a GPU batch: {e}")
+                errors += 1
+                error_details.append({"reason": str(e)})
 
     hours_out = sum(float(r.get('total_duration', 0.0)) for r in all_results) / 3600.0
 
@@ -629,6 +672,26 @@ def main(args):
             ),
             "max_merge_gap": config.get("max_merge_gap", DEFAULT_MAX_MERGE_GAP_S),
         },
+    )
+
+    write_stage_status(
+        stage=1,
+        stage_name="preprocess",
+        log_dir=args.log_dir or "./logs",
+        processed=processed,
+        skipped=0,
+        errors=errors,
+        error_details=error_details,
+    )
+
+    write_stage_status(
+        stage=1,
+        stage_name="preprocess",
+        log_dir=args.log_dir or "./logs",
+        processed=processed,
+        skipped=0,
+        errors=errors,
+        error_details=error_details,
     )
 
 
