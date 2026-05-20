@@ -32,6 +32,10 @@ def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Option
 
 
 def main(args):
+    processed = 0
+    errors = 0
+    error_details: list[dict] = []
+
     setup_logging("collate", log_dir=args.log_dir)
     config = load_config(args.config_path, 'download')
     base_path = Path(config.get('podcasts_path', '../../balalaika'))
@@ -100,7 +104,4 @@ if __name__ == "__main__":
     parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
 
     args = parser.parse_args()
-    processed = 0
-    errors = 0
-    error_details: list[dict] = []
     main(args)

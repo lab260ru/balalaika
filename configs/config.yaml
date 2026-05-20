@@ -76,7 +76,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_0
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -86,9 +86,9 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_0
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
   # Maximum duration of each output segment in seconds.
-  duration: 15
+  duration: 22
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
   num_workers: 1
   # DataLoader batch size for Sortformer diarization source loading.
@@ -152,7 +152,7 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_0
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
 
   music_detect:
     # Inference batch size for music classifier.
@@ -182,19 +182,36 @@ separation:
   distillmos_filter:
     # DistillMOS threshold. Files with DistillMOS below this are deleted.
     # Set to null → manual interactive mode. Set to a float → automatic mode.
-    threshold: null
+    threshold: 3.65
     # Parallel worker processes for deletion + CSV updates.
     num_workers: 4
 
+transcription:
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
+  model_names:
+    - giga_ctc
+    - giga_rnnt
+    - vosk
+    - tone
+  consensus_num: 3
+  with_timestamps: False
+  use_tensorrt: True
+  use_vad: False
+  use_rover: True
+  batch_size: 8
+  num_workers: 6
+  prefetch_factor: 2
+  retry_empty_outputs: True
+
 punctuation:
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_0
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_0
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -203,11 +220,11 @@ accent:
   use_tensorrt: False
 
 phonemizer:
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_0
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
   num_workers: 1
 
 export:
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_0
+  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
   # Parallel processes writing WebDataset shards.
   num_workers: 1
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.

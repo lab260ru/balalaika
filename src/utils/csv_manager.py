@@ -96,10 +96,19 @@ def _read_csv_safe(path: Path) -> Optional[pd.DataFrame]:
 
 
 def atomic_write_csv(df: pd.DataFrame, path: os.PathLike | str) -> None:
-    """Write ``df`` to ``path`` atomically (tmp file + rename + fsync)."""
+    """Write ``df`` to ``path`` atomically (tmp file + rename + fsync).
+
+    A backup ``<path>.bak`` is kept so :func:`ensure_main_csv` can recover if
+    the process is killed mid-write and leaves the CSV corrupt.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
+    bak = Path(str(path) + ".bak")
+
+    if path.exists():
+        shutil.copy2(path, bak)
+
     df.to_csv(tmp, index=False)
     if not tmp.exists():
         df.to_csv(tmp, index=False)
@@ -148,22 +157,43 @@ def ensure_main_csv(
 ) -> pd.DataFrame:
     """Create ``balalaika.csv`` if missing, optionally populating from audio paths.
 
+    If the CSV is corrupt (missing, empty, or lacks a ``filepath`` column),
+    the function first tries to restore from ``balalaika.csv.bak`` (kept by
+    :func:`atomic_write_csv`).  Only when the backup is also unusable does it
+    bootstrap a fresh CSV — and logs ``ERROR`` so the operator knows data was
+    lost.
+
     Returns the loaded DataFrame (potentially empty if ``audio_paths`` was not
     supplied and the CSV did not yet exist).
     """
     target = csv_path(podcasts_path)
+    bak = Path(str(target) + ".bak")
     df = _read_csv_safe(target)
 
     if df is None or df.empty or "filepath" not in df.columns:
-        if audio_paths is None:
-            logger.info(f"{target} is missing; creating empty CSV.")
+        bak_df = _read_csv_safe(bak)
+        if bak_df is not None and not bak_df.empty and "filepath" in bak_df.columns:
+            logger.warning(
+                f"{target.name} is corrupt — restored {len(bak_df)} rows from "
+                f"{bak.name}"
+            )
+            atomic_write_csv(bak_df, target)
+            df = _normalize_filepath_column(bak_df)
+        elif audio_paths is None:
+            logger.error(
+                f"{target.name} and {bak.name} are both corrupt — "
+                "creating empty CSV. Some column data may be permanently lost."
+            )
             df = pd.DataFrame(columns=["filepath"])
         else:
+            logger.error(
+                f"{target.name} and {bak.name} are both corrupt — "
+                "bootstrapping fresh CSV from audio tree. Some column data "
+                "may be permanently lost."
+            )
             paths = sorted({resolve_path(p) for p in audio_paths})
             df = pd.DataFrame({"filepath": paths})
-            logger.info(
-                f"{target} missing — bootstrapped with {len(df)} audio paths."
-            )
+
         atomic_write_csv(df, target)
         return df
 
