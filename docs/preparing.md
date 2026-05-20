@@ -68,9 +68,10 @@ If you want a fixed container regardless of input, set
 `preprocess.chunk_format` to one of `flac` / `wav` / `mp3` / `ogg` / `opus`
 (`auto` is the format-preserving default).
 
-If a file is **shorter than** `preprocess.duration`, it is **left in place**
-and only metrics are appended to `balalaika.csv` (no chunk subfolder for that
-case).
+If a file's total duration is already within the configured maximum segment
+duration (`preprocess.duration`, used as `max_duration` by the chunker), it is
+**left in place** and only metadata is appended to `balalaika.csv` (no chunk
+subfolder for that case).
 
 ### 2. Environment
 
@@ -82,16 +83,28 @@ Create a `.env` in the repo root (see main [README.md](../README.md)):
 
 Optional:
 
-- **`BALALAIKA_LOG_DIR`** — directory for per-stage rotating log files
-  (defaults to `./logs`). Each stage also accepts `--log_dir <path>` to
-  override per invocation.
+- Runtime defaults now live in `configs/config.yaml` under `runtime:`:
+  `venv_path`, `cpu_affinity`, `log_dir`, TensorRT cache path/workspace, and
+  `trt_fp16`.
+- **`BALALAIKA_LOG_DIR`** can still override the log directory for direct
+  module runs. When using `base.sh`, prefer `runtime.log_dir` or the per-stage
+  `--log_dir <path>` flag.
 
 ### 3. Configuration
 
-Edit **`configs/config.yaml`**: absolute `podcasts_path` everywhere you
-process data, batch sizes, thresholds, `model_names` for transcription and
-the new `chunk_format` knob. The file includes an inline **parameter
-reference** at the top.
+Edit **`configs/config.yaml`**: keep `podcasts_path` aligned in every section
+that processes your dataset, choose batch sizes and worker counts, set quality
+thresholds, define `transcription.model_names`, and choose `preprocess.chunk_format`
+(`auto` preserves the source container). The file includes an inline
+**parameter reference** at the top.
+
+Important thresholds:
+
+- `preprocess.crest_treshold`: deletes files with high peak/RMS ratio.
+- `separation.music_detect.threshold`: deletes music-heavy clips.
+- `separation.distillmos_filter.threshold`: deletes clips whose `DistillMOS`
+  score is below the threshold. Set it to `null` if you want to choose the
+  threshold interactively after seeing the MOS distribution.
 
 **Collate note:** `src/collate.py` reads the **`download`** section for
 `podcasts_path` and `num_workers`. Keep `download.podcasts_path` the same as
@@ -100,13 +113,26 @@ your working dataset root, or collate will look in the wrong place.
 ### 4. Run order
 
 `base.sh` is a Kaldi-style runner with `--stage` / `--stop_stage` flags
-(stages 0..12, see [docs/guide.md](guide.md) for the table). Full pipeline:
+(stages 0..12 plus stage 5.5, see [docs/guide.md](guide.md) for the table).
+With no flags it runs stages 1..9: chunking through phonemization.
 
 ```bash
 bash base.sh --config_path configs/config.yaml
 ```
 
-Just preprocess:
+Full local pipeline without Yandex download:
+
+```bash
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 12
+```
+
+Include Yandex download:
+
+```bash
+bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 12
+```
+
+Just preprocess and audio normalization:
 
 ```bash
 bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
@@ -115,6 +141,12 @@ bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
 The last stage (12) runs `src/report.py`, which materializes
 `filter_report.md` next to your dataset so you can see how much audio (in
 hours) was filtered at each step.
+
+To run only the DistillMOS quality filter after scoring:
+
+```bash
+bash base.sh --config_path configs/config.yaml --stage 5.5 --stop_stage 5.5
+```
 
 ---
 

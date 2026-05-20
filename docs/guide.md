@@ -60,10 +60,9 @@ Computes `crest_factor = peak / RMS` per file, writes the value to
 `crest_factor` row in `filter_summary.csv` with hours kept vs. removed.
 
 #### 2.3. Loudness normalization (`preprocess_audio.py`)
-ITU-R BS.1770-4 normalization (peak + integrated LUFS). Lossless containers
-(FLAC / WAV) are written through `soundfile` to keep the data lossless. Lossy
-containers (MP3, OGG, OPUS) are re-encoded by `torchaudio.save` since libsndfile
-can't write them.
+ITU-R BS.1770-4 normalization (peak + integrated LUFS). Files are overwritten
+in place with `torchaudio.save`, and `loudness_normalized` is written to
+`balalaika.csv` so interrupted runs can resume.
 
 **Configuration**: `config.yaml` → `preprocess` section
 - `crest_treshold`, `peak`, `loudness`, `block_size`
@@ -83,13 +82,22 @@ Fine-tuned **WavLM** classifier. Writes `music_prob` to `balalaika.csv`,
 deletes clips above `separation.music_detect.threshold` and emits a
 `music_detect` row in `filter_summary.csv`.
 
-#### 3.2. DistillMOS (`distillmos_process.py`)
+#### 3.2. DistillMOS scoring (`distillmos_process.py`)
 Predicts MOS for every surviving clip and writes `DistillMOS` to
 `balalaika.csv`. No deletion — purely an annotation stage.
+
+#### 3.3. DistillMOS filter (`distillmos_filter.py`)
+Reads the `DistillMOS` column, prints distribution statistics, and deletes
+clips below `separation.distillmos_filter.threshold`. If the threshold is
+`null` or the stage is run with `--manual`, it asks for a threshold
+interactively. Deletions are streamed through partial CSV files and recorded in
+`filter_summary.csv` as `distillmos_filter`.
 
 **Configuration**: `config.yaml` → `separation` section
 - `music_detect.bs`, `num_workers`, `music_detect_model`, `threshold`, optional
   `base_model` / `cache_path`
+- `distillmos.batch_size`, `distillmos.num_workers`, `distillmos.prefetch_factor`
+- `distillmos_filter.threshold`, `distillmos_filter.num_workers`
 
 ---
 
@@ -151,28 +159,43 @@ the chunked container is preserved end-to-end (no extra encode at export).
 **Run**:
 
 ```bash
-bash src/collate_yamls.sh configs/config.yaml
+bash base.sh --config_path configs/config.yaml --stage 10 --stop_stage 10
+bash base.sh --config_path configs/config.yaml --stage 11 --stop_stage 11
 ```
 
 ---
 
 ### 9. Filter report (`src/report.py`)
 
-After the pipeline finishes, `src/report.py` (also wrapped by
-`src/report_yaml.sh`) reads `filter_summary.csv` and writes
-`<podcasts_path>/filter_report.md` summarising hours filtered at every stage.
-The script is appended to `base.sh` so it runs automatically with the rest of
-the pipeline.
+After filtering stages finish, `src.report` reads `filter_summary.csv` and
+writes `<podcasts_path>/filter_report.md` summarising hours filtered at every
+stage. It is stage 12 in `base.sh`; it runs only when your selected
+`--stage`/`--stop_stage` range includes 12.
 
 ---
 
 ## Running the pipeline
 
-`base.sh` is now a Kaldi-style orchestrator with numbered stages
-(`--stage` / `--stop_stage` like CosyVoice's `run.sh`). The full pipeline:
+`base.sh` is a Kaldi-style orchestrator with numbered stages
+(`--stage` / `--stop_stage` like CosyVoice's `run.sh`). With no stage flags it
+runs stages 1..9: chunking through phonemization, skipping download, parquet
+collation, WebDataset export, and the final report.
 
 ```bash
 bash base.sh --config_path configs/config.yaml
+```
+
+Run all local processing stages, including parquet, WebDataset export, and the
+report:
+
+```bash
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 12
+```
+
+Include Yandex Music download as well:
+
+```bash
+bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 12
 ```
 
 Run a contiguous subrange (e.g. preprocess only):
@@ -197,6 +220,7 @@ Stage map:
 | 3 | Preprocess: loudness | `src.preprocess.preprocess_audio` |
 | 4 | Separation: music detection | `src.separation.music_detect` |
 | 5 | Separation: DistillMOS | `src.separation.distillmos_process` |
+| 5.5 | Separation: DistillMOS filter | `src.separation.distillmos_filter` |
 | 6 | Transcription | `src.transcription.transcription` |
 | 7 | Punctuation | `src.punctuation.punctuation` |
 | 8 | Accents | `src.accents.accents` |
@@ -205,10 +229,10 @@ Stage map:
 | 11 | Export (WebDataset) | `src.to_webdataset` |
 | 12 | Filter report | `src.report` |
 
-`base.sh` reads runtime parameters (venv path, CPU affinity, log dir, TRT
-cache and workspace) from the **`runtime`** block in the YAML via
-`src.utils.runtime_env`. The legacy `*_yaml.sh` wrappers under `src/` are kept
-as thin per-stage shortcuts and use the same helpers.
+`base.sh` reads runtime parameters (venv path, CPU affinity, log dir, TRT cache
+and workspace) from the **`runtime`** block in the YAML via
+`src.utils.runtime_env`. Add `--strict` if you want `base.sh` to stop when a
+stage writes a `stage_<id>_status.json` file with non-zero errors.
 
 ---
 
@@ -216,9 +240,8 @@ as thin per-stage shortcuts and use the same helpers.
 
 - Chunked segments preserve the source container by default (FLAC stays FLAC).
   Use `preprocess.chunk_format` to pin a specific extension when you need it.
-- Loudness normalization keeps lossless inputs lossless (`soundfile` writes
-  FLAC PCM_24 / WAV FLOAT). Lossy inputs go through `torchaudio.save` because
-  `libsndfile` can't write them.
+- Loudness normalization overwrites clips in place with `torchaudio.save` after
+  peak and integrated-loudness normalization.
 - Read-only stages (crest filter, music detection, DistillMOS, ASR, RUPunct,
   ruAccent, TryIParu, WebDataset export) never re-encode the audio. Bytes are
   copied verbatim into the WebDataset shards.
@@ -246,13 +269,13 @@ Quick recipes:
 
 ```bash
 # Tail the active stage live
-tail -f logs/preprocess_*.log | less +F
+less +F logs/preprocess_*.log
 
 # Find errors across the whole run
-grep -E "ERROR|WARNING" logs/*.log
+rg "ERROR|WARNING" logs/
 
-# Send all logs to a custom directory
-BALALAIKA_LOG_DIR=/var/log/balalaika bash base.sh configs/config.yaml
+# Send all logs to a custom directory by setting runtime.log_dir in configs/config.yaml
+bash base.sh --config_path configs/config.yaml
 ```
 
 ---
@@ -266,7 +289,7 @@ Each filtering stage appends a single row to
 | Column | Meaning |
 |--------|---------|
 | `timestamp` | UTC ISO-8601 (when the stage finished) |
-| `stage` | `preprocess` / `crest_factor` / `music_detect` (extend as needed) |
+| `stage` | `preprocess` / `crest_factor` / `music_detect` / `distillmos_filter` |
 | `files_in` / `files_out` | File counts before vs. after filtering |
 | `hours_in` / `hours_out` | Total audio hours before vs. after filtering |
 | `hours_removed` | Convenience: `max(0, hours_in - hours_out)` |
@@ -282,8 +305,6 @@ Manual invocation (without re-running the pipeline):
 
 ```bash
 python -m src.report --config_path configs/config.yaml
-# or with an explicit dataset root
-python -m src.report --podcasts_path /mnt/data/ruslan
 ```
 
 ---
@@ -306,8 +327,8 @@ Dataset-level files at `podcasts_path`:
 
 | File | Created by | Purpose |
 |------|------------|---------|
-| `balalaika.csv` | preprocess + crest + music_detect + distillmos | Per-clip metadata |
-| `filter_summary.csv` | every filter stage | Audit log of files/hours dropped |
+| `balalaika.csv` | preprocess + crest + loudness + music_detect + distillmos/filter | Per-clip metadata |
+| `filter_summary.csv` | filtering stages | Audit log of files/hours dropped |
 | `filter_report.md` | `src/report.py` | Human-readable report |
 | `balalaika.parquet` | `src/collate.py` | Final aggregated metadata |
 
@@ -318,9 +339,10 @@ Dataset-level files at `podcasts_path`:
 The main configuration file is `configs/config.yaml`. Key sections:
 
 ### Global parameters
-- `cache_path`: Path for caching temporary files
-- `podcasts_path`: **Absolute path** to your data directory (set in every
-  section that processes data)
+- `cache_path`: Reserved/general cache path; stage code normally reads its own
+  section-specific settings.
+- `podcasts_path`: Dataset root set inside each section that processes data.
+  Keep the values aligned unless you intentionally use separate trees.
 
 ### Runtime block
 
@@ -339,12 +361,15 @@ runtime:
 
 These values are exported as `BALALAIKA_*` env vars by
 `src.utils.runtime_env` and read by Python modules that need them
-(`get_providers`, `setup_logging`, ...). No shell-side YAML parsing required.
+(`get_onnx_providers`, `setup_logging`, ...). No shell-side YAML parsing
+required.
 
 ### Stage-specific configuration
 
 Each stage has its own block. The file ships with a comment header at the top
-that documents every section. **All paths must be absolute paths.**
+that documents every section. Dataset and model paths should be absolute paths
+for production runs; repo-local model paths such as `./models/...` are resolved
+relative to where you launch the command.
 
 ---
 
@@ -372,6 +397,7 @@ python -m src.preprocess.crest_factor_remover --config_path configs/config.yaml
 python -m src.preprocess.preprocess_audio     --config_path configs/config.yaml
 python -m src.separation.music_detect         --config_path configs/config.yaml
 python -m src.separation.distillmos_process   --config_path configs/config.yaml
+python -m src.separation.distillmos_filter    --config_path configs/config.yaml
 python -m src.transcription.transcription     --config_path configs/config.yaml
 python -m src.punctuation.punctuation         --config_path configs/config.yaml
 python -m src.accents.accents                 --config_path configs/config.yaml
@@ -385,7 +411,7 @@ python -m src.report                          --config_path configs/config.yaml
 
 1. **Download** → raw audio
 2. **Preprocess** → chunking → crest filter → loudness normalization
-3. **Separation** → music detection → DistillMOS
+3. **Separation** → music detection → DistillMOS scoring → optional DistillMOS filter
 4. **Transcription** → per-model ASR + ROVER
 5. **Punctuation** → `_rover.txt` → `_punct.txt`
 6. **Accents** → `_punct.txt` → `_accent.txt`

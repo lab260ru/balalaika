@@ -17,6 +17,7 @@ The main entrypoint is `base.sh`. It runs numbered stages from
 | 3 | `src.preprocess.preprocess_audio` | Loudness normalization. |
 | 4 | `src.separation.music_detect` | Music probability filtering. |
 | 5 | `src.separation.distillmos_process` | DistillMOS quality scoring. |
+| 5.5 | `src.separation.distillmos_filter` | DistillMOS threshold filtering. |
 | 6 | `src.transcription.transcription` | ASR with `onnx-asr` and optional ROVER. |
 | 7 | `src.punctuation.punctuation` | Punctuation restoration. |
 | 8 | `src.accents.accents` | Accent restoration. |
@@ -37,6 +38,11 @@ Run from a checkpoint:
 bash base.sh --config_path configs/config.yaml --stage 4
 ```
 
+By default, `base.sh` runs stages 1..9. Use `--stop_stage 12` when you also
+want parquet collation, WebDataset export, and the final report. Use
+`--strict` when the orchestrator should abort after any stage writes a status
+file with non-zero errors.
+
 Small per-stage wrappers under `src/*/*_yaml.sh` use `src/stage_runner.sh`.
 They are useful when you want to run one module directly while preserving the
 configured virtualenv, CPU affinity, and log directory.
@@ -50,7 +56,7 @@ Use one top-level section per pipeline area:
 - `runtime`: virtualenv, logs, CPU affinity, TensorRT cache paths.
 - `download`: downloader settings.
 - `preprocess`: diarization, VAD, chunking, crest factor, loudness.
-- `separation`: music detection, DistillMOS.
+- `separation`: music detection, DistillMOS scoring, DistillMOS filtering.
 - `transcription`: ASR models, batching, TensorRT, VAD, ROVER.
 - `punctuation`, `accent`, `phonemizer`, `export`: downstream stages.
 
@@ -115,9 +121,9 @@ Every model stage should keep three responsibilities separate:
 3. **Runtime knobs** live in `configs/config.yaml`.
 
 Do not load model inputs ad hoc inside the inference loop. If a model consumes
-audio, text, sidecar files, or tensors, add a Dataset and a DataLoader for that
-input path. The stage should receive already prepared batches and focus on model
-execution, error handling, and writing results.
+audio, text, sidecar files, or tensors at scale, add a Dataset and a DataLoader
+for that input path. The stage should receive already prepared batches and
+focus on model execution, error handling, and writing results.
 
 The expected shape is:
 
@@ -156,6 +162,8 @@ need:
 - `prefetch_factor` when `num_workers > 0`;
 - backend/runtime flags such as `use_tensorrt`, quantization, thresholds, or
   cache paths when relevant.
+- an explicit filter threshold for deletion stages, or a clearly documented
+  manual mode like `separation.distillmos_filter.threshold: null`.
 
 The project already has GPU parallelism helpers in `src/utils/parallel.py`:
 
@@ -319,6 +327,11 @@ absorb_partial_csvs(
 For filtering stages that delete files, pass `drop_missing_files=True` when
 absorbing or upserting results.
 
+If a filter consumes a score produced by a previous stage, follow
+`src/separation/distillmos_filter.py`: read `balalaika.csv`, preview the effect
+of the threshold, delete in workers, write partial CSV rows with enough metadata
+to audit the decision, then merge/prune the main CSV.
+
 ## Avoid Full Tree Scans When Possible
 
 `get_audio_paths()` and `discover_audio_paths()` use recursive filesystem scans.
@@ -345,6 +358,10 @@ only when the traceback is useful.
 Logs go to the configured runtime log directory and should be enough to resume
 or debug a failed batch run.
 
+Stages should also call `src.utils.stage_status.write_stage_status(...)` before
+exit. `base.sh --strict` reads `stage_<id>_status.json` from the log directory
+and aborts the pipeline when `errors > 0`.
+
 ## Audit And Reports
 
 Stages that remove or transform dataset size should record audit summaries with
@@ -356,6 +373,9 @@ Use it when a stage changes:
 - total hours,
 - filtering decisions,
 - quality thresholds.
+
+Current audit-producing stages include `preprocess`, `crest_factor`,
+`music_detect`, and `distillmos_filter`.
 
 Example:
 
@@ -382,13 +402,15 @@ record_stage_summary(
 6. Use one process per GPU for GPU-heavy models.
 7. Add the stage to `base.sh` if it should be part of the main pipeline.
 8. Add or update a `*_yaml.sh` wrapper if users need a direct stage script.
-9. Run syntax checks:
+9. Write a stage status file with `write_stage_status(...)` so `--strict`
+   works.
+10. Run syntax checks:
 
 ```bash
 .dev_venv/bin/python -m py_compile src/path/to/module.py src/utils/datasets/<area>.py
 ```
 
-10. Run the stage on a small limit or small test directory before launching the
+11. Run the stage on a small limit or small test directory before launching the
     full dataset.
 
 ## Common Pitfalls
