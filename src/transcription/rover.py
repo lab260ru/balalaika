@@ -1,23 +1,13 @@
 from pathlib import Path
 from typing import List
-import errno
 
 import pandas as pd
 from crowdkit.aggregation import ROVER
 from loguru import logger
 from tqdm import tqdm 
 
+from src.utils.sidecars import path_exists
 from src.utils.utils import read_file_content, get_audio_paths
-
-
-def path_exists(path: Path) -> bool:
-    try:
-        return path.exists()
-    except OSError as exc:
-        if exc.errno == errno.ENAMETOOLONG:
-            logger.error(f"Transcript path is too long, skipping: {path}")
-            return False
-        raise
 
 
 class ROVERWrapper:
@@ -48,7 +38,7 @@ class ROVERWrapper:
                 suffix = 'vosk' if 'vosk' in model_name else model_name
                 transcript_path = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
 
-                if not path_exists(transcript_path):
+                if not path_exists(transcript_path, missing_on_too_long=True, label="Transcript"):
                     continue
                 
                 try:

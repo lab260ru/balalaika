@@ -1,5 +1,4 @@
 import argparse
-import errno
 import multiprocessing as mp
 from collections import Counter
 from pathlib import Path
@@ -14,6 +13,7 @@ from src.utils.datasets.transcription import create_transcription_dataloader, re
 from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_processes
+from src.utils.sidecars import text_sidecar_complete
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import get_audio_paths, load_config, read_file_content
 
@@ -33,19 +33,6 @@ MODEL_MAP = {
 
 SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
 TARGET_SAMPLE_RATE = 16_000
-
-
-def sidecar_exists_or_unwritable(path: Path, retry_empty: bool = False) -> bool:
-    try:
-        exists = path.exists()
-        if exists and retry_empty and path.suffix == '.txt':
-            return path.stat().st_size != 0
-        return exists
-    except OSError as exc:
-        if exc.errno == errno.ENAMETOOLONG:
-            logger.error(f"Sidecar path is too long, skipping: {path}")
-            return True
-        raise
 
 
 def format_length_range(lengths: torch.Tensor, sample_rate: int) -> str:
@@ -230,7 +217,7 @@ def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int
     for mn in model_names:
         suffix = 'vosk' if 'vosk' in mn else mn
         tp = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
-        if sidecar_exists_or_unwritable(tp):
+        if text_sidecar_complete(tp):
             try:
                 t = read_file_content(tp)
                 if t:
@@ -253,15 +240,14 @@ def get_valid_paths(src_path: str, output_suffix: str,
     retry_empty_count = 0
     for p in all_paths:
         sidecar = p.with_name(f"{p.stem}_{output_suffix}.txt")
-        if sidecar_exists_or_unwritable(sidecar, retry_empty=retry_empty_outputs):
+        if text_sidecar_complete(sidecar, retry_empty=retry_empty_outputs):
             continue
         if retry_empty_outputs:
             try:
                 if sidecar.exists() and sidecar.stat().st_size == 0:
                     retry_empty_count += 1
-            except OSError as exc:
-                if exc.errno != errno.ENAMETOOLONG:
-                    raise
+            except OSError:
+                pass
         valid.append(p)
 
     if retry_empty_count:

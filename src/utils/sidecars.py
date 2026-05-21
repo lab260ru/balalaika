@@ -30,6 +30,25 @@ def path_exists(path: Path, *, missing_on_too_long: bool, label: str = "Sidecar"
         raise
 
 
+def text_sidecar_complete(path: Path, *, retry_empty: bool = False, label: str = "Sidecar") -> bool:
+    """Return whether a text sidecar should be treated as already complete.
+
+    ``retry_empty=True`` makes existing zero-byte ``.txt`` files count as
+    missing, which lets transcription rerun interrupted writes.
+    """
+    try:
+        if not path.exists():
+            return False
+        if retry_empty and path.suffix == ".txt":
+            return path.stat().st_size != 0
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            logger.error(f"{label} path is too long, skipping: {path}")
+            return True
+        raise
+
+
 def with_suffix_at_stem(path: Path, suffix: str) -> Path:
     """``foo.flac`` + ``"_punct.txt"`` → ``foo_punct.txt`` next to the input."""
     return path.with_name(f"{path.stem}{suffix}")
