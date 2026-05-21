@@ -36,7 +36,7 @@ Edit `configs/config.yaml`:
 - set model paths under `preprocess`, `separation`, etc.;
 - tune `runtime:` (`venv_path`, `cpu_affinity`, `log_dir`, TensorRT cache).
 
-Run the full pipeline:
+Run the default pipeline (stages 1..9):
 
 ```bash
 bash base.sh --config_path configs/config.yaml
@@ -52,7 +52,7 @@ bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
 bash base.sh --config_path configs/config.yaml --stage 6 --stop_stage 6
 
 # Regenerate the filtering report only
-bash base.sh --config_path configs/config.yaml --stage 12 --stop_stage 12
+bash base.sh --config_path configs/config.yaml --stage 13 --stop_stage 13
 ```
 
 ---
@@ -71,9 +71,10 @@ bash base.sh --config_path configs/config.yaml --stage 12 --stop_stage 12
 | 7 | Punctuation | `src.punctuation.punctuation` |
 | 8 | Stress marks / accents | `src.accents.accents` |
 | 9 | Phonemization | `src.phonemizer.phonemizer` |
-| 10 | Collate to Parquet | `src.collate` |
-| 11 | Export to WebDataset | `src.to_webdataset` |
-| 12 | Filtering report | `src.report` |
+| 10 | Denoising / enhancement | `src.denoising.denoising` |
+| 11 | Collate to Parquet | `src.collate` |
+| 12 | Export to WebDataset | `src.to_webdataset` |
+| 13 | Filtering report | `src.report` |
 
 `base.sh --help` prints the same map.
 
@@ -110,6 +111,8 @@ Balalaika avoids silent quality degradation:
   when you explicitly want a fixed output container.
 - Loudness normalization writes FLAC/WAV through `soundfile` as lossless
   containers. Lossy formats are handled by `torchaudio.save`.
+- Denoising uses ClearVoice `MossFormer2_SE_48K`, converts clips to 48 kHz
+  mono, and overwrites audio in place before export.
 - WebDataset export copies the produced audio bytes as-is.
 
 ---
@@ -177,6 +180,7 @@ Per-module notes live under `src/*/README.md`.
 | RUPunct | punctuation restoration |
 | ruAccent | lexical stress marks |
 | TryIParu | grapheme-to-phoneme conversion |
+| ClearVoice MossFormer2_SE_48K | denoising / speech enhancement |
 
 ---
 

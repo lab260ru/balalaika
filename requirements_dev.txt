@@ -14,6 +14,7 @@ torchaudio==2.8.0
 torch==2.8.0
 torchcodec==0.7
 librosa
+clearvoice
 distillmos
 pytest>=7.0.0
 black>=24.0.0

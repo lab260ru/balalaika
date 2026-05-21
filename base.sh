@@ -17,9 +17,10 @@
 #   7  Punctuation                  (src.punctuation.punctuation)
 #   8  Accents                      (src.accents.accents)
 #   9  Phonemizer                   (src.phonemizer.phonemizer)
-#   10 Collate -> parquet           (src.collate)
-#   11 Export -> WebDataset         (src.to_webdataset)
-#   12 Filter report                (src.report)
+#   10 Denoising / enhancement      (src.denoising.denoising)
+#   11 Collate -> parquet           (src.collate)
+#   12 Export -> WebDataset         (src.to_webdataset)
+#   13 Filter report                (src.report)
 #
 # Run a single stage:    bash base.sh --stage 6 --stop_stage 6
 # Run from a checkpoint: bash base.sh --stage 4
@@ -115,7 +116,25 @@ run_python() {
 stage_active() {
     # Returns 0 (true) when the requested stage falls into [stage, stop_stage].
     local s="$1"
-    (( $(echo "$stage <= $s && $stop_stage >= $s" | bc -l) ))
+    local stage_i stop_stage_i s_i
+    stage_i=$(stage_to_units "$stage")
+    stop_stage_i=$(stage_to_units "$stop_stage")
+    s_i=$(stage_to_units "$s")
+    (( stage_i <= s_i && stop_stage_i >= s_i ))
+}
+
+stage_to_units() {
+    # Convert stage numbers to integer hundredths so 5.5 works without bc.
+    local value="$1"
+    if [[ ! "$value" =~ ^([0-9]+)(\.([0-9]+))?$ ]]; then
+        echo "Invalid stage value: $value" >&2
+        return 1
+    fi
+    local whole="${BASH_REMATCH[1]}"
+    local frac="${BASH_REMATCH[3]:-}"
+    frac="${frac}00"
+    frac="${frac:0:2}"
+    echo $((10#$whole * 100 + 10#$frac))
 }
 
 check_stage_status() {
@@ -213,21 +232,27 @@ if stage_active 9; then
 fi
 
 if stage_active 10; then
-    echo "Stage 10: Collate — balalaika.parquet"
-    run_python src.collate
+    echo "Stage 10: Denoising — ClearVoice MossFormer2_SE_48K"
+    run_python src.denoising.denoising
     check_stage_status 10
 fi
 
 if stage_active 11; then
-    echo "Stage 11: Export — WebDataset shards"
-    run_python src.to_webdataset
+    echo "Stage 11: Collate — balalaika.parquet"
+    run_python src.collate
     check_stage_status 11
 fi
 
 if stage_active 12; then
-    echo "Stage 12: Filter report — filter_report.md"
-    run_python src.report --quiet
+    echo "Stage 12: Export — WebDataset shards"
+    run_python src.to_webdataset
     check_stage_status 12
+fi
+
+if stage_active 13; then
+    echo "Stage 13: Filter report — filter_report.md"
+    run_python src.report --quiet
+    check_stage_status 13
 fi
 
 echo -e "\n\033[1;32mPipeline finished (stages ${stage}..${stop_stage})\033[0m"

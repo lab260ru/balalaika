@@ -32,6 +32,7 @@ STAGE_ORDER = [
     "crest_factor",
     "music_detect",
     "distillmos",
+    "distillmos_filter",
     "transcription",
     "punctuation",
     "accents",
@@ -195,16 +196,7 @@ def main(args):
         print(report_md)
 
     write_stage_status(
-        stage=12,
-        stage_name="report",
-        log_dir=args.log_dir or "./logs",
-        processed=1,
-        skipped=0,
-        errors=0,
-    )
-
-    write_stage_status(
-        stage=12,
+        stage=13,
         stage_name="report",
         log_dir=args.log_dir or "./logs",
         processed=1,

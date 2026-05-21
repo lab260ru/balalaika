@@ -84,7 +84,7 @@ def main(args):
     logger.info(f"Successfully saved data to {output_path}")
 
     write_stage_status(
-        stage=10,
+        stage=11,
         stage_name="collate",
         log_dir=args.log_dir or "./logs",
         processed=processed,

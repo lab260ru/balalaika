@@ -31,6 +31,8 @@
 #
 # phonemizer — TryIParu G2P on *_rover.txt → *_rover_phonemes.txt.
 #
+# denoising — ClearVoice MossFormer2_SE_48K in-place speech enhancement.
+#
 # export — WebDataset tar shards (src/to_webdataset.py); collate parquet uses
 #   download section as noted above.
 #
@@ -76,7 +78,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
+  podcasts_path: /home/nikita/tets_dataset
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -86,7 +88,7 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
+  podcasts_path: /home/nikita/tets_dataset
   # Maximum duration of each output segment in seconds.
   duration: 22
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
@@ -152,7 +154,7 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
+  podcasts_path: /home/nikita/tets_dataset
 
   music_detect:
     # Inference batch size for music classifier.
@@ -187,15 +189,15 @@ separation:
     num_workers: 4
 
 transcription:
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
+  podcasts_path: /home/nikita/tets_dataset
   model_names:
     - giga_ctc
     - giga_rnnt
     - vosk
     - tone
   consensus_num: 3
-  with_timestamps: False
-  use_tensorrt: True
+  with_timestamps: True
+  use_tensorrt: False
   use_vad: False
   use_rover: True
   batch_size: 8
@@ -204,14 +206,14 @@ transcription:
   retry_empty_outputs: True
 
 punctuation:
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
+  podcasts_path: /home/nikita/tets_dataset
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
+  podcasts_path: /home/nikita/tets_dataset
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -220,11 +222,28 @@ accent:
   use_tensorrt: False
 
 phonemizer:
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
+  podcasts_path: /home/nikita/tets_dataset
   num_workers: 1
 
+denoising:
+  # Root containing chunked audio and balalaika.csv.
+  podcasts_path: /home/nikita/tets_dataset
+  # ClearVoice Numpy-to-Numpy model from demo_Numpy2Numpy.py.
+  task: speech_enhancement
+  model_name: MossFormer2_SE_48K
+  # MossFormer2_SE_48K expects 48 kHz float32 audio.
+  sample_rate: 48000
+  # Number of stage worker processes. Start with 1; each process loads a model.
+  processes: 1
+  # ClearVoice batch size per worker.
+  batch_size: 1
+  # DataLoader workers inside each process.
+  num_workers: 0
+  # Number of prefetched batches per DataLoader worker.
+  prefetch_factor: 2
+
 export:
-  podcasts_path: /home/tachka-5060ti-1/kirill_workspace/podcasts_3
+  podcasts_path: /home/nikita/tets_dataset
   # Parallel processes writing WebDataset shards.
   num_workers: 1
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.

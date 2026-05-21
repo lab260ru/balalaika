@@ -315,11 +315,15 @@ def main(args):
 
         logger.info(f"{len(paths)} files to process")
 
-        run_per_gpu_processes(
+        worker_errors, worker_error_details = run_per_gpu_processes(
             run_worker,
             num_gpus=num_gpus,
             args=(model_name, paths, config, args.config_path, processed, errors, error_details_list),
         )
+        if worker_errors:
+            errors.value += worker_errors
+            for detail in worker_error_details:
+                error_details_list.append({"model": model_name, **detail})
 
     if config.get('use_rover', False):
         logger.info("ROVER aggregation...")

@@ -147,7 +147,24 @@ optional **TensorRT**.
 
 ---
 
-### 8. Collate / export (`src/collate.py` + `src/to_webdataset.py`)
+### 8. Denoising / speech enhancement (`src/denoising/`)
+
+ClearVoice **MossFormer2_SE_48K** runs through the Numpy-to-Numpy API shown in
+the ClearerVoice-Studio demo:
+`ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])`.
+The stage decodes audio with `torchaudio`, converts it to mono 48 kHz float32
+batches, calls ClearVoice, and overwrites the audio file in place.
+
+**Output**: same audio paths, rewritten at `denoising.sample_rate` (default
+48 kHz), plus `denoised=True` in `balalaika.csv`.
+
+**Config**: `config.yaml` → `denoising` (`podcasts_path`, `task`,
+`model_name`, `sample_rate`, `processes`, `batch_size`, `num_workers`,
+`prefetch_factor`).
+
+---
+
+### 9. Collate / export (`src/collate.py` + `src/to_webdataset.py`)
 
 `collate.py` aggregates the text sidecars into `balalaika.parquet`; it reads
 `podcasts_path` and `num_workers` from the **`download`** section of the
@@ -159,18 +176,18 @@ the chunked container is preserved end-to-end (no extra encode at export).
 **Run**:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 10 --stop_stage 10
 bash base.sh --config_path configs/config.yaml --stage 11 --stop_stage 11
+bash base.sh --config_path configs/config.yaml --stage 12 --stop_stage 12
 ```
 
 ---
 
-### 9. Filter report (`src/report.py`)
+### 10. Filter report (`src/report.py`)
 
 After filtering stages finish, `src.report` reads `filter_summary.csv` and
 writes `<podcasts_path>/filter_report.md` summarising hours filtered at every
-stage. It is stage 12 in `base.sh`; it runs only when your selected
-`--stage`/`--stop_stage` range includes 12.
+stage. It is stage 13 in `base.sh`; it runs only when your selected
+`--stage`/`--stop_stage` range includes 13.
 
 ---
 
@@ -185,17 +202,17 @@ collation, WebDataset export, and the final report.
 bash base.sh --config_path configs/config.yaml
 ```
 
-Run all local processing stages, including parquet, WebDataset export, and the
+Run all local processing stages, including denoising, parquet, WebDataset export, and the
 report:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 12
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 13
 ```
 
 Include Yandex Music download as well:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 12
+bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 13
 ```
 
 Run a contiguous subrange (e.g. preprocess only):
@@ -225,9 +242,10 @@ Stage map:
 | 7 | Punctuation | `src.punctuation.punctuation` |
 | 8 | Accents | `src.accents.accents` |
 | 9 | Phonemizer | `src.phonemizer.phonemizer` |
-| 10 | Collate (parquet) | `src.collate` |
-| 11 | Export (WebDataset) | `src.to_webdataset` |
-| 12 | Filter report | `src.report` |
+| 10 | Denoising / enhancement | `src.denoising.denoising` |
+| 11 | Collate (parquet) | `src.collate` |
+| 12 | Export (WebDataset) | `src.to_webdataset` |
+| 13 | Filter report | `src.report` |
 
 `base.sh` reads runtime parameters (venv path, CPU affinity, log dir, TRT cache
 and workspace) from the **`runtime`** block in the YAML via
@@ -242,9 +260,11 @@ stage writes a `stage_<id>_status.json` file with non-zero errors.
   Use `preprocess.chunk_format` to pin a specific extension when you need it.
 - Loudness normalization overwrites clips in place with `torchaudio.save` after
   peak and integrated-loudness normalization.
+- Denoising intentionally rewrites audio in place using ClearVoice
+  `MossFormer2_SE_48K`; the default output sample rate is 48 kHz mono.
 - Read-only stages (crest filter, music detection, DistillMOS, ASR, RUPunct,
-  ruAccent, TryIParu, WebDataset export) never re-encode the audio. Bytes are
-  copied verbatim into the WebDataset shards.
+  ruAccent, TryIParu, WebDataset export) never re-encode the audio. WebDataset
+  export copies the current audio bytes verbatim.
 
 ---
 
@@ -327,7 +347,7 @@ Dataset-level files at `podcasts_path`:
 
 | File | Created by | Purpose |
 |------|------------|---------|
-| `balalaika.csv` | preprocess + crest + loudness + music_detect + distillmos/filter | Per-clip metadata |
+| `balalaika.csv` | preprocess + crest + loudness + music_detect + distillmos/filter + denoising | Per-clip metadata |
 | `filter_summary.csv` | filtering stages | Audit log of files/hours dropped |
 | `filter_report.md` | `src/report.py` | Human-readable report |
 | `balalaika.parquet` | `src/collate.py` | Final aggregated metadata |
@@ -402,6 +422,7 @@ python -m src.transcription.transcription     --config_path configs/config.yaml
 python -m src.punctuation.punctuation         --config_path configs/config.yaml
 python -m src.accents.accents                 --config_path configs/config.yaml
 python -m src.phonemizer.phonemizer           --config_path configs/config.yaml
+python -m src.denoising.denoising             --config_path configs/config.yaml
 python -m src.collate                         --config_path configs/config.yaml
 python -m src.to_webdataset                   --config_path configs/config.yaml
 python -m src.report                          --config_path configs/config.yaml
@@ -416,8 +437,9 @@ python -m src.report                          --config_path configs/config.yaml
 5. **Punctuation** → `_rover.txt` → `_punct.txt`
 6. **Accents** → `_punct.txt` → `_accent.txt`
 7. **Phonemizer** → `_rover.txt` → `_rover_phonemes.txt`
-8. **Collate / export** → `balalaika.parquet`, WebDataset shards
-9. **Report** → `filter_report.md`
+8. **Denoising** → in-place 48 kHz enhanced audio
+9. **Collate / export** → `balalaika.parquet`, WebDataset shards
+10. **Report** → `filter_report.md`
 
 ---
 

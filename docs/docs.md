@@ -20,7 +20,8 @@ idempotent — you can stop at any point and resume from where you left off.
 the Python venv, and calls each stage's Python module in order.
 
 ```bash
-bash base.sh --config_path configs/config.yaml                   # Full pipeline (stages 1–9)
+bash base.sh --config_path configs/config.yaml                   # Default core pipeline (stages 1–9)
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 13  # Full local pipeline
 bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3  # Preprocess only
 bash base.sh --config_path configs/config.yaml --stage 6 --stop_stage 6  # Transcription only
 ```
@@ -34,7 +35,8 @@ bash base.sh --config_path configs/config.yaml --stage 6 --stop_stage 6  # Trans
    `BALALAIKA_CPU_AFFINITY`, `BALALAIKA_LOG_DIR`, `BALALAIKA_TRT_CACHE_PATH`,
    `BALALAIKA_TRT_WORKSPACE`, and `BALALAIKA_TRT_FP16`.
 3. Activates the venv and sets up `LD_LIBRARY_PATH` for NVIDIA/CUDA/TensorRT libs.
-4. For each of the 13 stages (0–12), checks whether `stage <= N <= stop_stage`.
+4. For each configured stage (0–13, including 5.5), checks whether
+   `stage <= N <= stop_stage`.
    If yes, calls the stage's Python module with:
    ```bash
    taskset -c $BALALAIKA_CPU_AFFINITY python3 -m <module> --config_path ... --log_dir ...
@@ -352,7 +354,35 @@ out_derive=lambda p: p.with_name(f"{p.stem}_phonemes.txt"))`.
 
 ---
 
-### Stage 10 — Collate to Parquet (`src/collate.py`)
+### Stage 10 — Denoising / Speech Enhancement (`src/denoising/denoising.py`)
+
+**Purpose:** Enhance audio in place using ClearVoice MossFormer2_SE_48K.
+
+**Input:** All audio files under `podcasts_path`.
+
+**Process:**
+1. Loads `ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])`.
+2. Uses `DenoisingDataset` from `src/utils/datasets/denoising.py` to decode
+   audio with `torchaudio`, convert to mono, and resample to 48 kHz.
+3. Sends NumPy batches shaped `[batch, length]` to the ClearVoice
+   Numpy-to-Numpy API.
+4. Writes enhanced audio back to the same file path via `torchaudio.save`.
+5. Streams `denoised=True` rows to worker partial CSVs and merges them into
+   `balalaika.csv`.
+
+**Output:**
+- Audio files overwritten in place, default 48 kHz mono.
+- `denoised` column in `balalaika.csv`.
+
+**Idempotency:** Same CSV partial/resume pattern as loudness normalization:
+`ensure_main_csv`, `absorb_partial_csvs` for `denoising_part_*.csv`, and
+`unprocessed_paths` on the `denoised` column.
+
+**Config section:** `denoising`
+
+---
+
+### Stage 11 — Collate to Parquet (`src/collate.py`)
 
 **Purpose:** Merge all metadata and sidecar text files into a single Parquet file.
 
@@ -375,7 +405,7 @@ resume logic needed.
 
 ---
 
-### Stage 11 — Export to WebDataset (`src/to_webdataset.py`)
+### Stage 12 — Export to WebDataset (`src/to_webdataset.py`)
 
 **Purpose:** Pack audio bytes + metadata + text sidecars into WebDataset tar
 shards for efficient streaming training.
@@ -402,7 +432,7 @@ shard series.
 
 ---
 
-### Stage 12 — Filter Report (`src/report.py`)
+### Stage 13 — Filter Report (`src/report.py`)
 
 **Purpose:** Generate a human-readable Markdown report showing hours kept/removed
 at each filtering stage.
@@ -440,9 +470,10 @@ at each filtering stage.
 | 7 | `*_rover.txt` | `{stem}_punct.txt` |
 | 8 | `*_punct.txt` | `{stem}_accent.txt` |
 | 9 | `*_rover.txt` | `{stem}_rover_phonemes.txt` |
-| 10 | `balalaika.csv` + sidecars | `balalaika.parquet` |
-| 11 | Audio + `balalaika.csv` | WebDataset `.tar` shards |
-| 12 | `filter_summary.csv` | `filter_report.md` |
+| 10 | All audio files | Denoised 48 kHz audio in place; `denoised` in CSV |
+| 11 | `balalaika.csv` + sidecars | `balalaika.parquet` |
+| 12 | Audio + `balalaika.csv` | WebDataset `.tar` shards |
+| 13 | `filter_summary.csv` | `filter_report.md` |
 
 ---
 
@@ -458,8 +489,8 @@ If the pipeline fails at stage 6, re-run `--stage 6` to continue from there.
 
 ### Layer 2: CSV state with atomic writes (`balalaika.csv`)
 
-Used by stages 2–5 (crest factor, loudness, music detection, DistillMOS) via
-`src/utils/csv_manager.py`.
+Used by stages 2–5 and 10 (crest factor, loudness, music detection,
+DistillMOS, denoising) via `src/utils/csv_manager.py`.
 
 **`ensure_main_csv(podcasts_path, audio_paths)`**
 - If `balalaika.csv` doesn't exist, creates it from the audio tree with all
@@ -487,7 +518,7 @@ Used by stages 2–5 (crest factor, loudness, music detection, DistillMOS) via
   `crest_factor`, `music_prob`, `DistillMOS`). Workers round-robin over the
   pending list.
 
-**The resume flow for stages 2–5:**
+**The resume flow for CSV-based stages:**
 
 ```
 Step 1: ensure_main_csv()           # Create CSV from audio tree if missing
@@ -565,7 +596,7 @@ rows over multiple pipeline runs.
 
 ### Filter Report (`filter_report.md`)
 
-Stage 12 (`src/report.py`) reads `filter_summary.csv` and generates a Markdown
+Stage 13 (`src/report.py`) reads `filter_summary.csv` and generates a Markdown
 report at `<podcasts_path>/filter_report.md` with three sections:
 
 1. **Per-stage summary table:** For the latest run of each stage, shows the
@@ -580,7 +611,7 @@ report at `<podcasts_path>/filter_report.md` with three sections:
 
 Example usage:
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 12 --stop_stage 12
+bash base.sh --config_path configs/config.yaml --stage 13 --stop_stage 13
 ```
 
 ### Per-Stage Log Files
@@ -609,7 +640,8 @@ Each stage reads only its own YAML section via `load_config(config_path, SECTION
 | `punctuation` | RUPunct (stage 7) |
 | `accent` | ruAccent (stage 8) — note: singular `accent` |
 | `phonemizer` | TryIParu G2P (stage 9) |
-| `export` | WebDataset shard export (stage 11) |
+| `denoising` | ClearVoice MossFormer2_SE_48K enhancement (stage 10) |
+| `export` | WebDataset shard export (stage 12) |
 
 ### `runtime` block keys
 
@@ -623,7 +655,7 @@ Each stage reads only its own YAML section via `load_config(config_path, SECTION
 | `trt_fp16` | `True` | FP16 for TensorRT |
 
 ### Important note
-`src/collate.py` (Stage 10) reads the **`download`** section for
+`src/collate.py` (Stage 11) reads the **`download`** section for
 `podcasts_path` and `num_workers`, so keep `download.podcasts_path` aligned
 with the rest of the pipeline even if you don't use Stage 0.
 
@@ -642,6 +674,7 @@ with the rest of the pipeline even if you don't use Stage 0.
 | RUPunct | Punctuation restoration | HuggingFace |
 | ruAccent | Lexical stress marks | ONNX/PyTorch |
 | TryIParu | Grapheme → IPA phonemes | PyTorch |
+| ClearVoice MossFormer2_SE_48K | Denoising / speech enhancement | PyTorch |
 
 ---
 
@@ -652,9 +685,9 @@ balalaika/
 ├── base.sh                          # Main orchestrator (--stage / --stop_stage)
 ├── src/
 │   ├── __init__.py
-│   ├── collate.py                   # Stage 10: Parquet collation
-│   ├── to_webdataset.py             # Stage 11: WebDataset export
-│   ├── report.py                    # Stage 12: Filter report
+│   ├── collate.py                   # Stage 11: Parquet collation
+│   ├── to_webdataset.py             # Stage 12: WebDataset export
+│   ├── report.py                    # Stage 13: Filter report
 │   ├── recovery_from_meta.py        # Reconstruct chunks from parquet metadata
 │   ├── stage_runner.sh              # Shared shell bootstrap
 │   │
@@ -670,7 +703,8 @@ balalaika/
 │   │   └── datasets/
 │   │       ├── preprocess.py        # CrestFactor/Loudness/Diarization datasets + DataLoaders
 │   │       ├── separation.py        # DistillMOS dataset with length-sorted batching
-│   │       └── transcription.py     # Transcription dataset + batch recognition
+│   │       ├── transcription.py     # Transcription dataset + batch recognition
+│   │       └── denoising.py         # ClearVoice denoising DataLoader
 │   │
 │   ├── download/
 │   │   ├── download.py              # Stage 0: Yandex Music downloader
@@ -698,6 +732,9 @@ balalaika/
 │   │
 │   ├── phonemizer/
 │   │   └── phonemizer.py            # Stage 9: TryIParu G2P
+│   │
+│   ├── denoising/
+│   │   └── denoising.py             # Stage 10: ClearVoice MossFormer2_SE_48K
 │   │
 │   └── libs/
 │       └── smart_turn/

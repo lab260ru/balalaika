@@ -131,5 +131,45 @@ def run_per_gpu_processes(
     """
     if num_gpus <= 1:
         run_worker(0, max(num_gpus, 1), *args)
-    return 0, []
+
+    processes: List[mp.Process] = []
+    error_count = 0
+    error_details: list[dict] = []
+
+    try:
+        for gpu_id in range(num_gpus):
+            proc = mp.Process(
+                target=run_worker,
+                args=(gpu_id, num_gpus, *args),
+                name=f"{run_worker.__name__}-gpu{gpu_id}",
+            )
+            proc.start()
+            processes.append(proc)
+            logger.info(f"Launched {proc.name} with pid={proc.pid}")
+
+        if not join:
+            return 0, []
+
+        for proc in processes:
+            proc.join()
+            if proc.exitcode not in (0, None):
+                logger.error(f"{proc.name} exited with code {proc.exitcode}")
+                error_count += 1
+                error_details.append(
+                    {
+                        "worker": proc.name,
+                        "pid": proc.pid,
+                        "exitcode": proc.exitcode,
+                    }
+                )
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user; terminating GPU workers...")
+        for proc in processes:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in processes:
+            proc.join()
+        raise
+
+    return error_count, error_details
 

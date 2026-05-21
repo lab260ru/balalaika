@@ -22,9 +22,10 @@ The main entrypoint is `base.sh`. It runs numbered stages from
 | 7 | `src.punctuation.punctuation` | Punctuation restoration. |
 | 8 | `src.accents.accents` | Accent restoration. |
 | 9 | `src.phonemizer.phonemizer` | G2P / phonemization. |
-| 10 | `src.collate` | Merge sidecars into parquet. |
-| 11 | `src.to_webdataset` | Export WebDataset shards. |
-| 12 | `src.report` | Build filter report. |
+| 10 | `src.denoising.denoising` | ClearVoice denoising / speech enhancement. |
+| 11 | `src.collate` | Merge sidecars into parquet. |
+| 12 | `src.to_webdataset` | Export WebDataset shards. |
+| 13 | `src.report` | Build filter report. |
 
 Run a single stage:
 
@@ -38,8 +39,8 @@ Run from a checkpoint:
 bash base.sh --config_path configs/config.yaml --stage 4
 ```
 
-By default, `base.sh` runs stages 1..9. Use `--stop_stage 12` when you also
-want parquet collation, WebDataset export, and the final report. Use
+By default, `base.sh` runs stages 1..9. Use `--stop_stage 13` when you also
+want denoising, parquet collation, WebDataset export, and the final report. Use
 `--strict` when the orchestrator should abort after any stage writes a status
 file with non-zero errors.
 
@@ -59,6 +60,7 @@ Use one top-level section per pipeline area:
 - `separation`: music detection, DistillMOS scoring, DistillMOS filtering.
 - `transcription`: ASR models, batching, TensorRT, VAD, ROVER.
 - `punctuation`, `accent`, `phonemizer`, `export`: downstream stages.
+- `denoising`: ClearVoice MossFormer2_SE_48K in-place speech enhancement.
 
 When adding a setting:
 
@@ -191,6 +193,8 @@ Current layout:
   - `DistillMOSDataset`
 - `src/utils/datasets/transcription.py`
   - `TranscriptionDataset`
+- `src/utils/datasets/denoising.py`
+  - `DenoisingDataset`
 
 When adding a new module, add the loader to the file that matches the pipeline
 area. For example:
@@ -198,6 +202,7 @@ area. For example:
 - Preprocess audio loading goes to `src/utils/datasets/preprocess.py`.
 - Separation model loading goes to `src/utils/datasets/separation.py`.
 - Transcription audio loading goes to `src/utils/datasets/transcription.py`.
+- Denoising / enhancement loading goes to `src/utils/datasets/denoising.py`.
 
 Use this pattern:
 
