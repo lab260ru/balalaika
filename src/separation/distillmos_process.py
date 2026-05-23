@@ -29,9 +29,11 @@ from tqdm import tqdm
 
 from src.utils.csv_manager import (
     PartialCsvWriter,
+    PeriodicCsvMerger,
     absorb_partial_csvs,
     discover_audio_paths,
     ensure_main_csv,
+    load_csv_settings,
     resolve_path,
     unprocessed_paths,
 )
@@ -192,13 +194,22 @@ def main():
     skipped = mp.Value('i', 0)
     errors = mp.Value('i', 0)
 
+    csv_settings = load_csv_settings(args.config_path)
+
     try:
-        mp.spawn(
-            run_inference_worker,
-            args=(available_gpus, unprocessed, config, podcasts_path, processed, skipped, errors),
-            nprocs=available_gpus,
-            join=True,
-        )
+        with PeriodicCsvMerger(
+            podcasts_path,
+            prefix=PARTIAL_PREFIX,
+            value_columns=[COLUMN],
+            progress_counter=processed,
+            **csv_settings,
+        ):
+            mp.spawn(
+                run_inference_worker,
+                args=(available_gpus, unprocessed, config, podcasts_path, processed, skipped, errors),
+                nprocs=available_gpus,
+                join=True,
+            )
     except KeyboardInterrupt:
         logger.warning("DistillMOS stage interrupted; merging partials before exit.")
     except Exception as exc:

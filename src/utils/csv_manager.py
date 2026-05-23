@@ -30,14 +30,21 @@ from __future__ import annotations
 import csv
 import os
 import shutil
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from loguru import logger
 
 CSV_NAME = "balalaika.csv"
+
+# Default knobs for the periodic merger. Overridable via the top-level `csv:`
+# block of configs/config.yaml (see :func:`load_csv_settings`).
+DEFAULT_FLUSH_EVERY_ROWS = 10_000
+DEFAULT_FLUSH_EVERY_SECONDS = 300
 
 # Canonical column ordering for the main CSV. Anything not listed is appended
 # after the recognised columns in original insertion order.
@@ -201,6 +208,49 @@ def ensure_main_csv(
     return _normalize_filepath_column(df)
 
 
+def _merge_results_into_df(
+    df: pd.DataFrame,
+    results: pd.DataFrame,
+    value_columns: Sequence[str],
+) -> pd.DataFrame:
+    """Pure in-memory upsert helper shared by ``upsert_columns`` / ``CsvState``.
+
+    Semantics: for every ``filepath`` present in ``results``, *non-null* values
+    in ``value_columns`` overwrite whatever is currently in ``df``. Existing
+    values that are not re-supplied by ``results`` are preserved — important
+    for the periodic merger, which feeds the state only the *tail* of each
+    partial CSV instead of its full content.
+    """
+    if results is None or results.empty:
+        return df
+    if "filepath" not in results.columns:
+        raise ValueError("results must contain a 'filepath' column")
+    results = _normalize_filepath_column(results.copy())
+    present = [c for c in value_columns if c in results.columns]
+    results = results[["filepath", *present]].drop_duplicates(
+        subset="filepath", keep="last"
+    )
+
+    if df is None or df.empty or "filepath" not in df.columns:
+        df = pd.DataFrame(columns=["filepath"])
+
+    for col in present:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype="object")
+
+    existing = set(df["filepath"].astype(str).tolist())
+    new_rows = results[~results["filepath"].isin(existing)]
+    if not new_rows.empty:
+        df = pd.concat([df, new_rows], ignore_index=True)
+
+    if present:
+        df = df.set_index("filepath")
+        df.update(results.set_index("filepath")[present])
+        df = df.reset_index()
+
+    return df
+
+
 def upsert_columns(
     podcasts_path: os.PathLike | str,
     results_df: pd.DataFrame,
@@ -243,18 +293,7 @@ def upsert_columns(
             subset="filepath", keep="first"
         )
 
-    if results_df is not None and not results_df.empty:
-        if "filepath" not in results_df.columns:
-            raise ValueError("results_df must contain a 'filepath' column")
-        results = _normalize_filepath_column(results_df.copy())
-        # Keep only the columns we care about (plus filepath).
-        present = [c for c in value_columns if c in results.columns]
-        results = results[["filepath", *present]].drop_duplicates(
-            subset="filepath", keep="last"
-        )
-        # Drop existing target columns so the merge overwrites cleanly.
-        df = df.drop(columns=present, errors="ignore")
-        df = df.merge(results, on="filepath", how="outer")
+    df = _merge_results_into_df(df, results_df, value_columns)
 
     if drop_missing_files and not df.empty:
         before = len(df)
@@ -556,6 +595,337 @@ def audit_from_filter_partials(
             survived[duration_column].fillna(0.0).sum() / 3600.0
         )
     return audit
+
+
+# ---------------------------------------------------------------------------
+# In-memory mirror + periodic merger
+# ---------------------------------------------------------------------------
+
+class CsvState:
+    """In-memory mirror of ``balalaika.csv`` for fast periodic upserts.
+
+    Reading + writing the whole CSV every flush is fine for small datasets but
+    becomes a real cost at multi-million-row scale. ``CsvState`` keeps the
+    DataFrame in RAM, applies upserts there, and only ever writes the file
+    atomically.
+
+    The state is owned by the *main* process. Worker processes still produce
+    their own ``<prefix>_part_*.csv`` files; they never touch the main CSV
+    directly.
+    """
+
+    def __init__(self, podcasts_path: os.PathLike | str) -> None:
+        self.path = csv_path(podcasts_path)
+        df = _read_csv_safe(self.path)
+        if df is None or "filepath" not in df.columns:
+            df = pd.DataFrame(columns=["filepath"])
+        self.df = _normalize_filepath_column(df)
+
+    def upsert(
+        self,
+        results_df: pd.DataFrame,
+        value_columns: Sequence[str],
+        *,
+        drop_missing_files: bool = False,
+        bootstrap_audio_paths: Optional[Iterable[os.PathLike | str]] = None,
+    ) -> None:
+        """Update the in-memory mirror; does NOT touch disk."""
+        if bootstrap_audio_paths is not None:
+            boot = pd.DataFrame(
+                {"filepath": [resolve_path(p) for p in bootstrap_audio_paths]}
+            ).drop_duplicates(subset="filepath")
+            self.df = pd.concat([self.df, boot], ignore_index=True).drop_duplicates(
+                subset="filepath", keep="first"
+            )
+        self.df = _merge_results_into_df(self.df, results_df, value_columns)
+        if drop_missing_files and not self.df.empty:
+            before = len(self.df)
+            self.df = self.df[
+                self.df["filepath"].apply(lambda p: bool(p) and Path(p).exists())
+            ]
+            removed = before - len(self.df)
+            if removed:
+                logger.info(
+                    f"Pruned {removed} rows whose audio files no longer exist."
+                )
+        self.df = _reorder_columns(self.df)
+
+    def save(self) -> None:
+        """Flush the in-memory mirror to disk atomically."""
+        atomic_write_csv(self.df, self.path)
+
+
+class PeriodicCsvMerger:
+    """Background-thread merger that keeps ``balalaika.csv`` fresh during a stage.
+
+    A single thread runs in the main process and periodically reads each
+    worker's partial CSV (``<prefix>_part_*.csv``) and folds new rows into an
+    in-memory :class:`CsvState`, then atomically writes ``balalaika.csv``.
+
+    A flush is triggered whenever **either** condition is met:
+
+    * cumulative ``progress_counter`` advanced by ``flush_every_rows`` since
+      the last flush (set ``0`` to disable);
+    * ``flush_every_seconds`` elapsed since the last flush (set ``0`` to
+      disable).
+
+    Workers keep writing to their partials throughout — this thread never
+    deletes them. The post-stage :func:`absorb_partial_csvs` does the final
+    merge and cleanup, exactly as before. So the merger only *adds* freshness;
+    if it is killed mid-way, no data is lost.
+
+    Optimisations:
+
+    * Per-partial byte-offset tracking — each iteration only reads the *new*
+      tail of each partial instead of re-parsing the whole file.
+    * The main CSV stays resident in :class:`CsvState`; we never re-read it
+      from disk between flushes.
+    """
+
+    def __init__(
+        self,
+        podcasts_path: os.PathLike | str,
+        prefix: str,
+        value_columns: Sequence[str],
+        *,
+        progress_counter: Any = None,
+        flush_every_rows: int = DEFAULT_FLUSH_EVERY_ROWS,
+        flush_every_seconds: float = DEFAULT_FLUSH_EVERY_SECONDS,
+        drop_missing_files: bool = False,
+        bootstrap_audio_paths: Optional[Iterable[os.PathLike | str]] = None,
+        poll_interval: float = 5.0,
+    ) -> None:
+        self.podcasts_path = Path(podcasts_path)
+        self.prefix = prefix
+        self.value_columns = list(value_columns)
+        self.progress_counter = progress_counter
+        self.flush_every_rows = max(0, int(flush_every_rows or 0))
+        self.flush_every_seconds = max(0.0, float(flush_every_seconds or 0.0))
+        self.drop_missing_files = drop_missing_files
+        self.bootstrap_audio_paths = (
+            [resolve_path(p) for p in bootstrap_audio_paths]
+            if bootstrap_audio_paths is not None
+            else None
+        )
+        self.poll_interval = max(0.5, float(poll_interval))
+
+        self._state: Optional[CsvState] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        # filename -> next byte offset to read from in the partial CSV
+        self._offsets: Dict[str, int] = {}
+        # Rows we've buffered locally but not yet folded into balalaika.csv.
+        self._pending: List[pd.DataFrame] = []
+        self._pending_rows = 0
+        self._last_flush_ts = 0.0
+        self._enabled = self.flush_every_rows > 0 or self.flush_every_seconds > 0
+
+    def _ingest_new_partial_rows(self) -> int:
+        """Append fresh rows from each partial into ``self._pending``.
+
+        Reads only the *new* tail of each partial since the previous call,
+        so this is O(new bytes), not O(partial size). Returns the number of
+        rows appended this iteration.
+        """
+        added = 0
+        for path in list_partial_csvs(self.podcasts_path, self.prefix):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size == 0:
+                continue
+            offset = self._offsets.get(path.name, 0)
+            if offset >= size:
+                continue
+            try:
+                if offset == 0:
+                    df = pd.read_csv(path, low_memory=False)
+                else:
+                    # Stream the appended tail, prepending the original header
+                    # so pandas can parse it.
+                    with path.open("rb") as f:
+                        header = f.readline()
+                        f.seek(offset)
+                        tail = f.read()
+                    if not tail.strip():
+                        self._offsets[path.name] = size
+                        continue
+                    from io import BytesIO
+
+                    df = pd.read_csv(
+                        BytesIO(header + tail),
+                        low_memory=False,
+                        on_bad_lines="skip",
+                    )
+                self._offsets[path.name] = size
+            except pd.errors.EmptyDataError:
+                self._offsets[path.name] = size
+                continue
+            except Exception as exc:
+                logger.debug(f"Periodic merger: skipping partial {path.name}: {exc}")
+                continue
+            if not df.empty:
+                self._pending.append(df)
+                added += int(len(df))
+        self._pending_rows += added
+        return added
+
+    def _take_pending(self) -> pd.DataFrame:
+        if not self._pending:
+            return pd.DataFrame()
+        merged = pd.concat(self._pending, ignore_index=True)
+        self._pending.clear()
+        self._pending_rows = 0
+        if "filepath" in merged.columns:
+            merged = _normalize_filepath_column(merged)
+            merged = merged.drop_duplicates(subset="filepath", keep="last")
+        return merged
+
+    def flush_now(self, *, force: bool = False) -> int:
+        """Synchronously merge new partial rows into the main CSV.
+
+        Returns the number of rows folded in this flush. ``force=True`` flushes
+        even when nothing changed (mainly useful for the post-stage call).
+        """
+        if self._state is None:
+            self._state = CsvState(self.podcasts_path)
+            if self.bootstrap_audio_paths:
+                self._state.upsert(
+                    pd.DataFrame(),
+                    value_columns=self.value_columns,
+                    bootstrap_audio_paths=self.bootstrap_audio_paths,
+                )
+
+        with self._lock:
+            self._ingest_new_partial_rows()
+            new_rows = self._take_pending()
+            if new_rows.empty and not force:
+                return 0
+            if not new_rows.empty:
+                self._state.upsert(
+                    new_rows,
+                    value_columns=self.value_columns,
+                    drop_missing_files=self.drop_missing_files,
+                )
+            try:
+                self._state.save()
+            except Exception as exc:
+                logger.error(f"Periodic merger: atomic save failed: {exc}")
+                return 0
+            self._last_flush_ts = time.time()
+            return int(len(new_rows))
+
+    def _should_flush(self) -> bool:
+        if not self._enabled:
+            return False
+        now = time.time()
+        if (
+            self.flush_every_seconds > 0
+            and now - self._last_flush_ts >= self.flush_every_seconds
+            and self._pending_rows > 0
+        ):
+            return True
+        if self.flush_every_rows > 0 and self._pending_rows >= self.flush_every_rows:
+            return True
+        # If a progress counter was supplied, also trigger off it. Useful when
+        # rows are produced very slowly but the worker still wants to mark
+        # progress in balalaika.csv (e.g. for large multi-row chunks).
+        c = self.progress_counter
+        if c is not None and self.flush_every_rows > 0:
+            try:
+                if int(c.value) // self.flush_every_rows > getattr(
+                    self, "_last_counter_bucket", -1
+                ):
+                    self._last_counter_bucket = int(c.value) // self.flush_every_rows
+                    return self._pending_rows > 0
+            except AttributeError:
+                pass
+        return False
+
+    def _loop(self) -> None:
+        self._last_flush_ts = time.time()
+        while not self._stop.is_set():
+            try:
+                self._ingest_new_partial_rows()
+            except Exception as exc:
+                logger.debug(f"Periodic merger: ingest failed: {exc}")
+            if self._should_flush():
+                try:
+                    rows = self.flush_now()
+                    if rows:
+                        logger.debug(
+                            f"Periodic merger: folded {rows} new rows into "
+                            f"{csv_path(self.podcasts_path).name}"
+                        )
+                except Exception as exc:
+                    logger.warning(f"Periodic merger flush failed: {exc}")
+            self._stop.wait(self.poll_interval)
+
+    def __enter__(self) -> "PeriodicCsvMerger":
+        if self._enabled:
+            self._thread = threading.Thread(
+                target=self._loop,
+                name=f"csv-merger-{self.prefix}",
+                daemon=True,
+            )
+            self._thread.start()
+            logger.info(
+                f"Periodic CSV merger started: every {self.flush_every_rows} rows "
+                f"or {self.flush_every_seconds}s — folds {self.prefix}_part_*.csv "
+                f"into {csv_path(self.podcasts_path).name}."
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.poll_interval * 2)
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def load_csv_settings(config_path: Optional[os.PathLike | str]) -> Dict[str, float]:
+    """Read the top-level ``csv:`` block from a YAML config.
+
+    Returns a dict with ``flush_every_rows`` (int) and
+    ``flush_every_seconds`` (float). Missing keys/files fall back to the
+    documented defaults so stages never crash on a stale config.
+    """
+    settings = {
+        "flush_every_rows": DEFAULT_FLUSH_EVERY_ROWS,
+        "flush_every_seconds": DEFAULT_FLUSH_EVERY_SECONDS,
+    }
+    if not config_path:
+        return settings
+    try:
+        import yaml
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.warning(f"Could not read csv settings from {config_path}: {exc}")
+        return settings
+
+    block = raw.get("csv") if isinstance(raw, dict) else None
+    if not isinstance(block, dict):
+        return settings
+    try:
+        settings["flush_every_rows"] = max(0, int(block.get(
+            "flush_every_rows", DEFAULT_FLUSH_EVERY_ROWS
+        )))
+    except (TypeError, ValueError):
+        pass
+    try:
+        settings["flush_every_seconds"] = max(0.0, float(block.get(
+            "flush_every_seconds", DEFAULT_FLUSH_EVERY_SECONDS
+        )))
+    except (TypeError, ValueError):
+        pass
+    return settings
 
 
 # ---------------------------------------------------------------------------

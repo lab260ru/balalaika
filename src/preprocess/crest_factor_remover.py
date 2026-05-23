@@ -39,10 +39,12 @@ from tqdm import tqdm
 from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.csv_manager import (
     PartialCsvWriter,
+    PeriodicCsvMerger,
     absorb_partial_csvs,
     audit_from_filter_partials,
     discover_audio_paths,
     ensure_main_csv,
+    load_csv_settings,
     resolve_path,
     unprocessed_paths,
 )
@@ -226,12 +228,39 @@ def main(args):
     skipped = mp.Value('i', 0)
     errors = mp.Value('i', 0)
 
+    csv_settings = load_csv_settings(args.config_path)
+
     try:
-        if num_workers > 1:
-            mp.spawn(
-                run_worker,
-                args=(
-                    num_workers,
+        with PeriodicCsvMerger(
+            podcasts_path,
+            prefix=PARTIAL_PREFIX,
+            value_columns=[COLUMN],
+            progress_counter=processed,
+            drop_missing_files=True,
+            **csv_settings,
+        ):
+            if num_workers > 1:
+                mp.spawn(
+                    run_worker,
+                    args=(
+                        num_workers,
+                        pending,
+                        crest_threshold,
+                        str(podcasts_path),
+                        crest_batch_size,
+                        crest_loader_workers,
+                        crest_prefetch_factor,
+                        processed,
+                        skipped,
+                        errors,
+                    ),
+                    nprocs=num_workers,
+                    join=True,
+                )
+            else:
+                run_worker(
+                    0,
+                    1,
                     pending,
                     crest_threshold,
                     str(podcasts_path),
@@ -241,24 +270,7 @@ def main(args):
                     processed,
                     skipped,
                     errors,
-                ),
-                nprocs=num_workers,
-                join=True,
-            )
-        else:
-            run_worker(
-                0,
-                1,
-                pending,
-                crest_threshold,
-                str(podcasts_path),
-                crest_batch_size,
-                crest_loader_workers,
-                crest_prefetch_factor,
-                processed,
-                skipped,
-                errors,
-            )
+                )
     except KeyboardInterrupt:
         logger.warning("Crest factor stage interrupted; merging whatever partials are on disk.")
 
@@ -294,15 +306,6 @@ def main(args):
         hours_in=audit["hours_in"],
         hours_out=audit["hours_out"],
         params={"threshold": crest_threshold, "deleted": audit["files_deleted"]},
-    )
-
-    write_stage_status(
-        stage=2,
-        stage_name="crest_factor_remover",
-        log_dir=args.log_dir or "./logs",
-        processed=processed.value,
-        skipped=skipped.value,
-        errors=errors.value,
     )
 
     write_stage_status(

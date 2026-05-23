@@ -23,9 +23,11 @@ from tqdm import tqdm
 
 from src.utils.csv_manager import (
     PartialCsvWriter,
+    PeriodicCsvMerger,
     absorb_partial_csvs,
     discover_audio_paths,
     ensure_main_csv,
+    load_csv_settings,
     resolve_path,
     unprocessed_paths,
 )
@@ -35,6 +37,7 @@ from src.utils.datasets.denoising import (
 )
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
+from src.utils.parallel import run_per_gpu_processes
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 
@@ -92,6 +95,9 @@ def run_worker(
         logger.info(f"Worker {rank}: no files to process.")
         return
 
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+
     task = str(config.get("task", "speech_enhancement"))
     model_name = str(config.get("model_name", "MossFormer2_SE_48K"))
     sample_rate = int(config.get("sample_rate", DENOISING_SAMPLE_RATE))
@@ -100,6 +106,10 @@ def run_worker(
     prefetch_factor = int(config.get("prefetch_factor", 2))
 
     model = _load_clearvoice(task=task, model_name=model_name)
+    logger.info(
+        f"Worker {rank}/{world_size}: {len(my_files)} files, "
+        f"batch={batch_size}, sample_rate={sample_rate}, loader_workers={loader_workers}"
+    )
 
     with PartialCsvWriter(
         podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
@@ -181,7 +191,12 @@ def main():
     config = load_config(args.config_path, "denoising")
 
     podcasts_path = Path(config.get("podcasts_path", "."))
-    num_processes = int(config.get("processes", 1))
+    configured_processes = int(config.get("processes", 0))
+    available_gpus = torch.cuda.device_count()
+    if configured_processes > 0:
+        num_processes = min(configured_processes, available_gpus) if available_gpus > 0 else configured_processes
+    else:
+        num_processes = available_gpus if available_gpus > 0 else 1
     num_processes = max(1, num_processes)
 
     audio_paths = discover_audio_paths(podcasts_path)
@@ -211,40 +226,31 @@ def main():
         return
 
     logger.info(
-        f"Running denoising for {len(pending)} files with {num_processes} process(es)."
+        f"Running denoising for {len(pending)} files with {num_processes} process(es) "
+        f"({available_gpus} GPU(s) visible)."
     )
 
     processed = mp.Value("i", 0)
     skipped = mp.Value("i", 0)
     errors = mp.Value("i", 0)
 
+    csv_settings = load_csv_settings(args.config_path)
+
     try:
-        if num_processes > 1:
-            mp.spawn(
+        with PeriodicCsvMerger(
+            podcasts_path,
+            prefix=PARTIAL_PREFIX,
+            value_columns=[PROCESSED_COLUMN],
+            progress_counter=processed,
+            **csv_settings,
+        ):
+            worker_errors, _ = run_per_gpu_processes(
                 run_worker,
-                args=(
-                    num_processes,
-                    pending,
-                    config,
-                    podcasts_path,
-                    processed,
-                    skipped,
-                    errors,
-                ),
-                nprocs=num_processes,
-                join=True,
+                num_gpus=num_processes,
+                args=(pending, config, podcasts_path, processed, skipped, errors),
             )
-        else:
-            run_worker(
-                0,
-                1,
-                pending,
-                config,
-                podcasts_path,
-                processed,
-                skipped,
-                errors,
-            )
+            if worker_errors:
+                errors.value += worker_errors
     except KeyboardInterrupt:
         logger.warning("Denoising interrupted; merging partials before exit.")
     except Exception as exc:

@@ -42,10 +42,12 @@ from transformers import AutoFeatureExtractor
 from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.csv_manager import (
     PartialCsvWriter,
+    PeriodicCsvMerger,
     absorb_partial_csvs,
     audit_from_filter_partials,
     discover_audio_paths,
     ensure_main_csv,
+    load_csv_settings,
     resolve_path,
     unprocessed_paths,
 )
@@ -234,8 +236,18 @@ def main(args):
     skipped = mp.Value('i', 0)
     errors = mp.Value('i', 0)
 
+    csv_settings = load_csv_settings(args.config_path)
+
     try:
-        mp.spawn(run_worker, args=(n_gpus, pending, config, processed, skipped, errors), nprocs=n_gpus, join=True)
+        with PeriodicCsvMerger(
+            podcasts_path,
+            prefix=PARTIAL_PREFIX,
+            value_columns=[COLUMN],
+            progress_counter=processed,
+            drop_missing_files=True,
+            **csv_settings,
+        ):
+            mp.spawn(run_worker, args=(n_gpus, pending, config, processed, skipped, errors), nprocs=n_gpus, join=True)
     except KeyboardInterrupt:
         logger.warning("Music detection stage interrupted; merging partials before exit.")
 

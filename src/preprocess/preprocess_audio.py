@@ -37,9 +37,11 @@ from tqdm import tqdm
 
 from src.utils.csv_manager import (
     PartialCsvWriter,
+    PeriodicCsvMerger,
     absorb_partial_csvs,
     discover_audio_paths,
     ensure_main_csv,
+    load_csv_settings,
     resolve_path,
     unprocessed_paths,
 )
@@ -247,12 +249,40 @@ def main(args):
     skipped = mp.Value('i', 0)
     errors = mp.Value('i', 0)
 
+    csv_settings = load_csv_settings(args.config_path)
+
     try:
-        if num_processes > 1:
-            mp.spawn(
-                run_worker,
-                args=(
-                    num_processes,
+        with PeriodicCsvMerger(
+            podcasts_path,
+            prefix=PARTIAL_PREFIX,
+            value_columns=[NORMALIZED_COLUMN],
+            progress_counter=processed,
+            **csv_settings,
+        ):
+            if num_processes > 1:
+                mp.spawn(
+                    run_worker,
+                    args=(
+                        num_processes,
+                        paths_to_process,
+                        peak,
+                        loudness,
+                        block_size,
+                        str(podcasts_path),
+                        loudness_batch_size,
+                        loudness_loader_workers,
+                        loudness_prefetch_factor,
+                        processed,
+                        skipped,
+                        errors,
+                    ),
+                    nprocs=num_processes,
+                    join=True,
+                )
+            else:
+                run_worker(
+                    0,
+                    1,
                     paths_to_process,
                     peak,
                     loudness,
@@ -264,26 +294,7 @@ def main(args):
                     processed,
                     skipped,
                     errors,
-                ),
-                nprocs=num_processes,
-                join=True,
-            )
-        else:
-            run_worker(
-                0,
-                1,
-                paths_to_process,
-                peak,
-                loudness,
-                block_size,
-                str(podcasts_path),
-                loudness_batch_size,
-                loudness_loader_workers,
-                loudness_prefetch_factor,
-                processed,
-                skipped,
-                errors,
-            )
+                )
     except KeyboardInterrupt:
         logger.warning("Loudness normalization interrupted; merging partials before exit.")
 

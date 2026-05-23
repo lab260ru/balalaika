@@ -52,9 +52,35 @@
 #   Run `python -m src.report --config_path configs/config.yaml` (or via
 #   src/report_yaml.sh) at the end of a pipeline to render
 #   filter_report.md with hours dropped per stage.
+#
+# CSV liveness:
+#   The top-level `csv:` block controls how often per-worker partial CSVs are
+#   folded into balalaika.csv during a stage (default every 10 000 rows). This
+#   means a Ctrl+C / SIGKILL in the middle of a multi-hour run leaves
+#   balalaika.csv at most that many rows behind the on-disk truth, instead of
+#   stalling until the next start-up merge.
 # =============================================================================
 
 cache_path: ./cache
+
+# -----------------------------------------------------------------------------
+# CSV / balalaika.csv state block.
+# Read by every stage that touches balalaika.csv (preprocess, crest_factor,
+# loudness, music_detect, distillmos, denoising). The shared CSV manager
+# (src/utils/csv_manager.py) periodically folds worker partial CSVs into the
+# main file during a stage so balalaika.csv always reflects recent work — a
+# Ctrl+C / SIGKILL no longer leaves the metadata "stuck" in worker partials
+# until the next run.
+# -----------------------------------------------------------------------------
+csv:
+  # Fold worker partial CSVs into balalaika.csv after every N rows of
+  # cumulative progress across workers. 0 disables periodic flushing
+  # (only the post-stage merge runs). 10 000 rows ≈ a few seconds of pandas
+  # work on a multi-million-row CSV; raise it for very large datasets.
+  flush_every_rows: 10000
+  # Fallback timer: at least flush every N seconds even if the row threshold
+  # was not hit. 0 disables the timer.
+  flush_every_seconds: 300
 
 # -----------------------------------------------------------------------------
 # Runtime / orchestration block.
@@ -66,7 +92,7 @@ runtime:
   # Python virtualenv that base.sh / *_yaml.sh activate.
   venv_path: .dev_venv
   # CPU range passed to `taskset -c` for CPU-bound stages. Empty to disable.
-  cpu_affinity: "0-32"
+  cpu_affinity: "0-40"
   # Default directory for per-stage rotating log files. CLIs accept --log_dir.
   log_dir: ./logs
   # Root for TensorRT engine cache. Each session appends /trt_cache_<gpu_id>.
@@ -78,7 +104,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /home/nikita/tets_dataset
+  podcasts_path: /mnt/hdd_6tb_1/
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -88,7 +114,7 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /home/nikita/tets_dataset
+  podcasts_path: /mnt/hdd_6tb_1/
   # Maximum duration of each output segment in seconds.
   duration: 22
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
@@ -96,17 +122,17 @@ preprocess:
   # DataLoader batch size for Sortformer diarization source loading.
   diarization_batch_size: 1
   # DataLoader workers per GPU process for Sortformer diarization source loading.
-  diarization_loader_workers: 0
+  diarization_loader_workers: 8
   # Number of prefetched batches per diarization DataLoader worker.
-  diarization_prefetch_factor: 0
+  diarization_prefetch_factor: 2
   # Worker processes per GPU for crest factor removal.
-  num_workers_crest_factor: 1
+  num_workers_crest_factor: 4
   # Crest-factor DataLoader batch size per worker.
   crest_factor_batch_size: 1
   # Crest-factor DataLoader workers inside each process.
-  crest_factor_loader_workers: 0
+  crest_factor_loader_workers: 8
   # Number of prefetched batches per crest-factor DataLoader worker.
-  crest_factor_prefetch_factor: 0
+  crest_factor_prefetch_factor: 2
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
   # crest_factor is saved to balalaika.csv for all files; deleted files also have their CSV row removed.
   crest_treshold: 10
@@ -154,13 +180,13 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /home/nikita/tets_dataset
+  podcasts_path: /mnt/hdd_6tb_1/
 
   music_detect:
     # Inference batch size for music classifier.
     bs: 8
     # DataLoader worker processes per GPU worker.
-    num_workers: 1
+    num_workers: 8
     # Fine-tuned WavLM music-detector weights (safetensors).
     music_detect_model: ./models/music_detection.safetensors
     # If P(music) > threshold, the file is deleted and its CSV row removed.
@@ -172,8 +198,6 @@ separation:
     # cache_path: ./cache
 
   distillmos:
-    # Number of buffered rows before flushing per-worker partial CSV.
-    save_every: 10000
     # DistillMOS inference batch size per GPU worker.
     batch_size: 8
     # DataLoader workers per GPU worker for decoding/resampling audio.
@@ -184,12 +208,12 @@ separation:
   distillmos_filter:
     # DistillMOS threshold. Files with DistillMOS below this are deleted.
     # Set to null → manual interactive mode. Set to a float → automatic mode.
-    threshold: 3.65
+    threshold: 3.0
     # Parallel worker processes for deletion + CSV updates.
-    num_workers: 4
+    num_workers: 8
 
 transcription:
-  podcasts_path: /home/nikita/tets_dataset
+  podcasts_path: /mnt/hdd_6tb_1/
   model_names:
     - giga_ctc
     - giga_rnnt
@@ -197,7 +221,7 @@ transcription:
     - tone
   consensus_num: 3
   with_timestamps: True
-  use_tensorrt: False
+  use_tensorrt: True
   use_vad: False
   use_rover: True
   batch_size: 8
@@ -206,14 +230,14 @@ transcription:
   retry_empty_outputs: True
 
 punctuation:
-  podcasts_path: /home/nikita/tets_dataset
+  podcasts_path: /mnt/hdd_6tb_1/
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /home/nikita/tets_dataset
+  podcasts_path: /mnt/hdd_6tb_1/
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -222,28 +246,28 @@ accent:
   use_tensorrt: False
 
 phonemizer:
-  podcasts_path: /home/nikita/tets_dataset
+  podcasts_path: /mnt/hdd_6tb_1/
   num_workers: 1
 
 denoising:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /home/nikita/tets_dataset
+  podcasts_path: /mnt/hdd_6tb_1/
   # ClearVoice Numpy-to-Numpy model from demo_Numpy2Numpy.py.
   task: speech_enhancement
   model_name: MossFormer2_SE_48K
   # MossFormer2_SE_48K expects 48 kHz float32 audio.
   sample_rate: 48000
-  # Number of stage worker processes. Start with 1; each process loads a model.
-  processes: 1
-  # ClearVoice batch size per worker.
-  batch_size: 1
+  # Number of stage worker processes. 0 = one process per visible GPU.
+  processes: 0
+  # ClearVoice batch size per worker. Inputs are padded to the longest clip in the batch.
+  batch_size: 2
   # DataLoader workers inside each process.
-  num_workers: 0
+  num_workers: 4
   # Number of prefetched batches per DataLoader worker.
   prefetch_factor: 2
 
 export:
-  podcasts_path: /home/nikita/tets_dataset
+  podcasts_path: /mnt/hdd_6tb_1/
   # Parallel processes writing WebDataset shards.
   num_workers: 1
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.

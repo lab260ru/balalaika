@@ -23,7 +23,6 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 import torch
 import torchaudio
 from dotenv import load_dotenv
@@ -33,12 +32,18 @@ from tqdm import tqdm
 
 from src.libs.smart_turn.offline_svad import SmartVAD
 from src.utils.audit import record_stage_summary, safe_audio_duration
-from src.utils.stage_status import write_stage_status
-from src.utils.stage_status import write_stage_status
-from src.utils.csv_manager import upsert_columns
+from src.utils.csv_manager import (
+    PartialCsvWriter,
+    PeriodicCsvMerger,
+    absorb_partial_csvs,
+    ensure_main_csv,
+    load_csv_settings,
+    upsert_columns,
+)
 from src.utils.datasets.preprocess import create_diarization_dataloader
 from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
+from src.utils.stage_status import write_stage_status
 from src.utils.utils import get_audio_paths, load_config
 
 apply_torch_perf_defaults()
@@ -51,6 +56,20 @@ DEFAULT_MAX_MERGE_GAP_S = 0.5
 LOSSLESS_EXTENSIONS = {".flac", ".wav"}
 SUPPORTED_CHUNK_EXTS = {"flac", "wav", "mp3", "ogg", "opus"}
 MAX_FILENAME_BYTES = 240
+
+PARTIAL_PREFIX = "preprocess"
+PARTIAL_FIELDS = (
+    "filepath",
+    "speaker_id",
+    "start",
+    "end",
+    "total_duration",
+    "playlist_id",
+    "podcast_id",
+    "silence_percent",
+    "max_silence_duration",
+    "is_single_speaker",
+)
 
 sortformer_model = None
 smart_vad = None
@@ -518,8 +537,16 @@ def _run_diarization_shard(
     gpu_files: List[str],
     config: Dict[str, Any],
     num_loader_workers: int,
+    podcasts_path: str,
 ) -> List[Dict[str, Any]]:
-    results = []
+    """Diarize a shard and stream each chunk's metadata to a partial CSV.
+
+    Rows are flushed to ``preprocess_part_<gpu_id>.csv`` after every chunk so a
+    SIGINT / SIGKILL between batches preserves whatever was already produced.
+    The main process keeps a periodic merger watching that partial and folding
+    new rows into balalaika.csv every N rows.
+    """
+    results: List[Dict[str, Any]] = []
     dataloader = create_diarization_dataloader(
         gpu_files,
         batch_size=int(config.get("diarization_batch_size", 1)),
@@ -527,22 +554,27 @@ def _run_diarization_shard(
         prefetch_factor=int(config.get("diarization_prefetch_factor", 2)),
     )
 
-    for batch in tqdm(dataloader, total=len(dataloader), desc=f"GPU {gpu_id}", position=gpu_id):
-        for path_audio, audio, sr, error in batch:
-            if error:
-                logger.error(f"Broken file {path_audio}: {error}")
-                continue
-            try:
-                res = process_audio_file(str(path_audio), audio, sr, config)
-                if res and res.get("segments"):
-                    results.extend(res["segments"])
-            except Exception as e:
-                logger.error(f"Task error on GPU {gpu_id}: {e}")
+    with PartialCsvWriter(
+        podcasts_path, PARTIAL_PREFIX, gpu_id, fieldnames=PARTIAL_FIELDS
+    ) as writer:
+        for batch in tqdm(dataloader, total=len(dataloader), desc=f"GPU {gpu_id}", position=gpu_id):
+            for path_audio, audio, sr, error in batch:
+                if error:
+                    logger.error(f"Broken file {path_audio}: {error}")
+                    continue
+                try:
+                    res = process_audio_file(str(path_audio), audio, sr, config)
+                    if res and res.get("segments"):
+                        for seg in res["segments"]:
+                            writer.write({k: seg.get(k, "") for k in PARTIAL_FIELDS})
+                            results.append(seg)
+                except Exception as e:
+                    logger.error(f"Task error on GPU {gpu_id}: {e}")
 
     return results
 
 
-def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any], config_path: str, num_workers_per_gpu: int) -> List[Dict[str, Any]]:
+def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any], config_path: str, num_workers_per_gpu: int, podcasts_path: str) -> List[Dict[str, Any]]:
     logger.info(f"GPU:{gpu_id} processing {len(gpu_files)} files...")
     with ProcessPoolExecutor(
         max_workers=1,
@@ -555,6 +587,7 @@ def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any]
             [str(p) for p in gpu_files],
             config,
             num_workers_per_gpu,
+            podcasts_path,
         )
         results = future.result()
 
@@ -602,6 +635,21 @@ def main(args):
     hours_in = 0.0
     logger.info(f"Source audio total: {hours_in:.2f}h across {len(paths_to_process)} files")
 
+    # Make sure balalaika.csv exists; absorb any leftover partials from a prior
+    # interrupted run so resume picks up where things left off.
+    ensure_main_csv(podcasts_path)
+    chunk_value_columns = [c for c in PARTIAL_FIELDS if c != "filepath"]
+    _, absorbed = absorb_partial_csvs(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        value_columns=chunk_value_columns,
+    )
+    if absorbed:
+        logger.info(
+            f"Absorbed {absorbed} rows from leftover {PARTIAL_PREFIX}_part_*.csv "
+            "into balalaika.csv before scheduling new work."
+        )
+
     all_results: List[Dict[str, Any]] = []
     files_per_gpu: List[List[Path]] = (
         [[] for _ in range(num_gpus)] if num_gpus > 0 else [paths_to_process]
@@ -611,47 +659,60 @@ def main(args):
         for i, p in enumerate(paths_to_process):
             files_per_gpu[i % num_gpus].append(p)
 
-    with ThreadPoolExecutor(max_workers=max(1, num_gpus)) as thread_executor:
-        gpu_futures = []
-        for gpu_id in range(max(1, num_gpus)):
-            gpu_files = files_per_gpu[gpu_id]
-            if not gpu_files:
-                continue
-                
-            gpu_futures.append(
-                thread_executor.submit(
-                    process_gpu_batch,
-                    gpu_id,
-                    gpu_files,
-                    config,
-                    args.config_path,
-                    num_workers_per_gpu
-                )
-            )
+    csv_settings = load_csv_settings(args.config_path)
 
-        for future in as_completed(gpu_futures):
-            try:
-                all_results.extend(future.result())
-                processed += 1
-            except Exception as e:
-                logger.error(f"Failed to aggregate results from a GPU batch: {e}")
-                errors += 1
-                error_details.append({"reason": str(e)})
+    try:
+        with PeriodicCsvMerger(
+            podcasts_path,
+            prefix=PARTIAL_PREFIX,
+            value_columns=chunk_value_columns,
+            **csv_settings,
+        ):
+            with ThreadPoolExecutor(max_workers=max(1, num_gpus)) as thread_executor:
+                gpu_futures = []
+                for gpu_id in range(max(1, num_gpus)):
+                    gpu_files = files_per_gpu[gpu_id]
+                    if not gpu_files:
+                        continue
+
+                    gpu_futures.append(
+                        thread_executor.submit(
+                            process_gpu_batch,
+                            gpu_id,
+                            gpu_files,
+                            config,
+                            args.config_path,
+                            num_workers_per_gpu,
+                            str(podcasts_path),
+                        )
+                    )
+
+                for future in as_completed(gpu_futures):
+                    try:
+                        all_results.extend(future.result())
+                        processed += 1
+                    except Exception as e:
+                        logger.error(f"Failed to aggregate results from a GPU batch: {e}")
+                        errors += 1
+                        error_details.append({"reason": str(e)})
+    except KeyboardInterrupt:
+        logger.warning("Preprocess stage interrupted; merging partials before exit.")
+
+    # Final merge: fold whatever the workers wrote to the partial CSVs
+    # (including everything produced before a Ctrl+C) into balalaika.csv and
+    # delete the partials.
+    _, final_absorbed = absorb_partial_csvs(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        value_columns=chunk_value_columns,
+    )
+    if final_absorbed:
+        logger.success(
+            f"Successfully processed {final_absorbed} samples. "
+            f"Metadata atomically written to {podcasts_path / 'balalaika.csv'}."
+        )
 
     hours_out = sum(float(r.get('total_duration', 0.0)) for r in all_results) / 3600.0
-
-    if all_results:
-        new_df = pd.DataFrame(all_results)
-        chunk_value_columns = [c for c in new_df.columns if c != 'filepath']
-        df = upsert_columns(
-            podcasts_path,
-            new_df,
-            value_columns=chunk_value_columns,
-        )
-        logger.success(
-            f"Successfully processed {len(all_results)} samples. "
-            f"Metadata atomically written to {podcasts_path / 'balalaika.csv'} ({len(df)} total rows)."
-        )
 
     record_stage_summary(
         podcasts_path=podcasts_path,
@@ -672,16 +733,6 @@ def main(args):
             ),
             "max_merge_gap": config.get("max_merge_gap", DEFAULT_MAX_MERGE_GAP_S),
         },
-    )
-
-    write_stage_status(
-        stage=1,
-        stage_name="preprocess",
-        log_dir=args.log_dir or "./logs",
-        processed=processed,
-        skipped=0,
-        errors=errors,
-        error_details=error_details,
     )
 
     write_stage_status(

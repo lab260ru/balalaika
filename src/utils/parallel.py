@@ -131,6 +131,7 @@ def run_per_gpu_processes(
     """
     if num_gpus <= 1:
         run_worker(0, max(num_gpus, 1), *args)
+        return 0, []
 
     processes: List[mp.Process] = []
     error_count = 0
