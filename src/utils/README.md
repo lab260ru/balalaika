@@ -68,7 +68,8 @@ already produced; on the next run those rows are folded into
 Worker partials are flushed row-by-row, but on their own they only become
 visible in `balalaika.csv` at the *end* of the stage. For multi-hour runs
 that's not enough — a Ctrl+C / SIGKILL would leave the main CSV stale until
-the next start-up merge. `PeriodicCsvMerger` fixes that:
+the next start-up merge. `PeriodicCsvMerger` fixes that with a deliberately
+minimal design:
 
 ```python
 from src.utils.csv_manager import PeriodicCsvMerger, load_csv_settings
@@ -79,7 +80,6 @@ with PeriodicCsvMerger(
     podcasts_path,
     prefix="distillmos",
     value_columns=["DistillMOS"],
-    progress_counter=processed,        # optional mp.Value('i')
     drop_missing_files=False,
     **csv_settings,
 ):
@@ -88,21 +88,18 @@ with PeriodicCsvMerger(
 
 What it does:
 
-* Runs in a daemon thread inside the main process.
-* Reads only the *new tail* of each `<prefix>_part_*.csv` per poll
-  (byte-offset tracking) — O(new bytes), not O(partial size).
-* Folds new rows into an in-memory `CsvState` (the main CSV is never re-read
-  from disk between flushes — important once `balalaika.csv` is multi-GB).
-* Atomically writes `balalaika.csv` whenever **either** trigger fires:
-  `flush_every_rows` rows have accumulated, **or** `flush_every_seconds`
-  elapsed since the last flush. Both come from the top-level `csv:` block
-  of `configs/config.yaml`.
+* Runs one daemon thread in the main process.
+* Every `poll_interval` seconds (default 30s) counts data rows on disk
+  across all `<prefix>_part_*.csv` using a cheap byte-level newline count —
+  no pandas, no in-memory mirror, no buffering.
+* When the count has grown by `flush_every_rows` since the last flush
+  (or `flush_every_seconds` elapsed), calls the existing on-disk
+  `upsert_columns` exactly once. That's a single straightforward merge.
 * Never deletes partials — the post-stage `absorb_partial_csvs` still owns
   cleanup so the merger crashing mid-flush cannot lose data.
 
-The semantics of `_merge_results_into_df` are now strict upserts (NaN values
-in incoming rows do **not** clobber existing values), which is what makes
-streaming partial slices into the in-memory mirror correct.
+Both `flush_every_rows` and `flush_every_seconds` come from the top-level
+`csv:` block of `configs/config.yaml`.
 
 ### Filter-stage audit
 

@@ -93,11 +93,23 @@ clips below `separation.distillmos_filter.threshold`. If the threshold is
 interactively. Deletions are streamed through partial CSV files and recorded in
 `filter_summary.csv` as `distillmos_filter`.
 
+#### 3.4. Anti-spoofing (`antispoofing.py`)
+Runs a Spectra-0 ONNX classifier on fixed 16 kHz / 64,600-sample batches.
+Audio preparation follows the official repo after decoding with
+`torchaudio.load_with_torchcodec`: mono mixdown, 16 kHz resampling,
+preemphasis, then random crop for long clips or repeat for short clips. The
+stage writes `antispoof_score` and
+`antispoof_generated_prob` to `balalaika.csv`, deletes clips above
+`separation.antispoofing.threshold`, and records deletions in
+`filter_summary.csv` as `antispoofing`.
+
 **Configuration**: `config.yaml` → `separation` section
 - `music_detect.bs`, `num_workers`, `music_detect_model`, `threshold`, optional
   `base_model` / `cache_path`
 - `distillmos.batch_size`, `distillmos.num_workers`, `distillmos.prefetch_factor`
 - `distillmos_filter.threshold`, `distillmos_filter.num_workers`
+- `antispoofing.onnx_path`, `threshold`, `batch_size`, `num_workers`,
+  `use_tensorrt`
 
 ---
 
@@ -238,6 +250,7 @@ Stage map:
 | 4 | Separation: music detection | `src.separation.music_detect` |
 | 5 | Separation: DistillMOS | `src.separation.distillmos_process` |
 | 5.5 | Separation: DistillMOS filter | `src.separation.distillmos_filter` |
+| 5.6 | Separation: anti-spoofing | `src.separation.antispoofing` |
 | 6 | Transcription | `src.transcription.transcription` |
 | 7 | Punctuation | `src.punctuation.punctuation` |
 | 8 | Accents | `src.accents.accents` |
@@ -309,7 +322,7 @@ Each filtering stage appends a single row to
 | Column | Meaning |
 |--------|---------|
 | `timestamp` | UTC ISO-8601 (when the stage finished) |
-| `stage` | `preprocess` / `crest_factor` / `music_detect` / `distillmos_filter` |
+| `stage` | `preprocess` / `crest_factor` / `music_detect` / `distillmos_filter` / `antispoofing` |
 | `files_in` / `files_out` | File counts before vs. after filtering |
 | `hours_in` / `hours_out` | Total audio hours before vs. after filtering |
 | `hours_removed` | Convenience: `max(0, hours_in - hours_out)` |
@@ -347,7 +360,7 @@ Dataset-level files at `podcasts_path`:
 
 | File | Created by | Purpose |
 |------|------------|---------|
-| `balalaika.csv` | preprocess + crest + loudness + music_detect + distillmos/filter + denoising | Per-clip metadata |
+| `balalaika.csv` | preprocess + crest + loudness + music/music-prob + DistillMOS + anti-spoofing + denoising | Per-clip metadata |
 | `filter_summary.csv` | filtering stages | Audit log of files/hours dropped |
 | `filter_report.md` | `src/report.py` | Human-readable report |
 | `balalaika.parquet` | `src/collate.py` | Final aggregated metadata |
@@ -418,6 +431,7 @@ python -m src.preprocess.preprocess_audio     --config_path configs/config.yaml
 python -m src.separation.music_detect         --config_path configs/config.yaml
 python -m src.separation.distillmos_process   --config_path configs/config.yaml
 python -m src.separation.distillmos_filter    --config_path configs/config.yaml
+python -m src.separation.antispoofing         --config_path configs/config.yaml
 python -m src.transcription.transcription     --config_path configs/config.yaml
 python -m src.punctuation.punctuation         --config_path configs/config.yaml
 python -m src.accents.accents                 --config_path configs/config.yaml
@@ -432,7 +446,7 @@ python -m src.report                          --config_path configs/config.yaml
 
 1. **Download** → raw audio
 2. **Preprocess** → chunking → crest filter → loudness normalization
-3. **Separation** → music detection → DistillMOS scoring → optional DistillMOS filter
+3. **Separation** → music detection → DistillMOS scoring/filter → anti-spoofing
 4. **Transcription** → per-model ASR + ROVER
 5. **Punctuation** → `_rover.txt` → `_punct.txt`
 6. **Accents** → `_punct.txt` → `_accent.txt`

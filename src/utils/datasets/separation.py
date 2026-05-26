@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -13,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 DISTILLMOS_SAMPLE_RATE = 16_000
+ANTISPOOF_SAMPLE_RATE = 16_000
+ANTISPOOF_NUM_SAMPLES = 64_600
 
 
 class DistillMOSDataset(Dataset):
@@ -114,6 +117,95 @@ def create_distillmos_dataloader(
         "num_workers": num_workers,
         "pin_memory": False,
         "collate_fn": distillmos_collate,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(dataset, **loader_kwargs)
+
+
+class AntiSpoofingDataset(Dataset):
+    def __init__(
+        self,
+        file_paths: List[str],
+        sample_rate: int = ANTISPOOF_SAMPLE_RATE,
+        num_samples: int = ANTISPOOF_NUM_SAMPLES,
+    ):
+        self.file_paths = file_paths
+        self.sample_rate = int(sample_rate)
+        self.num_samples = int(num_samples)
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+    def _pad_random(self, waveform: torch.Tensor) -> torch.Tensor:
+        if waveform.ndim > 1:
+            waveform = waveform.squeeze()
+        wave_len = int(waveform.shape[0])
+        if wave_len <= 0:
+            raise ValueError("empty audio")
+        if wave_len >= self.num_samples:
+            start = random.randint(0, wave_len - self.num_samples)
+            return waveform[start : start + self.num_samples]
+        num_repeats = int(self.num_samples / wave_len) + 1
+        return waveform.repeat(num_repeats)[: self.num_samples]
+
+    def __getitem__(self, idx: int):
+        path_str = self.file_paths[idx]
+        try:
+            waveform, source_sample_rate = torchaudio.load_with_torchcodec(path_str)
+            waveform = waveform.to(dtype=torch.float32)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0)
+            else:
+                waveform = waveform.squeeze(0)
+            if int(source_sample_rate) != self.sample_rate:
+                waveform = torchaudio.functional.resample(
+                    waveform,
+                    int(source_sample_rate),
+                    self.sample_rate,
+                )
+            original_length = int(waveform.numel())
+            waveform = torchaudio.functional.preemphasis(waveform.unsqueeze(0))
+            waveform = self._pad_random(waveform.squeeze(0))
+            return path_str, waveform.contiguous(), original_length, ""
+        except Exception as exc:
+            return path_str, torch.empty(0, dtype=torch.float32), 0, str(exc)
+
+
+def antispoofing_collate(batch):
+    paths, waveforms, lengths, errors = zip(*batch)
+    valid_indices = [idx for idx, error in enumerate(errors) if not error]
+    valid_paths = [paths[idx] for idx in valid_indices]
+    valid_lengths = torch.tensor([lengths[idx] for idx in valid_indices], dtype=torch.int64)
+    valid_errors = [(paths[idx], errors[idx]) for idx in range(len(paths)) if errors[idx]]
+
+    if not valid_indices:
+        return [], torch.empty(0, 0, dtype=torch.float32), torch.empty(0, dtype=torch.int64), valid_errors
+
+    batch_tensor = torch.stack([waveforms[idx] for idx in valid_indices]).contiguous()
+    return valid_paths, batch_tensor, valid_lengths, valid_errors
+
+
+def create_antispoofing_dataloader(
+    file_paths: List[str],
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    sample_rate: int = ANTISPOOF_SAMPLE_RATE,
+    num_samples: int = ANTISPOOF_NUM_SAMPLES,
+) -> DataLoader:
+    dataset = AntiSpoofingDataset(
+        file_paths,
+        sample_rate=sample_rate,
+        num_samples=num_samples,
+    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": False,
+        "collate_fn": antispoofing_collate,
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:

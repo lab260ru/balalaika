@@ -67,6 +67,8 @@ bash base.sh --config_path configs/config.yaml --stage 13 --stop_stage 13
 | 3 | Preprocess: loudness normalization | `src.preprocess.preprocess_audio` |
 | 4 | Separation: music detection | `src.separation.music_detect` |
 | 5 | Separation: DistillMOS scoring | `src.separation.distillmos_process` |
+| 5.5 | Separation: DistillMOS filter | `src.separation.distillmos_filter` |
+| 5.6 | Separation: anti-spoofing | `src.separation.antispoofing` |
 | 6 | Transcription + ROVER | `src.transcription.transcription` |
 | 7 | Punctuation | `src.punctuation.punctuation` |
 | 8 | Stress marks / accents | `src.accents.accents` |
@@ -176,6 +178,7 @@ Per-module notes live under `src/*/README.md`.
 | Smart Turn (`smart-turn-v3.0.onnx`) | end-of-turn refinement |
 | WavLM music detector | removes music-heavy chunks |
 | DistillMOS | predicts speech quality score |
+| Spectra-0 anti-spoofing (ONNX) | removes generated / spoofed speech |
 | [onnx-asr](https://github.com/istupakov/onnx-asr) | ASR models and optional TensorRT |
 | RUPunct | punctuation restoration |
 | ruAccent | lexical stress marks |

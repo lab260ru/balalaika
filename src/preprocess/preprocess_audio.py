@@ -256,7 +256,6 @@ def main(args):
             podcasts_path,
             prefix=PARTIAL_PREFIX,
             value_columns=[NORMALIZED_COLUMN],
-            progress_counter=processed,
             **csv_settings,
         ):
             if num_processes > 1:

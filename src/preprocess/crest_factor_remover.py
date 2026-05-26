@@ -235,7 +235,6 @@ def main(args):
             podcasts_path,
             prefix=PARTIAL_PREFIX,
             value_columns=[COLUMN],
-            progress_counter=processed,
             drop_missing_files=True,
             **csv_settings,
         ):

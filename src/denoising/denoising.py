@@ -241,7 +241,6 @@ def main():
             podcasts_path,
             prefix=PARTIAL_PREFIX,
             value_columns=[PROCESSED_COLUMN],
-            progress_counter=processed,
             **csv_settings,
         ):
             worker_errors, _ = run_per_gpu_processes(

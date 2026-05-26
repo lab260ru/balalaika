@@ -12,10 +12,15 @@ Production notes:
   report can attribute removed audio to this stage.
 * **Per-stage log file.** ``setup_logging`` initialises a stderr sink and a
   rotating file sink so long runs never lose log lines.
+* **Per-GPU partial CSVs.** Each GPU subprocess streams chunk metadata into
+  its own ``preprocess_part_<gpu_id>.csv`` row-by-row (``flush()`` after every
+  row). A background merger in the main process folds those partials into
+  ``balalaika.csv`` every ``csv.flush_every_rows`` rows (default 10 000), and
+  a final ``absorb_partial_csvs`` runs at stage end. A Ctrl+C / OOM kill
+  therefore loses at most the rows from the last in-flight chunk.
 """
 
 import argparse
-import hashlib
 import multiprocessing
 import os
 import re
@@ -38,7 +43,6 @@ from src.utils.csv_manager import (
     absorb_partial_csvs,
     ensure_main_csv,
     load_csv_settings,
-    upsert_columns,
 )
 from src.utils.datasets.preprocess import create_diarization_dataloader
 from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
@@ -55,7 +59,6 @@ DEFAULT_MAX_MERGE_GAP_S = 0.5
 
 LOSSLESS_EXTENSIONS = {".flac", ".wav"}
 SUPPORTED_CHUNK_EXTS = {"flac", "wav", "mp3", "ogg", "opus"}
-MAX_FILENAME_BYTES = 240
 
 PARTIAL_PREFIX = "preprocess"
 PARTIAL_FIELDS = (
@@ -346,38 +349,6 @@ def _save_audio_chunk(out_path: str, segment: torch.Tensor, sr: int, fmt: str) -
         torchaudio.save(out_path, segment, sr, format=fmt)
 
 
-def _truncate_utf8(text: str, max_bytes: int) -> str:
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text
-    clipped = encoded[:max(0, max_bytes)]
-    while clipped:
-        try:
-            return clipped.decode("utf-8")
-        except UnicodeDecodeError:
-            clipped = clipped[:-1]
-    return ""
-
-
-def _chunk_filename(start: float, end: float, album_id: str, episode_id: str, fmt: str) -> str:
-    """Return a chunk filename that fits common 255-byte filesystem limits."""
-    ext = f".{fmt}"
-    prefix = f"{start:.2f}_{end:.2f}_"
-    tail = f"{album_id}_{episode_id}"
-    candidate = f"{prefix}{tail}{ext}"
-    if len(candidate.encode("utf-8")) <= MAX_FILENAME_BYTES:
-        return candidate
-
-    digest = hashlib.sha1(tail.encode("utf-8")).hexdigest()[:10]
-    fixed_bytes = len(prefix.encode("utf-8")) + len(ext.encode("utf-8")) + len(digest) + 2
-    tail_budget = max(0, MAX_FILENAME_BYTES - fixed_bytes)
-    album_budget = min(48, max(0, tail_budget // 3))
-    episode_budget = max(0, tail_budget - album_budget - 1)
-    short_album = _truncate_utf8(album_id, album_budget)
-    short_episode = _truncate_utf8(episode_id, episode_budget)
-    return f"{prefix}{short_album}_{short_episode}_{digest}{ext}"
-
-
 def cut_audio(
     audio: torch.Tensor,
     sr: int,
@@ -405,7 +376,7 @@ def cut_audio(
         sil_pct, max_sil, unique_spk = get_chunk_metrics(start, end, raw_segments)
 
         segment = audio[:, s_sample:e_sample]
-        fname = _chunk_filename(start, end, album_id, episode_id, fmt)
+        fname = f"{start:.2f}_{end:.2f}_{album_id}_{episode_id}.{fmt}"
         out_path = os.path.join(output_folder, fname)
         _save_audio_chunk(out_path, segment, sr, fmt)
 
@@ -503,6 +474,7 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
                 f"Processed {len(seg_results)} chunks ({chunk_fmt}) from: {p_audio.name}"
             )
             if p_audio.exists():
+                pass
                 os.remove(p_audio)
 
         return {"segments": seg_results, "source_duration_s": total_audio_duration}
@@ -532,6 +504,7 @@ def _measure_source_hours(paths: List[Path], max_workers: int = None) -> float:
 
     return total_seconds / 3600.0
 
+
 def _run_diarization_shard(
     gpu_id: int,
     gpu_files: List[str],
@@ -539,12 +512,13 @@ def _run_diarization_shard(
     num_loader_workers: int,
     podcasts_path: str,
 ) -> List[Dict[str, Any]]:
-    """Diarize a shard and stream each chunk's metadata to a partial CSV.
+    """Diarize a shard.
 
-    Rows are flushed to ``preprocess_part_<gpu_id>.csv`` after every chunk so a
-    SIGINT / SIGKILL between batches preserves whatever was already produced.
-    The main process keeps a periodic merger watching that partial and folding
-    new rows into balalaika.csv every N rows.
+    Chunk metadata is streamed to ``preprocess_part_<gpu_id>.csv`` (one row per
+    chunk, ``flush()`` after each write). The main process owns aggregation:
+    a background ``PeriodicCsvMerger`` folds these partials into
+    ``balalaika.csv`` every N rows, and a final ``absorb_partial_csvs`` runs
+    at the end. No retries, no respawns — keep this hot path simple.
     """
     results: List[Dict[str, Any]] = []
     dataloader = create_diarization_dataloader(
@@ -593,6 +567,7 @@ def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any]
 
     return results
 
+
 def main(args):
     setup_logging("preprocess", log_dir=args.log_dir)
     load_dotenv()
@@ -605,10 +580,6 @@ def main(args):
 
     chunk_format_cfg = config.get('chunk_format', 'auto')
     logger.info(f"Chunk format policy: '{chunk_format_cfg}' (lossless input stays lossless).")
-
-    processed = 0
-    errors = 0
-    error_details: list[dict] = []
 
     num_gpus = torch.cuda.device_count()
     total_workers = max(1, num_gpus * num_workers_per_gpu)
@@ -646,8 +617,8 @@ def main(args):
     )
     if absorbed:
         logger.info(
-            f"Absorbed {absorbed} rows from leftover {PARTIAL_PREFIX}_part_*.csv "
-            "into balalaika.csv before scheduling new work."
+            f"Absorbed {absorbed} leftover rows from {PARTIAL_PREFIX}_part_*.csv "
+            "before scheduling new work."
         )
 
     all_results: List[Dict[str, Any]] = []
@@ -660,6 +631,9 @@ def main(args):
             files_per_gpu[i % num_gpus].append(p)
 
     csv_settings = load_csv_settings(args.config_path)
+    processed = 0
+    errors = 0
+    error_details: list[dict] = []
 
     try:
         with PeriodicCsvMerger(
@@ -696,11 +670,10 @@ def main(args):
                         errors += 1
                         error_details.append({"reason": str(e)})
     except KeyboardInterrupt:
-        logger.warning("Preprocess stage interrupted; merging partials before exit.")
+        logger.warning("Preprocess stage interrupted; final partial absorb still runs.")
 
-    # Final merge: fold whatever the workers wrote to the partial CSVs
-    # (including everything produced before a Ctrl+C) into balalaika.csv and
-    # delete the partials.
+    # Final merge: fold everything the workers wrote into balalaika.csv and
+    # delete the per-GPU partial CSVs.
     _, final_absorbed = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
@@ -708,7 +681,7 @@ def main(args):
     )
     if final_absorbed:
         logger.success(
-            f"Successfully processed {final_absorbed} samples. "
+            f"Processed {final_absorbed} chunk rows. "
             f"Metadata atomically written to {podcasts_path / 'balalaika.csv'}."
         )
 

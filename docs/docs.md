@@ -244,6 +244,37 @@ and processing a round-robin shard of files.
 
 ---
 
+### Stage 5.6 — Anti-Spoofing (`src/separation/antispoofing.py`)
+
+**Purpose:** Detect and remove generated / spoofed speech clips.
+
+**Input:** All audio files under `podcasts_path`.
+
+**Process:**
+1. Loads Spectra-0 ONNX model from `separation.antispoofing.onnx_path`;
+   if the file is missing, downloads `lab260/spectra_0/model.onnx` from
+   Hugging Face.
+2. Uses `AntiSpoofingDataset` to decode audio with
+   `torchaudio.load_with_torchcodec`, convert to mono, resample to 16 kHz,
+   apply preemphasis, then random-crop long clips or repeat short clips to
+   64,600 samples.
+3. Runs batched ONNX Runtime inference on each GPU.
+4. Writes `antispoof_score` and `antispoof_generated_prob` to `balalaika.csv`.
+5. Deletes clips whose generated probability exceeds `threshold`.
+
+**Output:**
+- `antispoof_score`, `antispoof_generated_prob` columns in `balalaika.csv`.
+- Generated/spoofed files deleted from disk and pruned from CSV.
+- Audit row in `filter_summary.csv` (stage: `antispoofing`).
+
+**Idempotency:** Same partial CSV/resume pattern as music detection:
+`ensure_main_csv`, `absorb_partial_csvs` for `antispoof_part_*.csv`, and
+`unprocessed_paths` on `antispoof_score`.
+
+**Config section:** `separation.antispoofing`
+
+---
+
 ### Stage 6 — Transcription (`src/transcription/transcription.py`)
 
 **Purpose:** Multi-model ASR via onnx-asr, with optional consensus skip, word-level
@@ -466,6 +497,7 @@ at each filtering stage.
 | 3 | All audio files | Normalized audio (in-place); `loudness_normalized` in CSV |
 | 4 | All audio files | Deleted music-heavy files; `music_prob` in CSV + audit |
 | 5 | All audio files | `DistillMOS` in CSV (annotation only) |
+| 5.6 | All audio files | Deleted generated speech; anti-spoofing scores in CSV + audit |
 | 6 | All audio files | `{stem}_{model}.txt` + `.tst` + `_rover.txt` |
 | 7 | `*_rover.txt` | `{stem}_punct.txt` |
 | 8 | `*_punct.txt` | `{stem}_accent.txt` |
@@ -669,6 +701,7 @@ with the rest of the pipeline even if you don't use Stage 0.
 | Smart Turn v3.2 | End-of-speech detection | ONNX |
 | WavLM (fine-tuned) | Music detection | Safetensors |
 | DistillMOS | Speech quality prediction (MOS) | PyTorch |
+| Spectra-0 | Generated / spoofed speech detection | ONNX |
 | onnx-asr (GigaAM, Vosk, T-one, Whisper, etc.) | Speech-to-text | ONNX |
 | ROVER (crowd-kit) | Multi-model consensus aggregation | Python |
 | RUPunct | Punctuation restoration | HuggingFace |
@@ -718,7 +751,8 @@ balalaika/
 │   │
 │   ├── separation/
 │   │   ├── music_detect.py          # Stage 4: WavLM music detection filter
-│   │   └── distillmos_process.py    # Stage 5: DistillMOS scoring
+│   │   ├── distillmos_process.py    # Stage 5: DistillMOS scoring
+│   │   └── antispoofing.py          # Stage 5.6: Spectra-0 generated speech filter
 │   │
 │   ├── transcription/
 │   │   ├── transcription.py         # Stage 6: Multi-model ASR via onnx-asr

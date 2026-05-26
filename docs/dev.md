@@ -18,6 +18,7 @@ The main entrypoint is `base.sh`. It runs numbered stages from
 | 4 | `src.separation.music_detect` | Music probability filtering. |
 | 5 | `src.separation.distillmos_process` | DistillMOS quality scoring. |
 | 5.5 | `src.separation.distillmos_filter` | DistillMOS threshold filtering. |
+| 5.6 | `src.separation.antispoofing` | Generated speech filtering. |
 | 6 | `src.transcription.transcription` | ASR with `onnx-asr` and optional ROVER. |
 | 7 | `src.punctuation.punctuation` | Punctuation restoration. |
 | 8 | `src.accents.accents` | Accent restoration. |
@@ -57,7 +58,7 @@ Use one top-level section per pipeline area:
 - `runtime`: virtualenv, logs, CPU affinity, TensorRT cache paths.
 - `download`: downloader settings.
 - `preprocess`: diarization, VAD, chunking, crest factor, loudness.
-- `separation`: music detection, DistillMOS scoring, DistillMOS filtering.
+- `separation`: music detection, DistillMOS scoring/filtering, anti-spoofing.
 - `transcription`: ASR models, batching, TensorRT, VAD, ROVER.
 - `punctuation`, `accent`, `phonemizer`, `export`: downstream stages.
 - `denoising`: ClearVoice MossFormer2_SE_48K in-place speech enhancement.

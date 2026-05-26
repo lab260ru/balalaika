@@ -33,6 +33,7 @@ STAGE_ORDER = [
     "music_detect",
     "distillmos",
     "distillmos_filter",
+    "antispoofing",
     "transcription",
     "punctuation",
     "accents",

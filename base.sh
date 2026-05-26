@@ -13,6 +13,7 @@
 #   4  Separation: music detection  (src.separation.music_detect)
 #   5  Separation: DistillMOS       (src.separation.distillmos_process)
 #   5.5 DistillMOS filter            (src.separation.distillmos_filter)
+#   5.6 Anti-spoofing filter         (src.separation.antispoofing)
 #   6  Transcription                (src.transcription.transcription)
 #   7  Punctuation                  (src.punctuation.punctuation)
 #   8  Accents                      (src.accents.accents)
@@ -66,10 +67,11 @@ echo "Using config: $config_path"
 
 # ---- runtime env from configs/config.yaml ----------------------------------
 # Exports BALALAIKA_VENV / BALALAIKA_CPU_AFFINITY / BALALAIKA_LOG_DIR / ...
-if ! eval "$(python3 -m src.utils.runtime_env --config_path "$config_path")"; then
+runtime_exports="$(python3 -m src.utils.runtime_env --config_path "$config_path")" || {
     echo "Failed to read runtime env from $config_path" >&2
     exit 1
-fi
+}
+eval "$runtime_exports"
 
 # ---- venv activation --------------------------------------------------------
 activate_venv() {
@@ -205,6 +207,12 @@ if stage_active 5.5; then
     echo "Stage 5.5: DistillMOS filter — quality-based deletion"
     run_python src.separation.distillmos_filter
     check_stage_status 5.5
+fi
+
+if stage_active 5.6; then
+    echo "Stage 5.6: Anti-spoofing — generated speech filter"
+    run_python src.separation.antispoofing
+    check_stage_status 5.6
 fi
 
 if stage_active 6; then

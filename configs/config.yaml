@@ -21,7 +21,7 @@
 # preprocess — Sortformer diarization, Smart Turn VAD, chunking, crest filter,
 #   loudness normalization (see src/preprocess/preprocess_yaml.sh order).
 #
-# separation — music detection (deletes clips) + DistillMOS → balalaika.csv.
+# separation — music detection, DistillMOS, anti-spoofing → balalaika.csv.
 #
 # transcription — onnx-asr multi-model ASR, optional ROVER (src/transcription).
 #
@@ -104,7 +104,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /mnt/hdd_6tb_1/
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -114,25 +114,25 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /mnt/hdd_6tb_1/
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   # Maximum duration of each output segment in seconds.
-  duration: 22
+  duration: 15
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
-  num_workers: 1
+  num_workers: 0
   # DataLoader batch size for Sortformer diarization source loading.
   diarization_batch_size: 1
   # DataLoader workers per GPU process for Sortformer diarization source loading.
-  diarization_loader_workers: 8
+  diarization_loader_workers: 0
   # Number of prefetched batches per diarization DataLoader worker.
-  diarization_prefetch_factor: 2
+  diarization_prefetch_factor: 0
   # Worker processes per GPU for crest factor removal.
-  num_workers_crest_factor: 4
+  num_workers_crest_factor: 0
   # Crest-factor DataLoader batch size per worker.
   crest_factor_batch_size: 1
   # Crest-factor DataLoader workers inside each process.
-  crest_factor_loader_workers: 8
+  crest_factor_loader_workers: 0
   # Number of prefetched batches per crest-factor DataLoader worker.
-  crest_factor_prefetch_factor: 2
+  crest_factor_prefetch_factor: 0
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
   # crest_factor is saved to balalaika.csv for all files; deleted files also have their CSV row removed.
   crest_treshold: 10
@@ -143,13 +143,13 @@ preprocess:
   # Block size in seconds for loudness measurement windows.
   block_size: 0.400
   # Worker processes for loudness normalization.
-  loudness_num_workers: 4
+  loudness_num_workers: 0
   # Loudness-normalization DataLoader batch size per process.
-  loudness_batch_size: 8
+  loudness_batch_size: 1
   # Loudness-normalization DataLoader workers inside each process.
   loudness_loader_workers: 1
   # Number of prefetched batches per loudness-normalization DataLoader worker.
-  loudness_prefetch_factor: 2
+  loudness_prefetch_factor: 0
   # Max audio length in seconds fed to Sortformer at once; longer files are windowed.
   chunk_duration: 900
   # Output container for chunked segments. 'auto' preserves the source extension
@@ -180,7 +180,7 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/hdd_6tb_1/
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
 
   music_detect:
     # Inference batch size for music classifier.
@@ -212,8 +212,20 @@ separation:
     # Parallel worker processes for deletion + CSV updates.
     num_workers: 8
 
+  antispoofing:
+    # Spectra-0 ONNX model. If missing, the stage downloads it from Hugging Face.
+    onnx_path: ./models/spectra_0.onnx
+    # Batch and DataLoader settings per GPU worker.
+    batch_size: 8
+    num_workers: 4
+    prefetch_factor: 2
+    # Generated-speech probability threshold. If prob > threshold, file is deleted.
+    threshold: 0.5
+    # TensorRT is supported when the exported ONNX has compatible dynamic batch profile.
+    use_tensorrt: False
+
 transcription:
-  podcasts_path: /mnt/hdd_6tb_1/
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   model_names:
     - giga_ctc
     - giga_rnnt
@@ -230,14 +242,14 @@ transcription:
   retry_empty_outputs: True
 
 punctuation:
-  podcasts_path: /mnt/hdd_6tb_1/
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /mnt/hdd_6tb_1/
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -246,12 +258,12 @@ accent:
   use_tensorrt: False
 
 phonemizer:
-  podcasts_path: /mnt/hdd_6tb_1/
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   num_workers: 1
 
 denoising:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/hdd_6tb_1/
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   # ClearVoice Numpy-to-Numpy model from demo_Numpy2Numpy.py.
   task: speech_enhancement
   model_name: MossFormer2_SE_48K
@@ -267,7 +279,7 @@ denoising:
   prefetch_factor: 2
 
 export:
-  podcasts_path: /mnt/hdd_6tb_1/
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   # Parallel processes writing WebDataset shards.
   num_workers: 1
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.
