@@ -4,6 +4,9 @@ import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
+from torchcodec.decoders import AudioDecoder
+
+DIARIZATION_SAMPLE_RATE = 16_000
 
 
 class CrestFactorDataset(Dataset):
@@ -95,6 +98,15 @@ def create_loudness_normalize_dataloader(
 
 
 class DiarizationDataset(Dataset):
+    """Stream audio decoded to ``DIARIZATION_SAMPLE_RATE`` (16 kHz) mono.
+
+    Sortformer and SmartVAD both run at 16 kHz, so we resample inside the
+    decoder rather than carrying the native-rate (often 44.1/48 kHz) waveform
+    through VRAM. The native file is *not* touched here — chunk export reads
+    it lazily later via :class:`torchcodec.decoders.AudioDecoder`, so audio
+    cuts keep the source's original quality.
+    """
+
     def __init__(self, file_paths: List[str]):
         self.file_paths = [str(p) for p in file_paths]
 
@@ -104,8 +116,14 @@ class DiarizationDataset(Dataset):
     def __getitem__(self, idx: int):
         path = self.file_paths[idx]
         try:
-            waveform, sample_rate = torchaudio.load_with_torchcodec(path)
-            return path, waveform.to(dtype=torch.float32).contiguous(), int(sample_rate), ""
+            decoder = AudioDecoder(path, sample_rate=DIARIZATION_SAMPLE_RATE)
+            samples = decoder.get_all_samples()
+            waveform = samples.data.to(dtype=torch.float32)
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            return path, waveform.contiguous(), DIARIZATION_SAMPLE_RATE, ""
         except Exception as exc:
             return path, torch.empty(0, dtype=torch.float32), 0, str(exc)
 

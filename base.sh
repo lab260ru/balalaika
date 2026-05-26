@@ -100,12 +100,37 @@ activate_venv "${BALALAIKA_VENV:-.dev_venv}"
 
 mkdir -p "${BALALAIKA_LOG_DIR:-./logs}"
 
+# ---- cudf.pandas accelerator ------------------------------------------------
+# Each stage's main process does the heavy CSV work (read_csv -> merge ->
+# atomic write) through pandas in csv_manager. cudf.pandas transparently
+# routes those calls to GPU when available and silently falls back to CPU
+# otherwise. We probe once at startup and toggle a launcher prefix per call.
+#
+# Disable explicitly with BALALAIKA_DISABLE_CUDF=1 (handy when debugging a
+# regression that smells like a cuDF/pandas API drift).
+cudf_prefix=()
+if [[ "${BALALAIKA_DISABLE_CUDF:-0}" == "1" ]]; then
+    echo "cudf.pandas: disabled via BALALAIKA_DISABLE_CUDF=1"
+elif python3 -c "import cudf.pandas" >/dev/null 2>&1; then
+    cudf_prefix=(python3 -m cudf.pandas)
+    echo "cudf.pandas: enabled (Pandas Accelerator Mode)"
+else
+    echo "cudf.pandas: not available, falling back to vanilla pandas"
+fi
+
 # ---- helpers ----------------------------------------------------------------
 run_python() {
     # Run a Python module with optional CPU pinning + the configured log dir.
     local module="$1"; shift
     local extra_args=("$@")
-    local cmd=(python3 -m "$module" --config_path "$config_path" --log_dir "$BALALAIKA_LOG_DIR" "${extra_args[@]}")
+    local cmd
+    if (( ${#cudf_prefix[@]} > 0 )); then
+        # `python -m cudf.pandas -m <module>` installs the cuDF import hook
+        # in the *main* interpreter before any `import pandas` happens.
+        cmd=("${cudf_prefix[@]}" -m "$module" --config_path "$config_path" --log_dir "$BALALAIKA_LOG_DIR" "${extra_args[@]}")
+    else
+        cmd=(python3 -m "$module" --config_path "$config_path" --log_dir "$BALALAIKA_LOG_DIR" "${extra_args[@]}")
+    fi
 
     if [[ -n "${BALALAIKA_CPU_AFFINITY:-}" ]] && command -v taskset >/dev/null 2>&1; then
         cmd=(taskset -c "$BALALAIKA_CPU_AFFINITY" "${cmd[@]}")

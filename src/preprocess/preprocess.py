@@ -33,6 +33,8 @@ import torchaudio
 from dotenv import load_dotenv
 from huggingface_hub import login
 from loguru import logger
+from torchcodec.decoders import AudioDecoder
+from torchcodec.encoders import AudioEncoder
 from tqdm import tqdm
 
 from src.libs.smart_turn.offline_svad import SmartVAD
@@ -336,22 +338,22 @@ def resolve_chunk_format(source_path: Path, chunk_format: str) -> str:
 
 
 def _save_audio_chunk(out_path: str, segment: torch.Tensor, sr: int, fmt: str) -> None:
-    """Write a chunk preserving as much fidelity as possible.
+    """Write a chunk in its native sample rate via torchcodec.
 
-    For lossless containers (flac/wav) ``torchaudio.save`` is bit-exact at the
-    requested sample format. For lossy containers we still let torchaudio pick
-    a sane default rather than hard-coding bitrates we can't tune per system.
+    ``segment`` is ``(channels, samples)`` float32 in [-1, 1] — exactly what
+    :meth:`torchcodec.decoders.AudioDecoder.get_samples_played_in_range`
+    returns. :class:`torchcodec.encoders.AudioEncoder` picks reasonable
+    container defaults per extension (FLAC/WAV bit-exact, lossy formats use
+    sensible bitrate).
     """
-    fmt = fmt.lower().lstrip(".")
-    if fmt in {"flac", "wav"}:
-        torchaudio.save(out_path, segment, sr, format=fmt)
-    else:
-        torchaudio.save(out_path, segment, sr, format=fmt)
+    if segment.ndim == 1:
+        segment = segment.unsqueeze(0)
+    encoder = AudioEncoder(segment.contiguous(), sample_rate=int(sr))
+    encoder.to_file(out_path)
 
 
 def cut_audio(
-    audio: torch.Tensor,
-    sr: int,
+    source_path: str,
     final_segments: List[Tuple[float, float, int]],
     raw_segments: List[Tuple[float, float, int]],
     output_folder: str,
@@ -361,24 +363,67 @@ def cut_audio(
     max_duration: float = 15.0,
     min_save_duration: float = DEFAULT_MIN_SAVE_DURATION_S,
 ) -> List[Dict]:
+    """Cut chunks from ``source_path`` lazily, in the source's native SR.
+
+    The diarization tensor used upstream is downsampled to 16 kHz to keep VRAM
+    flat. Here we re-open the original file with ``AudioDecoder`` *without* a
+    target ``sample_rate`` and decode only the requested ``[start, end]``
+    windows via ``get_samples_played_in_range``. The full waveform is never
+    materialised in memory, so cutting a 2 h FLAC into ~hundreds of chunks
+    costs only the size of one chunk at a time.
+    """
     os.makedirs(output_folder, exist_ok=True)
-    results = []
+    results: List[Dict] = []
+
+    try:
+        decoder = AudioDecoder(source_path)
+    except Exception as exc:
+        logger.error(f"Could not open source for cutting {source_path}: {exc}")
+        return results
+
+    native_sr = int(decoder.metadata.sample_rate)
+    # Attribute name shifted across torchcodec releases; fall back gracefully
+    # so the cutter still clamps end-of-file overflow.
+    dur_attr = (
+        getattr(decoder.metadata, "duration_seconds", None)
+        or getattr(decoder.metadata, "duration_seconds_from_header", None)
+    )
+    source_duration = float(dur_attr) if dur_attr else 0.0
 
     for start, end, spk in final_segments:
         dur = end - start
         if dur <= min_save_duration:
             continue
 
-        s_sample, e_sample = int(start * sr), min(int(end * sr), audio.shape[-1])
-        if e_sample <= s_sample:
+        clamped_end = min(end, source_duration) if source_duration > 0 else end
+        if clamped_end <= start:
             continue
 
         sil_pct, max_sil, unique_spk = get_chunk_metrics(start, end, raw_segments)
 
-        segment = audio[:, s_sample:e_sample]
+        try:
+            samples = decoder.get_samples_played_in_range(
+                start_seconds=float(start), stop_seconds=float(clamped_end)
+            )
+        except Exception as exc:
+            logger.error(
+                f"Failed to decode {start:.2f}-{clamped_end:.2f}s from {source_path}: {exc}"
+            )
+            continue
+
+        segment = samples.data.to(dtype=torch.float32)
+        if segment.ndim == 1:
+            segment = segment.unsqueeze(0)
+        if segment.shape[-1] == 0:
+            continue
+
         fname = f"{start:.2f}_{end:.2f}_{album_id}_{episode_id}.{fmt}"
         out_path = os.path.join(output_folder, fname)
-        _save_audio_chunk(out_path, segment, sr, fmt)
+        try:
+            _save_audio_chunk(out_path, segment, native_sr, fmt)
+        except Exception as exc:
+            logger.error(f"Failed to write chunk {out_path}: {exc}")
+            continue
 
         results.append({
             'filepath': os.path.abspath(out_path),
@@ -457,8 +502,7 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
             return {"segments": [], "source_duration_s": total_audio_duration}
 
         seg_results = cut_audio(
-            audio,
-            sr,
+            str(p_audio),
             final_segments,
             raw_segments,
             str(episode_folder),
