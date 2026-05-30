@@ -30,8 +30,8 @@ set -euo pipefail
 
 # ---- defaults ---------------------------------------------------------------
 config_path="configs/config.yaml"
-stage=1
-stop_stage=9
+stage=10
+stop_stage=13
 strict_mode=0
 
 while [[ $# -gt 0 ]]; do
@@ -124,10 +124,28 @@ run_python() {
     local module="$1"; shift
     local extra_args=("$@")
     local cmd
+
     if (( ${#cudf_prefix[@]} > 0 )); then
-        # `python -m cudf.pandas -m <module>` installs the cuDF import hook
-        # in the *main* interpreter before any `import pandas` happens.
-        cmd=("${cudf_prefix[@]}" -m "$module" --config_path "$config_path" --log_dir "$BALALAIKA_LOG_DIR" "${extra_args[@]}")
+        # Do NOT use:
+        #   python3 -m cudf.pandas -m "$module" --config_path ...
+        #
+        # Because cudf.pandas CLI parses arguments itself and can fail on
+        # project-specific args like --config_path / --log_dir.
+        #
+        # Instead, install cudf.pandas hook inside Python before importing
+        # the target module, then run the target module with corrected sys.argv.
+        cmd=(python3 -c '
+import runpy
+import sys
+
+import cudf.pandas
+cudf.pandas.install()
+
+module = sys.argv[1]
+sys.argv = [module] + sys.argv[2:]
+
+runpy.run_module(module, run_name="__main__", alter_sys=True)
+' "$module" --config_path "$config_path" --log_dir "$BALALAIKA_LOG_DIR" "${extra_args[@]}")
     else
         cmd=(python3 -m "$module" --config_path "$config_path" --log_dir "$BALALAIKA_LOG_DIR" "${extra_args[@]}")
     fi

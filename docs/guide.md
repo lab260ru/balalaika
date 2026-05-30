@@ -75,7 +75,8 @@ in place with `torchaudio.save`, and `loudness_normalized` is written to
 ### 3. Separation (`src/separation/`)
 
 Quality filtering on chunked clips. Diarization itself is handled in the
-preprocess stage; separation only does music detection and DistillMOS scoring.
+preprocess stage; separation covers music detection, DistillMOS scoring/filtering,
+and Spectra-0 anti-spoofing.
 
 #### 3.1. Music detection (`music_detect.py`)
 Fine-tuned **WavLM** classifier. Writes `music_prob` to `balalaika.csv`,
@@ -94,7 +95,7 @@ interactively. Deletions are streamed through partial CSV files and recorded in
 `filter_summary.csv` as `distillmos_filter`.
 
 #### 3.4. Anti-spoofing (`antispoofing.py`)
-Runs a Spectra-0 ONNX classifier on fixed 16 kHz / 64,600-sample batches.
+Runs the **[Spectra-0](https://huggingface.co/lab260/spectra_0)** ONNX classifier on fixed 16 kHz / 64,600-sample batches.
 Audio preparation follows the official repo after decoding with
 `torchaudio.load_with_torchcodec`: mono mixdown, 16 kHz resampling,
 preemphasis, then random crop for long clips or repeat for short clips. The
@@ -161,18 +162,23 @@ optional **TensorRT**.
 
 ### 8. Denoising / speech enhancement (`src/denoising/`)
 
-ClearVoice **MossFormer2_SE_48K** runs through the Numpy-to-Numpy API shown in
-the ClearerVoice-Studio demo:
-`ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])`.
-The stage decodes audio with `torchaudio`, converts it to mono 48 kHz float32
-batches, calls ClearVoice, and overwrites the audio file in place.
+The denoising stage runs a dynamic ONNX export of
+**[MossFormer2_SE_48K](https://huggingface.co/alibabasglab/MossFormer2_SE_48K)**,
+the 48 kHz speech-enhancement model from ClearerVoice-Studio. The original
+ClearVoice API exposes it as
+`ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])`;
+Balalaika uses ONNX Runtime so the same stage can run with CUDA or TensorRT EP.
 
-**Output**: same audio paths, rewritten at `denoising.sample_rate` (default
-48 kHz), plus `denoised=True` in `balalaika.csv`.
+The stage decodes audio with `torchaudio`, converts it to mono 48 kHz batches,
+runs ONNX inference, trims the output to the source length, and overwrites the
+audio file in place.
 
-**Config**: `config.yaml` → `denoising` (`podcasts_path`, `task`,
-`model_name`, `sample_rate`, `processes`, `batch_size`, `num_workers`,
-`prefetch_factor`).
+**Output**: same audio paths rewritten at 48 kHz, plus `denoised=True` in
+`balalaika.csv`.
+
+**Config**: `config.yaml` → `denoising` (`podcasts_path`, `onnx_path`,
+`hf_repo_id`, `hf_filename`, `processes`, `batch_size`, `num_workers`,
+`prefetch_factor`, `use_tensorrt`).
 
 ---
 
@@ -273,8 +279,8 @@ stage writes a `stage_<id>_status.json` file with non-zero errors.
   Use `preprocess.chunk_format` to pin a specific extension when you need it.
 - Loudness normalization overwrites clips in place with `torchaudio.save` after
   peak and integrated-loudness normalization.
-- Denoising intentionally rewrites audio in place using ClearVoice
-  `MossFormer2_SE_48K`; the default output sample rate is 48 kHz mono.
+- Denoising intentionally rewrites audio in place using the ONNX export of
+  ClearerVoice-Studio `MossFormer2_SE_48K`; the model sample rate is 48 kHz mono.
 - Read-only stages (crest filter, music detection, DistillMOS, ASR, RUPunct,
   ruAccent, TryIParu, WebDataset export) never re-encode the audio. WebDataset
   export copies the current audio bytes verbatim.

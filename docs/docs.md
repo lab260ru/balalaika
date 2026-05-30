@@ -251,7 +251,7 @@ and processing a round-robin shard of files.
 **Input:** All audio files under `podcasts_path`.
 
 **Process:**
-1. Loads Spectra-0 ONNX model from `separation.antispoofing.onnx_path`;
+1. Loads [Spectra-0](https://huggingface.co/lab260/spectra_0) ONNX model from `separation.antispoofing.onnx_path`;
    if the file is missing, downloads `lab260/spectra_0/model.onnx` from
    Hugging Face.
 2. Uses `AntiSpoofingDataset` to decode audio with
@@ -387,17 +387,19 @@ out_derive=lambda p: p.with_name(f"{p.stem}_phonemes.txt"))`.
 
 ### Stage 10 — Denoising / Speech Enhancement (`src/denoising/denoising.py`)
 
-**Purpose:** Enhance audio in place using ClearVoice MossFormer2_SE_48K.
+**Purpose:** Enhance audio in place using a dynamic ONNX export of ClearerVoice-Studio MossFormer2_SE_48K.
 
 **Input:** All audio files under `podcasts_path`.
 
 **Process:**
-1. Loads `ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])`.
+1. Loads the ONNX model from `denoising.onnx_path`; if missing, downloads
+   `denoising.hf_repo_id` / `denoising.hf_filename` from Hugging Face.
 2. Uses `DenoisingDataset` from `src/utils/datasets/denoising.py` to decode
    audio with `torchaudio`, convert to mono, and resample to 48 kHz.
-3. Sends NumPy batches shaped `[batch, length]` to the ClearVoice
-   Numpy-to-Numpy API.
-4. Writes enhanced audio back to the same file path via `torchaudio.save`.
+3. Pads batches to the model multiple and runs ONNX Runtime inference through
+   CUDA or TensorRT EP.
+4. Trims enhanced output back to the original decoded length and writes audio
+   back to the same file path via `torchaudio.save`.
 5. Streams `denoised=True` rows to worker partial CSVs and merges them into
    `balalaika.csv`.
 
@@ -672,7 +674,7 @@ Each stage reads only its own YAML section via `load_config(config_path, SECTION
 | `punctuation` | RUPunct (stage 7) |
 | `accent` | ruAccent (stage 8) — note: singular `accent` |
 | `phonemizer` | TryIParu G2P (stage 9) |
-| `denoising` | ClearVoice MossFormer2_SE_48K enhancement (stage 10) |
+| `denoising` | MossFormer2_SE_48K ONNX Runtime / TensorRT enhancement (stage 10) |
 | `export` | WebDataset shard export (stage 12) |
 
 ### `runtime` block keys
@@ -701,13 +703,13 @@ with the rest of the pipeline even if you don't use Stage 0.
 | Smart Turn v3.2 | End-of-speech detection | ONNX |
 | WavLM (fine-tuned) | Music detection | Safetensors |
 | DistillMOS | Speech quality prediction (MOS) | PyTorch |
-| Spectra-0 | Generated / spoofed speech detection | ONNX |
+| [Spectra-0](https://huggingface.co/lab260/spectra_0) | Generated / spoofed speech detection | ONNX |
 | onnx-asr (GigaAM, Vosk, T-one, Whisper, etc.) | Speech-to-text | ONNX |
 | ROVER (crowd-kit) | Multi-model consensus aggregation | Python |
 | RUPunct | Punctuation restoration | HuggingFace |
 | ruAccent | Lexical stress marks | ONNX/PyTorch |
 | TryIParu | Grapheme → IPA phonemes | PyTorch |
-| ClearVoice MossFormer2_SE_48K | Denoising / speech enhancement | PyTorch |
+| [MossFormer2_SE_48K](https://huggingface.co/alibabasglab/MossFormer2_SE_48K) | 48 kHz denoising / speech enhancement from ClearerVoice-Studio | ONNX Runtime / TensorRT |
 
 ---
 
@@ -737,7 +739,7 @@ balalaika/
 │   │       ├── preprocess.py        # CrestFactor/Loudness/Diarization datasets + DataLoaders
 │   │       ├── separation.py        # DistillMOS dataset with length-sorted batching
 │   │       ├── transcription.py     # Transcription dataset + batch recognition
-│   │       └── denoising.py         # ClearVoice denoising DataLoader
+│   │       └── denoising.py         # MossFormer2 ONNX denoising DataLoader
 │   │
 │   ├── download/
 │   │   ├── download.py              # Stage 0: Yandex Music downloader
@@ -768,7 +770,7 @@ balalaika/
 │   │   └── phonemizer.py            # Stage 9: TryIParu G2P
 │   │
 │   ├── denoising/
-│   │   └── denoising.py             # Stage 10: ClearVoice MossFormer2_SE_48K
+│   │   └── denoising.py             # Stage 10: MossFormer2_SE_48K ONNX/TRT
 │   │
 │   └── libs/
 │       └── smart_turn/

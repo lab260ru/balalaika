@@ -23,7 +23,7 @@ The main entrypoint is `base.sh`. It runs numbered stages from
 | 7 | `src.punctuation.punctuation` | Punctuation restoration. |
 | 8 | `src.accents.accents` | Accent restoration. |
 | 9 | `src.phonemizer.phonemizer` | G2P / phonemization. |
-| 10 | `src.denoising.denoising` | ClearVoice denoising / speech enhancement. |
+| 10 | `src.denoising.denoising` | ONNX Runtime / TensorRT denoising / speech enhancement. |
 | 11 | `src.collate` | Merge sidecars into parquet. |
 | 12 | `src.to_webdataset` | Export WebDataset shards. |
 | 13 | `src.report` | Build filter report. |
@@ -61,7 +61,7 @@ Use one top-level section per pipeline area:
 - `separation`: music detection, DistillMOS scoring/filtering, anti-spoofing.
 - `transcription`: ASR models, batching, TensorRT, VAD, ROVER.
 - `punctuation`, `accent`, `phonemizer`, `export`: downstream stages.
-- `denoising`: ClearVoice MossFormer2_SE_48K in-place speech enhancement.
+- `denoising`: MossFormer2_SE_48K ONNX Runtime / TensorRT in-place speech enhancement.
 
 When adding a setting:
 

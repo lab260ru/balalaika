@@ -113,8 +113,9 @@ Balalaika avoids silent quality degradation:
   when you explicitly want a fixed output container.
 - Loudness normalization writes FLAC/WAV through `soundfile` as lossless
   containers. Lossy formats are handled by `torchaudio.save`.
-- Denoising uses ClearVoice `MossFormer2_SE_48K`, converts clips to 48 kHz
-  mono, and overwrites audio in place before export.
+- Denoising uses a dynamic ONNX export of ClearerVoice-Studio
+  `MossFormer2_SE_48K`, converts clips to 48 kHz mono, and overwrites audio
+  in place before export.
 - WebDataset export copies the produced audio bytes as-is.
 
 ---
@@ -178,12 +179,12 @@ Per-module notes live under `src/*/README.md`.
 | Smart Turn (`smart-turn-v3.0.onnx`) | end-of-turn refinement |
 | WavLM music detector | removes music-heavy chunks |
 | DistillMOS | predicts speech quality score |
-| Spectra-0 anti-spoofing (ONNX) | removes generated / spoofed speech |
+| [Spectra-0 anti-spoofing](https://huggingface.co/lab260/spectra_0) (ONNX) | removes generated / spoofed speech |
 | [onnx-asr](https://github.com/istupakov/onnx-asr) | ASR models and optional TensorRT |
 | RUPunct | punctuation restoration |
 | ruAccent | lexical stress marks |
 | TryIParu | grapheme-to-phoneme conversion |
-| ClearVoice MossFormer2_SE_48K | denoising / speech enhancement |
+| [ClearerVoice-Studio MossFormer2_SE_48K](https://huggingface.co/alibabasglab/MossFormer2_SE_48K) (ONNX export in pipeline) | denoising / speech enhancement |
 
 ---
 
@@ -215,6 +216,8 @@ Per-module notes live under `src/*/README.md`.
 | **[RUPunct](https://huggingface.co/RUPunct/RUPunct_big)** | punctuation |
 | **[ruAccent](https://github.com/Den4ikAI/ruaccent)** | stress marks |
 | **TryIParu** (`tryiparu`) | grapheme → IPA |
+| **[Spectra-0](https://huggingface.co/lab260/spectra_0)** | generated / spoofed speech detection |
+| **[MossFormer2_SE_48K](https://huggingface.co/alibabasglab/MossFormer2_SE_48K)** | 48 kHz denoising / speech enhancement via ONNX Runtime |
 
 ---
 

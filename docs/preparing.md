@@ -138,8 +138,9 @@ Just preprocess and audio normalization:
 bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
 ```
 
-Stage 10 runs ClearVoice `MossFormer2_SE_48K` denoising / speech enhancement and
-overwrites audio in place at 48 kHz by default. The last stage (13) runs
+Stage 10 runs an ONNX Runtime / TensorRT export of ClearerVoice-Studio
+`MossFormer2_SE_48K` denoising / speech enhancement and overwrites audio in
+place at 48 kHz. The last stage (13) runs
 `src/report.py`, which materializes
 `filter_report.md` next to your dataset so you can see how much audio (in
 hours) was filtered at each step.

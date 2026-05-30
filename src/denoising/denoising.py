@@ -1,20 +1,18 @@
-"""ClearVoice MossFormer2_SE_48K denoising stage.
+"""ONNX Runtime / TensorRT MossFormer2_SE_48K denoising stage.
 
-This stage mirrors the Numpy-to-Numpy ClearVoice demo:
-
-    ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])
-
-Inputs are decoded with torchaudio, converted to mono 48 kHz float32 batches,
-processed by ClearVoice, and written back in place. Progress is tracked in
-``balalaika.csv`` through the ``denoised`` column so interrupted runs resume.
+The stage processes audio files in place and tracks progress in
+``balalaika.csv`` through the ``denoised`` column. Inputs are decoded as mono
+48 kHz int16 batches, padded for the dynamic ONNX profile, sent to ONNX Runtime,
+and trimmed back to the original decoded length before saving.
 """
 
 import argparse
 import warnings
 from pathlib import Path
-from typing import List, Set
+from typing import Dict, List, Set
 
 import numpy as np
+import onnxruntime as ort
 import torch
 import torch.multiprocessing as mp
 import torchaudio
@@ -35,7 +33,7 @@ from src.utils.datasets.denoising import (
     DENOISING_SAMPLE_RATE,
     create_denoising_dataloader,
 )
-from src.utils.gpu import apply_torch_perf_defaults
+from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_processes
 from src.utils.stage_status import write_stage_status
@@ -47,37 +45,120 @@ apply_torch_perf_defaults()
 PARTIAL_PREFIX = "denoising"
 PROCESSED_COLUMN = "denoised"
 PARTIAL_FIELDS = ("filepath", PROCESSED_COLUMN)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MODEL_SAMPLE_RATE = DENOISING_SAMPLE_RATE
+MODEL_PAD_TO_MULTIPLE = 384
+MODEL_PAD_MODE = "noise"
+MODEL_MAX_PADDED_LEN = 960_000
+MODEL_TRT_MIN_SHAPE = "1x1x8000"
+MODEL_REPO_FILENAME = "MossFormer2_SE_48K_dynamic.onnx"
+DEFAULT_ONNX_PATH = "./models/MossFormer2_SE_48K_dynamic.onnx"
+ORT_THREADS = 4
 
 
-def _write_audio(audio_path: str, samples: np.ndarray, sample_rate: int) -> None:
-    tensor = torch.from_numpy(samples.astype(np.float32, copy=False))
-    if tensor.ndim == 1:
-        tensor = tensor.unsqueeze(0)
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*save_with_torchcodec.*",
-            category=UserWarning,
+def resolve_model_path(raw_path: str | Path) -> Path:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return (REPO_ROOT / path).resolve()
+
+
+def ensure_model(model_path: Path, cfg: Dict) -> None:
+    if model_path.exists():
+        return
+
+    repo_id = str(cfg.get("hf_repo_id") or "").strip()
+    filename = str(cfg.get("hf_filename") or MODEL_REPO_FILENAME).strip()
+    if not repo_id:
+        raise FileNotFoundError(
+            f"Denoising ONNX model not found: {model_path}. "
+            "Set denoising.hf_repo_id after uploading the ONNX model to Hugging Face, "
+            "or place the model at denoising.onnx_path."
         )
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*StreamingMediaEncoder has been deprecated.*",
-            category=UserWarning,
-        )
-        torchaudio.save(audio_path, tensor, sample_rate)
 
-
-def _load_clearvoice(task: str, model_name: str):
     try:
-        from clearvoice import ClearVoice
+        import huggingface_hub
     except Exception as exc:
         raise RuntimeError(
-            "ClearVoice is not installed. Install the clearvoice package before "
-            "running the denoising stage."
+            "huggingface_hub is required to download the denoising ONNX model. "
+            "Install it or place the model at denoising.onnx_path."
         ) from exc
 
-    logger.info(f"Loading ClearVoice model: task={task}, model={model_name}")
-    return ClearVoice(task=task, model_names=[model_name])
+    logger.info(f"Downloading denoising ONNX from Hugging Face: {repo_id}/{filename}")
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    downloaded = Path(
+        huggingface_hub.hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=str(model_path.parent),
+        )
+    )
+
+    if downloaded != model_path:
+        downloaded.replace(model_path)
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Denoising ONNX model not found: {model_path}")
+
+
+
+def add_denoising_trt_profile_options(
+    providers,
+    input_name: str,
+    batch_size: int,
+):
+    patched = []
+    for provider in providers:
+        if isinstance(provider, tuple):
+            provider_name, options = provider
+            options = dict(options)
+        else:
+            provider_name, options = provider, {}
+
+        if provider_name == "TensorrtExecutionProvider":
+            options.update(
+                {
+                    "trt_profile_min_shapes": f"{input_name}:{MODEL_TRT_MIN_SHAPE}",
+                    "trt_profile_opt_shapes": f"{input_name}:{batch_size}x1x{MODEL_SAMPLE_RATE}",
+                    "trt_profile_max_shapes": f"{input_name}:{batch_size}x1x{MODEL_MAX_PADDED_LEN}",
+                    "trt_timing_cache_enable": True,
+                    "trt_detailed_build_log": True,
+                }
+            )
+        patched.append((provider_name, options))
+    return patched
+
+
+def create_session(
+    model_path: Path,
+    rank: int,
+    cfg: Dict,
+    config_path: str | None,
+    batch_size: int,
+) -> ort.InferenceSession:
+    ensure_model(model_path, cfg)
+
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    sess_options.inter_op_num_threads = ORT_THREADS
+    sess_options.intra_op_num_threads = ORT_THREADS
+    sess_options.add_session_config_entry("session.set_denormal_as_zero", "1")
+
+    probe = ort.InferenceSession(
+        str(model_path),
+        sess_options=sess_options,
+        providers=["CPUExecutionProvider"],
+    )
+    input_name = probe.get_inputs()[0].name
+    del probe
+
+    use_tensorrt = bool(cfg.get("use_tensorrt", True))
+    providers = get_onnx_providers(rank, use_tensorrt=use_tensorrt, config_path=config_path)
+    providers = add_denoising_trt_profile_options(providers, input_name, batch_size)
+
+    logger.info(f"[cuda:{rank}] Denoising ONNX providers: {providers}")
+    return ort.InferenceSession(str(model_path), sess_options, providers=providers)
 
 
 def run_worker(
@@ -85,6 +166,7 @@ def run_worker(
     world_size: int,
     all_file_paths: List[str],
     config: dict,
+    config_path: str | None,
     podcasts_path: Path,
     processed_counter,
     skipped_counter,
@@ -98,17 +180,25 @@ def run_worker(
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
 
-    task = str(config.get("task", "speech_enhancement"))
-    model_name = str(config.get("model_name", "MossFormer2_SE_48K"))
-    sample_rate = int(config.get("sample_rate", DENOISING_SAMPLE_RATE))
-    batch_size = int(config.get("batch_size", 1))
+    batch_size = int(config.get("batch_size", 2))
     loader_workers = int(config.get("num_workers", 0))
     prefetch_factor = int(config.get("prefetch_factor", 2))
+    model_path = resolve_model_path(str(config.get("onnx_path", DEFAULT_ONNX_PATH)))
 
-    model = _load_clearvoice(task=task, model_name=model_name)
+    session = create_session(
+        model_path=model_path,
+        rank=rank,
+        cfg=config,
+        config_path=config_path,
+        batch_size=batch_size,
+    )
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
     logger.info(
-        f"Worker {rank}/{world_size}: {len(my_files)} files, "
-        f"batch={batch_size}, sample_rate={sample_rate}, loader_workers={loader_workers}"
+        f"Worker {rank}/{world_size}: {len(my_files)} files, batch={batch_size}, "
+        f"sample_rate={MODEL_SAMPLE_RATE}, providers={session.get_providers()}, "
+        f"input={input_name}{session.get_inputs()[0].shape}, "
+        f"output={output_name}{session.get_outputs()[0].shape}"
     )
 
     with PartialCsvWriter(
@@ -127,7 +217,10 @@ def run_worker(
             batch_size=batch_size,
             num_workers=loader_workers,
             prefetch_factor=prefetch_factor,
-            sample_rate=sample_rate,
+            sample_rate=MODEL_SAMPLE_RATE,
+            pad_to_multiple=MODEL_PAD_TO_MULTIPLE,
+            pad_mode=MODEL_PAD_MODE,
+            max_padded_len=MODEL_MAX_PADDED_LEN,
         )
 
         for paths, batch, lengths, errors in tqdm(
@@ -154,19 +247,38 @@ def run_worker(
 
             try:
                 input_np = batch[valid_indices].numpy().astype(np.float32, copy=False)
-                output_np = model(input_np, False)
-                output_np = np.asarray(output_np, dtype=np.float32)
-                if output_np.ndim == 1:
-                    output_np = output_np[np.newaxis, :]
+                denoised = session.run([output_name], {input_name: input_np})[0]
+                denoised = np.asarray(denoised)
+                if denoised.ndim == 1:
+                    denoised = denoised[np.newaxis, :]
             except Exception as exc:
-                logger.error(f"ClearVoice batch failed on worker {rank}: {exc}")
+                logger.error(f"ONNX denoising batch failed on worker {rank}: {exc}")
                 errors_counter.value += len(valid_indices)
                 continue
 
-            for path_str, length, enhanced in zip(valid_paths, valid_lengths, output_np):
+            for out_index, (path_str, length) in enumerate(zip(valid_paths, valid_lengths)):
                 try:
-                    enhanced = np.asarray(enhanced[:length], dtype=np.float32)
-                    _write_audio(str(path_str), enhanced[np.newaxis, :], sample_rate)
+                    enhanced = denoised[out_index]
+                    if enhanced.ndim == 2:
+                        enhanced = enhanced[0]
+                    if enhanced.shape[-1] < length:
+                        enhanced = np.pad(enhanced, (0, length - enhanced.shape[-1]))
+                    enhanced = np.clip(enhanced[:length], -32768.0, 32767.0)
+                    enhanced_tensor = torch.from_numpy(
+                        enhanced.astype(np.float32, copy=False) / 32768.0
+                    ).unsqueeze(0)
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=r".*save_with_torchcodec.*",
+                            category=UserWarning,
+                        )
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=r".*StreamingMediaEncoder has been deprecated.*",
+                            category=UserWarning,
+                        )
+                        torchaudio.save(str(path_str), enhanced_tensor, MODEL_SAMPLE_RATE)
                     writer.write(
                         {
                             "filepath": resolve_path(path_str),
@@ -180,7 +292,6 @@ def run_worker(
 
 
 def main():
-    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, required=True)
     parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
@@ -198,6 +309,9 @@ def main():
     else:
         num_processes = available_gpus if available_gpus > 0 else 1
     num_processes = max(1, num_processes)
+
+    model_path = resolve_model_path(str(config.get("onnx_path", DEFAULT_ONNX_PATH)))
+    ensure_model(model_path, config)
 
     audio_paths = discover_audio_paths(podcasts_path)
     if not audio_paths:
@@ -226,8 +340,8 @@ def main():
         return
 
     logger.info(
-        f"Running denoising for {len(pending)} files with {num_processes} process(es) "
-        f"({available_gpus} GPU(s) visible)."
+        f"Running ONNX denoising for {len(pending)} files with {num_processes} process(es) "
+        f"({available_gpus} GPU(s) visible), model={model_path}."
     )
 
     processed = mp.Value("i", 0)
@@ -246,7 +360,7 @@ def main():
             worker_errors, _ = run_per_gpu_processes(
                 run_worker,
                 num_gpus=num_processes,
-                args=(pending, config, podcasts_path, processed, skipped, errors),
+                args=(pending, config, args.config_path, podcasts_path, processed, skipped, errors),
             )
             if worker_errors:
                 errors.value += worker_errors
@@ -276,4 +390,5 @@ def main():
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()

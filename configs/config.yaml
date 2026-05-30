@@ -31,7 +31,7 @@
 #
 # phonemizer — TryIParu G2P on *_rover.txt → *_rover_phonemes.txt.
 #
-# denoising — ClearVoice MossFormer2_SE_48K in-place speech enhancement.
+# denoising — ONNX Runtime / TensorRT MossFormer2_SE_48K in-place speech enhancement.
 #
 # export — WebDataset tar shards (src/to_webdataset.py); collate parquet uses
 #   download section as noted above.
@@ -118,7 +118,7 @@ preprocess:
   # Maximum duration of each output segment in seconds.
   duration: 15
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
-  num_workers: 0
+  num_workers: 1
   # DataLoader batch size for Sortformer diarization source loading.
   diarization_batch_size: 1
   # DataLoader workers per GPU process for Sortformer diarization source loading.
@@ -126,13 +126,13 @@ preprocess:
   # Number of prefetched batches per diarization DataLoader worker.
   diarization_prefetch_factor: 0
   # Worker processes per GPU for crest factor removal.
-  num_workers_crest_factor: 0
+  num_workers_crest_factor: 4
   # Crest-factor DataLoader batch size per worker.
   crest_factor_batch_size: 1
   # Crest-factor DataLoader workers inside each process.
-  crest_factor_loader_workers: 0
+  crest_factor_loader_workers: 4
   # Number of prefetched batches per crest-factor DataLoader worker.
-  crest_factor_prefetch_factor: 0
+  crest_factor_prefetch_factor: 2
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
   # crest_factor is saved to balalaika.csv for all files; deleted files also have their CSV row removed.
   crest_treshold: 10
@@ -143,13 +143,13 @@ preprocess:
   # Block size in seconds for loudness measurement windows.
   block_size: 0.400
   # Worker processes for loudness normalization.
-  loudness_num_workers: 0
+  loudness_num_workers: 4
   # Loudness-normalization DataLoader batch size per process.
   loudness_batch_size: 1
   # Loudness-normalization DataLoader workers inside each process.
-  loudness_loader_workers: 1
+  loudness_loader_workers: 4
   # Number of prefetched batches per loudness-normalization DataLoader worker.
-  loudness_prefetch_factor: 0
+  loudness_prefetch_factor: 2
   # Max audio length in seconds fed to Sortformer at once; longer files are windowed.
   chunk_duration: 900
   # Output container for chunked segments. 'auto' preserves the source extension
@@ -264,19 +264,17 @@ phonemizer:
 denoising:
   # Root containing chunked audio and balalaika.csv.
   podcasts_path: /mnt/hdd_6tb_1/yandex_data
-  # ClearVoice Numpy-to-Numpy model from demo_Numpy2Numpy.py.
-  task: speech_enhancement
-  model_name: MossFormer2_SE_48K
-  # MossFormer2_SE_48K expects 48 kHz float32 audio.
-  sample_rate: 48000
+  # MossFormer2_SE_48K dynamic ONNX. If missing, it is downloaded from Hugging Face.
+  onnx_path: ./models/MossFormer2_SE_48K_dynamic_fp32.onnx
+  # Fill after uploading the ONNX model.
+  # Batch and DataLoader settings per GPU worker.
+  batch_size: 2
+  num_workers: 4
+  prefetch_factor: 2
   # Number of stage worker processes. 0 = one process per visible GPU.
   processes: 0
-  # ClearVoice batch size per worker. Inputs are padded to the longest clip in the batch.
-  batch_size: 2
-  # DataLoader workers inside each process.
-  num_workers: 4
-  # Number of prefetched batches per DataLoader worker.
-  prefetch_factor: 2
+  # TensorRT EP uses the shared runtime.trt_cache_path cache.
+  use_tensorrt: True
 
 export:
   podcasts_path: /mnt/hdd_6tb_1/yandex_data

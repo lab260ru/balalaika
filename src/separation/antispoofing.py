@@ -75,25 +75,24 @@ def generated_probability(logits: np.ndarray, class_index: int) -> np.ndarray:
     return probs[:, class_index]
 
 
-def ensure_model(model_path: Path) -> None:
-    if not model_path.exists():
-        logger.info(
-            f"Downloading Spectra-0 ONNX from Hugging Face: "
-            f"{MODEL_REPO_ID}/{MODEL_REPO_FILENAME}"
+def ensure_model(model_path: Path, cfg: Dict) -> None:
+    if model_path.exists():
+        return
+
+    import huggingface_hub
+
+    logger.info(f"Downloading denoising ONNX from Hugging Face")
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    downloaded = Path(
+        huggingface_hub.hf_hub_download(
+            repo_id='NikiPshg/spectra_0_onnx',
+            filename='spectra_0.onnx',
+            local_dir='./models',
         )
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        downloaded = Path(
-            huggingface_hub.hf_hub_download(
-                repo_id=MODEL_REPO_ID,
-                filename=MODEL_REPO_FILENAME,
-                local_dir=str(model_path.parent),
-            )
-        )
-        if downloaded != model_path:
-            downloaded.replace(model_path)
+    )
 
     if not model_path.exists():
-        raise FileNotFoundError(f"Anti-spoofing ONNX model not found: {model_path}")
+        raise FileNotFoundError(f"Denoising ONNX model not found: {model_path}")
 
 
 def create_session(model_path: Path, rank: int, cfg: dict, config_path: str | None) -> ort.InferenceSession:
