@@ -17,6 +17,7 @@ from typing import Callable, Iterable, List
 
 from loguru import logger
 
+from src.utils.csv_manager import discover_audio_paths
 from src.utils.utils import get_audio_paths, get_txt_paths
 
 
@@ -86,13 +87,18 @@ def pending_audio_to_sidecar(
     *,
     in_suffix: str,
     out_suffix: str,
+    config_path: str | Path | None = None,
 ) -> List[Path]:
     """Audio-rooted scan: keep ``stem+in_suffix`` paths that lack ``stem+out_suffix``.
 
     Returns the **input sidecar** paths (not the audio paths), matching the
     convention of the original stage helpers.
     """
-    audio = get_audio_paths(str(podcasts_path))
+    audio = (
+        discover_audio_paths(podcasts_path, config_path=config_path)
+        if config_path
+        else get_audio_paths(str(podcasts_path))
+    )
     pendings: List[Path] = []
     for a in audio:
         a = Path(a)
@@ -110,13 +116,19 @@ def pending_sidecar_chain(
     *,
     in_suffix: str,
     out_derive: Callable[[Path], Path],
+    config_path: str | Path | None = None,
 ) -> List[Path]:
-    """Sidecar-rooted scan: enumerate ``*<in_suffix>`` and keep ones missing output.
+    """Return sidecar inputs whose derived output is missing.
 
-    ``out_derive(input_sidecar)`` returns the expected output path. This is
-    the path-style equivalent of :func:`pending_audio_to_sidecar` but driven
-    from the input ``.txt`` files directly (handy when the audio file may
-    already have been deleted by an earlier filter stage).
+    Without ``config_path`` this scans ``*<in_suffix>`` directly. With
+    ``config_path`` it derives sidecars from the configured audio source, so
+    stages can use ``runtime.audio_paths_source`` consistently.
     """
-    inputs = get_txt_paths(str(podcasts_path), in_suffix)
+    if config_path:
+        inputs = [
+            with_suffix_at_stem(Path(path), in_suffix)
+            for path in discover_audio_paths(podcasts_path, config_path=config_path)
+        ]
+    else:
+        inputs = get_txt_paths(str(podcasts_path), in_suffix)
     return pending(inputs, out_derive)

@@ -13,9 +13,10 @@ from src.utils.datasets.transcription import create_transcription_dataloader, re
 from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_processes
+from src.utils.csv_manager import discover_audio_paths
 from src.utils.sidecars import text_sidecar_complete
 from src.utils.stage_status import write_stage_status
-from src.utils.utils import get_audio_paths, load_config, read_file_content
+from src.utils.utils import load_config, read_file_content
 
 MODEL_MAP = {
     'giga_rnnt': 'gigaam-v3-rnnt',
@@ -231,8 +232,9 @@ def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int
 
 def get_valid_paths(src_path: str, output_suffix: str,
                     processed: List[str], consensus_num: int,
-                    retry_empty_outputs: bool = False) -> List[str]:
-    all_paths = get_audio_paths(src_path)
+                    retry_empty_outputs: bool = False,
+                    config_path: Optional[str] = None) -> List[str]:
+    all_paths = [Path(p) for p in discover_audio_paths(src_path, config_path=config_path)]
     if not all_paths:
         return []
 
@@ -293,7 +295,7 @@ def main(args):
 
         output_suffix = 'vosk' if 'vosk' in model_name else model_name
         processed_names = model_names[:idx] if consensus_num > 0 else []
-        paths = get_valid_paths(src_path, output_suffix, processed_names, consensus_num, retry_empty_outputs)
+        paths = get_valid_paths(src_path, output_suffix, processed_names, consensus_num, retry_empty_outputs, args.config_path)
 
         if not paths:
             logger.info(f"No files to process for {model_name}")
@@ -315,7 +317,7 @@ def main(args):
         logger.info("ROVER aggregation...")
         try:
             from src.transcription.rover import ROVERWrapper
-            ROVERWrapper(podcasts_path=src_path, model_names=model_names).aggregate_and_save()
+            ROVERWrapper(podcasts_path=src_path, model_names=model_names, config_path=args.config_path).aggregate_and_save()
             logger.info("ROVER done.")
         except ImportError:
             logger.warning("ROVER module not available, skipping")

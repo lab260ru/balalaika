@@ -273,6 +273,7 @@ def run_deletion_workers(
     podcasts_path: Path,
     threshold: float,
     num_workers: int,
+    config_path: Optional[str] = None,
 ) -> tuple:
     """Spawn workers to delete files below threshold in parallel.
 
@@ -280,7 +281,7 @@ def run_deletion_workers(
     """
     from multiprocessing import Process, Value
 
-    audio_paths = discover_audio_paths(podcasts_path)
+    audio_paths = discover_audio_paths(podcasts_path, config_path=config_path)
     if not audio_paths:
         logger.warning("No audio files found.")
         return 0, 0, 0
@@ -398,7 +399,7 @@ def main(args):
     num_workers = cfg.get("num_workers", 4)
 
     # Bootstrap CSV + absorb leftover partials
-    audio_paths = discover_audio_paths(podcasts_path)
+    audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     ensure_main_csv(podcasts_path, audio_paths=audio_paths)
 
     leftover_partials, absorbed = absorb_partial_csvs(
@@ -414,7 +415,7 @@ def main(args):
         )
 
     processed, deleted, errors = run_deletion_workers(
-        podcasts_path, threshold, num_workers
+        podcasts_path, threshold, num_workers, args.config_path
     )
 
     # Merge partials + audit

@@ -159,7 +159,7 @@ def main():
         logger.error("No GPU detected.")
         return
 
-    audio_paths = discover_audio_paths(podcasts_path)
+    audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     if not audio_paths:
         logger.warning("No audio files found.")
         return

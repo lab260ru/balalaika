@@ -63,6 +63,7 @@ def main(args):
         podcasts_path,
         in_suffix="_rover.txt",
         out_suffix="_punct.txt",
+        config_path=args.config_path,
     )
     if not pending_files:
         logger.success("No pending _rover.txt files; punctuation already up to date.")

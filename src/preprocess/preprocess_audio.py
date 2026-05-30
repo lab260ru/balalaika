@@ -211,7 +211,7 @@ def main(args):
         """
     )
 
-    audio_paths = discover_audio_paths(podcasts_path)
+    audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     if not audio_paths:
         logger.info("No audio files found for processing.")
         return

@@ -176,12 +176,12 @@ def main(args):
         f"threshold={crest_threshold}, workers={num_workers}"
     )
 
-    audio_paths = discover_audio_paths(podcasts_path)
+    audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     if not audio_paths:
         logger.info("No audio files found for processing.")
         return
 
-    logger.info(f"Found {len(audio_paths)} audio files on disk.")
+    logger.info(f"Found {len(audio_paths)} audio files.")
 
     # 1) Make sure balalaika.csv exists; bootstrap it from the audio tree if not.
     ensure_main_csv(podcasts_path, audio_paths=audio_paths)

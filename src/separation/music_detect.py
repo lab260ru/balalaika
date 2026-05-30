@@ -181,7 +181,7 @@ def main(args):
         return
 
     podcasts_path = Path(podcasts_path)
-    audio_paths = discover_audio_paths(podcasts_path)
+    audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     n_gpus = torch.cuda.device_count()
 
     if not audio_paths:

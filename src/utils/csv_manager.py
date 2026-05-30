@@ -38,8 +38,10 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from loguru import logger
+from tqdm import tqdm
 
 CSV_NAME = "balalaika.csv"
+AUDIO_EXTENSIONS: Tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".opus")
 
 # Default knobs for the periodic merger. Overridable via the top-level `csv:`
 # block of configs/config.yaml (see :func:`load_csv_settings`).
@@ -766,11 +768,106 @@ def load_csv_settings(config_path: Optional[os.PathLike | str]) -> Dict[str, flo
 # Misc helpers
 # ---------------------------------------------------------------------------
 
-def discover_audio_paths(podcasts_path: os.PathLike | str) -> List[str]:
-    """Resolve all audio paths under ``podcasts_path`` (lazy import)."""
+def _normalise_audio_paths_source(source: object) -> str:
+    value = str(source or "auto").strip().lower().replace("-", "_")
+    aliases = {
+        "balalaika.csv": "csv",
+        "balalaika_csv": "csv",
+        "filesystem": "rglob",
+        "fs": "rglob",
+        "file_system": "rglob",
+    }
+    value = aliases.get(value, value)
+    if value not in {"auto", "csv", "rglob"}:
+        logger.warning(
+            f"Unknown runtime.audio_paths_source={source!r}; using 'auto'. "
+            "Expected one of: auto, csv, rglob."
+        )
+        return "auto"
+    return value
+
+
+def _runtime_audio_paths_source(config_path: Optional[os.PathLike | str]) -> str:
+    if not config_path:
+        return "rglob"
+    try:
+        from src.utils.runtime_env import runtime_cfg
+
+        return _normalise_audio_paths_source(
+            runtime_cfg(str(config_path)).get("audio_paths_source", "auto")
+        )
+    except Exception as exc:
+        logger.warning(f"Could not read runtime.audio_paths_source: {exc}; using 'rglob'.")
+        return "rglob"
+
+
+def _dedupe_paths(paths: Iterable[os.PathLike | str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for raw in tqdm(paths, desc="dedupe_paths processing"):
+        if raw is None:
+            continue
+        path = str(raw).strip()
+        if not path:
+            continue
+        if Path(path).suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        resolved = resolve_path(path)
+        if resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
+    return out
+
+
+def _audio_paths_from_csv(podcasts_path: os.PathLike | str) -> List[str]:
+    target = csv_path(podcasts_path)
+    if not target.exists():
+        logger.info(f"{target.name} not found; cannot load audio paths from CSV.")
+        return []
+    try:
+        df = pd.read_csv(target, usecols=["filepath"], low_memory=False)
+    except (ValueError, pd.errors.EmptyDataError):
+        logger.warning(f"{target.name} has no usable filepath column.")
+        return []
+    except Exception as exc:
+        logger.warning(f"Could not load audio paths from {target}: {exc}")
+        return []
+
+    paths = _dedupe_paths(df["filepath"].dropna().astype(str))
+    logger.info(f"Loaded {len(paths)} audio paths from {target.name}.")
+    return paths
+
+
+def _audio_paths_from_rglob(podcasts_path: os.PathLike | str) -> List[str]:
     from src.utils.utils import get_audio_paths
 
-    return [resolve_path(p) for p in get_audio_paths(str(podcasts_path))]
+    paths = _dedupe_paths(get_audio_paths(str(podcasts_path)))
+    logger.info(f"Discovered {len(paths)} audio paths via rglob.")
+    return paths
+
+
+def discover_audio_paths(
+    podcasts_path: os.PathLike | str,
+    *,
+    config_path: Optional[os.PathLike | str] = None,
+    source: Optional[str] = None,
+) -> List[str]:
+    """Resolve audio paths using runtime.audio_paths_source.
+
+    Sources:
+    * ``rglob``: scan the filesystem recursively.
+    * ``csv``: trust ``balalaika.csv`` as the source of filepaths.
+    * ``auto``: prefer ``balalaika.csv`` when populated, otherwise fall back to rglob.
+    """
+    selected = _normalise_audio_paths_source(source) if source is not None else _runtime_audio_paths_source(config_path)
+
+    if selected in {"auto", "csv"}:
+        paths = _audio_paths_from_csv(podcasts_path)
+        if paths or selected == "csv":
+            return paths
+        logger.info("Falling back to rglob because balalaika.csv did not provide audio paths.")
+
+    return _audio_paths_from_rglob(podcasts_path)
 
 
 def files_in_csv(df: pd.DataFrame) -> Set[str]:

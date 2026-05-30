@@ -10,8 +10,9 @@ import webdataset as wds
 from tqdm import tqdm
 from loguru import logger
 
+from src.utils.csv_manager import discover_audio_paths
 from src.utils.logging_setup import setup_logging
-from src.utils.utils import get_audio_paths, load_config
+from src.utils.utils import load_config
 from src.utils.stage_status import write_stage_status
 
 def load_metadata(csv_path: Path) -> Dict[str, dict]:
@@ -113,7 +114,7 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
 
     return samples_processed, errors_count
 
-def main(config):
+def main(config, config_path: str | None = None):
     podcasts_path_str = config.get('podcasts_path')
     if not podcasts_path_str:
         logger.error("podcasts_path is not defined in the config!")
@@ -132,7 +133,7 @@ def main(config):
     num_workers = config.get('num_workers', 4)
     num_workers = max(1, num_workers)
 
-    all_audio_paths = get_audio_paths(podcasts_path_str)
+    all_audio_paths = discover_audio_paths(podcasts_path_str, config_path=config_path)
     if not all_audio_paths:
         logger.warning("No audio data to process.")
         return
@@ -181,4 +182,4 @@ if __name__ == "__main__":
 
     setup_logging("to_webdataset", log_dir=args.log_dir)
     config = load_config(args.config_path, process_name='export')
-    main(config)
+    main(config, args.config_path)

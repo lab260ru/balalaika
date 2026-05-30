@@ -218,7 +218,7 @@ def main(args):
     podcasts_path = Path(config.get("podcasts_path", "."))
     cfg = config.get("antispoofing", {})
 
-    audio_paths = discover_audio_paths(podcasts_path)
+    audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     n_gpus = torch.cuda.device_count()
 
     if not audio_paths:

@@ -393,6 +393,7 @@ runtime:
   venv_path: .dev_venv          # virtualenv activated by base.sh
   cpu_affinity: "0-24"          # taskset -c argument; empty disables pinning
   log_dir: ./logs               # directory for rotating per-stage logs
+  audio_paths_source: auto      # auto/csv/rglob source for stage file lists
   trt_cache_path: ./cache/trt   # TensorRT engine cache root
   trt_workspace_bytes: 4294967296   # 4 GiB per session
   trt_fp16: True                # FP16 for TensorRT EP

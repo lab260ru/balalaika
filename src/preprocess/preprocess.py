@@ -44,13 +44,14 @@ from src.utils.csv_manager import (
     PeriodicCsvMerger,
     absorb_partial_csvs,
     ensure_main_csv,
+    discover_audio_paths,
     load_csv_settings,
 )
 from src.utils.datasets.preprocess import create_diarization_dataloader
 from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
-from src.utils.utils import get_audio_paths, load_config
+from src.utils.utils import load_config
 
 apply_torch_perf_defaults()
 
@@ -629,7 +630,7 @@ def main(args):
     total_workers = max(1, num_gpus * num_workers_per_gpu)
     logger.info(f"GPUs: {num_gpus}, workers/GPU: {num_workers_per_gpu}, total workers: {total_workers}")
 
-    raw_audio_paths = get_audio_paths(str(podcasts_path))
+    raw_audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     paths_to_process: List[Path] = []
 
     chunk_pattern = re.compile(r'^\d+\.\d+_\d+\.\d+_')

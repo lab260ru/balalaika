@@ -684,6 +684,7 @@ Each stage reads only its own YAML section via `load_config(config_path, SECTION
 | `venv_path` | `.dev_venv` | Python venv path |
 | `cpu_affinity` | `"0-32"` | `taskset -c` range (empty = disable) |
 | `log_dir` | `./logs` | Per-stage log directory |
+| `audio_paths_source` | `auto` | Source for stage audio lists: prefer `balalaika.csv`, force `csv`, or force `rglob` |
 | `trt_cache_path` | `./cache/trt` | TensorRT engine cache root |
 | `trt_workspace_bytes` | 4 GiB | Per-session TensorRT workspace |
 | `trt_fp16` | `True` | FP16 for TensorRT |

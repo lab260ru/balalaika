@@ -59,6 +59,7 @@ def main(args):
         podcast_path,
         in_suffix="_punct.txt",
         out_derive=lambda p: replace_in_stem(p, "_punct", "_accent"),
+        config_path=args.config_path,
     )
     if not pending_files:
         logger.success("No pending _punct.txt files; accents already up to date.")

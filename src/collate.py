@@ -6,9 +6,10 @@ from typing import Dict, Optional
 import concurrent.futures
 from loguru import logger
 
+from src.utils.csv_manager import discover_audio_paths
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
-from src.utils.utils import get_audio_paths, load_config, read_file_content
+from src.utils.utils import load_config, read_file_content
 
 def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Optional[str]]:
 
@@ -48,7 +49,7 @@ def main(args):
         df.drop_duplicates(subset='filepath', inplace=True)
     else:
         logger.info(f"No existing dataframe found. Creating new one from audio paths.")
-        audio_paths = [str(path) for path in get_audio_paths(base_path)]
+        audio_paths = discover_audio_paths(base_path, config_path=args.config_path)
         df = pd.DataFrame({'filepath': audio_paths})
     
     audio_paths = df['filepath'].tolist()

@@ -6,14 +6,16 @@ from crowdkit.aggregation import ROVER
 from loguru import logger
 from tqdm import tqdm 
 
+from src.utils.csv_manager import discover_audio_paths
 from src.utils.sidecars import path_exists
-from src.utils.utils import read_file_content, get_audio_paths
+from src.utils.utils import read_file_content
 
 
 class ROVERWrapper:
-    def __init__(self, podcasts_path: str, model_names: List[str]):
+    def __init__(self, podcasts_path: str, model_names: List[str], config_path: str | None = None):
         self.podcasts_path = Path(podcasts_path)
         self.model_names = model_names
+        self.config_path = config_path
         self.tokenizer = lambda s: s.lower().split()
         self.detokenizer = lambda tokens: ' '.join(tokens)
         self.rover_aggregator = ROVER(self.tokenizer, self.detokenizer)
@@ -21,7 +23,7 @@ class ROVERWrapper:
     def aggregate_and_save(self):
         logger.info("Starting transcription aggregation based on audio files.")
         
-        all_audio_paths = get_audio_paths(str(self.podcasts_path))
+        all_audio_paths = [Path(p) for p in discover_audio_paths(self.podcasts_path, config_path=self.config_path)]
         
         if not all_audio_paths:
             logger.warning("Audio files not found. Aggregation finished.")

@@ -45,6 +45,7 @@ def main(args):
         src_path,
         in_suffix="_rover.txt",
         out_derive=lambda p: p.with_name(f"{p.stem}_phonemes.txt"),
+        config_path=args.config_path,
     )
     if not pending_files:
         logger.success("No pending _rover.txt files; phonemes already up to date.")

@@ -313,7 +313,7 @@ def main():
     model_path = resolve_model_path(str(config.get("onnx_path", DEFAULT_ONNX_PATH)))
     ensure_model(model_path, config)
 
-    audio_paths = discover_audio_paths(podcasts_path)
+    audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     if not audio_paths:
         logger.warning("No audio files found.")
         return
