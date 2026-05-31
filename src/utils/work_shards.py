@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from loguru import logger
+from tqdm import tqdm
 
 DEFAULT_WORK_SHARD_SIZE = 10_000
 WORK_ROOT_NAME = ".balalaika_work"
@@ -86,8 +87,17 @@ def prepare_work_shards(
     total = 0
     shard_count = 0
     current: List[str] = []
+    expected_total = (
+        limit
+        if limit is not None
+        else (len(paths) if hasattr(paths, "__len__") else None)
+    )
 
-    for raw in paths:
+    for raw in tqdm(
+        paths,
+        total=expected_total,
+        desc=f"write_{stage_name}_work_shards",
+    ):
         if limit is not None and total >= limit:
             break
         path = str(raw).strip()

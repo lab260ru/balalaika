@@ -47,6 +47,7 @@ AUDIO_EXTENSIONS: Tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".opus")
 # block of configs/config.yaml (see :func:`load_csv_settings`).
 DEFAULT_FLUSH_EVERY_ROWS = 10_000
 DEFAULT_FLUSH_EVERY_SECONDS = 300
+CSV_WRITE_CHUNK_ROWS = 100_000
 
 # Canonical column ordering for the main CSV. Anything not listed is appended
 # after the recognised columns in original insertion order.
@@ -81,6 +82,43 @@ def resolve_path(p: os.PathLike | str) -> str:
     return str(Path(p).resolve())
 
 
+def normalize_path_string(p: os.PathLike | str) -> str:
+    """Fast path normalisation for already-absolute CSV filepaths.
+
+    ``Path.resolve()`` performs filesystem work and is prohibitively expensive
+    when repeated over tens of millions of rows. Pipeline CSVs store absolute
+    paths, so only relative paths need resolution.
+    """
+    path = str(p).strip()
+    if not path:
+        return ""
+    path_obj = Path(path)
+    return path if path_obj.is_absolute() else resolve_path(path)
+
+
+def _sequence_total(values: Iterable[object]) -> Optional[int]:
+    try:
+        return len(values)  # type: ignore[arg-type]
+    except TypeError:
+        return None
+
+
+def normalize_path_values(
+    values: Iterable[os.PathLike | str],
+    *,
+    desc: str,
+    drop_empty: bool = False,
+) -> List[str]:
+    """Normalise many path values with visible progress for large CSV passes."""
+    total = _sequence_total(values)
+    out: List[str] = []
+    for raw in tqdm(values, total=total, desc=desc):
+        path = normalize_path_string(raw)
+        if path or not drop_empty:
+            out.append(path)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Atomic CSV read/write helpers
 # ---------------------------------------------------------------------------
@@ -89,7 +127,10 @@ def _read_csv_safe(path: Path) -> Optional[pd.DataFrame]:
     """Best-effort read; tolerates a stale ``.tmp`` left by an earlier crash."""
     if path.exists():
         try:
-            return pd.read_csv(path, low_memory=False)
+            logger.info(f"Reading CSV {path.name}...")
+            df = pd.read_csv(path, low_memory=False)
+            logger.info(f"Read {len(df)} rows from {path.name}.")
+            return df
         except pd.errors.EmptyDataError:
             return pd.DataFrame()
         except Exception as exc:
@@ -98,6 +139,7 @@ def _read_csv_safe(path: Path) -> Optional[pd.DataFrame]:
     tmp = path.with_suffix(path.suffix + ".tmp")
     if tmp.exists():
         try:
+            logger.info(f"Reading CSV fallback {tmp.name}...")
             df = pd.read_csv(tmp, low_memory=False)
             logger.info(f"Recovered {len(df)} rows from leftover {tmp.name}.")
             return df
@@ -105,6 +147,39 @@ def _read_csv_safe(path: Path) -> Optional[pd.DataFrame]:
             logger.warning(f"Could not recover {tmp}: {exc}")
 
     return None
+
+
+def _copy_file_with_progress(src: Path, dst: Path, *, desc: str) -> None:
+    total = src.stat().st_size
+    with src.open("rb") as fsrc, dst.open("wb") as fdst:
+        with tqdm(total=total, unit="B", unit_scale=True, desc=desc) as bar:
+            while True:
+                chunk = fsrc.read(16 * 1024 * 1024)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                bar.update(len(chunk))
+    shutil.copystat(src, dst)
+
+
+def _write_csv_with_progress(df: pd.DataFrame, path: Path, *, desc: str) -> None:
+    total_rows = len(df)
+    if total_rows == 0:
+        df.to_csv(path, index=False)
+        return
+
+    total_chunks = (total_rows + CSV_WRITE_CHUNK_ROWS - 1) // CSV_WRITE_CHUNK_ROWS
+    with path.open("w", encoding="utf-8", newline="") as f:
+        for start in tqdm(
+            range(0, total_rows, CSV_WRITE_CHUNK_ROWS),
+            total=total_chunks,
+            desc=desc,
+        ):
+            df.iloc[start:start + CSV_WRITE_CHUNK_ROWS].to_csv(
+                f,
+                index=False,
+                header=start == 0,
+            )
 
 
 def atomic_write_csv(df: pd.DataFrame, path: os.PathLike | str) -> None:
@@ -119,11 +194,9 @@ def atomic_write_csv(df: pd.DataFrame, path: os.PathLike | str) -> None:
     bak = Path(str(path) + ".bak")
 
     if path.exists():
-        shutil.copy2(path, bak)
+        _copy_file_with_progress(path, bak, desc=f"backup_{path.name}")
 
-    df.to_csv(tmp, index=False)
-    if not tmp.exists():
-        df.to_csv(tmp, index=False)
+    _write_csv_with_progress(df, tmp, desc=f"write_{path.name}")
     try:
         with open(tmp, "rb") as f:
             os.fsync(f.fileno())
@@ -141,7 +214,10 @@ def _normalize_filepath_column(df: pd.DataFrame) -> pd.DataFrame:
         return df
     if "filepath" in df.columns:
         df = df.copy()
-        df["filepath"] = df["filepath"].astype(str).map(resolve_path)
+        df["filepath"] = normalize_path_values(
+            df["filepath"].astype(str).tolist(),
+            desc="normalize_filepath",
+        )
     return df
 
 
@@ -203,7 +279,15 @@ def ensure_main_csv(
                 "bootstrapping fresh CSV from audio tree. Some column data "
                 "may be permanently lost."
             )
-            paths = sorted({resolve_path(p) for p in audio_paths})
+            paths = sorted(
+                set(
+                    normalize_path_values(
+                        audio_paths,
+                        desc="bootstrap_audio_paths",
+                        drop_empty=True,
+                    )
+                )
+            )
             df = pd.DataFrame({"filepath": paths})
 
         atomic_write_csv(df, target)
@@ -246,7 +330,13 @@ def upsert_columns(
 
     if bootstrap_audio_paths is not None:
         boot = pd.DataFrame(
-            {"filepath": [resolve_path(p) for p in bootstrap_audio_paths]}
+            {
+                "filepath": normalize_path_values(
+                    bootstrap_audio_paths,
+                    desc="bootstrap_audio_paths",
+                    drop_empty=True,
+                )
+            }
         )
         boot = boot.drop_duplicates(subset="filepath")
         # Preserve any existing column values; only add brand-new rows.
@@ -267,7 +357,15 @@ def upsert_columns(
 
     if drop_missing_files and not df.empty:
         before = len(df)
-        df = df[df["filepath"].apply(lambda p: bool(p) and Path(p).exists())]
+        existing_mask = [
+            bool(p) and Path(p).exists()
+            for p in tqdm(
+                df["filepath"].astype(str).tolist(),
+                total=len(df),
+                desc="check_existing_files",
+            )
+        ]
+        df = df[existing_mask]
         removed = before - len(df)
         if removed:
             logger.info(
@@ -289,19 +387,44 @@ def unprocessed_paths(
     Files that aren't represented in the CSV at all are also returned so a
     fresh-disk-but-stale-CSV state still gets processed.
     """
+    logger.info(f"Loading main CSV to find unprocessed paths for column '{column}'.")
     df = load_main_csv(podcasts_path)
-    audio_resolved = [resolve_path(p) for p in audio_paths]
-    audio_set = set(audio_resolved)
+
+    total = len(audio_paths) if hasattr(audio_paths, "__len__") else None
+    audio_resolved = []
+    for raw in tqdm(audio_paths, total=total, desc=f"resolve_{column}_paths"):
+        path = str(raw).strip()
+        if not path:
+            continue
+        audio_resolved.append(normalize_path_string(path))
 
     if column not in df.columns or df.empty:
+        logger.info(
+            f"Column '{column}' is missing or CSV is empty; "
+            f"all {len(audio_resolved)} paths are pending."
+        )
         return audio_resolved
 
+    logger.info(f"Building done set for column '{column}'.")
     done_mask = df[column].notna()
     if df[column].dtype == object:
         done_mask &= df[column].astype(str).str.strip().ne("")
     done = set(df.loc[done_mask, "filepath"].tolist())
 
-    return [p for p in audio_resolved if p not in done]
+    pending = []
+    for path in tqdm(
+        audio_resolved,
+        total=len(audio_resolved),
+        desc=f"filter_pending_{column}",
+    ):
+        if path not in done:
+            pending.append(path)
+
+    logger.info(
+        f"Column '{column}': {len(done)} done, {len(pending)} pending "
+        f"out of {len(audio_resolved)} audio paths."
+    )
+    return pending
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +455,7 @@ def read_partial_csvs(
         return pd.DataFrame()
 
     frames: List[pd.DataFrame] = []
-    for p in parts:
+    for p in tqdm(parts, total=len(parts), desc=f"read_{prefix}_partials"):
         try:
             df = pd.read_csv(p, low_memory=False)
         except pd.errors.EmptyDataError:
@@ -356,7 +479,8 @@ def read_partial_csvs(
 def delete_partial_csvs(podcasts_path: os.PathLike | str, prefix: str) -> int:
     """Remove all ``<prefix>_part_*.csv`` files; return the number deleted."""
     deleted = 0
-    for p in list_partial_csvs(podcasts_path, prefix):
+    parts = list_partial_csvs(podcasts_path, prefix)
+    for p in tqdm(parts, total=len(parts), desc=f"delete_{prefix}_partials"):
         try:
             p.unlink()
             deleted += 1
@@ -485,7 +609,13 @@ class PartialCsvWriter:
             return set()
         if key_column not in df.columns:
             return set()
-        return set(df[key_column].astype(str).map(resolve_path).tolist())
+        return set(
+            normalize_path_values(
+                df[key_column].astype(str).tolist(),
+                desc=f"partial_{self.path.stem}_already_done",
+                drop_empty=True,
+            )
+        )
 
     def close(self) -> None:
         if self._file is not None:
@@ -813,7 +943,7 @@ def _dedupe_paths(paths: Iterable[os.PathLike | str]) -> List[str]:
         path_obj = Path(path)
         if path_obj.suffix.lower() not in AUDIO_EXTENSIONS:
             continue
-        resolved = path if path_obj.is_absolute() else resolve_path(path)
+        resolved = normalize_path_string(path)
         if resolved not in seen:
             seen.add(resolved)
             out.append(resolved)
@@ -874,4 +1004,10 @@ def discover_audio_paths(
 def files_in_csv(df: pd.DataFrame) -> Set[str]:
     if df is None or df.empty or "filepath" not in df.columns:
         return set()
-    return set(df["filepath"].astype(str).map(resolve_path).tolist())
+    return set(
+        normalize_path_values(
+            df["filepath"].astype(str).tolist(),
+            desc="files_in_csv",
+            drop_empty=True,
+        )
+    )
