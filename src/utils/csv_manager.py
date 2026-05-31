@@ -38,6 +38,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from loguru import logger
+from tqdm import tqdm
 
 CSV_NAME = "balalaika.csv"
 AUDIO_EXTENSIONS: Tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".opus")
