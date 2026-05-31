@@ -52,6 +52,13 @@ from src.utils.datasets.preprocess import create_crest_factor_dataloader
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
+from src.utils.work_shards import (
+    claim_work_shard,
+    load_work_shard_size,
+    mark_work_shard_done,
+    prepare_work_shards,
+    read_work_shard,
+)
 
 PARTIAL_PREFIX = "crest"
 PARTIAL_FIELDS = ("filepath", "crest_factor", "duration_s", "deleted")
@@ -67,10 +74,93 @@ def calculate_crest_factors(waveforms: torch.Tensor, lengths: torch.Tensor) -> t
     return torch.where(rms > 0, peak / rms, torch.full_like(rms, float("inf")))
 
 
+def _process_files(
+    rank: int,
+    files: List[str],
+    writer: PartialCsvWriter,
+    already_done: Set[str],
+    crest_threshold: float,
+    batch_size: int,
+    loader_workers: int,
+    prefetch_factor: int,
+    processed_counter,
+    skipped_counter,
+    errors_counter,
+) -> None:
+    pending_files = []
+    for path in files:
+        resolved = resolve_path(path)
+        if resolved in already_done:
+            skipped_counter.value += 1
+            continue
+        pending_files.append(path)
+
+    if not pending_files:
+        return
+
+    dataloader = create_crest_factor_dataloader(
+        pending_files,
+        batch_size=batch_size,
+        num_workers=loader_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    for paths, waveforms, lengths, sample_rates, errors in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
+        valid_indices = []
+        for idx, (path_str, error) in enumerate(zip(paths, errors)):
+            if error:
+                logger.error(f"Error loading {path_str}: {error}")
+            else:
+                valid_indices.append(idx)
+        if not valid_indices:
+            continue
+
+        valid = torch.tensor(valid_indices, dtype=torch.long)
+        try:
+            batch_waveforms = waveforms.index_select(0, valid)
+            batch_lengths = lengths.index_select(0, valid)
+            batch_sample_rates = sample_rates.index_select(0, valid)
+            crest_factors = calculate_crest_factors(batch_waveforms, batch_lengths).tolist()
+            durations = (
+                batch_lengths.to(torch.float64) / batch_sample_rates.clamp_min(1).to(torch.float64)
+            ).tolist()
+        except Exception as exc:
+            errors_counter.value += 1
+            logger.error(f"Error processing batch on worker {rank}: {exc}")
+            continue
+
+        valid_paths = [paths[i] for i in valid_indices]
+        for path_str, cf, duration_s in zip(valid_paths, crest_factors, durations):
+            resolved = resolve_path(path_str)
+            if resolved in already_done:
+                skipped_counter.value += 1
+                continue
+
+            deleted = False
+            if cf > crest_threshold:
+                try:
+                    os.remove(path_str)
+                    deleted = True
+                    logger.debug(f"Deleted {path_str} (crest_factor={cf:.2f})")
+                except OSError as exc:
+                    logger.error(f"Could not delete {path_str}: {exc}")
+
+            writer.write(
+                {
+                    "filepath": resolved,
+                    "crest_factor": round(cf, 4),
+                    "duration_s": round(duration_s, 4),
+                    "deleted": deleted,
+                }
+            )
+            already_done.add(resolved)
+            processed_counter.value += 1
+
+
 def run_worker(
     rank: int,
     world_size: int,
-    all_file_paths: List[str],
+    work_dir: str,
     crest_threshold: float,
     output_dir: str,
     batch_size: int,
@@ -80,79 +170,42 @@ def run_worker(
     skipped_counter,
     errors_counter,
 ):
-    my_files = all_file_paths[rank::world_size]
-    if not my_files:
-        return
-
     logger.info(
-        f"Worker {rank}/{world_size} processing {len(my_files)} files "
+        f"Worker {rank}/{world_size} claiming work shards "
         f"(batch={batch_size}, loader_workers={loader_workers})"
     )
 
+    claimed = 0
     with PartialCsvWriter(output_dir, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS) as writer:
         already_done: Set[str] = writer.already_done()
-        skipped_counter.value += len(already_done)
         if already_done:
             logger.info(
-                f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping."
+                f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping repeats."
             )
 
-        pending_files = [p for p in my_files if resolve_path(p) not in already_done]
-        dataloader = create_crest_factor_dataloader(
-            pending_files,
-            batch_size=batch_size,
-            num_workers=loader_workers,
-            prefetch_factor=prefetch_factor,
-        )
+        while True:
+            shard_path = claim_work_shard(work_dir, rank)
+            if shard_path is None:
+                break
+            shard_files = read_work_shard(shard_path)
+            claimed += 1
+            logger.info(f"Worker {rank}: processing {len(shard_files)} files from {shard_path.name}")
+            _process_files(
+                rank,
+                shard_files,
+                writer,
+                already_done,
+                crest_threshold,
+                batch_size,
+                loader_workers,
+                prefetch_factor,
+                processed_counter,
+                skipped_counter,
+                errors_counter,
+            )
+            mark_work_shard_done(shard_path)
 
-        for paths, waveforms, lengths, sample_rates, errors in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
-            valid_indices = []
-            for idx, (path_str, error) in enumerate(zip(paths, errors)):
-                if error:
-                    logger.error(f"Error loading {path_str}: {error}")
-                else:
-                    valid_indices.append(idx)
-            if not valid_indices:
-                continue
-
-            valid = torch.tensor(valid_indices, dtype=torch.long)
-            try:
-                batch_waveforms = waveforms.index_select(0, valid)
-                batch_lengths = lengths.index_select(0, valid)
-                batch_sample_rates = sample_rates.index_select(0, valid)
-                crest_factors = calculate_crest_factors(batch_waveforms, batch_lengths).tolist()
-                durations = (
-                    batch_lengths.to(torch.float64) / batch_sample_rates.clamp_min(1).to(torch.float64)
-                ).tolist()
-            except Exception as exc:
-                errors_counter.value += 1
-                logger.error(f"Error processing batch on worker {rank}: {exc}")
-                continue
-
-            valid_paths = [paths[i] for i in valid_indices]
-            for path_str, cf, duration_s in zip(valid_paths, crest_factors, durations):
-                deleted = False
-                if cf > crest_threshold:
-                    try:
-                        os.remove(path_str)
-                        deleted = True
-                        logger.debug(f"Deleted {path_str} (crest_factor={cf:.2f})")
-                    except OSError as exc:
-                        logger.error(f"Could not delete {path_str}: {exc}")
-
-                writer.write(
-                    {
-                        "filepath": resolve_path(path_str),
-                        "crest_factor": round(cf, 4),
-                        "duration_s": round(duration_s, 4),
-                        "deleted": deleted,
-                    }
-                )
-
-            processed_counter.value += len(valid_paths)
-
-    logger.info(f"Worker {rank} finished its shard.")
-
+    logger.info(f"Worker {rank} finished after {claimed} claimed shard(s).")
 
 def main(args):
     setup_logging("crest_factor", log_dir=args.log_dir)
@@ -222,7 +275,20 @@ def main(args):
         )
         return
 
-    logger.info(f"{len(pending)} files still need a crest_factor; starting workers.")
+    shard_size = load_work_shard_size(args.config_path)
+    work_plan = prepare_work_shards(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        pending,
+        shard_size=shard_size,
+    )
+    pending_count = work_plan.total_items
+    del pending
+
+    logger.info(
+        f"{pending_count} files still need a crest_factor; "
+        f"starting workers over {work_plan.shard_count} shard(s)."
+    )
 
     processed = mp.Value('i', 0)
     skipped = mp.Value('i', 0)
@@ -243,7 +309,7 @@ def main(args):
                     run_worker,
                     args=(
                         num_workers,
-                        pending,
+                        str(work_plan.work_dir),
                         crest_threshold,
                         str(podcasts_path),
                         crest_batch_size,
@@ -260,7 +326,7 @@ def main(args):
                 run_worker(
                     0,
                     1,
-                    pending,
+                    str(work_plan.work_dir),
                     crest_threshold,
                     str(podcasts_path),
                     crest_batch_size,

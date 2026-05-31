@@ -40,6 +40,13 @@ from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
+from src.utils.work_shards import (
+    claim_work_shard,
+    load_work_shard_size,
+    mark_work_shard_done,
+    prepare_work_shards,
+    read_work_shard,
+)
 
 
 PARTIAL_PREFIX = "antispoof"
@@ -75,7 +82,7 @@ def generated_probability(logits: np.ndarray, class_index: int) -> np.ndarray:
     return probs[:, class_index]
 
 
-def ensure_model(model_path: Path, cfg: Dict) -> None:
+def ensure_model(model_path: Path, cfg: dict | None = None) -> None:
     if model_path.exists():
         return
 
@@ -96,7 +103,7 @@ def ensure_model(model_path: Path, cfg: Dict) -> None:
 
 
 def create_session(model_path: Path, rank: int, cfg: dict, config_path: str | None) -> ort.InferenceSession:
-    ensure_model(model_path)
+    ensure_model(model_path, cfg)
 
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -108,108 +115,154 @@ def create_session(model_path: Path, rank: int, cfg: dict, config_path: str | No
     return ort.InferenceSession(str(model_path), sess_options, providers=providers)
 
 
+def _process_files(
+    rank: int,
+    files: List[str],
+    session: ort.InferenceSession,
+    cfg: dict,
+    writer: PartialCsvWriter,
+    already_done: Set[str],
+    processed_counter,
+    skipped_counter,
+    errors_counter,
+) -> None:
+    threshold = float(cfg.get("threshold", 0.5))
+    batch_size = int(cfg.get("batch_size", 8))
+    num_workers = int(cfg.get("num_workers", 2))
+    prefetch_factor = int(cfg.get("prefetch_factor", 2))
+
+    pending_files = []
+    for path in files:
+        resolved = resolve_path(path)
+        if resolved in already_done:
+            skipped_counter.value += 1
+            continue
+        pending_files.append(path)
+
+    if not pending_files:
+        return
+
+    dataloader = create_antispoofing_dataloader(
+        pending_files,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        sample_rate=MODEL_SAMPLE_RATE,
+        num_samples=MODEL_NUM_SAMPLES,
+    )
+
+    for paths, batch, lengths, load_errors in tqdm(
+        dataloader, desc=f"AntiSpoof-{rank}", position=rank
+    ):
+        for path_str, reason in load_errors:
+            logger.error(f"Audio load failed {path_str}: {reason}")
+            errors_counter.value += 1
+
+        if not paths:
+            continue
+
+        feed = {MODEL_INPUT_NAME: batch.numpy().astype(np.float32, copy=False)}
+        try:
+            logits = session.run([MODEL_OUTPUT_NAME], feed)[0]
+            generated_probs = generated_probability(logits, GENERATED_CLASS_INDEX)
+        except Exception as exc:
+            logger.error(f"Anti-spoofing batch failed on worker {rank}: {exc}")
+            errors_counter.value += len(paths)
+            continue
+
+        for path_str, length, prob in zip(paths, lengths.tolist(), generated_probs.tolist()):
+            resolved = resolve_path(path_str)
+            if resolved in already_done:
+                skipped_counter.value += 1
+                continue
+
+            duration_s = float(length) / float(MODEL_SAMPLE_RATE) if length else 0.0
+            if duration_s <= 0:
+                duration_s = safe_audio_duration(path_str)
+
+            prob_val = round(float(prob), 6)
+            deleted = False
+            if prob_val > threshold:
+                try:
+                    os.remove(path_str)
+                    deleted = True
+                except OSError as exc:
+                    logger.warning(f"Could not delete {path_str}: {exc}")
+                    errors_counter.value += 1
+
+            writer.write(
+                {
+                    "filepath": resolved,
+                    SCORE_COLUMN: prob_val,
+                    PROB_COLUMN: prob_val,
+                    "duration_s": round(duration_s, 4),
+                    "deleted": deleted,
+                }
+            )
+            already_done.add(resolved)
+            processed_counter.value += 1
+
+
 def run_worker(
     rank: int,
     world_size: int,
-    all_paths: List[str],
+    work_dir: str,
     config: dict,
     config_path: str | None,
     processed_counter,
     skipped_counter,
     errors_counter,
 ) -> None:
-    my_paths = all_paths[rank::world_size]
-    if not my_paths:
-        return
-
-    torch.cuda.set_device(rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
     podcasts_path = Path(config.get("podcasts_path", "."))
     cfg = config.get("antispoofing", {})
 
     model_path = Path(cfg.get("onnx_path", "./models/spectra_0.onnx"))
-    threshold = float(cfg.get("threshold", 0.5))
     batch_size = int(cfg.get("batch_size", 8))
-    num_workers = int(cfg.get("num_workers", 2))
-    prefetch_factor = int(cfg.get("prefetch_factor", 2))
+    threshold = float(cfg.get("threshold", 0.5))
 
     logger.info(
-        f"[cuda:{rank}] Anti-spoofing {len(my_paths)} files, "
+        f"[cuda:{rank}] Anti-spoofing claiming shards, "
         f"batch={batch_size}, threshold={threshold}, samples={MODEL_NUM_SAMPLES}"
     )
 
     try:
         session = create_session(model_path, rank, cfg, config_path)
-        dataloader = create_antispoofing_dataloader(
-            my_paths,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor,
-            sample_rate=MODEL_SAMPLE_RATE,
-            num_samples=MODEL_NUM_SAMPLES,
-        )
-
+        claimed = 0
         with PartialCsvWriter(
             podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
         ) as writer:
             already_done: Set[str] = writer.already_done()
-            skipped_counter.value += len(already_done)
             if already_done:
                 logger.info(
-                    f"Worker {rank}: {len(already_done)} files already in this partial; skipping."
+                    f"Worker {rank}: {len(already_done)} files already in this partial; skipping repeats."
                 )
 
-            for paths, batch, lengths, load_errors in tqdm(
-                dataloader, desc=f"AntiSpoof-{rank}", position=rank
-            ):
-                for path_str, reason in load_errors:
-                    logger.error(f"Audio load failed {path_str}: {reason}")
-                    errors_counter.value += 1
+            while True:
+                shard_path = claim_work_shard(work_dir, rank)
+                if shard_path is None:
+                    break
+                shard_files = read_work_shard(shard_path)
+                claimed += 1
+                logger.info(f"[cuda:{rank}] Processing {len(shard_files)} files from {shard_path.name}")
+                _process_files(
+                    rank,
+                    shard_files,
+                    session,
+                    cfg,
+                    writer,
+                    already_done,
+                    processed_counter,
+                    skipped_counter,
+                    errors_counter,
+                )
+                mark_work_shard_done(shard_path)
 
-                if not paths:
-                    continue
-
-                feed = {MODEL_INPUT_NAME: batch.numpy().astype(np.float32, copy=False)}
-                try:
-                    logits = session.run([MODEL_OUTPUT_NAME], feed)[0]
-                    generated_probs = generated_probability(logits, GENERATED_CLASS_INDEX)
-                except Exception as exc:
-                    logger.error(f"Anti-spoofing batch failed on worker {rank}: {exc}")
-                    errors_counter.value += len(paths)
-                    continue
-
-                for path_str, length, prob in zip(paths, lengths.tolist(), generated_probs.tolist()):
-                    resolved = resolve_path(path_str)
-                    if resolved in already_done:
-                        continue
-
-                    duration_s = float(length) / float(MODEL_SAMPLE_RATE) if length else 0.0
-                    if duration_s <= 0:
-                        duration_s = safe_audio_duration(path_str)
-
-                    prob_val = round(float(prob), 6)
-                    deleted = False
-                    if prob_val > threshold:
-                        try:
-                            os.remove(path_str)
-                            deleted = True
-                        except OSError as exc:
-                            logger.warning(f"Could not delete {path_str}: {exc}")
-                            errors_counter.value += 1
-
-                    writer.write(
-                        {
-                            "filepath": resolved,
-                            SCORE_COLUMN: prob_val,
-                            PROB_COLUMN: prob_val,
-                            "duration_s": round(duration_s, 4),
-                            "deleted": deleted,
-                        }
-                    )
-                    processed_counter.value += 1
+        logger.info(f"Worker {rank} done after {claimed} claimed shard(s).")
     except Exception as exc:
         logger.exception(f"Anti-spoofing worker {rank} failed: {exc}")
         errors_counter.value += 1
-
 
 def main(args):
     setup_logging("antispoofing", log_dir=args.log_dir)
@@ -262,7 +315,20 @@ def main(args):
         )
         return
 
-    logger.info(f"{len(pending)} files need anti-spoofing; starting workers on {n_gpus} GPUs.")
+    shard_size = load_work_shard_size(args.config_path)
+    work_plan = prepare_work_shards(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        pending,
+        shard_size=shard_size,
+        limit=args.limit,
+    )
+    del pending
+
+    logger.info(
+        f"{work_plan.total_items} files need anti-spoofing; "
+        f"starting workers on {n_gpus} GPUs over {work_plan.shard_count} shard(s)."
+    )
 
     processed = mp.Value("i", 0)
     skipped = mp.Value("i", 0)
@@ -279,7 +345,7 @@ def main(args):
         ):
             mp.spawn(
                 run_worker,
-                args=(n_gpus, pending, config, args.config_path, processed, skipped, errors),
+                args=(n_gpus, str(work_plan.work_dir), config, args.config_path, processed, skipped, errors),
                 nprocs=n_gpus,
                 join=True,
             )

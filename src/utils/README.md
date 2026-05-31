@@ -8,6 +8,7 @@ folder instead of duplicating boilerplate.
 | `csv_manager.py` | Single source of truth for `balalaika.csv` (bootstrap, atomic writes, partial-CSV streaming, resume, filter-stage audit). |
 | `gpu.py` | `apply_torch_perf_defaults`, `get_onnx_providers`, `gpu_count`. |
 | `parallel.py` | `run_per_gpu_pool` (one `ProcessPoolExecutor` per GPU) and `run_per_gpu_processes` (one `mp.Process` per GPU). |
+| `work_shards.py` | Disk-backed work queues for huge multiprocessing stages; workers atomically claim shard files instead of receiving giant path lists. |
 | `sidecars.py` | `pending`, `pending_audio_to_sidecar`, `pending_sidecar_chain`, `with_suffix_at_stem`, `replace_in_stem` — for stages that pair an input `.txt` with an output `.txt`. |
 | `audit.py` | `record_stage_summary`, `safe_audio_duration`, `total_hours` — appends a row to `<podcasts_path>/filter_summary.csv` for the final report. |
 | `runtime_env.py` | Reads the `runtime:` block of `configs/config.yaml`; powers `eval "$(python3 -m src.utils.runtime_env --config_path …)"` in `base.sh`. |
@@ -62,6 +63,15 @@ partials, n = absorb_partial_csvs(
 The pattern guarantees that a forced stop preserves whatever rows the workers
 already produced; on the next run those rows are folded into
 `balalaika.csv` before new work is scheduled.
+
+### Disk-backed work shards
+
+For very large datasets, stages should not pass `list[str]` with millions of
+paths into `mp.spawn` or `mp.Process`. `src.utils.work_shards` writes pending
+paths to `<podcasts_path>/.balalaika_work/<stage>/shard_*.pending`; workers
+atomically claim shards by renaming them to `.running.<rank>` and mark them
+`.done` after processing. `runtime.work_shard_size` controls the number of
+paths per shard.
 
 ### Live `balalaika.csv` during long stages — `PeriodicCsvMerger`
 

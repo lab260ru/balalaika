@@ -685,6 +685,7 @@ Each stage reads only its own YAML section via `load_config(config_path, SECTION
 | `cpu_affinity` | `"0-32"` | `taskset -c` range (empty = disable) |
 | `log_dir` | `./logs` | Per-stage log directory |
 | `audio_paths_source` | `auto` | Source for stage audio lists: prefer `balalaika.csv`, force `csv`, or force `rglob` |
+| `work_shard_size` | `10000` | File paths per on-disk work shard for multiprocessing stages |
 | `trt_cache_path` | `./cache/trt` | TensorRT engine cache root |
 | `trt_workspace_bytes` | 4 GiB | Per-session TensorRT workspace |
 | `trt_fp16` | `True` | FP16 for TensorRT |
@@ -733,6 +734,7 @@ balalaika/
 │   │   ├── csv_manager.py           # Core CSV resilience (bootstrap, atomic, partials, resume)
 │   │   ├── audit.py                 # filter_summary.csv recording
 │   │   ├── parallel.py              # Multi-GPU parallelism: run_per_gpu_pool / run_per_gpu_processes
+│   │   ├── work_shards.py           # On-disk work queues for huge multiprocessing stages
 │   │   ├── gpu.py                   # TF32/SDP defaults, ONNX providers (CUDA/TensorRT)
 │   │   ├── sidecars.py              # Sidecar file discovery: pending_audio_to_sidecar, pending_sidecar_chain
 │   │   ├── runtime_env.py           # Shell env export from runtime config block

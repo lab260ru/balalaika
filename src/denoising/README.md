@@ -78,6 +78,8 @@ The stage uses `src.utils.csv_manager` just like other long-running stages:
 - leftover `denoising_part_*.csv` files are absorbed at startup;
 - pending files are selected with `unprocessed_paths(..., "denoised", ...)`;
 - worker progress is flushed row-by-row to partial CSVs;
+- pending files are split into `.balalaika_work/denoising/shard_*.pending`
+  files and claimed by workers, avoiding huge multiprocessing pickle payloads;
 - `PeriodicCsvMerger` keeps `balalaika.csv` fresh during long runs;
 - final merge happens before the stage exits.
 

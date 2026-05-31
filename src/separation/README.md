@@ -86,6 +86,8 @@ All long-running sub-stages use `src.utils.csv_manager`:
 - **Auto-bootstrap** from the audio tree if the CSV is missing.
 - **Incremental partial CSVs** such as `music_part_<rank>.csv`,
   `distillmos_part_<rank>.csv`, and `antispoof_part_<rank>.csv`.
+- **Disk-backed work shards** under `.balalaika_work/<stage>/`, so workers
+  claim bounded shard files instead of unpickling millions of paths at start.
 - **Resume on next run** by absorbing leftovers and scheduling only files still
   missing the relevant column.
 - **Deletion-aware merges** prune rows whose files were removed by filtering

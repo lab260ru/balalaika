@@ -55,6 +55,13 @@ from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
+from src.utils.work_shards import (
+    claim_work_shard,
+    load_work_shard_size,
+    mark_work_shard_done,
+    prepare_work_shards,
+    read_work_shard,
+)
 
 apply_torch_perf_defaults(disable_math_sdp=False)
 
@@ -90,85 +97,132 @@ def load_model(model_path: str, base_model: str, device: torch.device):
     return model
 
 
-def run_worker(rank: int, world_size: int, all_paths: List[str], config: dict, processed_counter, skipped_counter, errors_counter):
-    my_paths = all_paths[rank::world_size]
-    if not my_paths:
-        return
+def _process_files(
+    rank: int,
+    device: torch.device,
+    files: List[str],
+    config: dict,
+    cache_file: Path,
+    model,
+    writer: PartialCsvWriter,
+    already_done: Set[str],
+    processed_counter,
+    skipped_counter,
+    errors_counter,
+) -> int:
+    cfg = config.get("music_detect", {})
+    threshold = cfg.get("threshold", 0.5)
 
+    pending_files = []
+    for path in files:
+        resolved = resolve_path(path)
+        if resolved in already_done:
+            skipped_counter.value += 1
+            continue
+        pending_files.append(path)
+
+    if not pending_files:
+        return 0
+
+    dataloader, audio_lengths = create_loader(
+        pending_files,
+        cfg.get("base_model", "microsoft/wavlm-base-plus"),
+        cfg.get("bs", 32),
+        cfg.get("num_workers", 4),
+        cache_file,
+    )
+
+    probs, paths = model.predict_proba(dataloader)
+
+    deleted_count = 0
+    for path, prob in zip(paths, probs.detach().flatten()):
+        resolved = resolve_path(path)
+        if resolved in already_done:
+            skipped_counter.value += 1
+            continue
+
+        prob_val = round(float(prob), 6)
+        duration_s = float(audio_lengths.get(str(path), 0.0))
+        if duration_s <= 0:
+            duration_s = safe_audio_duration(path)
+
+        deleted = False
+        if prob_val > threshold:
+            try:
+                os.remove(path)
+                deleted_count += 1
+                deleted = True
+            except OSError as exc:
+                logger.warning(f"Could not delete {path}: {exc}")
+                errors_counter.value += 1
+
+        writer.write(
+            {
+                "filepath": resolved,
+                "music_prob": prob_val,
+                "duration_s": round(duration_s, 4),
+                "deleted": deleted,
+            }
+        )
+        already_done.add(resolved)
+        processed_counter.value += 1
+
+    return deleted_count
+
+
+def run_worker(rank: int, world_size: int, work_dir: str, config: dict, processed_counter, skipped_counter, errors_counter):
     device = torch.device(f"cuda:{rank}")
     cfg = config.get("music_detect", {})
     podcasts_path = Path(config.get("podcasts_path", "."))
 
-    threshold = cfg.get("threshold", 0.5)
-    cache_dir = Path(cfg.get("cache_path", "./cache")) / f"nisqa_temp_worker_{rank}"
+    cache_dir = Path(cfg.get("cache_path", "./cache")) / f"music_detect_worker_{rank}"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"[{device}] Processing {len(my_paths)} files...")
-
     try:
-        dataloader, audio_lengths = create_loader(
-            my_paths,
-            cfg.get("base_model", "microsoft/wavlm-base-plus"),
-            cfg.get("bs", 32),
-            cfg.get("num_workers", 4),
-            cache_dir / "audio_lengths.json",
-        )
-
         model = load_model(
             cfg.get("music_detect_model"),
             cfg.get("base_model", "microsoft/wavlm-base-plus"),
             device,
         )
 
-        probs, paths = model.predict_proba(dataloader)
-
-        deleted_count = 0
+        deleted_total = 0
+        claimed = 0
         with PartialCsvWriter(
             podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
         ) as writer:
             already_done: Set[str] = writer.already_done()
-            skipped_counter.value += len(already_done)
             if already_done:
                 logger.info(
-                    f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping."
+                    f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping repeats."
                 )
 
-            for path, prob in zip(paths, probs.detach().flatten()):
-                resolved = resolve_path(path)
-                if resolved in already_done:
-                    continue
-
-                prob_val = round(float(prob), 6)
-                duration_s = float(audio_lengths.get(str(path), 0.0))
-                if duration_s <= 0:
-                    duration_s = safe_audio_duration(path)
-
-                deleted = False
-                if prob_val > threshold:
-                    try:
-                        os.remove(path)
-                        deleted_count += 1
-                        deleted = True
-                    except OSError as exc:
-                        logger.warning(f"Could not delete {path}: {exc}")
-                        errors_counter.value += 1
-
-                writer.write(
-                    {
-                        "filepath": resolved,
-                        "music_prob": prob_val,
-                        "duration_s": round(duration_s, 4),
-                        "deleted": deleted,
-                    }
+            while True:
+                shard_path = claim_work_shard(work_dir, rank)
+                if shard_path is None:
+                    break
+                shard_files = read_work_shard(shard_path)
+                claimed += 1
+                logger.info(f"[{device}] Processing {len(shard_files)} files from {shard_path.name}...")
+                deleted_total += _process_files(
+                    rank,
+                    device,
+                    shard_files,
+                    config,
+                    cache_dir / f"{shard_path.stem}_audio_lengths.json",
+                    model,
+                    writer,
+                    already_done,
+                    processed_counter,
+                    skipped_counter,
+                    errors_counter,
                 )
-                processed_counter.value += 1
+                mark_work_shard_done(shard_path)
 
-        logger.success(f"[{device}] Done. Deleted {deleted_count}/{len(my_paths)} files.")
+        logger.success(f"[{device}] Done. Claimed {claimed} shard(s), deleted {deleted_total} files.")
 
     except Exception as exc:
         logger.exception(f"Worker {rank} error: {exc}")
         errors_counter.value += 1
-
 
 def main(args):
     setup_logging("music_detect", log_dir=args.log_dir)
@@ -230,7 +284,19 @@ def main(args):
         )
         return
 
-    logger.info(f"{len(pending)} files still need a music_prob; starting workers on {n_gpus} GPUs.")
+    shard_size = load_work_shard_size(args.config_path)
+    work_plan = prepare_work_shards(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        pending,
+        shard_size=shard_size,
+    )
+    del pending
+
+    logger.info(
+        f"{work_plan.total_items} files still need a music_prob; "
+        f"starting workers on {n_gpus} GPUs over {work_plan.shard_count} shard(s)."
+    )
 
     processed = mp.Value('i', 0)
     skipped = mp.Value('i', 0)
@@ -246,7 +312,7 @@ def main(args):
             drop_missing_files=True,
             **csv_settings,
         ):
-            mp.spawn(run_worker, args=(n_gpus, pending, config, processed, skipped, errors), nprocs=n_gpus, join=True)
+            mp.spawn(run_worker, args=(n_gpus, str(work_plan.work_dir), config, processed, skipped, errors), nprocs=n_gpus, join=True)
     except KeyboardInterrupt:
         logger.warning("Music detection stage interrupted; merging partials before exit.")
 

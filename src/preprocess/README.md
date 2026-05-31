@@ -100,6 +100,9 @@ forced stop never breaks the dataset:
 * **Incremental partial CSVs.** Each worker streams rows to its own
   `<prefix>_part_<rank>.csv` (`crest_part_*`, `loudness_part_*`) row by row.
   A `Ctrl+C` keeps everything that already landed on disk.
+* **Disk-backed work shards.** Crest-factor and loudness stages write pending
+  paths to `.balalaika_work/<stage>/shard_*.pending`; workers claim those
+  files instead of receiving giant Python lists through multiprocessing.
 * **Resume on next run.** At startup each sub-stage absorbs any leftover
   partials into `balalaika.csv` (deleting rows for files that were removed
   by the same stage, e.g. crest-factor deletions), then schedules only the

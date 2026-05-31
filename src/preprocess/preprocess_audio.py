@@ -50,6 +50,13 @@ from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
+from src.utils.work_shards import (
+    claim_work_shard,
+    load_work_shard_size,
+    mark_work_shard_done,
+    prepare_work_shards,
+    read_work_shard,
+)
 
 apply_torch_perf_defaults()
 
@@ -123,10 +130,60 @@ def process_audio_file(
         return False
 
 
+def _process_files(
+    rank: int,
+    files: List[str],
+    writer: PartialCsvWriter,
+    already_done: Set[str],
+    peak: float,
+    loudness: float,
+    block_size: float,
+    batch_size: int,
+    loader_workers: int,
+    prefetch_factor: int,
+    processed_counter,
+    skipped_counter,
+    errors_counter,
+) -> None:
+    pending_files = []
+    for path in files:
+        resolved = resolve_path(path)
+        if resolved in already_done:
+            skipped_counter.value += 1
+            continue
+        pending_files.append(path)
+
+    if not pending_files:
+        return
+
+    dataloader = create_loudness_normalize_dataloader(
+        pending_files,
+        batch_size=batch_size,
+        num_workers=loader_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    for batch in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
+        for file_path, audio, sample_rate, error in batch:
+            if error:
+                logger.error(f"Error loading {file_path}: {error}")
+                errors_counter.value += 1
+                continue
+            resolved = resolve_path(file_path)
+            if resolved in already_done:
+                skipped_counter.value += 1
+                continue
+            ok = process_audio_file(str(file_path), audio, sample_rate, peak, loudness, block_size)
+            if ok:
+                writer.write({"filepath": resolved, NORMALIZED_COLUMN: True})
+                already_done.add(resolved)
+                processed_counter.value += 1
+
+
 def run_worker(
     rank: int,
     world_size: int,
-    all_file_paths: List[str],
+    work_dir: str,
     peak: float,
     loudness: float,
     block_size: float,
@@ -138,46 +195,45 @@ def run_worker(
     skipped_counter,
     errors_counter,
 ):
-    """Worker that processes a sharded subset of files."""
-    if not all_file_paths:
-        return
-
-    my_files = all_file_paths[rank::world_size]
-    if not my_files:
-        return
-
+    """Worker that claims work shards from disk."""
     logger.info(
-        f"Worker {rank}/{world_size} processing {len(my_files)} files "
+        f"Worker {rank}/{world_size} claiming work shards "
         f"(batch={batch_size}, loader_workers={loader_workers})"
     )
 
+    claimed = 0
     with PartialCsvWriter(output_dir, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS) as writer:
         already_done: Set[str] = writer.already_done()
-        skipped_counter.value += len(already_done)
         if already_done:
             logger.info(
-                f"Worker {rank}: {len(already_done)} files already in this partial; skipping."
+                f"Worker {rank}: {len(already_done)} files already in this partial; skipping repeats."
             )
 
-        pending_files = [p for p in my_files if resolve_path(p) not in already_done]
-        dataloader = create_loudness_normalize_dataloader(
-            pending_files,
-            batch_size=batch_size,
-            num_workers=loader_workers,
-            prefetch_factor=prefetch_factor,
-        )
+        while True:
+            shard_path = claim_work_shard(work_dir, rank)
+            if shard_path is None:
+                break
+            shard_files = read_work_shard(shard_path)
+            claimed += 1
+            logger.info(f"Worker {rank}: processing {len(shard_files)} files from {shard_path.name}")
+            _process_files(
+                rank,
+                shard_files,
+                writer,
+                already_done,
+                peak,
+                loudness,
+                block_size,
+                batch_size,
+                loader_workers,
+                prefetch_factor,
+                processed_counter,
+                skipped_counter,
+                errors_counter,
+            )
+            mark_work_shard_done(shard_path)
 
-        for batch in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
-            for file_path, audio, sample_rate, error in batch:
-                if error:
-                    logger.error(f"Error loading {file_path}: {error}")
-                    errors_counter.value += 1
-                    continue
-                ok = process_audio_file(str(file_path), audio, sample_rate, peak, loudness, block_size)
-                if ok:
-                    writer.write({"filepath": resolve_path(file_path), NORMALIZED_COLUMN: True})
-                    processed_counter.value += 1
-
+    logger.info(f"Worker {rank} finished after {claimed} claimed shard(s).")
 
 def main(args):
     setup_logging("preprocess_audio", log_dir=args.log_dir)
@@ -245,6 +301,20 @@ def main(args):
         logger.info("All audio files are already loudness-normalized.")
         return
 
+    shard_size = load_work_shard_size(args.config_path)
+    work_plan = prepare_work_shards(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        paths_to_process,
+        shard_size=shard_size,
+    )
+    del paths_to_process
+
+    logger.info(
+        f"Starting loudness workers over {work_plan.total_items} files "
+        f"in {work_plan.shard_count} shard(s)."
+    )
+
     processed = mp.Value('i', 0)
     skipped = mp.Value('i', 0)
     errors = mp.Value('i', 0)
@@ -263,7 +333,7 @@ def main(args):
                     run_worker,
                     args=(
                         num_processes,
-                        paths_to_process,
+                        str(work_plan.work_dir),
                         peak,
                         loudness,
                         block_size,
@@ -282,7 +352,7 @@ def main(args):
                 run_worker(
                     0,
                     1,
-                    paths_to_process,
+                    str(work_plan.work_dir),
                     peak,
                     loudness,
                     block_size,

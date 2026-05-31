@@ -38,7 +38,6 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from loguru import logger
-from tqdm import tqdm
 
 CSV_NAME = "balalaika.csv"
 AUDIO_EXTENSIONS: Tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".opus")
@@ -804,15 +803,16 @@ def _runtime_audio_paths_source(config_path: Optional[os.PathLike | str]) -> str
 def _dedupe_paths(paths: Iterable[os.PathLike | str]) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
-    for raw in tqdm(paths, desc="dedupe_paths processing"):
+    for raw in tqdm(paths, desc="dedupe_paths"):
         if raw is None:
             continue
         path = str(raw).strip()
         if not path:
             continue
-        if Path(path).suffix.lower() not in AUDIO_EXTENSIONS:
+        path_obj = Path(path)
+        if path_obj.suffix.lower() not in AUDIO_EXTENSIONS:
             continue
-        resolved = resolve_path(path)
+        resolved = path if path_obj.is_absolute() else resolve_path(path)
         if resolved not in seen:
             seen.add(resolved)
             out.append(resolved)

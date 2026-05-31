@@ -38,6 +38,13 @@ from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_processes
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
+from src.utils.work_shards import (
+    claim_work_shard,
+    load_work_shard_size,
+    mark_work_shard_done,
+    prepare_work_shards,
+    read_work_shard,
+)
 
 apply_torch_perf_defaults()
 
@@ -161,10 +168,122 @@ def create_session(
     return ort.InferenceSession(str(model_path), sess_options, providers=providers)
 
 
+def _process_files(
+    rank: int,
+    files: List[str],
+    session: ort.InferenceSession,
+    input_name: str,
+    output_name: str,
+    config: dict,
+    writer: PartialCsvWriter,
+    already_done: Set[str],
+    processed_counter,
+    skipped_counter,
+    errors_counter,
+) -> None:
+    batch_size = int(config.get("batch_size", 2))
+    loader_workers = int(config.get("num_workers", 0))
+    prefetch_factor = int(config.get("prefetch_factor", 2))
+
+    pending_files = []
+    for path in files:
+        resolved = resolve_path(path)
+        if resolved in already_done:
+            skipped_counter.value += 1
+            continue
+        pending_files.append(path)
+
+    if not pending_files:
+        return
+
+    dataloader = create_denoising_dataloader(
+        pending_files,
+        batch_size=batch_size,
+        num_workers=loader_workers,
+        prefetch_factor=prefetch_factor,
+        sample_rate=MODEL_SAMPLE_RATE,
+        pad_to_multiple=MODEL_PAD_TO_MULTIPLE,
+        pad_mode=MODEL_PAD_MODE,
+        max_padded_len=MODEL_MAX_PADDED_LEN,
+    )
+
+    for paths, batch, lengths, errors in tqdm(
+        dataloader, desc=f"Denoising-{rank}", position=rank
+    ):
+        valid_indices = []
+        valid_paths = []
+        valid_lengths = []
+        for idx, (path_str, length, error) in enumerate(zip(paths, lengths.tolist(), errors)):
+            if error:
+                logger.error(f"Error loading {path_str}: {error}")
+                errors_counter.value += 1
+                continue
+            if int(length) <= 0:
+                logger.warning(f"Skipping empty audio: {path_str}")
+                skipped_counter.value += 1
+                continue
+            valid_indices.append(idx)
+            valid_paths.append(path_str)
+            valid_lengths.append(int(length))
+
+        if not valid_indices:
+            continue
+
+        try:
+            input_np = batch[valid_indices].numpy().astype(np.float32, copy=False)
+            denoised = session.run([output_name], {input_name: input_np})[0]
+            denoised = np.asarray(denoised)
+            if denoised.ndim == 1:
+                denoised = denoised[np.newaxis, :]
+        except Exception as exc:
+            logger.error(f"ONNX denoising batch failed on worker {rank}: {exc}")
+            errors_counter.value += len(valid_indices)
+            continue
+
+        for out_index, (path_str, length) in enumerate(zip(valid_paths, valid_lengths)):
+            resolved = resolve_path(path_str)
+            if resolved in already_done:
+                skipped_counter.value += 1
+                continue
+            try:
+                enhanced = denoised[out_index]
+                if enhanced.ndim == 2:
+                    enhanced = enhanced[0]
+                if enhanced.shape[-1] < length:
+                    enhanced = np.pad(enhanced, (0, length - enhanced.shape[-1]))
+                enhanced = np.clip(enhanced[:length], -32768.0, 32767.0)
+                enhanced_tensor = torch.from_numpy(
+                    enhanced.astype(np.float32, copy=False) / 32768.0
+                ).unsqueeze(0)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r".*save_with_torchcodec.*",
+                        category=UserWarning,
+                    )
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r".*StreamingMediaEncoder has been deprecated.*",
+                        category=UserWarning,
+                    )
+                    torchaudio.save(str(path_str), enhanced_tensor, MODEL_SAMPLE_RATE)
+                writer.write(
+                    {
+                        "filepath": resolved,
+                        PROCESSED_COLUMN: True,
+                    }
+                )
+                already_done.add(resolved)
+                processed_counter.value += 1
+            except Exception as exc:
+                logger.error(f"Failed to save denoised audio {path_str}: {exc}")
+                errors_counter.value += 1
+
+
 def run_worker(
     rank: int,
     world_size: int,
-    all_file_paths: List[str],
+    work_dir: str,
     config: dict,
     config_path: str | None,
     podcasts_path: Path,
@@ -172,17 +291,10 @@ def run_worker(
     skipped_counter,
     errors_counter,
 ):
-    my_files = all_file_paths[rank::world_size]
-    if not my_files:
-        logger.info(f"Worker {rank}: no files to process.")
-        return
-
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
 
     batch_size = int(config.get("batch_size", 2))
-    loader_workers = int(config.get("num_workers", 0))
-    prefetch_factor = int(config.get("prefetch_factor", 2))
     model_path = resolve_model_path(str(config.get("onnx_path", DEFAULT_ONNX_PATH)))
 
     session = create_session(
@@ -195,101 +307,45 @@ def run_worker(
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
     logger.info(
-        f"Worker {rank}/{world_size}: {len(my_files)} files, batch={batch_size}, "
+        f"Worker {rank}/{world_size}: claiming shards, batch={batch_size}, "
         f"sample_rate={MODEL_SAMPLE_RATE}, providers={session.get_providers()}, "
         f"input={input_name}{session.get_inputs()[0].shape}, "
         f"output={output_name}{session.get_outputs()[0].shape}"
     )
 
+    claimed = 0
     with PartialCsvWriter(
         podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
     ) as writer:
         already_done: Set[str] = writer.already_done()
-        skipped_counter.value += len(already_done)
         if already_done:
             logger.info(
-                f"Worker {rank}: {len(already_done)} files already in this partial; skipping."
+                f"Worker {rank}: {len(already_done)} files already in this partial; skipping repeats."
             )
 
-        pending_files = [p for p in my_files if resolve_path(p) not in already_done]
-        dataloader = create_denoising_dataloader(
-            pending_files,
-            batch_size=batch_size,
-            num_workers=loader_workers,
-            prefetch_factor=prefetch_factor,
-            sample_rate=MODEL_SAMPLE_RATE,
-            pad_to_multiple=MODEL_PAD_TO_MULTIPLE,
-            pad_mode=MODEL_PAD_MODE,
-            max_padded_len=MODEL_MAX_PADDED_LEN,
-        )
+        while True:
+            shard_path = claim_work_shard(work_dir, rank)
+            if shard_path is None:
+                break
+            shard_files = read_work_shard(shard_path)
+            claimed += 1
+            logger.info(f"Worker {rank}: processing {len(shard_files)} files from {shard_path.name}")
+            _process_files(
+                rank,
+                shard_files,
+                session,
+                input_name,
+                output_name,
+                config,
+                writer,
+                already_done,
+                processed_counter,
+                skipped_counter,
+                errors_counter,
+            )
+            mark_work_shard_done(shard_path)
 
-        for paths, batch, lengths, errors in tqdm(
-            dataloader, desc=f"Denoising-{rank}", position=rank
-        ):
-            valid_indices = []
-            valid_paths = []
-            valid_lengths = []
-            for idx, (path_str, length, error) in enumerate(zip(paths, lengths.tolist(), errors)):
-                if error:
-                    logger.error(f"Error loading {path_str}: {error}")
-                    errors_counter.value += 1
-                    continue
-                if int(length) <= 0:
-                    logger.warning(f"Skipping empty audio: {path_str}")
-                    skipped_counter.value += 1
-                    continue
-                valid_indices.append(idx)
-                valid_paths.append(path_str)
-                valid_lengths.append(int(length))
-
-            if not valid_indices:
-                continue
-
-            try:
-                input_np = batch[valid_indices].numpy().astype(np.float32, copy=False)
-                denoised = session.run([output_name], {input_name: input_np})[0]
-                denoised = np.asarray(denoised)
-                if denoised.ndim == 1:
-                    denoised = denoised[np.newaxis, :]
-            except Exception as exc:
-                logger.error(f"ONNX denoising batch failed on worker {rank}: {exc}")
-                errors_counter.value += len(valid_indices)
-                continue
-
-            for out_index, (path_str, length) in enumerate(zip(valid_paths, valid_lengths)):
-                try:
-                    enhanced = denoised[out_index]
-                    if enhanced.ndim == 2:
-                        enhanced = enhanced[0]
-                    if enhanced.shape[-1] < length:
-                        enhanced = np.pad(enhanced, (0, length - enhanced.shape[-1]))
-                    enhanced = np.clip(enhanced[:length], -32768.0, 32767.0)
-                    enhanced_tensor = torch.from_numpy(
-                        enhanced.astype(np.float32, copy=False) / 32768.0
-                    ).unsqueeze(0)
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings(
-                            "ignore",
-                            message=r".*save_with_torchcodec.*",
-                            category=UserWarning,
-                        )
-                        warnings.filterwarnings(
-                            "ignore",
-                            message=r".*StreamingMediaEncoder has been deprecated.*",
-                            category=UserWarning,
-                        )
-                        torchaudio.save(str(path_str), enhanced_tensor, MODEL_SAMPLE_RATE)
-                    writer.write(
-                        {
-                            "filepath": resolve_path(path_str),
-                            PROCESSED_COLUMN: True,
-                        }
-                    )
-                    processed_counter.value += 1
-                except Exception as exc:
-                    logger.error(f"Failed to save denoised audio {path_str}: {exc}")
-                    errors_counter.value += 1
-
+    logger.info(f"Worker {rank} finished after {claimed} claimed shard(s).")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -339,9 +395,20 @@ def main():
         logger.success("All audio files are already denoised. Exiting.")
         return
 
+    shard_size = load_work_shard_size(args.config_path)
+    work_plan = prepare_work_shards(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        pending,
+        shard_size=shard_size,
+        limit=args.limit,
+    )
+    del pending
+
     logger.info(
-        f"Running ONNX denoising for {len(pending)} files with {num_processes} process(es) "
-        f"({available_gpus} GPU(s) visible), model={model_path}."
+        f"Running ONNX denoising for {work_plan.total_items} files with {num_processes} process(es) "
+        f"({available_gpus} GPU(s) visible), model={model_path}, "
+        f"shards={work_plan.shard_count}."
     )
 
     processed = mp.Value("i", 0)
@@ -360,7 +427,7 @@ def main():
             worker_errors, _ = run_per_gpu_processes(
                 run_worker,
                 num_gpus=num_processes,
-                args=(pending, config, args.config_path, podcasts_path, processed, skipped, errors),
+                args=(str(work_plan.work_dir), config, args.config_path, podcasts_path, processed, skipped, errors),
             )
             if worker_errors:
                 errors.value += worker_errors

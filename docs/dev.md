@@ -340,14 +340,16 @@ to audit the decision, then merge/prune the main CSV.
 
 ## Avoid Full Tree Scans When Possible
 
-`get_audio_paths()` and `discover_audio_paths()` use recursive filesystem scans.
-On very large datasets this can be slow.
+`get_audio_paths()` is the raw recursive filesystem scan.
+`discover_audio_paths()` follows `runtime.audio_paths_source`: `csv` trusts
+`balalaika.csv`, `rglob` forces a scan, and `auto` prefers CSV with a scan
+fallback. On very large datasets, prefer `csv` after `balalaika.csv` exists.
 
-If a stage can safely use `balalaika.csv` as its source of truth, prefer reading
-the `filepath` column from CSV and only fall back to a full scan when the CSV is
-missing or invalid.
-
-This is especially important for stages that run repeatedly after preprocessing.
+Do not pass multi-million-item path lists into `mp.spawn` / `mp.Process`. Use
+`src.utils.work_shards.prepare_work_shards()` in the parent, pass only the
+work directory to workers, and have workers claim shards with
+`claim_work_shard()` + `mark_work_shard_done()`. This keeps multiprocessing
+startup bounded and avoids pickle OOM failures.
 
 ## Logging
 

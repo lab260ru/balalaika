@@ -42,6 +42,13 @@ from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
+from src.utils.work_shards import (
+    claim_work_shard,
+    load_work_shard_size,
+    mark_work_shard_done,
+    prepare_work_shards,
+    read_work_shard,
+)
 
 apply_torch_perf_defaults(disable_math_sdp=False)
 
@@ -51,21 +58,80 @@ PARTIAL_FIELDS = ("filepath", "DistillMOS")
 COLUMN = "DistillMOS"
 
 
+def _process_files(
+    rank: int,
+    files: List[str],
+    config: dict,
+    podcasts_path: Path,
+    sqa_model,
+    device: torch.device,
+    writer: PartialCsvWriter,
+    already_done: Set[str],
+    processed_counter,
+    skipped_counter,
+    errors_counter,
+) -> None:
+    batch_size = int(config.get("distillmos", {}).get("batch_size", 16))
+    num_loader_workers = int(config.get("distillmos", {}).get("num_workers", 2))
+    prefetch_factor = int(config.get("distillmos", {}).get("prefetch_factor", 2))
+
+    pending_files = []
+    for path in files:
+        resolved = resolve_path(path)
+        if resolved in already_done:
+            skipped_counter.value += 1
+            continue
+        pending_files.append(path)
+
+    if not pending_files:
+        return
+
+    dataloader = create_distillmos_dataloader(
+        pending_files,
+        batch_size=batch_size,
+        num_workers=num_loader_workers,
+        prefetch_factor=prefetch_factor,
+        cache_dir=str(podcasts_path),
+    )
+
+    with torch.inference_mode():
+        for paths, batch in tqdm(dataloader, desc=f"DistillMOS-{rank}", position=rank):
+            try:
+                batch = batch.to(device, non_blocking=True)
+                mos = sqa_model(batch).detach().flatten().cpu()
+                for path_str, mos_val in zip(paths, mos.tolist()):
+                    resolved = resolve_path(path_str)
+                    if resolved in already_done:
+                        skipped_counter.value += 1
+                        continue
+                    writer.write(
+                        {
+                            "filepath": resolved,
+                            COLUMN: float(mos_val),
+                        }
+                    )
+                    already_done.add(resolved)
+                    processed_counter.value += 1
+            except torch.cuda.OutOfMemoryError:
+                logger.critical(f"CUDA OOM on worker {rank}, stopping")
+                errors_counter.value += 1
+                raise
+            except Exception as exc:
+                logger.warning(f"Error processing batch on worker {rank}: {exc}")
+                errors_counter.value += 1
+                continue
+
+
 def run_inference_worker(
     rank: int,
     world_size: int,
-    file_paths: List[str],
+    work_dir: str,
     config: dict,
     podcasts_path: Path,
     processed_counter,
     skipped_counter,
     errors_counter,
 ):
-    my_files = file_paths[rank::world_size]
-    if not my_files:
-        logger.info(f"Worker {rank}: No files to process.")
-        return
-
     device = torch.device(f"cuda:{rank}")
 
     logger.info(f"[cuda:{rank}] Loading DistillMOS model...")
@@ -81,60 +147,48 @@ def run_inference_worker(
 
     batch_size = int(config.get("distillmos", {}).get("batch_size", 16))
     num_loader_workers = int(config.get("distillmos", {}).get("num_workers", 2))
-    prefetch_factor = int(config.get("distillmos", {}).get("prefetch_factor", 2))
-
-    logger.info(f"[cuda:{rank}] Starting inference for {len(my_files)} files.")
+    logger.info(
+        f"[cuda:{rank}] Claiming DistillMOS shards "
+        f"(batch={batch_size}, loader_workers={num_loader_workers})."
+    )
     started_at = time.perf_counter()
 
-    dataloader = create_distillmos_dataloader(
-        my_files,
-        batch_size=batch_size,
-        num_workers=num_loader_workers,
-        prefetch_factor=prefetch_factor,
-        cache_dir=str(podcasts_path),
-    )
-
+    claimed = 0
     with PartialCsvWriter(
         podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
     ) as writer:
         already_done: Set[str] = writer.already_done()
-        skipped_counter.value += len(already_done)
         if already_done:
             logger.info(
-                f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping."
+                f"Worker {rank}: {len(already_done)} files already scored in this partial; skipping repeats."
             )
 
-        with torch.inference_mode():
-            for paths, batch in tqdm(dataloader, desc=f"DistillMOS-{rank}", position=rank):
-                try:
-                    batch = batch.to(device, non_blocking=True)
-                    mos = sqa_model(batch).detach().flatten().cpu()
-                    for path_str, mos_val in zip(paths, mos.tolist()):
-                        resolved = resolve_path(path_str)
-                        if resolved in already_done:
-                            continue
-                        writer.write(
-                            {
-                                "filepath": resolved,
-                                COLUMN: float(mos_val),
-                            }
-                        )
-                        processed_counter.value += 1
-                except torch.cuda.OutOfMemoryError:
-                    logger.critical(f"CUDA OOM on worker {rank}, stopping")
-                    errors_counter.value += 1
-                    raise
-                except Exception as exc:
-                    logger.warning(f"Error processing batch on worker {rank}: {exc}")
-                    errors_counter.value += 1
-                    continue
+        while True:
+            shard_path = claim_work_shard(work_dir, rank)
+            if shard_path is None:
+                break
+            shard_files = read_work_shard(shard_path)
+            claimed += 1
+            logger.info(f"[cuda:{rank}] Processing {len(shard_files)} files from {shard_path.name}.")
+            _process_files(
+                rank,
+                shard_files,
+                config,
+                podcasts_path,
+                sqa_model,
+                device,
+                writer,
+                already_done,
+                processed_counter,
+                skipped_counter,
+                errors_counter,
+            )
+            mark_work_shard_done(shard_path)
 
     elapsed = time.perf_counter() - started_at
     logger.success(
-        f"[cuda:{rank}] Finished {len(my_files)} files in {elapsed:.2f}s "
-        f"({len(my_files) / max(elapsed, 1e-6):.2f} files/s)."
+        f"[cuda:{rank}] Finished {claimed} shard(s) in {elapsed:.2f}s."
     )
-
 
 def main():
     mp.set_start_method("spawn", force=True)
@@ -188,7 +242,19 @@ def main():
         logger.success("All audio files already have a DistillMOS score. Exiting.")
         return
 
-    logger.info(f"Processing {len(unprocessed)} files on {available_gpus} GPUs.")
+    shard_size = load_work_shard_size(args.config_path)
+    work_plan = prepare_work_shards(
+        podcasts_path,
+        PARTIAL_PREFIX,
+        unprocessed,
+        shard_size=shard_size,
+    )
+    del unprocessed
+
+    logger.info(
+        f"Processing {work_plan.total_items} files on {available_gpus} GPUs "
+        f"over {work_plan.shard_count} shard(s)."
+    )
 
     processed = mp.Value('i', 0)
     skipped = mp.Value('i', 0)
@@ -205,7 +271,7 @@ def main():
         ):
             mp.spawn(
                 run_inference_worker,
-                args=(available_gpus, unprocessed, config, podcasts_path, processed, skipped, errors),
+                args=(available_gpus, str(work_plan.work_dir), config, podcasts_path, processed, skipped, errors),
                 nprocs=available_gpus,
                 join=True,
             )

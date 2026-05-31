@@ -92,6 +92,8 @@ runtime:
   venv_path: .dev_venv
   cpu_affinity: "0-24"          # empty string disables taskset
   log_dir: ./logs
+  audio_paths_source: csv        # csv avoids repeated rglob after balalaika.csv exists
+  work_shard_size: 10000         # file paths per on-disk multiprocessing shard
   trt_cache_path: ./cache/trt
   trt_workspace_bytes: 4294967296
   trt_fp16: True
@@ -99,7 +101,10 @@ runtime:
 
 `base.sh` reads this block through `src.utils.runtime_env` and exports
 `BALALAIKA_*` variables before running stages. Python modules use the same
-values for logging and TensorRT provider setup.
+values for logging, TensorRT provider setup, CSV-backed file discovery, and
+on-disk work-shard sizing. Heavy stages write work queues under
+`<podcasts_path>/.balalaika_work/<stage>/` so multiprocessing workers claim
+small shard files instead of receiving millions of paths through pickle.
 
 ---
 

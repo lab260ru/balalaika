@@ -77,10 +77,10 @@ csv:
   # cumulative progress across workers. 0 disables periodic flushing
   # (only the post-stage merge runs). 10 000 rows ≈ a few seconds of pandas
   # work on a multi-million-row CSV; raise it for very large datasets.
-  flush_every_rows: 10000
+  flush_every_rows: 100000
   # Fallback timer: at least flush every N seconds even if the row threshold
   # was not hit. 0 disables the timer.
-  flush_every_seconds: 300
+  flush_every_seconds: 600
 
 # -----------------------------------------------------------------------------
 # Runtime / orchestration block.
@@ -99,6 +99,9 @@ runtime:
   # to rglob when the CSV is missing/empty; csv never scans and requires an
   # existing balalaika.csv; rglob always scans.
   audio_paths_source: csv
+  # Number of file paths per on-disk work shard for multiprocessing stages.
+  # Keep this small enough that a worker only materializes a bounded list.
+  work_shard_size: 10000
   # Root for TensorRT engine cache. Each session appends /trt_cache_<gpu_id>.
   trt_cache_path: ./cache/trt
   # Per-session TensorRT workspace size in bytes (4 GiB by default).
@@ -130,11 +133,11 @@ preprocess:
   # Number of prefetched batches per diarization DataLoader worker.
   diarization_prefetch_factor: 0
   # Worker processes per GPU for crest factor removal.
-  num_workers_crest_factor: 4
+  num_workers_crest_factor: 1
   # Crest-factor DataLoader batch size per worker.
   crest_factor_batch_size: 1
   # Crest-factor DataLoader workers inside each process.
-  crest_factor_loader_workers: 4
+  crest_factor_loader_workers: 0
   # Number of prefetched batches per crest-factor DataLoader worker.
   crest_factor_prefetch_factor: 2
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
@@ -147,11 +150,11 @@ preprocess:
   # Block size in seconds for loudness measurement windows.
   block_size: 0.400
   # Worker processes for loudness normalization.
-  loudness_num_workers: 4
+  loudness_num_workers: 1
   # Loudness-normalization DataLoader batch size per process.
   loudness_batch_size: 1
   # Loudness-normalization DataLoader workers inside each process.
-  loudness_loader_workers: 4
+  loudness_loader_workers: 0
   # Number of prefetched batches per loudness-normalization DataLoader worker.
   loudness_prefetch_factor: 2
   # Max audio length in seconds fed to Sortformer at once; longer files are windowed.

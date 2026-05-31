@@ -394,6 +394,7 @@ runtime:
   cpu_affinity: "0-24"          # taskset -c argument; empty disables pinning
   log_dir: ./logs               # directory for rotating per-stage logs
   audio_paths_source: auto      # auto/csv/rglob source for stage file lists
+  work_shard_size: 10000        # paths per on-disk multiprocessing shard
   trt_cache_path: ./cache/trt   # TensorRT engine cache root
   trt_workspace_bytes: 4294967296   # 4 GiB per session
   trt_fp16: True                # FP16 for TensorRT EP
@@ -401,7 +402,9 @@ runtime:
 
 These values are exported as `BALALAIKA_*` env vars by
 `src.utils.runtime_env` and read by Python modules that need them
-(`get_onnx_providers`, `setup_logging`, ...). No shell-side YAML parsing
+(`get_onnx_providers`, `setup_logging`, ...). Python stages also read
+`audio_paths_source` and `work_shard_size` to avoid repeated tree scans and
+to keep multiprocessing work queues on disk. No shell-side YAML parsing
 required.
 
 ### Stage-specific configuration

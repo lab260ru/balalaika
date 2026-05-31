@@ -17,6 +17,13 @@ from src.utils.csv_manager import discover_audio_paths
 from src.utils.sidecars import text_sidecar_complete
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config, read_file_content
+from src.utils.work_shards import (
+    claim_work_shard,
+    load_work_shard_size,
+    mark_work_shard_done,
+    prepare_work_shards,
+    read_work_shard,
+)
 
 MODEL_MAP = {
     'giga_rnnt': 'gigaam-v3-rnnt',
@@ -109,18 +116,72 @@ def format_timestamps(result) -> str:
     return '\n'.join(f"{start:.3f}\t{end:.3f}\t{word}" for start, end, word in words)
 
 
-def run_worker(cuda_id: int, world_size: int, model_name: str,
-               all_files: List[str], config: dict, config_path: Optional[str] = None,
-               processed_counter=None, errors_counter=None, error_details=None):
-    """Inference worker: loads onnx-asr model on a single GPU and processes its shard."""
-    my_files = all_files[cuda_id::world_size]
-    if not my_files:
-        return
-    torch.cuda.set_device(cuda_id)
-
+def _process_files(cuda_id: int, model_name: str, files: List[str], model, config: dict,
+                   output_suffix: str, do_timestamps: bool, target_sample_rate: int,
+                   processed_counter=None, errors_counter=None, error_details=None):
     batch_size = config.get('batch_size', 16)
     num_loader_workers = int(config.get('num_workers', 4))
     prefetch_factor = int(config.get('prefetch_factor', 2))
+
+    dataloader = create_transcription_dataloader(
+        files,
+        sample_rate=target_sample_rate,
+        batch_size=batch_size,
+        num_workers=num_loader_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    for paths, waveforms, lengths, load_errors in tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id):
+        for path_str, reason in load_errors:
+            logger.error(f"Audio load failed {path_str}: {reason}")
+            if errors_counter is not None:
+                errors_counter.value += 1
+            if error_details is not None:
+                error_details.append({"file": path_str, "model": model_name, "reason": reason})
+
+        if not paths:
+            continue
+
+        try:
+            results = recognize_batch(model, waveforms, lengths)
+        except Exception as e:
+            logger.error(
+                f"Batch failed for {model_name}: files={len(paths)}, "
+                f"lengths=({format_length_range(lengths, target_sample_rate)}): {e}. "
+                "Falling back to single-file mode."
+            )
+            results = []
+            for path_str, waveform, length in zip(paths, waveforms, lengths):
+                try:
+                    results.extend(recognize_batch(model, waveform[:length].unsqueeze(0).contiguous(), length.unsqueeze(0)))
+                except Exception as e2:
+                    seconds = float(length.item()) / float(target_sample_rate)
+                    logger.error(f"File failed for {model_name}: seconds={seconds:.2f}, file={path_str}: {e2}")
+                    results.append(None)
+                    if errors_counter is not None:
+                        errors_counter.value += 1
+                    if error_details is not None:
+                        error_details.append({"file": path_str, "model": model_name, "seconds": seconds, "reason": str(e2)})
+
+        if not isinstance(results, list):
+            results = [results]
+
+        texts = [None if r is None else extract_text(r) for r in results]
+        ts = [None if r is None else format_timestamps(r) for r in results] if do_timestamps else None
+
+        save_results(paths, texts, ts, output_suffix)
+
+        if processed_counter is not None:
+            processed_counter.value += len(paths)
+
+
+def run_worker(cuda_id: int, world_size: int, model_name: str,
+               work_dir: str, config: dict, config_path: Optional[str] = None,
+               processed_counter=None, errors_counter=None, error_details=None):
+    """Inference worker: loads onnx-asr model on a single GPU and claims file shards."""
+    torch.cuda.set_device(cuda_id)
+
+    batch_size = config.get('batch_size', 16)
     use_trt = config.get('use_tensorrt', False)
     quantization = config.get('quantization')
 
@@ -132,7 +193,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
 
     logger.info(
         f"Worker {cuda_id}/{world_size}: {onnx_name} on cuda:{cuda_id}, "
-        f"{len(my_files)} files, batch={batch_size}, tensorrt={use_trt}"
+        f"claiming shards, batch={batch_size}, tensorrt={use_trt}"
     )
 
     try:
@@ -154,56 +215,31 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
             model = model.with_vad(vad)
 
         target_sample_rate = int(model.asr._get_sample_rate()) if hasattr(model, "asr") else TARGET_SAMPLE_RATE
-        dataloader = create_transcription_dataloader(
-            my_files,
-            sample_rate=target_sample_rate,
-            batch_size=batch_size,
-            num_workers=num_loader_workers,
-            prefetch_factor=prefetch_factor,
-        )
 
-        for paths, waveforms, lengths, load_errors in tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id):
-            for path_str, reason in load_errors:
-                logger.error(f"Audio load failed {path_str}: {reason}")
-                if errors_counter is not None:
-                    errors_counter.value += 1
-                if error_details is not None:
-                    error_details.append({"file": path_str, "model": model_name, "reason": reason})
+        claimed = 0
+        while True:
+            shard_path = claim_work_shard(work_dir, cuda_id)
+            if shard_path is None:
+                break
+            files = read_work_shard(shard_path)
+            claimed += 1
+            logger.info(f"Worker {cuda_id}: processing {len(files)} files from {shard_path.name}")
+            _process_files(
+                cuda_id,
+                model_name,
+                files,
+                model,
+                config,
+                output_suffix,
+                do_timestamps,
+                target_sample_rate,
+                processed_counter,
+                errors_counter,
+                error_details,
+            )
+            mark_work_shard_done(shard_path)
 
-            if not paths:
-                continue
-
-            try:
-                results = recognize_batch(model, waveforms, lengths)
-            except Exception as e:
-                logger.error(
-                    f"Batch failed for {model_name}: files={len(paths)}, "
-                    f"lengths=({format_length_range(lengths, target_sample_rate)}): {e}. "
-                    "Falling back to single-file mode."
-                )
-                results = []
-                for path_str, waveform, length in zip(paths, waveforms, lengths):
-                    try:
-                        results.extend(recognize_batch(model, waveform[:length].unsqueeze(0).contiguous(), length.unsqueeze(0)))
-                    except Exception as e2:
-                        seconds = float(length.item()) / float(target_sample_rate)
-                        logger.error(f"File failed for {model_name}: seconds={seconds:.2f}, file={path_str}: {e2}")
-                        results.append(None)
-                        if errors_counter is not None:
-                            errors_counter.value += 1
-                        if error_details is not None:
-                            error_details.append({"file": path_str, "model": model_name, "seconds": seconds, "reason": str(e2)})
-
-            if not isinstance(results, list):
-                results = [results]
-
-            texts = [None if r is None else extract_text(r) for r in results]
-            ts = [None if r is None else format_timestamps(r) for r in results] if do_timestamps else None
-
-            save_results(paths, texts, ts, output_suffix)
-
-            if processed_counter is not None:
-                processed_counter.value += len(paths)
+        logger.info(f"Worker {cuda_id} finished {claimed} shard(s) for {model_name}.")
 
     except Exception as e:
         logger.exception(f"Worker {cuda_id} fatal error ({model_name}): {e}")
@@ -211,7 +247,6 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
             errors_counter.value += 1
         if error_details is not None:
             error_details.append({"worker": cuda_id, "model": model_name, "reason": str(e)})
-
 
 def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int) -> bool:
     texts = []
@@ -301,12 +336,24 @@ def main(args):
             logger.info(f"No files to process for {model_name}")
             continue
 
-        logger.info(f"{len(paths)} files to process")
+        shard_size = load_work_shard_size(args.config_path)
+        work_plan = prepare_work_shards(
+            src_path,
+            f"transcription_{output_suffix}",
+            paths,
+            shard_size=shard_size,
+        )
+        del paths
+
+        logger.info(
+            f"{work_plan.total_items} files to process for {model_name} "
+            f"in {work_plan.shard_count} shard(s)."
+        )
 
         worker_errors, worker_error_details = run_per_gpu_processes(
             run_worker,
             num_gpus=num_gpus,
-            args=(model_name, paths, config, args.config_path, processed, errors, error_details_list),
+            args=(model_name, str(work_plan.work_dir), config, args.config_path, processed, errors, error_details_list),
         )
         if worker_errors:
             errors.value += worker_errors

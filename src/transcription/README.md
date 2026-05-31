@@ -48,6 +48,9 @@ Transcription does **not** touch `balalaika.csv`; per-file results live in the
   already has a `{stem}_{model}.txt` (or matches the `consensus_num` early
   skip rule) so a forced stop simply resumes on the next run.
 * `run_per_gpu_processes` cleanly terminates child processes on `Ctrl+C`.
+* Pending audio paths are written to `.balalaika_work/transcription_<model>/`
+  and claimed shard-by-shard, so large runs do not pickle huge path lists into
+  GPU workers.
 
 ## Dependencies
 
