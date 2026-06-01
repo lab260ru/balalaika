@@ -139,9 +139,11 @@ exceeds a threshold, indicating heavily distorted or clipped audio.
 **Input:** All audio files under `podcasts_path`.
 
 **Process:**
-1. Computes `crest_factor = peak / RMS` for each file using GPU-batched
-   computation via a PyTorch DataLoader.
-2. Writes `crest_factor` to `balalaika.csv`.
+1. Loader workers decode each file and reduce it to scalar `peak`,
+   `sum_squares`, `length`, and `sample_rate` stats, avoiding waveform IPC and
+   padded audio batches in the parent process.
+2. Computes `crest_factor = peak / RMS` from those stats and writes it to
+   `balalaika.csv`.
 3. If `crest_factor > crest_threshold` (default 10.0), **deletes** the audio file.
 4. Records the deletion status and duration in a per-worker partial CSV.
 
@@ -160,7 +162,8 @@ exceeds a threshold, indicating heavily distorted or clipped audio.
 5. On `KeyboardInterrupt`, whatever partial rows exist are merged on next run.
 
 **Config section:** `preprocess` (keys: `crest_treshold`,
-`num_workers_crest_factor`, `crest_factor_batch_size`)
+`num_workers_crest_factor`, `crest_factor_batch_size`,
+`crest_factor_loader_workers`, `crest_factor_prefetch_factor`)
 
 ---
 

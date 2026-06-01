@@ -13,9 +13,9 @@ normalization (ITU-R BS.1770-4).
    default `auto`), upserts rows into `balalaika.csv`; **deletes the original
    long file** after successful chunking.
 2. **`crest_factor_remover`** — computes crest factor (peak/RMS) for every
-   chunk, writes it to `balalaika.csv` as `crest_factor`, deletes files that
-   exceed the threshold, and records the kept/dropped totals (files + hours)
-   to `filter_summary.csv`.
+   chunk from per-file scalar stats produced by loader workers, writes it to
+   `balalaika.csv` as `crest_factor`, deletes files that exceed the threshold,
+   and records the kept/dropped totals (files + hours) to `filter_summary.csv`.
 3. **`preprocess_audio`** — peak + target LUFS. Lossless containers
    (FLAC / WAV) are written through `soundfile` and stay lossless; lossy
    containers (MP3 / OGG / OPUS) round-trip through `torchaudio.save`. Marks

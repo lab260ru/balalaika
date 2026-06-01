@@ -2,7 +2,6 @@ from typing import List
 
 import torch
 import torchaudio
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from torchcodec.decoders import AudioDecoder
 
@@ -22,19 +21,39 @@ class CrestFactorDataset(Dataset):
             waveform, sample_rate = torchaudio.load_with_torchcodec(path)
             waveform = waveform.to(dtype=torch.float32)
             if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            waveform = waveform.squeeze(0).contiguous()
-            return path, waveform, int(sample_rate), int(waveform.numel()), ""
+                waveform = waveform.mean(dim=0)
+            else:
+                waveform = waveform.squeeze(0)
+            waveform = waveform.contiguous()
+            length = int(waveform.numel())
+            if length == 0:
+                return path, 0.0, 0.0, int(sample_rate), 0, ""
+
+            peak = float(waveform.abs().amax().item())
+            sum_squares = float(waveform.square().sum().item())
+            return path, peak, sum_squares, int(sample_rate), length, ""
         except Exception as exc:
-            return path, torch.empty(0, dtype=torch.float32), 0, 0, str(exc)
+            return path, 0.0, 0.0, 0, 0, str(exc)
+
+
+def crest_factor_worker_init(_: int) -> None:
+    torch.set_num_threads(1)
 
 
 def crest_factor_collate(batch):
-    paths, waveforms, sample_rates, lengths, errors = zip(*batch)
+    paths, peaks, sum_squares, sample_rates, lengths, errors = zip(*batch)
+    peaks_tensor = torch.tensor(peaks, dtype=torch.float32)
+    sum_squares_tensor = torch.tensor(sum_squares, dtype=torch.float32)
     lengths_tensor = torch.tensor(lengths, dtype=torch.int64)
     sample_rates_tensor = torch.tensor(sample_rates, dtype=torch.int64)
-    padded = pad_sequence(waveforms, batch_first=True)
-    return list(paths), padded.contiguous(), lengths_tensor, sample_rates_tensor, list(errors)
+    return (
+        list(paths),
+        peaks_tensor,
+        sum_squares_tensor,
+        lengths_tensor,
+        sample_rates_tensor,
+        list(errors),
+    )
 
 
 def create_crest_factor_dataloader(
@@ -54,6 +73,7 @@ def create_crest_factor_dataloader(
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["worker_init_fn"] = crest_factor_worker_init
     return DataLoader(dataset, **loader_kwargs)
 
 

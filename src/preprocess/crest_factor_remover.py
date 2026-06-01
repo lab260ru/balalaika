@@ -74,6 +74,18 @@ def calculate_crest_factors(waveforms: torch.Tensor, lengths: torch.Tensor) -> t
     return torch.where(rms > 0, peak / rms, torch.full_like(rms, float("inf")))
 
 
+def calculate_crest_factors_from_stats(
+    peaks: torch.Tensor,
+    sum_squares: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    lengths_f = lengths.clamp_min(1).to(dtype=sum_squares.dtype)
+    rms = (sum_squares / lengths_f).sqrt()
+    peaks = peaks.to(dtype=sum_squares.dtype)
+    valid = (lengths > 0) & (rms > 0)
+    return torch.where(valid, peaks / rms, torch.full_like(rms, float("inf")))
+
+
 def _process_files(
     rank: int,
     files: List[str],
@@ -105,10 +117,15 @@ def _process_files(
         prefetch_factor=prefetch_factor,
     )
 
-    for paths, waveforms, lengths, sample_rates, errors in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
+    for paths, peaks, sum_squares, lengths, sample_rates, errors in tqdm(
+        dataloader,
+        desc=f"Worker-{rank}",
+        position=rank,
+    ):
         valid_indices = []
         for idx, (path_str, error) in enumerate(zip(paths, errors)):
             if error:
+                errors_counter.value += 1
                 logger.error(f"Error loading {path_str}: {error}")
             else:
                 valid_indices.append(idx)
@@ -117,10 +134,15 @@ def _process_files(
 
         valid = torch.tensor(valid_indices, dtype=torch.long)
         try:
-            batch_waveforms = waveforms.index_select(0, valid)
+            batch_peaks = peaks.index_select(0, valid)
+            batch_sum_squares = sum_squares.index_select(0, valid)
             batch_lengths = lengths.index_select(0, valid)
             batch_sample_rates = sample_rates.index_select(0, valid)
-            crest_factors = calculate_crest_factors(batch_waveforms, batch_lengths).tolist()
+            crest_factors = calculate_crest_factors_from_stats(
+                batch_peaks,
+                batch_sum_squares,
+                batch_lengths,
+            ).tolist()
             durations = (
                 batch_lengths.to(torch.float64) / batch_sample_rates.clamp_min(1).to(torch.float64)
             ).tolist()
