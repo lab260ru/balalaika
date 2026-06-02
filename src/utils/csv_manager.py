@@ -28,6 +28,7 @@ guarantees:
 from __future__ import annotations
 
 import csv
+import fcntl
 import os
 import shutil
 import threading
@@ -48,6 +49,7 @@ AUDIO_EXTENSIONS: Tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".opus")
 DEFAULT_FLUSH_EVERY_ROWS = 10_000
 DEFAULT_FLUSH_EVERY_SECONDS = 300
 CSV_WRITE_CHUNK_ROWS = 100_000
+_CSV_THREAD_LOCK = threading.RLock()
 
 # Canonical column ordering for the main CSV. Anything not listed is appended
 # after the recognised columns in original insertion order.
@@ -136,8 +138,17 @@ def _read_csv_safe(path: Path) -> Optional[pd.DataFrame]:
         except Exception as exc:
             logger.warning(f"Failed to read {path}: {exc}; trying tmp fallback.")
 
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    if tmp.exists():
+    tmp_candidates = [path.with_suffix(path.suffix + ".tmp")]
+    tmp_candidates.extend(
+        sorted(
+            path.parent.glob(f"{path.name}.tmp.*"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+            reverse=True,
+        )
+    )
+    for tmp in tmp_candidates:
+        if not tmp.exists():
+            continue
         try:
             logger.info(f"Reading CSV fallback {tmp.name}...")
             df = pd.read_csv(tmp, low_memory=False)
@@ -147,6 +158,20 @@ def _read_csv_safe(path: Path) -> Optional[pd.DataFrame]:
             logger.warning(f"Could not recover {tmp}: {exc}")
 
     return None
+
+
+@contextmanager
+def _csv_write_lock(path: Path):
+    """Serialize read/merge/write cycles for one main CSV across threads/processes."""
+    lock_path = Path(str(path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _CSV_THREAD_LOCK:
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _copy_file_with_progress(src: Path, dst: Path, *, desc: str) -> None:
@@ -182,15 +207,11 @@ def _write_csv_with_progress(df: pd.DataFrame, path: Path, *, desc: str) -> None
             )
 
 
-def atomic_write_csv(df: pd.DataFrame, path: os.PathLike | str) -> None:
-    """Write ``df`` to ``path`` atomically (tmp file + rename + fsync).
-
-    A backup ``<path>.bak`` is kept so :func:`ensure_main_csv` can recover if
-    the process is killed mid-write and leaves the CSV corrupt.
-    """
-    path = Path(path)
+def _atomic_write_csv_unlocked(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(
+        f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
     bak = Path(str(path) + ".bak")
 
     if path.exists():
@@ -203,6 +224,18 @@ def atomic_write_csv(df: pd.DataFrame, path: os.PathLike | str) -> None:
     except OSError:
         pass
     os.replace(tmp, path)
+
+
+def atomic_write_csv(df: pd.DataFrame, path: os.PathLike | str) -> None:
+    """Write ``df`` to ``path`` atomically (tmp file + rename + fsync).
+
+    A backup ``<path>.bak`` is kept so :func:`ensure_main_csv` can recover if
+    the process is killed mid-write and leaves the CSV corrupt. The whole write
+    is serialized with a per-CSV lock so periodic and final merges cannot race.
+    """
+    path = Path(path)
+    with _csv_write_lock(path):
+        _atomic_write_csv_unlocked(df, path)
 
 
 # ---------------------------------------------------------------------------
@@ -255,45 +288,46 @@ def ensure_main_csv(
     supplied and the CSV did not yet exist).
     """
     target = csv_path(podcasts_path)
-    bak = Path(str(target) + ".bak")
-    df = _read_csv_safe(target)
+    with _csv_write_lock(target):
+        bak = Path(str(target) + ".bak")
+        df = _read_csv_safe(target)
 
-    if df is None or df.empty or "filepath" not in df.columns:
-        bak_df = _read_csv_safe(bak)
-        if bak_df is not None and not bak_df.empty and "filepath" in bak_df.columns:
-            logger.warning(
-                f"{target.name} is corrupt — restored {len(bak_df)} rows from "
-                f"{bak.name}"
-            )
-            atomic_write_csv(bak_df, target)
-            df = _normalize_filepath_column(bak_df)
-        elif audio_paths is None:
-            logger.error(
-                f"{target.name} and {bak.name} are both corrupt — "
-                "creating empty CSV. Some column data may be permanently lost."
-            )
-            df = pd.DataFrame(columns=["filepath"])
-        else:
-            logger.error(
-                f"{target.name} and {bak.name} are both corrupt — "
-                "bootstrapping fresh CSV from audio tree. Some column data "
-                "may be permanently lost."
-            )
-            paths = sorted(
-                set(
-                    normalize_path_values(
-                        audio_paths,
-                        desc="bootstrap_audio_paths",
-                        drop_empty=True,
+        if df is None or df.empty or "filepath" not in df.columns:
+            bak_df = _read_csv_safe(bak)
+            if bak_df is not None and not bak_df.empty and "filepath" in bak_df.columns:
+                logger.warning(
+                    f"{target.name} is corrupt — restored {len(bak_df)} rows from "
+                    f"{bak.name}"
+                )
+                _atomic_write_csv_unlocked(bak_df, target)
+                df = _normalize_filepath_column(bak_df)
+            elif audio_paths is None:
+                logger.error(
+                    f"{target.name} and {bak.name} are both corrupt — "
+                    "creating empty CSV. Some column data may be permanently lost."
+                )
+                df = pd.DataFrame(columns=["filepath"])
+            else:
+                logger.error(
+                    f"{target.name} and {bak.name} are both corrupt — "
+                    "bootstrapping fresh CSV from audio tree. Some column data "
+                    "may be permanently lost."
+                )
+                paths = sorted(
+                    set(
+                        normalize_path_values(
+                            audio_paths,
+                            desc="bootstrap_audio_paths",
+                            drop_empty=True,
+                        )
                     )
                 )
-            )
-            df = pd.DataFrame({"filepath": paths})
+                df = pd.DataFrame({"filepath": paths})
 
-        atomic_write_csv(df, target)
-        return df
+            _atomic_write_csv_unlocked(df, target)
+            return df
 
-    return _normalize_filepath_column(df)
+        return _normalize_filepath_column(df)
 
 
 def upsert_columns(
@@ -327,75 +361,76 @@ def upsert_columns(
     Returns the resulting DataFrame after the atomic write.
     """
     target = csv_path(podcasts_path)
-    df = _read_csv_safe(target)
-    if df is None or "filepath" not in df.columns:
-        df = pd.DataFrame(columns=["filepath"])
-    df = _normalize_filepath_column(df)
+    with _csv_write_lock(target):
+        df = _read_csv_safe(target)
+        if df is None or "filepath" not in df.columns:
+            df = pd.DataFrame(columns=["filepath"])
+        df = _normalize_filepath_column(df)
 
-    if bootstrap_audio_paths is not None:
-        boot = pd.DataFrame(
-            {
-                "filepath": normalize_path_values(
-                    bootstrap_audio_paths,
-                    desc="bootstrap_audio_paths",
-                    drop_empty=True,
+        if bootstrap_audio_paths is not None:
+            boot = pd.DataFrame(
+                {
+                    "filepath": normalize_path_values(
+                        bootstrap_audio_paths,
+                        desc="bootstrap_audio_paths",
+                        drop_empty=True,
+                    )
+                }
+            )
+            boot = boot.drop_duplicates(subset="filepath")
+            # Preserve any existing column values; only add brand-new rows.
+            df = pd.concat([df, boot], ignore_index=True).drop_duplicates(
+                subset="filepath", keep="first"
+            )
+
+        if results_df is not None and not results_df.empty:
+            if "filepath" not in results_df.columns:
+                raise ValueError("results_df must contain a 'filepath' column")
+            results = _normalize_filepath_column(results_df.copy())
+            present = [c for c in value_columns if c in results.columns]
+            results = results[["filepath", *present]].drop_duplicates(
+                subset="filepath", keep="last"
+            )
+            if preserve_existing:
+                df = df.merge(
+                    results,
+                    on="filepath",
+                    how="outer",
+                    suffixes=("", "__incoming"),
                 )
-            }
-        )
-        boot = boot.drop_duplicates(subset="filepath")
-        # Preserve any existing column values; only add brand-new rows.
-        df = pd.concat([df, boot], ignore_index=True).drop_duplicates(
-            subset="filepath", keep="first"
-        )
+                for col in present:
+                    incoming_col = f"{col}__incoming"
+                    if incoming_col not in df.columns:
+                        continue
+                    if col in df.columns:
+                        df[col] = df[incoming_col].combine_first(df[col])
+                        df = df.drop(columns=[incoming_col])
+                    else:
+                        df = df.rename(columns={incoming_col: col})
+            else:
+                df = df.drop(columns=present, errors="ignore")
+                df = df.merge(results, on="filepath", how="outer")
 
-    if results_df is not None and not results_df.empty:
-        if "filepath" not in results_df.columns:
-            raise ValueError("results_df must contain a 'filepath' column")
-        results = _normalize_filepath_column(results_df.copy())
-        present = [c for c in value_columns if c in results.columns]
-        results = results[["filepath", *present]].drop_duplicates(
-            subset="filepath", keep="last"
-        )
-        if preserve_existing:
-            df = df.merge(
-                results,
-                on="filepath",
-                how="outer",
-                suffixes=("", "__incoming"),
-            )
-            for col in present:
-                incoming_col = f"{col}__incoming"
-                if incoming_col not in df.columns:
-                    continue
-                if col in df.columns:
-                    df[col] = df[incoming_col].combine_first(df[col])
-                    df = df.drop(columns=[incoming_col])
-                else:
-                    df = df.rename(columns={incoming_col: col})
-        else:
-            df = df.drop(columns=present, errors="ignore")
-            df = df.merge(results, on="filepath", how="outer")
+        if drop_missing_files and not df.empty:
+            before = len(df)
+            existing_mask = [
+                bool(p) and Path(p).exists()
+                for p in tqdm(
+                    df["filepath"].astype(str).tolist(),
+                    total=len(df),
+                    desc="check_existing_files",
+                )
+            ]
+            df = df[existing_mask]
+            removed = before - len(df)
+            if removed:
+                logger.info(
+                    f"Pruned {removed} rows whose audio files no longer exist."
+                )
 
-    if drop_missing_files and not df.empty:
-        before = len(df)
-        existing_mask = [
-            bool(p) and Path(p).exists()
-            for p in tqdm(
-                df["filepath"].astype(str).tolist(),
-                total=len(df),
-                desc="check_existing_files",
-            )
-        ]
-        df = df[existing_mask]
-        removed = before - len(df)
-        if removed:
-            logger.info(
-                f"Pruned {removed} rows whose audio files no longer exist."
-            )
-
-    df = _reorder_columns(df)
-    atomic_write_csv(df, target)
-    return df
+        df = _reorder_columns(df)
+        _atomic_write_csv_unlocked(df, target)
+        return df
 
 
 def unprocessed_paths(
@@ -868,7 +903,12 @@ class PeriodicCsvMerger:
     def __exit__(self, exc_type, exc, tb) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=self.poll_interval + 5)
+            if self._thread.is_alive():
+                logger.info(
+                    "Periodic CSV merger stopping; waiting for any active "
+                    "balalaika.csv flush to finish."
+                )
+            self._thread.join()
 
 
 # ---------------------------------------------------------------------------

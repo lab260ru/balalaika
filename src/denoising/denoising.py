@@ -7,6 +7,7 @@ and trimmed back to the original decoded length before saving.
 """
 
 import argparse
+import time
 from pathlib import Path
 from typing import Dict, List, Set
 
@@ -210,10 +211,24 @@ def _process_files(
         pad_mode=MODEL_PAD_MODE,
         max_padded_len=MODEL_MAX_PADDED_LEN,
     )
+    prefetch_batches = loader_workers * prefetch_factor if loader_workers > 0 else 0
+    logger.debug(
+        f"perf dataloader_config stage=denoising rank={rank} "
+        f"batch_size={batch_size} workers={loader_workers} "
+        f"prefetch_factor={prefetch_factor} prefetch_batches={prefetch_batches} "
+        f"items={len(pending_files)}"
+    )
 
-    for paths, batch, lengths, errors in tqdm(
+    batch_wait_started_at = time.perf_counter()
+    for batch_idx, (paths, batch, lengths, errors) in enumerate(tqdm(
         dataloader, desc=f"Denoising-{rank}", position=rank
-    ):
+    )):
+        batch_received_at = time.perf_counter()
+        logger.debug(
+            f"perf dataloader_wait stage=denoising rank={rank} "
+            f"batch={batch_idx} seconds={batch_received_at - batch_wait_started_at:.6f} "
+            f"items={len(paths)}"
+        )
         valid_indices = []
         valid_paths = []
         valid_lengths = []
@@ -231,17 +246,25 @@ def _process_files(
             valid_lengths.append(int(length))
 
         if not valid_indices:
+            batch_wait_started_at = time.perf_counter()
             continue
 
         try:
             input_np = batch[valid_indices].numpy().astype(np.float32, copy=False)
+            inference_started_at = time.perf_counter()
             denoised = session.run([output_name], {input_name: input_np})[0]
+            logger.debug(
+                f"perf model=denoising event=inference rank={rank} "
+                f"batch={batch_idx} seconds={time.perf_counter() - inference_started_at:.6f} "
+                f"items={len(valid_indices)} frames={int(input_np.shape[-1])}"
+            )
             denoised = np.asarray(denoised)
             if denoised.ndim == 1:
                 denoised = denoised[np.newaxis, :]
         except Exception as exc:
             logger.error(f"ONNX denoising batch failed on worker {rank}: {exc}")
             errors_counter.value += len(valid_indices)
+            batch_wait_started_at = time.perf_counter()
             continue
 
         for out_index, (path_str, length) in enumerate(zip(valid_paths, valid_lengths)):
@@ -259,22 +282,34 @@ def _process_files(
                 enhanced_tensor = torch.from_numpy(
                     enhanced.astype(np.float32, copy=False) / 32768.0
                 ).unsqueeze(0)
+                save_started_at = time.perf_counter()
                 torchaudio.save_with_torchcodec(
                     str(path_str),
                     enhanced_tensor,
                     MODEL_SAMPLE_RATE,
                 )
+                logger.debug(
+                    f"perf audio_save stage=denoising rank={rank} "
+                    f"seconds={time.perf_counter() - save_started_at:.6f} "
+                    f"path={path_str} sample_rate={MODEL_SAMPLE_RATE} frames={int(length)}"
+                )
+                write_started_at = time.perf_counter()
                 writer.write(
                     {
                         "filepath": resolved,
                         PROCESSED_COLUMN: True,
                     }
                 )
+                logger.debug(
+                    f"perf partial_write stage=denoising rank={rank} "
+                    f"seconds={time.perf_counter() - write_started_at:.6f} path={resolved}"
+                )
                 already_done.add(resolved)
                 processed_counter.value += 1
             except Exception as exc:
                 logger.error(f"Failed to save denoised audio {path_str}: {exc}")
                 errors_counter.value += 1
+        batch_wait_started_at = time.perf_counter()
 
 
 def run_worker(

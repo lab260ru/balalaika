@@ -7,6 +7,7 @@ probability exceeds the configured threshold.
 
 import argparse
 import os
+import time
 from pathlib import Path
 from typing import List, Set
 
@@ -155,24 +156,46 @@ def _process_files(
         sample_rate=MODEL_SAMPLE_RATE,
         num_samples=MODEL_NUM_SAMPLES,
     )
+    prefetch_batches = num_workers * prefetch_factor if num_workers > 0 else 0
+    logger.debug(
+        f"perf dataloader_config stage=antispoofing rank={rank} "
+        f"batch_size={batch_size} workers={num_workers} "
+        f"prefetch_factor={prefetch_factor} prefetch_batches={prefetch_batches} "
+        f"items={len(pending_files)}"
+    )
 
-    for paths, batch, lengths, load_errors in tqdm(
+    batch_wait_started_at = time.perf_counter()
+    for batch_idx, (paths, batch, lengths, load_errors) in enumerate(tqdm(
         dataloader, desc=f"AntiSpoof-{rank}", position=rank
-    ):
+    )):
+        batch_received_at = time.perf_counter()
+        logger.debug(
+            f"perf dataloader_wait stage=antispoofing rank={rank} "
+            f"batch={batch_idx} seconds={batch_received_at - batch_wait_started_at:.6f} "
+            f"items={len(paths)}"
+        )
         for path_str, reason in load_errors:
             logger.error(f"Audio load failed {path_str}: {reason}")
             errors_counter.value += 1
 
         if not paths:
+            batch_wait_started_at = time.perf_counter()
             continue
 
         feed = {MODEL_INPUT_NAME: batch.numpy().astype(np.float32, copy=False)}
         try:
+            inference_started_at = time.perf_counter()
             logits = session.run([MODEL_OUTPUT_NAME], feed)[0]
             generated_probs = generated_probability(logits, GENERATED_CLASS_INDEX)
+            logger.debug(
+                f"perf model=antispoofing event=inference rank={rank} "
+                f"batch={batch_idx} seconds={time.perf_counter() - inference_started_at:.6f} "
+                f"items={len(paths)} frames={int(batch.shape[-1])}"
+            )
         except Exception as exc:
             logger.error(f"Anti-spoofing batch failed on worker {rank}: {exc}")
             errors_counter.value += len(paths)
+            batch_wait_started_at = time.perf_counter()
             continue
 
         for path_str, length, prob in zip(paths, lengths.tolist(), generated_probs.tolist()):
@@ -189,12 +212,18 @@ def _process_files(
             deleted = False
             if prob_val > threshold:
                 try:
+                    delete_started_at = time.perf_counter()
                     os.remove(path_str)
+                    logger.debug(
+                        f"perf audio_delete stage=antispoofing rank={rank} "
+                        f"seconds={time.perf_counter() - delete_started_at:.6f} path={path_str}"
+                    )
                     deleted = True
                 except OSError as exc:
                     logger.warning(f"Could not delete {path_str}: {exc}")
                     errors_counter.value += 1
 
+            write_started_at = time.perf_counter()
             writer.write(
                 {
                     "filepath": resolved,
@@ -204,8 +233,13 @@ def _process_files(
                     "deleted": deleted,
                 }
             )
+            logger.debug(
+                f"perf partial_write stage=antispoofing rank={rank} "
+                f"seconds={time.perf_counter() - write_started_at:.6f} path={resolved}"
+            )
             already_done.add(resolved)
             processed_counter.value += 1
+        batch_wait_started_at = time.perf_counter()
 
 
 def run_worker(

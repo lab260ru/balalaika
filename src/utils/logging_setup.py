@@ -45,7 +45,7 @@ def _resolve_log_dir(log_dir: Optional[str]) -> Path:
 def setup_logging(
     stage: str,
     log_dir: Optional[str] = None,
-    level: str = "INFO",
+    level: Optional[str] = None,
     capture_warnings: bool = True,
 ) -> Path:
     """Configure loguru sinks for a pipeline stage.
@@ -62,6 +62,7 @@ def setup_logging(
     Returns:
         The absolute path to the file sink for this run.
     """
+    resolved_level = str(level or os.environ.get("BALALAIKA_LOG_LEVEL", "INFO")).upper()
     resolved_dir = _resolve_log_dir(log_dir)
     resolved_dir.mkdir(parents=True, exist_ok=True)
 
@@ -72,7 +73,7 @@ def setup_logging(
     logger.add(
         sys.stderr,
         format=_FORMAT_CONSOLE,
-        level=level,
+        level=resolved_level,
         enqueue=True,
         backtrace=True,
         diagnose=False,
@@ -80,7 +81,7 @@ def setup_logging(
     logger.add(
         log_path,
         format=_FORMAT_FILE,
-        level=level,
+        level=resolved_level,
         rotation="200 MB",
         retention=10,
         encoding="utf-8",

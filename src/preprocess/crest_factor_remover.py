@@ -27,6 +27,7 @@ operators can replay long batch runs offline.
 
 import argparse
 import os
+import time
 from pathlib import Path
 from typing import List, Set
 
@@ -116,12 +117,26 @@ def _process_files(
         num_workers=loader_workers,
         prefetch_factor=prefetch_factor,
     )
+    prefetch_batches = loader_workers * prefetch_factor if loader_workers > 0 else 0
+    logger.debug(
+        f"perf dataloader_config stage=crest_factor rank={rank} "
+        f"batch_size={batch_size} workers={loader_workers} "
+        f"prefetch_factor={prefetch_factor} prefetch_batches={prefetch_batches} "
+        f"items={len(pending_files)}"
+    )
 
-    for paths, peaks, sum_squares, lengths, sample_rates, errors in tqdm(
+    batch_wait_started_at = time.perf_counter()
+    for batch_idx, (paths, peaks, sum_squares, lengths, sample_rates, errors) in enumerate(tqdm(
         dataloader,
         desc=f"Worker-{rank}",
         position=rank,
-    ):
+    )):
+        batch_received_at = time.perf_counter()
+        logger.debug(
+            f"perf dataloader_wait stage=crest_factor rank={rank} "
+            f"batch={batch_idx} seconds={batch_received_at - batch_wait_started_at:.6f} "
+            f"items={len(paths)}"
+        )
         valid_indices = []
         for idx, (path_str, error) in enumerate(zip(paths, errors)):
             if error:
@@ -130,10 +145,12 @@ def _process_files(
             else:
                 valid_indices.append(idx)
         if not valid_indices:
+            batch_wait_started_at = time.perf_counter()
             continue
 
         valid = torch.tensor(valid_indices, dtype=torch.long)
         try:
+            inference_started_at = time.perf_counter()
             batch_peaks = peaks.index_select(0, valid)
             batch_sum_squares = sum_squares.index_select(0, valid)
             batch_lengths = lengths.index_select(0, valid)
@@ -146,9 +163,15 @@ def _process_files(
             durations = (
                 batch_lengths.to(torch.float64) / batch_sample_rates.clamp_min(1).to(torch.float64)
             ).tolist()
+            logger.debug(
+                f"perf model=crest_factor event=batch_compute rank={rank} "
+                f"batch={batch_idx} seconds={time.perf_counter() - inference_started_at:.6f} "
+                f"items={len(valid_indices)}"
+            )
         except Exception as exc:
             errors_counter.value += 1
             logger.error(f"Error processing batch on worker {rank}: {exc}")
+            batch_wait_started_at = time.perf_counter()
             continue
 
         valid_paths = [paths[i] for i in valid_indices]
@@ -167,6 +190,7 @@ def _process_files(
                 except OSError as exc:
                     logger.error(f"Could not delete {path_str}: {exc}")
 
+            write_started_at = time.perf_counter()
             writer.write(
                 {
                     "filepath": resolved,
@@ -175,8 +199,13 @@ def _process_files(
                     "deleted": deleted,
                 }
             )
+            logger.debug(
+                f"perf partial_write stage=crest_factor rank={rank} "
+                f"seconds={time.perf_counter() - write_started_at:.6f} path={resolved}"
+            )
             already_done.add(resolved)
             processed_counter.value += 1
+        batch_wait_started_at = time.perf_counter()
 
 
 def run_worker(

@@ -22,6 +22,7 @@ CSV resilience:
 """
 
 import argparse
+import time
 from pathlib import Path
 from typing import List, Set, Tuple
 
@@ -97,7 +98,13 @@ def _write_audio(audio_path: str, samples: np.ndarray, sample_rate: int) -> None
     """Write samples shaped ``(channels, frames)`` using TorchCodec."""
     array = samples if samples.ndim == 2 else samples[np.newaxis, :]
     tensor = torch.as_tensor(array, dtype=torch.float32)
+    save_started_at = time.perf_counter()
     torchaudio.save_with_torchcodec(audio_path, tensor, sample_rate)
+    logger.debug(
+        f"perf audio_save stage=loudness path={audio_path} "
+        f"seconds={time.perf_counter() - save_started_at:.6f} "
+        f"sample_rate={int(sample_rate)} frames={int(tensor.shape[-1])}"
+    )
 
 
 def process_audio_file(
@@ -165,8 +172,22 @@ def _process_files(
         num_workers=loader_workers,
         prefetch_factor=prefetch_factor,
     )
+    prefetch_batches = loader_workers * prefetch_factor if loader_workers > 0 else 0
+    logger.debug(
+        f"perf dataloader_config stage=loudness rank={rank} "
+        f"batch_size={batch_size} workers={loader_workers} "
+        f"prefetch_factor={prefetch_factor} prefetch_batches={prefetch_batches} "
+        f"items={len(pending_files)}"
+    )
 
-    for batch in tqdm(dataloader, desc=f"Worker-{rank}", position=rank):
+    batch_wait_started_at = time.perf_counter()
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Worker-{rank}", position=rank)):
+        batch_received_at = time.perf_counter()
+        logger.debug(
+            f"perf dataloader_wait stage=loudness rank={rank} "
+            f"batch={batch_idx} seconds={batch_received_at - batch_wait_started_at:.6f} "
+            f"items={len(batch)}"
+        )
         for file_path, audio, sample_rate, error in batch:
             if error:
                 logger.error(f"Error loading {file_path}: {error}")
@@ -176,11 +197,23 @@ def _process_files(
             if resolved in already_done:
                 skipped_counter.value += 1
                 continue
+            inference_started_at = time.perf_counter()
             ok = process_audio_file(str(file_path), audio, sample_rate, peak, loudness, block_size)
+            logger.debug(
+                f"perf model=loudness_normalize event=process_file rank={rank} "
+                f"seconds={time.perf_counter() - inference_started_at:.6f} "
+                f"path={file_path} sample_rate={int(sample_rate)} frames={int(audio.shape[-1])}"
+            )
             if ok:
+                write_started_at = time.perf_counter()
                 writer.write({"filepath": resolved, NORMALIZED_COLUMN: True})
+                logger.debug(
+                    f"perf partial_write stage=loudness rank={rank} "
+                    f"seconds={time.perf_counter() - write_started_at:.6f} path={resolved}"
+                )
                 already_done.add(resolved)
                 processed_counter.value += 1
+        batch_wait_started_at = time.perf_counter()
 
 
 def run_worker(

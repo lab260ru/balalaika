@@ -24,6 +24,7 @@ import argparse
 import multiprocessing
 import os
 import re
+import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -148,7 +149,13 @@ def diarize_audio(audio: torch.Tensor, sr: int, chunk_duration: float = DEFAULT_
         end = min(offset + chunk_samples, total_samples)
         chunk = audio[:, offset:end]
 
+        inference_started_at = time.perf_counter()
         raw = sortformer_model.diarize(audio=chunk, sample_rate=sr, include_tensor_outputs=False)
+        logger.debug(
+            f"perf model=sortformer event=inference "
+            f"seconds={time.perf_counter() - inference_started_at:.6f} "
+            f"sample_rate={sr} frames={int(chunk.shape[-1])}"
+        )
         segs = parse_diarization_output(raw)
 
         offset_sec = offset / sr
@@ -237,7 +244,13 @@ def apply_eos_classification(
         segment_audio = audio_np[int(s * vad_sr):min(int(e * vad_sr), len(audio_np))]
         if len(segment_audio) == 0:
             continue
+        inference_started_at = time.perf_counter()
         pred = smart_vad.predict_endpoint(segment_audio, sample_rate=vad_sr)['prediction'] if smart_vad else 1
+        logger.debug(
+            f"perf model=smart_vad event=inference "
+            f"seconds={time.perf_counter() - inference_started_at:.6f} "
+            f"sample_rate={vad_sr} frames={len(segment_audio)}"
+        )
         classified.append((s, e, spk, pred))
 
     merged: List[Tuple[float, float, int]] = []
@@ -350,7 +363,13 @@ def _save_audio_chunk(out_path: str, segment: torch.Tensor, sr: int, fmt: str) -
     if segment.ndim == 1:
         segment = segment.unsqueeze(0)
     encoder = AudioEncoder(segment.contiguous(), sample_rate=int(sr))
+    save_started_at = time.perf_counter()
     encoder.to_file(out_path)
+    logger.debug(
+        f"perf audio_save stage=preprocess path={out_path} "
+        f"seconds={time.perf_counter() - save_started_at:.6f} "
+        f"sample_rate={int(sr)} frames={int(segment.shape[-1])} format={fmt}"
+    )
 
 
 def cut_audio(
@@ -572,11 +591,28 @@ def _run_diarization_shard(
         num_workers=int(config.get("diarization_loader_workers", num_loader_workers)),
         prefetch_factor=int(config.get("diarization_prefetch_factor", 2)),
     )
+    batch_size = int(config.get("diarization_batch_size", 1))
+    loader_workers = int(config.get("diarization_loader_workers", num_loader_workers))
+    prefetch_factor = int(config.get("diarization_prefetch_factor", 2))
+    prefetch_batches = loader_workers * prefetch_factor if loader_workers > 0 else 0
+    logger.debug(
+        f"perf dataloader_config stage=preprocess rank={gpu_id} "
+        f"batch_size={batch_size} workers={loader_workers} "
+        f"prefetch_factor={prefetch_factor} prefetch_batches={prefetch_batches} "
+        f"items={len(gpu_files)}"
+    )
 
     with PartialCsvWriter(
         podcasts_path, PARTIAL_PREFIX, gpu_id, fieldnames=PARTIAL_FIELDS
     ) as writer:
-        for batch in tqdm(dataloader, total=len(dataloader), desc=f"GPU {gpu_id}", position=gpu_id):
+        batch_wait_started_at = time.perf_counter()
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=len(dataloader), desc=f"GPU {gpu_id}", position=gpu_id)):
+            batch_received_at = time.perf_counter()
+            logger.debug(
+                f"perf dataloader_wait stage=preprocess rank={gpu_id} "
+                f"batch={batch_idx} seconds={batch_received_at - batch_wait_started_at:.6f} "
+                f"items={len(batch)}"
+            )
             for path_audio, audio, sr, error in batch:
                 if error:
                     logger.error(f"Broken file {path_audio}: {error}")
@@ -585,10 +621,17 @@ def _run_diarization_shard(
                     res = process_audio_file(str(path_audio), audio, sr, config)
                     if res and res.get("segments"):
                         for seg in res["segments"]:
+                            write_started_at = time.perf_counter()
                             writer.write({k: seg.get(k, "") for k in PARTIAL_FIELDS})
+                            logger.debug(
+                                f"perf partial_write stage=preprocess rank={gpu_id} "
+                                f"seconds={time.perf_counter() - write_started_at:.6f} "
+                                f"path={seg.get('filepath', '')}"
+                            )
                             results.append(seg)
                 except Exception as e:
                     logger.error(f"Task error on GPU {gpu_id}: {e}")
+            batch_wait_started_at = time.perf_counter()
 
     return results
 

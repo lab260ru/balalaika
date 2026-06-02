@@ -1,7 +1,9 @@
+import time
 from typing import List
 
 import torch
 import torchaudio
+from loguru import logger
 from torch.utils.data import DataLoader, Dataset
 from torchcodec.decoders import AudioDecoder
 
@@ -17,6 +19,7 @@ class CrestFactorDataset(Dataset):
 
     def __getitem__(self, idx: int):
         path = self.file_paths[idx]
+        started_at = time.perf_counter()
         try:
             waveform, sample_rate = torchaudio.load_with_torchcodec(path)
             waveform = waveform.to(dtype=torch.float32)
@@ -31,8 +34,17 @@ class CrestFactorDataset(Dataset):
 
             peak = float(waveform.abs().amax().item())
             sum_squares = float(waveform.square().sum().item())
+            logger.debug(
+                f"dataloader_audio_load dataset=crest path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} "
+                f"sample_rate={int(sample_rate)} frames={length}"
+            )
             return path, peak, sum_squares, int(sample_rate), length, ""
         except Exception as exc:
+            logger.debug(
+                f"dataloader_audio_load dataset=crest path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
+            )
             return path, 0.0, 0.0, 0, 0, str(exc)
 
 
@@ -86,10 +98,20 @@ class LoudnessNormalizeDataset(Dataset):
 
     def __getitem__(self, idx: int):
         path = self.file_paths[idx]
+        started_at = time.perf_counter()
         try:
             waveform, sample_rate = torchaudio.load_with_torchcodec(path)
+            logger.debug(
+                f"dataloader_audio_load dataset=loudness path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} "
+                f"sample_rate={int(sample_rate)} frames={int(waveform.shape[-1])}"
+            )
             return path, waveform.to(dtype=torch.float32).contiguous(), int(sample_rate), ""
         except Exception as exc:
+            logger.debug(
+                f"dataloader_audio_load dataset=loudness path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
+            )
             return path, torch.empty(0, dtype=torch.float32), 0, str(exc)
 
 
@@ -135,6 +157,7 @@ class DiarizationDataset(Dataset):
 
     def __getitem__(self, idx: int):
         path = self.file_paths[idx]
+        started_at = time.perf_counter()
         try:
             decoder = AudioDecoder(path, sample_rate=DIARIZATION_SAMPLE_RATE)
             samples = decoder.get_all_samples()
@@ -143,8 +166,17 @@ class DiarizationDataset(Dataset):
                 waveform = waveform.unsqueeze(0)
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
+            logger.debug(
+                f"dataloader_audio_load dataset=diarization path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} "
+                f"sample_rate={DIARIZATION_SAMPLE_RATE} frames={int(waveform.shape[-1])}"
+            )
             return path, waveform.contiguous(), DIARIZATION_SAMPLE_RATE, ""
         except Exception as exc:
+            logger.debug(
+                f"dataloader_audio_load dataset=diarization path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
+            )
             return path, torch.empty(0, dtype=torch.float32), 0, str(exc)
 
 

@@ -98,22 +98,47 @@ def _process_files(
         prefetch_factor=prefetch_factor,
         cache_dir=str(podcasts_path),
     )
+    prefetch_batches = num_loader_workers * prefetch_factor if num_loader_workers > 0 else 0
+    logger.debug(
+        f"perf dataloader_config stage=distillmos rank={rank} "
+        f"batch_size={batch_size} workers={num_loader_workers} "
+        f"prefetch_factor={prefetch_factor} prefetch_batches={prefetch_batches} "
+        f"items={len(pending_files)}"
+    )
 
     with torch.inference_mode():
-        for paths, batch in tqdm(dataloader, desc=f"DistillMOS-{rank}", position=rank):
+        batch_wait_started_at = time.perf_counter()
+        for batch_idx, (paths, batch) in enumerate(tqdm(dataloader, desc=f"DistillMOS-{rank}", position=rank)):
+            batch_received_at = time.perf_counter()
+            logger.debug(
+                f"perf dataloader_wait stage=distillmos rank={rank} "
+                f"batch={batch_idx} seconds={batch_received_at - batch_wait_started_at:.6f} "
+                f"items={len(paths)}"
+            )
             try:
                 batch = batch.to(device, non_blocking=True)
+                inference_started_at = time.perf_counter()
                 mos = sqa_model(batch).detach().flatten().cpu()
+                logger.debug(
+                    f"perf model=distillmos event=inference rank={rank} "
+                    f"batch={batch_idx} seconds={time.perf_counter() - inference_started_at:.6f} "
+                    f"items={len(paths)} frames={int(batch.shape[-1])}"
+                )
                 for path_str, mos_val in zip(paths, mos.tolist()):
                     resolved = resolve_path(path_str)
                     if resolved in already_done:
                         skipped_counter.value += 1
                         continue
+                    write_started_at = time.perf_counter()
                     writer.write(
                         {
                             "filepath": resolved,
                             COLUMN: float(mos_val),
                         }
+                    )
+                    logger.debug(
+                        f"perf partial_write stage=distillmos rank={rank} "
+                        f"seconds={time.perf_counter() - write_started_at:.6f} path={resolved}"
                     )
                     already_done.add(resolved)
                     processed_counter.value += 1
@@ -124,7 +149,9 @@ def _process_files(
             except Exception as exc:
                 logger.warning(f"Error processing batch on worker {rank}: {exc}")
                 errors_counter.value += 1
+                batch_wait_started_at = time.perf_counter()
                 continue
+            batch_wait_started_at = time.perf_counter()
 
 
 def run_inference_worker(

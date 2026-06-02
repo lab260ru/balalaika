@@ -1,10 +1,12 @@
 import math
+import time
 from functools import partial
 from typing import List, Tuple
 
 import numpy as np
 import torch
 import torchaudio
+from loguru import logger
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -44,6 +46,7 @@ class DenoisingDataset(Dataset):
 
     def __getitem__(self, idx: int):
         path = self.file_paths[idx]
+        started_at = time.perf_counter()
         try:
             waveform, source_sample_rate = torchaudio.load_with_torchcodec(path)
             waveform = waveform.to(dtype=torch.float32)
@@ -58,8 +61,17 @@ class DenoisingDataset(Dataset):
             audio = normalize_to_int16(waveform.squeeze(0).numpy())
             if audio.size == 0:
                 raise RuntimeError("empty audio")
+            logger.debug(
+                f"dataloader_audio_load dataset=denoising path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} "
+                f"sample_rate={self.sample_rate} frames={int(audio.shape[0])}"
+            )
             return path, torch.from_numpy(audio), int(audio.shape[0]), ""
         except Exception as exc:
+            logger.debug(
+                f"dataloader_audio_load dataset=denoising path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
+            )
             return path, torch.empty(0, dtype=torch.int16), 0, str(exc)
 
 

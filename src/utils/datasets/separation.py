@@ -1,11 +1,13 @@
 import json
 import logging
 import random
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
 import torchaudio
+from loguru import logger as loguru_logger
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -27,9 +29,14 @@ class DistillMOSDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[str, torch.Tensor]:
         path_str = self.file_paths[idx]
+        started_at = time.perf_counter()
         try:
             waveform, sample_rate = torchaudio.load_with_torchcodec(path_str)
         except Exception:
+            loguru_logger.debug(
+                f"dataloader_audio_load dataset=distillmos path={path_str} "
+                f"seconds={time.perf_counter() - started_at:.6f} error=load_failed"
+            )
             logger.warning("Failed to load %s, returning silence", path_str)
             return path_str, torch.zeros(DISTILLMOS_SAMPLE_RATE // 100)
         if waveform.shape[0] > 1:
@@ -40,6 +47,11 @@ class DistillMOSDataset(Dataset):
                 sample_rate,
                 DISTILLMOS_SAMPLE_RATE,
             )
+        loguru_logger.debug(
+            f"dataloader_audio_load dataset=distillmos path={path_str} "
+            f"seconds={time.perf_counter() - started_at:.6f} "
+            f"sample_rate={DISTILLMOS_SAMPLE_RATE} frames={int(waveform.shape[-1])}"
+        )
         return path_str, waveform.squeeze(0).contiguous()
 
 
@@ -152,6 +164,7 @@ class AntiSpoofingDataset(Dataset):
 
     def __getitem__(self, idx: int):
         path_str = self.file_paths[idx]
+        started_at = time.perf_counter()
         try:
             waveform, source_sample_rate = torchaudio.load_with_torchcodec(path_str)
             waveform = waveform.to(dtype=torch.float32)
@@ -168,8 +181,17 @@ class AntiSpoofingDataset(Dataset):
             original_length = int(waveform.numel())
             waveform = torchaudio.functional.preemphasis(waveform.unsqueeze(0))
             waveform = self._pad_random(waveform.squeeze(0))
+            loguru_logger.debug(
+                f"dataloader_audio_load dataset=antispoofing path={path_str} "
+                f"seconds={time.perf_counter() - started_at:.6f} "
+                f"sample_rate={self.sample_rate} frames={original_length}"
+            )
             return path_str, waveform.contiguous(), original_length, ""
         except Exception as exc:
+            loguru_logger.debug(
+                f"dataloader_audio_load dataset=antispoofing path={path_str} "
+                f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
+            )
             return path_str, torch.empty(0, dtype=torch.float32), 0, str(exc)
 
 

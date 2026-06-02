@@ -11,6 +11,7 @@ Output keys (printed only when present / non-empty):
 * ``BALALAIKA_VENV``           — virtualenv root (defaults to ``.dev_venv``)
 * ``BALALAIKA_CPU_AFFINITY``   — argument for ``taskset -c`` (empty disables)
 * ``BALALAIKA_LOG_DIR``        — directory for rotating log files
+* ``BALALAIKA_LOG_LEVEL``      — minimum log level for loguru sinks
 * ``BALALAIKA_TRT_CACHE_PATH`` — TensorRT engine cache root
 * ``BALALAIKA_TRT_WORKSPACE``  — TensorRT workspace bytes (per session)
 * ``BALALAIKA_TRT_FP16``       — ``1`` / ``0`` toggle for fp16
@@ -32,6 +33,7 @@ DEFAULTS: Dict[str, Any] = {
     "venv_path": ".dev_venv",
     "cpu_affinity": "",
     "log_dir": "./logs",
+    "log_level": "INFO",
     "trt_cache_path": "./cache/trt",
     "trt_workspace_bytes": 4 * 1024 ** 3,
     "trt_fp16": True,
@@ -41,6 +43,7 @@ ENV_KEYS = {
     "venv_path": "BALALAIKA_VENV",
     "cpu_affinity": "BALALAIKA_CPU_AFFINITY",
     "log_dir": "BALALAIKA_LOG_DIR",
+    "log_level": "BALALAIKA_LOG_LEVEL",
     "trt_cache_path": "BALALAIKA_TRT_CACHE_PATH",
     "trt_workspace_bytes": "BALALAIKA_TRT_WORKSPACE",
     "trt_fp16": "BALALAIKA_TRT_FP16",

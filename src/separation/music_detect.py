@@ -24,6 +24,7 @@ A per-stage log file is initialised at startup for offline debugging.
 
 import argparse
 import os
+import time
 from pathlib import Path
 from typing import List, Set
 
@@ -131,8 +132,22 @@ def _process_files(
         cfg.get("num_workers", 4),
         cache_file,
     )
+    loader_workers = int(cfg.get("num_workers", 4))
+    batch_size = int(cfg.get("bs", 32))
+    logger.debug(
+        f"perf dataloader_config stage=music_detect rank={rank} "
+        f"batch_size={batch_size} workers={loader_workers} "
+        f"prefetch_factor=library_default prefetch_batches=library_default "
+        f"items={len(pending_files)}"
+    )
 
+    inference_started_at = time.perf_counter()
     probs, paths = model.predict_proba(dataloader)
+    logger.debug(
+        f"perf model=music_detect event=predict_proba rank={rank} "
+        f"seconds={time.perf_counter() - inference_started_at:.6f} "
+        f"items={len(paths)}"
+    )
 
     deleted_count = 0
     for path, prob in zip(paths, probs.detach().flatten()):
@@ -149,13 +164,19 @@ def _process_files(
         deleted = False
         if prob_val > threshold:
             try:
+                delete_started_at = time.perf_counter()
                 os.remove(path)
+                logger.debug(
+                    f"perf audio_delete stage=music_detect rank={rank} "
+                    f"seconds={time.perf_counter() - delete_started_at:.6f} path={path}"
+                )
                 deleted_count += 1
                 deleted = True
             except OSError as exc:
                 logger.warning(f"Could not delete {path}: {exc}")
                 errors_counter.value += 1
 
+        write_started_at = time.perf_counter()
         writer.write(
             {
                 "filepath": resolved,
@@ -163,6 +184,10 @@ def _process_files(
                 "duration_s": round(duration_s, 4),
                 "deleted": deleted,
             }
+        )
+        logger.debug(
+            f"perf partial_write stage=music_detect rank={rank} "
+            f"seconds={time.perf_counter() - write_started_at:.6f} path={resolved}"
         )
         already_done.add(resolved)
         processed_counter.value += 1
