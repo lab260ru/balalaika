@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import multiprocessing as mp
+import queue
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -28,12 +30,14 @@ class ROVERWrapper:
         config_path: str | None = None,
         *,
         shard_size: Optional[int] = None,
+        workers: int = 1,
         retry_empty_outputs: bool = False,
     ):
         self.podcasts_path = Path(podcasts_path)
         self.model_names = model_names
         self.config_path = config_path
         self.shard_size = max(1, int(shard_size)) if shard_size else None
+        self.workers = max(1, int(workers or 1))
         self.retry_empty_outputs = retry_empty_outputs
         self.tokenizer = lambda s: s.lower().split()
         self.detokenizer = lambda tokens: ' '.join(tokens)
@@ -149,6 +153,87 @@ class ROVERWrapper:
         audio_paths = read_work_shard(shard_path)
         return self._aggregate_with_fallback(audio_paths, shard_path.name)
 
+    def _aggregate_shards_sequential(self, work_dir: Path) -> tuple[int, int, int, int]:
+        total_seen = 0
+        total_tasks = 0
+        total_saved = 0
+        failed_shards = 0
+        while True:
+            shard_path = claim_work_shard(work_dir, 0)
+            if shard_path is None:
+                break
+            try:
+                seen, tasks, saved = self._aggregate_shard(shard_path)
+                total_seen += seen
+                total_tasks += tasks
+                total_saved += saved
+                mark_work_shard_done(shard_path)
+            except Exception as exc:
+                failed_shards += 1
+                logger.exception(f"ROVER shard failed {shard_path.name}: {exc}")
+        return total_seen, total_tasks, total_saved, failed_shards
+
+    def _aggregate_shards_parallel(self, work_dir: Path, worker_count: int) -> tuple[int, int, int, int]:
+        stats_queue: mp.Queue = mp.Queue()
+        processes: List[mp.Process] = []
+        try:
+            for worker_id in range(worker_count):
+                proc = mp.Process(
+                    target=_rover_worker_main,
+                    args=(
+                        worker_id,
+                        str(work_dir),
+                        str(self.podcasts_path),
+                        list(self.model_names),
+                        self.retry_empty_outputs,
+                        stats_queue,
+                    ),
+                    name=f"rover-worker-{worker_id}",
+                )
+                proc.start()
+                processes.append(proc)
+                logger.info(f"Launched {proc.name} with pid={proc.pid}")
+
+            for proc in processes:
+                proc.join()
+        except KeyboardInterrupt:
+            logger.warning("Interrupted by user; terminating ROVER workers...")
+            for proc in processes:
+                if proc.is_alive():
+                    proc.terminate()
+            for proc in processes:
+                proc.join()
+            raise
+
+        total_seen = 0
+        total_tasks = 0
+        total_saved = 0
+        failed_shards = 0
+        received_stats = 0
+        for _ in processes:
+            try:
+                stats = stats_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            received_stats += 1
+            total_seen += int(stats.get("seen", 0))
+            total_tasks += int(stats.get("tasks", 0))
+            total_saved += int(stats.get("saved", 0))
+            failed_shards += int(stats.get("failed_shards", 0))
+
+        for proc in processes:
+            if proc.exitcode not in (0, None):
+                logger.error(f"{proc.name} exited with code {proc.exitcode}")
+                failed_shards += 1
+
+        if received_stats < len(processes):
+            missing = len(processes) - received_stats
+            logger.warning(f"ROVER did not receive stats from {missing} worker process(es).")
+
+        stats_queue.close()
+        stats_queue.join_thread()
+        return total_seen, total_tasks, total_saved, failed_shards
+
     def aggregate_and_save(self):
         logger.info("Starting sharded transcription aggregation based on audio files.")
 
@@ -173,26 +258,67 @@ class ROVERWrapper:
         )
         del pending_paths
 
-        total_seen = 0
-        total_tasks = 0
-        total_saved = 0
-        failed_shards = 0
-        while True:
-            shard_path = claim_work_shard(work_plan.work_dir, 0)
-            if shard_path is None:
-                break
-            try:
-                seen, tasks, saved = self._aggregate_shard(shard_path)
-                total_seen += seen
-                total_tasks += tasks
-                total_saved += saved
-                mark_work_shard_done(shard_path)
-            except Exception as exc:
-                failed_shards += 1
-                logger.exception(f"ROVER shard failed {shard_path.name}: {exc}")
+        worker_count = min(self.workers, max(1, work_plan.shard_count))
+        logger.info(
+            f"ROVER aggregation will use {worker_count} worker process(es) "
+            f"for {work_plan.shard_count} shard(s)."
+        )
+        if worker_count <= 1:
+            total_seen, total_tasks, total_saved, failed_shards = self._aggregate_shards_sequential(
+                work_plan.work_dir
+            )
+        else:
+            total_seen, total_tasks, total_saved, failed_shards = self._aggregate_shards_parallel(
+                work_plan.work_dir,
+                worker_count,
+            )
 
         logger.info(
             f"ROVER aggregation complete: {total_saved} result(s) saved, "
             f"{total_tasks} task(s) with transcripts, {total_seen} pending audio file(s) seen, "
             f"{failed_shards} failed shard(s)."
+        )
+
+
+def _rover_worker_main(
+    worker_id: int,
+    work_dir: str,
+    podcasts_path: str,
+    model_names: List[str],
+    retry_empty_outputs: bool,
+    stats_queue,
+) -> None:
+    wrapper = ROVERWrapper(
+        podcasts_path=podcasts_path,
+        model_names=model_names,
+        retry_empty_outputs=retry_empty_outputs,
+    )
+    stats = {
+        "seen": 0,
+        "tasks": 0,
+        "saved": 0,
+        "failed_shards": 0,
+        "claimed_shards": 0,
+    }
+
+    try:
+        while True:
+            shard_path = claim_work_shard(work_dir, worker_id)
+            if shard_path is None:
+                break
+            stats["claimed_shards"] += 1
+            try:
+                seen, tasks, saved = wrapper._aggregate_shard(shard_path)
+                stats["seen"] += seen
+                stats["tasks"] += tasks
+                stats["saved"] += saved
+                mark_work_shard_done(shard_path)
+            except Exception as exc:
+                stats["failed_shards"] += 1
+                logger.exception(f"ROVER worker {worker_id} failed shard {shard_path.name}: {exc}")
+    finally:
+        stats_queue.put(stats)
+        logger.info(
+            f"ROVER worker {worker_id} finished: {stats['claimed_shards']} shard(s), "
+            f"{stats['saved']} result(s), {stats['failed_shards']} failed shard(s)."
         )

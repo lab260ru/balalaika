@@ -245,6 +245,8 @@ transcription:
   use_tensorrt: True
   use_vad: False
   use_rover: True
+  # CPU processes for ROVER shard aggregation.
+  rover_workers: 4
   batch_size: 16
   num_workers: 16
   prefetch_factor: 2

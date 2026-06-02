@@ -389,6 +389,7 @@ def main(args):
                 model_names=model_names,
                 config_path=args.config_path,
                 shard_size=config.get('rover_shard_size'),
+                workers=config.get('rover_workers', 1),
                 retry_empty_outputs=retry_empty_outputs,
             ).aggregate_and_save()
             logger.info("ROVER done.")

@@ -55,6 +55,8 @@ Transcription does **not** touch `balalaika.csv`; per-file results live in the
   and writes `{stem}_rover.txt` after each shard, so it does not build one
   dataset-wide CrowdKit DataFrame. `transcription.rover_shard_size` can be set
   lower than `runtime.work_shard_size` when transcripts are large.
+* `transcription.rover_workers` controls how many CPU processes claim ROVER
+  shards in parallel.
 
 ## Dependencies
 
