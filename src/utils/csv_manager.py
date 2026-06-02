@@ -303,6 +303,7 @@ def upsert_columns(
     *,
     drop_missing_files: bool = False,
     bootstrap_audio_paths: Optional[Iterable[os.PathLike | str]] = None,
+    preserve_existing: bool = False,
 ) -> pd.DataFrame:
     """Merge ``results_df`` into ``balalaika.csv`` on ``filepath``.
 
@@ -319,6 +320,9 @@ def upsert_columns(
         bootstrap_audio_paths: optional list of audio paths to add to the
             CSV's universe before merging (so brand-new files appear even if
             this stage didn't produce a row for them yet).
+        preserve_existing: when True, only non-null incoming values update the
+            main CSV and existing values outside results_df are kept. This
+            is useful for sparse metadata backfills such as audio durations.
 
     Returns the resulting DataFrame after the atomic write.
     """
@@ -352,8 +356,25 @@ def upsert_columns(
         results = results[["filepath", *present]].drop_duplicates(
             subset="filepath", keep="last"
         )
-        df = df.drop(columns=present, errors="ignore")
-        df = df.merge(results, on="filepath", how="outer")
+        if preserve_existing:
+            df = df.merge(
+                results,
+                on="filepath",
+                how="outer",
+                suffixes=("", "__incoming"),
+            )
+            for col in present:
+                incoming_col = f"{col}__incoming"
+                if incoming_col not in df.columns:
+                    continue
+                if col in df.columns:
+                    df[col] = df[incoming_col].combine_first(df[col])
+                    df = df.drop(columns=[incoming_col])
+                else:
+                    df = df.rename(columns={incoming_col: col})
+        else:
+            df = df.drop(columns=present, errors="ignore")
+            df = df.merge(results, on="filepath", how="outer")
 
     if drop_missing_files and not df.empty:
         before = len(df)

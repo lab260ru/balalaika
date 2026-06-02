@@ -15,6 +15,31 @@ from src.utils.logging_setup import setup_logging
 from src.utils.utils import load_config
 from src.utils.stage_status import write_stage_status
 
+TEXT_COLUMNS = {
+    "accent",
+    "rover",
+    "punct",
+    "phonemes",
+    "rover_phonemes",
+    "text",
+    "transcript",
+    "transcription",
+    "giga_ctc",
+    "giga_rnnt",
+    "giga_ctc_lm",
+    "gigaam-v3-e2e-ctc",
+    "gigaam_v3_e2e_ctc",
+    "tone",
+    "vosk",
+    "vosk_small",
+    "parakeet_v2",
+    "parakeet_v3",
+    "canary",
+    "whisper_base",
+    "whisper_turbo",
+}
+
+
 def load_metadata(csv_path: Path) -> Dict[str, dict]:
     """Загружает balalaika.csv и делает словарь с ключом по базовому имени файла."""
     if not csv_path.exists():
@@ -22,6 +47,15 @@ def load_metadata(csv_path: Path) -> Dict[str, dict]:
         return {}
     
     df = pd.read_csv(csv_path)
+    drop_cols = [
+        col
+        for col in df.columns
+        if str(col).lower() in TEXT_COLUMNS
+        or str(col).lower().endswith(("_txt", "_text", "_transcript"))
+    ]
+    if drop_cols:
+        logger.info(f"Dropping text columns from CSV metadata: {drop_cols}")
+        df = df.drop(columns=drop_cols)
     metadata_dict = {}
     
     for _, row in df.iterrows():

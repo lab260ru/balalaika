@@ -1,11 +1,11 @@
 """ITU-R BS.1770-4 loudness normalization.
 
-The original implementation re-encoded everything through ``torchaudio.save``,
-which silently degraded MP3 files and made the FLAC → ``.mp3`` mismatch
+The original implementation re-encoded everything through classic
+``torchaudio.save``, which silently degraded MP3 files and made the FLAC → ``.mp3`` mismatch
 operators reported. This rewrite:
 
 * Reads samples through a torch DataLoader backed by ``torchaudio``.
-* Writes samples back with ``torchaudio.save``.
+* Writes samples back with ``torchaudio.save_with_torchcodec``.
 * Sets up a per-stage log file via :func:`setup_logging`.
 
 CSV resilience:
@@ -22,9 +22,8 @@ CSV resilience:
 """
 
 import argparse
-import warnings
 from pathlib import Path
-from typing import List, Set
+from typing import List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -64,6 +63,16 @@ apply_torch_perf_defaults()
 NORMALIZED_COLUMN = "loudness_normalized"
 PARTIAL_PREFIX = "loudness"
 PARTIAL_FIELDS = ("filepath", NORMALIZED_COLUMN)
+_METER_CACHE: dict[Tuple[int, float], pyln.Meter] = {}
+
+
+def _get_meter(rate: int, block_size: float) -> pyln.Meter:
+    key = (int(rate), float(block_size))
+    meter = _METER_CACHE.get(key)
+    if meter is None:
+        meter = pyln.Meter(rate, block_size=block_size)
+        _METER_CACHE[key] = meter
+    return meter
 
 
 def normalize_audio_loudness(
@@ -73,28 +82,22 @@ def normalize_audio_loudness(
     loudness: float = -23.0,
     block_size: float = 0.400,
 ) -> np.ndarray:
-    """ITU-R BS.1770-4 loudness normalization (peak then integrated LUFS)."""
-    audio = pyln.normalize.peak(audio, peak)
-    meter = pyln.Meter(rate, block_size=block_size)
+    """ITU-R BS.1770-4 loudness normalization.
+
+    The peak argument is kept for config compatibility; peak scaling before
+    LUFS normalization cancels out algebraically in the final waveform.
+    """
+    _ = peak
+    meter = _get_meter(rate, block_size)
     measured = meter.integrated_loudness(audio)
     return pyln.normalize.loudness(audio, measured, loudness)
 
 
 def _write_audio(audio_path: str, samples: np.ndarray, sample_rate: int) -> None:
-    """Write samples shaped ``(channels, frames)`` using torchaudio."""
-    tensor = torch.from_numpy(samples if samples.ndim == 2 else samples[np.newaxis, :])
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*save_with_torchcodec.*",
-            category=UserWarning,
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*StreamingMediaEncoder has been deprecated.*",
-            category=UserWarning,
-        )
-        torchaudio.save(audio_path, tensor, sample_rate)
+    """Write samples shaped ``(channels, frames)`` using TorchCodec."""
+    array = samples if samples.ndim == 2 else samples[np.newaxis, :]
+    tensor = torch.as_tensor(array, dtype=torch.float32)
+    torchaudio.save_with_torchcodec(audio_path, tensor, sample_rate)
 
 
 def process_audio_file(

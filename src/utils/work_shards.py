@@ -8,10 +8,11 @@ files, and workers atomically claim one shard at a time by renaming it.
 """
 from __future__ import annotations
 
+import math
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Mapping, Optional
 
 from loguru import logger
 from tqdm import tqdm
@@ -66,6 +67,33 @@ def _write_one_shard(work_dir: Path, shard_index: int, paths: List[str]) -> None
     tmp.replace(final)
 
 
+def _write_labeled_shard(work_dir: Path, shard_index: int, label: str, paths: List[str]) -> None:
+    final = work_dir / f"shard_{shard_index:06d}_{label}.pending"
+    tmp = final.with_suffix(final.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        for path in paths:
+            f.write(path)
+            f.write("\n")
+    tmp.replace(final)
+
+
+def _duration_bucket_label(bucket_index: int, bucket_seconds: float, max_duration: float) -> str:
+    lower = bucket_index * bucket_seconds
+    upper = lower + bucket_seconds
+    if lower >= max_duration:
+        return f"len_ge_{int(round(max_duration)):03d}s"
+    return f"len_{int(lower):03d}_{int(upper):03d}s"
+
+
+def _duration_bucket_index(duration: float, bucket_seconds: float, max_duration: float) -> int:
+    if duration <= 0:
+        return 0
+    bucket_count = max(1, int(math.ceil(max_duration / bucket_seconds)))
+    if duration <= max_duration:
+        return min(int(duration / bucket_seconds), bucket_count - 1)
+    return bucket_count
+
+
 def prepare_work_shards(
     podcasts_path: str | Path,
     stage_name: str,
@@ -117,6 +145,78 @@ def prepare_work_shards(
     logger.info(
         f"Prepared {shard_count} work shard(s) with {total} item(s) "
         f"for {stage_name} at {work_dir} (shard_size={shard_size})."
+    )
+    return WorkShardPlan(work_dir=work_dir, total_items=total, shard_count=shard_count, shard_size=shard_size)
+
+
+def prepare_length_bucketed_work_shards(
+    podcasts_path: str | Path,
+    stage_name: str,
+    paths: Iterable[str | Path],
+    durations: Mapping[str, float],
+    *,
+    shard_size: int = DEFAULT_WORK_SHARD_SIZE,
+    bucket_seconds: float = 1.0,
+    max_duration: float = 15.0,
+    limit: Optional[int] = None,
+) -> WorkShardPlan:
+    """Write work shards grouped by audio duration buckets.
+
+    Every produced shard contains files from a single duration bucket, e.g.
+    0-1s, 1-2s, ... up to ``max_duration``. Files longer than the configured
+    max go into a separate overflow bucket so they do not inflate normal
+    short-clip batches. Existing stage shards are discarded, same as
+    :func:`prepare_work_shards`.
+    """
+    shard_size = max(1, int(shard_size or DEFAULT_WORK_SHARD_SIZE))
+    bucket_seconds = max(0.001, float(bucket_seconds or 1.0))
+    max_duration = max(bucket_seconds, float(max_duration or bucket_seconds))
+    work_dir = stage_work_dir(podcasts_path, stage_name)
+    _reset_work_dir(work_dir)
+
+    buckets: dict[int, List[str]] = {}
+    total = 0
+    expected_total = (
+        limit
+        if limit is not None
+        else (len(paths) if hasattr(paths, "__len__") else None)
+    )
+
+    for raw in tqdm(
+        paths,
+        total=expected_total,
+        desc=f"bucket_{stage_name}_work_shards",
+    ):
+        if limit is not None and total >= limit:
+            break
+        path = str(raw).strip()
+        if not path:
+            continue
+        duration = float(durations.get(path, 0.0) or 0.0)
+        bucket_index = _duration_bucket_index(duration, bucket_seconds, max_duration)
+        buckets.setdefault(bucket_index, []).append(path)
+        total += 1
+
+    shard_count = 0
+    for bucket_index in sorted(buckets):
+        label = _duration_bucket_label(bucket_index, bucket_seconds, max_duration)
+        bucket_paths = sorted(
+            buckets[bucket_index],
+            key=lambda p: float(durations.get(p, 0.0) or 0.0),
+        )
+        for start in range(0, len(bucket_paths), shard_size):
+            _write_labeled_shard(
+                work_dir,
+                shard_count,
+                label,
+                bucket_paths[start:start + shard_size],
+            )
+            shard_count += 1
+
+    logger.info(
+        f"Prepared {shard_count} length-bucketed work shard(s) with {total} item(s) "
+        f"for {stage_name} at {work_dir} "
+        f"(bucket_seconds={bucket_seconds}, max_duration={max_duration}, shard_size={shard_size})."
     )
     return WorkShardPlan(work_dir=work_dir, total_items=total, shard_count=shard_count, shard_size=shard_size)
 

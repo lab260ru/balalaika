@@ -9,6 +9,11 @@ import torch
 from loguru import logger
 from tqdm import tqdm
 
+from src.utils.audio_durations import (
+    duration_bucket_settings,
+    duration_probe_workers,
+    ensure_audio_durations,
+)
 from src.utils.datasets.transcription import create_transcription_dataloader, recognize_batch
 from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
@@ -21,7 +26,7 @@ from src.utils.work_shards import (
     claim_work_shard,
     load_work_shard_size,
     mark_work_shard_done,
-    prepare_work_shards,
+    prepare_length_bucketed_work_shards,
     read_work_shard,
 )
 
@@ -37,6 +42,7 @@ MODEL_MAP = {
     'canary': 'nemo-canary-1b-v2',
     'whisper_base': 'whisper-base',
     'whisper_turbo': 'onnx-community/whisper-large-v3-turbo',
+    'gigaam-v3-e2e-ctc': 'gigaam-v3-e2e-ctc'
 }
 
 SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
@@ -337,13 +343,27 @@ def main(args):
             continue
 
         shard_size = load_work_shard_size(args.config_path)
-        work_plan = prepare_work_shards(
+        duration_workers = duration_probe_workers(config)
+        durations = ensure_audio_durations(
+            src_path,
+            paths,
+            num_workers=duration_workers,
+        )
+        bucket_seconds, max_bucket_duration = duration_bucket_settings(
+            args.config_path,
+            config,
+        )
+        work_plan = prepare_length_bucketed_work_shards(
             src_path,
             f"transcription_{output_suffix}",
             paths,
+            durations,
             shard_size=shard_size,
+            bucket_seconds=bucket_seconds,
+            max_duration=max_bucket_duration,
         )
         del paths
+        del durations
 
         logger.info(
             f"{work_plan.total_items} files to process for {model_name} "
@@ -364,7 +384,13 @@ def main(args):
         logger.info("ROVER aggregation...")
         try:
             from src.transcription.rover import ROVERWrapper
-            ROVERWrapper(podcasts_path=src_path, model_names=model_names, config_path=args.config_path).aggregate_and_save()
+            ROVERWrapper(
+                podcasts_path=src_path,
+                model_names=model_names,
+                config_path=args.config_path,
+                shard_size=config.get('rover_shard_size'),
+                retry_empty_outputs=retry_empty_outputs,
+            ).aggregate_and_save()
             logger.info("ROVER done.")
         except ImportError:
             logger.warning("ROVER module not available, skipping")

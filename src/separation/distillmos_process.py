@@ -27,6 +27,11 @@ import torch.multiprocessing as mp
 from loguru import logger
 from tqdm import tqdm
 
+from src.utils.audio_durations import (
+    duration_bucket_settings,
+    duration_probe_workers,
+    ensure_audio_durations,
+)
 from src.utils.csv_manager import (
     PartialCsvWriter,
     PeriodicCsvMerger,
@@ -46,7 +51,7 @@ from src.utils.work_shards import (
     claim_work_shard,
     load_work_shard_size,
     mark_work_shard_done,
-    prepare_work_shards,
+    prepare_length_bucketed_work_shards,
     read_work_shard,
 )
 
@@ -243,13 +248,29 @@ def main():
         return
 
     shard_size = load_work_shard_size(args.config_path)
-    work_plan = prepare_work_shards(
+    distillmos_cfg = config.get("distillmos", {})
+    duration_workers = duration_probe_workers(distillmos_cfg, config)
+    durations = ensure_audio_durations(
+        podcasts_path,
+        unprocessed,
+        num_workers=duration_workers,
+    )
+    bucket_seconds, max_bucket_duration = duration_bucket_settings(
+        args.config_path,
+        distillmos_cfg,
+        config,
+    )
+    work_plan = prepare_length_bucketed_work_shards(
         podcasts_path,
         PARTIAL_PREFIX,
         unprocessed,
+        durations,
         shard_size=shard_size,
+        bucket_seconds=bucket_seconds,
+        max_duration=max_bucket_duration,
     )
     del unprocessed
+    del durations
 
     logger.info(
         f"Processing {work_plan.total_items} files on {available_gpus} GPUs "

@@ -7,7 +7,6 @@ and trimmed back to the original decoded length before saving.
 """
 
 import argparse
-import warnings
 from pathlib import Path
 from typing import Dict, List, Set
 
@@ -19,6 +18,11 @@ import torchaudio
 from loguru import logger
 from tqdm import tqdm
 
+from src.utils.audio_durations import (
+    duration_bucket_settings,
+    duration_probe_workers,
+    ensure_audio_durations,
+)
 from src.utils.csv_manager import (
     PartialCsvWriter,
     PeriodicCsvMerger,
@@ -42,7 +46,7 @@ from src.utils.work_shards import (
     claim_work_shard,
     load_work_shard_size,
     mark_work_shard_done,
-    prepare_work_shards,
+    prepare_length_bucketed_work_shards,
     read_work_shard,
 )
 
@@ -255,18 +259,11 @@ def _process_files(
                 enhanced_tensor = torch.from_numpy(
                     enhanced.astype(np.float32, copy=False) / 32768.0
                 ).unsqueeze(0)
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        message=r".*save_with_torchcodec.*",
-                        category=UserWarning,
-                    )
-                    warnings.filterwarnings(
-                        "ignore",
-                        message=r".*StreamingMediaEncoder has been deprecated.*",
-                        category=UserWarning,
-                    )
-                    torchaudio.save(str(path_str), enhanced_tensor, MODEL_SAMPLE_RATE)
+                torchaudio.save_with_torchcodec(
+                    str(path_str),
+                    enhanced_tensor,
+                    MODEL_SAMPLE_RATE,
+                )
                 writer.write(
                     {
                         "filepath": resolved,
@@ -396,14 +393,27 @@ def main():
         return
 
     shard_size = load_work_shard_size(args.config_path)
-    work_plan = prepare_work_shards(
+    duration_workers = duration_probe_workers(config)
+    durations = ensure_audio_durations(
+        podcasts_path,
+        pending,
+        num_workers=duration_workers,
+    )
+    bucket_seconds, max_bucket_duration = duration_bucket_settings(
+        args.config_path,
+        config,
+    )
+    work_plan = prepare_length_bucketed_work_shards(
         podcasts_path,
         PARTIAL_PREFIX,
         pending,
+        durations,
         shard_size=shard_size,
-        limit=args.limit,
+        bucket_seconds=bucket_seconds,
+        max_duration=max_bucket_duration,
     )
     del pending
+    del durations
 
     logger.info(
         f"Running ONNX denoising for {work_plan.total_items} files with {num_processes} process(es) "

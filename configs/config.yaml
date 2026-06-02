@@ -92,7 +92,7 @@ runtime:
   # Python virtualenv that base.sh / *_yaml.sh activate.
   venv_path: .dev_venv
   # CPU range passed to `taskset -c` for CPU-bound stages. Empty to disable.
-  cpu_affinity: "0-40"
+  cpu_affinity: "0-80"
   # Default directory for per-stage rotating log files. CLIs accept --log_dir.
   log_dir: ./logs
   # Source for stage audio file lists: auto prefers balalaika.csv and falls back
@@ -111,7 +111,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /mnt/hdd_6tb_1/data
+  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -121,8 +121,9 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /mnt/hdd_6tb_1/data
+  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
   # Maximum duration of each output segment in seconds.
+  
   duration: 15
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
   num_workers: 1
@@ -187,7 +188,7 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/hdd_6tb_1/data
+  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
 
   music_detect:
     # Inference batch size for music classifier.
@@ -232,8 +233,9 @@ separation:
     use_tensorrt: False
 
 transcription:
-  podcasts_path: /mnt/hdd_6tb_1/data
+  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
   model_names:
+    - gigaam-v3-e2e-ctc
     - giga_ctc
     - giga_rnnt
     - vosk
@@ -243,20 +245,20 @@ transcription:
   use_tensorrt: True
   use_vad: False
   use_rover: True
-  batch_size: 8
-  num_workers: 6
+  batch_size: 16
+  num_workers: 16
   prefetch_factor: 2
   retry_empty_outputs: True
 
 punctuation:
-  podcasts_path: /mnt/hdd_6tb_1/data
+  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /mnt/hdd_6tb_1/data
+  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -265,12 +267,12 @@ accent:
   use_tensorrt: False
 
 phonemizer:
-  podcasts_path: /mnt/hdd_6tb_1/data
+  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
   num_workers: 1
 
 denoising:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/hdd_6tb_1/data
+  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
   # MossFormer2_SE_48K dynamic ONNX. If missing, it is downloaded from Hugging Face.
   onnx_path: ./models/MossFormer2_SE_48K_dynamic_fp32.onnx
   # Fill after uploading the ONNX model.
@@ -284,7 +286,7 @@ denoising:
   use_tensorrt: True
 
 export:
-  podcasts_path: /mnt/hdd_6tb_1/data
+  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
   # Parallel processes writing WebDataset shards.
   num_workers: 1
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.

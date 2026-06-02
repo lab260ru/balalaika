@@ -4,7 +4,6 @@ pandas==2.2.3
 matplotlib
 loguru==0.7.3
 PyYAML==6.0.2
-soundfile==0.13.1
 music-tag==0.4.3
 yandex-music==2.2.0
 transformers==4.51.3
@@ -29,6 +28,6 @@ webdataset
 
 pyloudnorm
 git+https://github.com/NikiPshg/ruaccent.git
-git+https://github.com/mtuciru/TryIPaG2P.git
+git+https://github.com/lab260ru/TryIPaG2P.git
 git+https://github.com/Toloka/crowd-kit.git
-git+https://github.com/NikiPshg/musicdetection
+# git+https://github.com/NikiPshg/musicdetection

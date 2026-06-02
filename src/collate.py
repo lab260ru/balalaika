@@ -11,6 +11,45 @@ from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config, read_file_content
 
+TEXT_COLUMNS = {
+    "accent",
+    "rover",
+    "punct",
+    "phonemes",
+    "rover_phonemes",
+    "text",
+    "transcript",
+    "transcription",
+    "giga_ctc",
+    "giga_rnnt",
+    "giga_ctc_lm",
+    "gigaam-v3-e2e-ctc",
+    "gigaam_v3_e2e_ctc",
+    "tone",
+    "vosk",
+    "vosk_small",
+    "parakeet_v2",
+    "parakeet_v3",
+    "canary",
+    "whisper_base",
+    "whisper_turbo",
+}
+
+
+def drop_csv_text_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep balalaika.csv as metadata-only; sidecars feed final parquet text."""
+    drop_cols = [
+        col
+        for col in df.columns
+        if str(col).lower() in TEXT_COLUMNS
+        or str(col).lower().endswith(("_txt", "_text", "_transcript"))
+    ]
+    if drop_cols:
+        logger.info(f"Dropping text columns from CSV metadata: {drop_cols}")
+        return df.drop(columns=drop_cols)
+    return df
+
+
 def process_audio_file(audio_path_str: str, base_path: Path) -> Dict[str, Optional[str]]:
 
     audio_path = Path(audio_path_str)
@@ -47,6 +86,7 @@ def main(args):
         logger.info(f"Loading existing dataframe from {df_path}")
         df = pd.read_csv(df_path)
         df.drop_duplicates(subset='filepath', inplace=True)
+        df = drop_csv_text_columns(df)
     else:
         logger.info(f"No existing dataframe found. Creating new one from audio paths.")
         audio_paths = discover_audio_paths(base_path, config_path=args.config_path)

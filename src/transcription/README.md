@@ -51,6 +51,10 @@ Transcription does **not** touch `balalaika.csv`; per-file results live in the
 * Pending audio paths are written to `.balalaika_work/transcription_<model>/`
   and claimed shard-by-shard, so large runs do not pickle huge path lists into
   GPU workers.
+* ROVER also runs shard-by-shard under `.balalaika_work/transcription_rover/`
+  and writes `{stem}_rover.txt` after each shard, so it does not build one
+  dataset-wide CrowdKit DataFrame. `transcription.rover_shard_size` can be set
+  lower than `runtime.work_shard_size` when transcripts are large.
 
 ## Dependencies
 
