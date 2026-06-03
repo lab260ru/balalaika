@@ -62,8 +62,9 @@ from src.utils.work_shards import (
 )
 
 PARTIAL_PREFIX = "crest"
-PARTIAL_FIELDS = ("filepath", "crest_factor", "duration_s", "deleted")
 COLUMN = "crest_factor"
+PARTIAL_FIELDS = ("filepath", "crest_factor", "total_duration", "duration_s", "deleted")
+VALUE_COLUMNS = [COLUMN, "total_duration"]
 
 
 def calculate_crest_factors(waveforms: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -195,6 +196,7 @@ def _process_files(
                 {
                     "filepath": resolved,
                     "crest_factor": round(cf, 4),
+                    "total_duration": round(duration_s, 4),
                     "duration_s": round(duration_s, 4),
                     "deleted": deleted,
                 }
@@ -296,9 +298,10 @@ def main(args):
     leftover_partials, absorbed = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[COLUMN],
+        value_columns=VALUE_COLUMNS,
         drop_missing_files=True,
         bootstrap_audio_paths=audio_paths,
+        preserve_existing=True,
     )
     if absorbed:
         logger.info(
@@ -351,8 +354,9 @@ def main(args):
         with PeriodicCsvMerger(
             podcasts_path,
             prefix=PARTIAL_PREFIX,
-            value_columns=[COLUMN],
+            value_columns=VALUE_COLUMNS,
             drop_missing_files=True,
+            preserve_existing=True,
             **csv_settings,
         ):
             if num_workers > 1:
@@ -395,8 +399,9 @@ def main(args):
     new_partials, _ = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[COLUMN],
+        value_columns=VALUE_COLUMNS,
         drop_missing_files=True,
+        preserve_existing=True,
     )
 
     combined = pd.concat(

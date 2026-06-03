@@ -32,7 +32,6 @@ import pandas as pd
 import torch
 import torch.multiprocessing as mp
 from loguru import logger
-from musicdetection.audio_cache import create_audio_length_cache
 from musicdetection.audio_sampler import LengthBasedBatchSampler
 from musicdetection.core.model import WavLMForMusicDetection
 from musicdetection.dataset import AudioCollate, MusicDetectionDataset
@@ -41,6 +40,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoFeatureExtractor
 
 from src.utils.audit import record_stage_summary, safe_audio_duration
+from src.utils.audio_durations import duration_probe_workers, ensure_audio_durations
 from src.utils.csv_manager import (
     PartialCsvWriter,
     PeriodicCsvMerger,
@@ -68,24 +68,21 @@ apply_torch_perf_defaults(disable_math_sdp=False)
 
 
 PARTIAL_PREFIX = "music"
-PARTIAL_FIELDS = ("filepath", "music_prob", "duration_s", "deleted")
 COLUMN = "music_prob"
+PARTIAL_FIELDS = ("filepath", "music_prob", "total_duration", "duration_s", "deleted")
+VALUE_COLUMNS = [COLUMN, "total_duration"]
 
 
-def create_loader(paths: List[str], model_name: str, batch_size: int, num_workers: int, cache_file: Path):
-    audio_lengths = create_audio_length_cache(file_paths=paths, cache_file=str(cache_file))
+def create_loader(paths: List[str], model_name: str, batch_size: int, num_workers: int, audio_lengths: dict[str, float]):
     processor = AutoFeatureExtractor.from_pretrained(model_name)
     dataset = MusicDetectionDataset(file_paths=paths, target_sample_rate=processor.sampling_rate)
     sampler = LengthBasedBatchSampler(paths, audio_lengths, batch_size=batch_size, shuffle=False)
-    return (
-        DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            collate_fn=AudioCollate(processor),
-            num_workers=num_workers,
-            pin_memory=False,
-        ),
-        audio_lengths,
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=AudioCollate(processor),
+        num_workers=num_workers,
+        pin_memory=False,
     )
 
 
@@ -103,7 +100,6 @@ def _process_files(
     device: torch.device,
     files: List[str],
     config: dict,
-    cache_file: Path,
     model,
     writer: PartialCsvWriter,
     already_done: Set[str],
@@ -113,6 +109,7 @@ def _process_files(
 ) -> int:
     cfg = config.get("music_detect", {})
     threshold = cfg.get("threshold", 0.5)
+    podcasts_path = Path(config.get("podcasts_path", "."))
 
     pending_files = []
     for path in files:
@@ -125,12 +122,17 @@ def _process_files(
     if not pending_files:
         return 0
 
-    dataloader, audio_lengths = create_loader(
+    audio_lengths = ensure_audio_durations(
+        podcasts_path,
+        pending_files,
+        num_workers=duration_probe_workers(cfg, config),
+    )
+    dataloader = create_loader(
         pending_files,
         cfg.get("base_model", "microsoft/wavlm-base-plus"),
         cfg.get("bs", 32),
         cfg.get("num_workers", 4),
-        cache_file,
+        audio_lengths,
     )
     loader_workers = int(cfg.get("num_workers", 4))
     batch_size = int(cfg.get("bs", 32))
@@ -181,6 +183,7 @@ def _process_files(
             {
                 "filepath": resolved,
                 "music_prob": prob_val,
+                "total_duration": round(duration_s, 4),
                 "duration_s": round(duration_s, 4),
                 "deleted": deleted,
             }
@@ -199,9 +202,6 @@ def run_worker(rank: int, world_size: int, work_dir: str, config: dict, processe
     device = torch.device(f"cuda:{rank}")
     cfg = config.get("music_detect", {})
     podcasts_path = Path(config.get("podcasts_path", "."))
-
-    cache_dir = Path(cfg.get("cache_path", "./cache")) / f"music_detect_worker_{rank}"
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         model = load_model(
@@ -233,7 +233,6 @@ def run_worker(rank: int, world_size: int, work_dir: str, config: dict, processe
                     device,
                     shard_files,
                     config,
-                    cache_dir / f"{shard_path.stem}_audio_lengths.json",
                     model,
                     writer,
                     already_done,
@@ -279,9 +278,10 @@ def main(args):
     leftover_partials, absorbed = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[COLUMN],
+        value_columns=VALUE_COLUMNS,
         drop_missing_files=True,
         bootstrap_audio_paths=audio_paths,
+        preserve_existing=True,
     )
     if absorbed:
         logger.info(
@@ -333,8 +333,9 @@ def main(args):
         with PeriodicCsvMerger(
             podcasts_path,
             prefix=PARTIAL_PREFIX,
-            value_columns=[COLUMN],
+            value_columns=VALUE_COLUMNS,
             drop_missing_files=True,
+            preserve_existing=True,
             **csv_settings,
         ):
             mp.spawn(run_worker, args=(n_gpus, str(work_plan.work_dir), config, processed, skipped, errors), nprocs=n_gpus, join=True)
@@ -345,8 +346,9 @@ def main(args):
     new_partials, _ = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[COLUMN],
+        value_columns=VALUE_COLUMNS,
         drop_missing_files=True,
+        preserve_existing=True,
     )
 
     combined = pd.concat(

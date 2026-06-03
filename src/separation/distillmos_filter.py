@@ -32,8 +32,9 @@ from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 
 PARTIAL_PREFIX = "distillmos_filter"
-PARTIAL_FIELDS = ("filepath", "DistillMOS", "duration_s", "deleted")
 COLUMN = "DistillMOS"
+PARTIAL_FIELDS = ("filepath", "DistillMOS", "total_duration", "duration_s", "deleted")
+VALUE_COLUMNS = [COLUMN, "total_duration"]
 
 
 def compute_statistics(df: pd.DataFrame) -> dict:
@@ -258,6 +259,7 @@ def run_worker(
                 writer.write({
                     "filepath": resolved,
                     COLUMN: mos_val,
+                    "total_duration": round(duration_s, 4),
                     "duration_s": round(duration_s, 4),
                     "deleted": deleted,
                 })
@@ -405,9 +407,10 @@ def main(args):
     leftover_partials, absorbed = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[COLUMN],
+        value_columns=VALUE_COLUMNS,
         drop_missing_files=True,
         bootstrap_audio_paths=audio_paths,
+        preserve_existing=True,
     )
     if absorbed:
         logger.info(
@@ -422,8 +425,9 @@ def main(args):
     new_partials_df, _ = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[COLUMN],
+        value_columns=VALUE_COLUMNS,
         drop_missing_files=True,
+        preserve_existing=True,
     )
 
     combined = pd.concat(

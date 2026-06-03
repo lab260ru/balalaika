@@ -552,6 +552,7 @@ def absorb_partial_csvs(
     *,
     drop_missing_files: bool = False,
     bootstrap_audio_paths: Optional[Iterable[os.PathLike | str]] = None,
+    preserve_existing: bool = False,
 ) -> Tuple[pd.DataFrame, int]:
     """Merge any leftover partials into the main CSV and delete them.
 
@@ -571,6 +572,7 @@ def absorb_partial_csvs(
         value_columns=value_columns,
         drop_missing_files=drop_missing_files,
         bootstrap_audio_paths=bootstrap_audio_paths,
+        preserve_existing=preserve_existing,
     )
     delete_partial_csvs(podcasts_path, prefix)
     return partials, int(len(partials))
@@ -810,6 +812,7 @@ class PeriodicCsvMerger:
         flush_every_seconds: float = DEFAULT_FLUSH_EVERY_SECONDS,
         drop_missing_files: bool = False,
         bootstrap_audio_paths: Optional[Iterable[os.PathLike | str]] = None,
+        preserve_existing: bool = False,
         poll_interval: float = 30.0,
     ) -> None:
         self.podcasts_path = Path(podcasts_path)
@@ -823,6 +826,7 @@ class PeriodicCsvMerger:
             if bootstrap_audio_paths is not None
             else None
         )
+        self.preserve_existing = preserve_existing
         self.poll_interval = max(5.0, float(poll_interval))
 
         self._stop = threading.Event()
@@ -845,6 +849,7 @@ class PeriodicCsvMerger:
             value_columns=self.value_columns,
             drop_missing_files=self.drop_missing_files,
             bootstrap_audio_paths=self.bootstrap_audio_paths,
+            preserve_existing=self.preserve_existing,
         )
         return int(len(partials))
 

@@ -58,7 +58,8 @@ from src.utils.work_shards import (
 PARTIAL_PREFIX = "antispoof"
 SCORE_COLUMN = "antispoof_score"
 PROB_COLUMN = "antispoof_generated_prob"
-PARTIAL_FIELDS = ("filepath", SCORE_COLUMN, PROB_COLUMN, "duration_s", "deleted")
+PARTIAL_FIELDS = ("filepath", SCORE_COLUMN, PROB_COLUMN, "total_duration", "duration_s", "deleted")
+VALUE_COLUMNS = [SCORE_COLUMN, PROB_COLUMN, "total_duration"]
 MODEL_SAMPLE_RATE = ANTISPOOF_SAMPLE_RATE
 MODEL_NUM_SAMPLES = ANTISPOOF_NUM_SAMPLES
 GENERATED_CLASS_INDEX = 1
@@ -229,6 +230,7 @@ def _process_files(
                     "filepath": resolved,
                     SCORE_COLUMN: prob_val,
                     PROB_COLUMN: prob_val,
+                    "total_duration": round(duration_s, 4),
                     "duration_s": round(duration_s, 4),
                     "deleted": deleted,
                 }
@@ -326,9 +328,10 @@ def main(args):
     leftover_partials, absorbed = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[SCORE_COLUMN, PROB_COLUMN],
+        value_columns=VALUE_COLUMNS,
         drop_missing_files=True,
         bootstrap_audio_paths=audio_paths,
+        preserve_existing=True,
     )
     if absorbed:
         logger.info(f"Absorbed {absorbed} leftover anti-spoofing rows.")
@@ -392,8 +395,9 @@ def main(args):
         with PeriodicCsvMerger(
             podcasts_path,
             prefix=PARTIAL_PREFIX,
-            value_columns=[SCORE_COLUMN, PROB_COLUMN],
+            value_columns=VALUE_COLUMNS,
             drop_missing_files=True,
+            preserve_existing=True,
             **csv_settings,
         ):
             mp.spawn(
@@ -408,8 +412,9 @@ def main(args):
     new_partials, _ = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[SCORE_COLUMN, PROB_COLUMN],
+        value_columns=VALUE_COLUMNS,
         drop_missing_files=True,
+        preserve_existing=True,
     )
     combined = pd.concat(
         [df for df in (leftover_partials, new_partials) if df is not None and not df.empty],
