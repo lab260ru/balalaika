@@ -12,6 +12,7 @@ from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config, read_file_content
 
 SUPPORTED_TIMESTAMP_MODELS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
+ASR_CONSISTENCY_COLUMN = "asr_consistency_percent"
 
 TEXT_COLUMNS = {
     "accent",
@@ -49,6 +50,7 @@ def transcription_sidecar_columns(model_names: Iterable[str]) -> set[str]:
         suffix = output_suffix_for_model(model_name)
         columns.add(suffix)
         columns.add(f"{suffix}_timestamps")
+    columns.add(ASR_CONSISTENCY_COLUMN)
     return columns
 
 
@@ -86,6 +88,60 @@ def sidecar_specs(model_names: Iterable[str]) -> Dict[str, str]:
         specs[f"{suffix}_timestamps"] = f"_{suffix}.tst"
 
     return specs
+
+
+def normalize_transcript(text: object) -> str:
+    if text is None:
+        return ""
+    if pd.isna(text):
+        return ""
+    return " ".join(str(text).lower().split())
+
+
+def asr_consistency_percent(row: pd.Series, asr_columns: list[str]) -> float:
+    transcripts = [
+        normalized
+        for col in asr_columns
+        if col in row.index
+        for normalized in [normalize_transcript(row[col])]
+        if normalized
+    ]
+    if len(transcripts) < 2:
+        return float("nan")
+
+    best_matching_others = max(
+        transcripts.count(transcript) - 1
+        for transcript in set(transcripts)
+    )
+    return best_matching_others / (len(transcripts) - 1) * 100.0
+
+
+def add_asr_consistency_column(df: pd.DataFrame, model_names: Iterable[str]) -> pd.DataFrame:
+    asr_columns = []
+    seen = set()
+    for model_name in model_names:
+        suffix = output_suffix_for_model(model_name)
+        if suffix in seen:
+            continue
+        seen.add(suffix)
+        if suffix in df.columns:
+            asr_columns.append(suffix)
+
+    out = df
+    if len(asr_columns) < 2:
+        out[ASR_CONSISTENCY_COLUMN] = float("nan")
+        logger.info("ASR consistency skipped: fewer than two ASR text columns found.")
+        return out
+
+    out[ASR_CONSISTENCY_COLUMN] = out.apply(
+        asr_consistency_percent,
+        axis=1,
+        asr_columns=asr_columns,
+    )
+    logger.info(
+        f"Added {ASR_CONSISTENCY_COLUMN} from ASR columns: {asr_columns}"
+    )
+    return out
 
 
 def process_audio_file(audio_path_str: str, base_path: Path, file_types: Dict[str, str]) -> Dict[str, Optional[str]]:
@@ -161,6 +217,7 @@ def main(args):
     extracted_df = pd.DataFrame(results)
 
     final_df = pd.merge(df, extracted_df, on='filepath', how='left')
+    final_df = add_asr_consistency_column(final_df, model_names)
 
     output_path = base_path / "balalaika.parquet"
     final_df.to_parquet(output_path, engine='pyarrow', index=False)

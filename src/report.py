@@ -17,7 +17,7 @@ import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -27,6 +27,8 @@ from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 
 # Stages emit rows in this canonical order; unknown stages are appended after.
+MISSING_VALUE_BATCH_SIZE = 100_000
+
 STAGE_ORDER = [
     "preprocess",
     "crest_factor",
@@ -55,6 +57,112 @@ def _format_hours(hours: float) -> str:
     return f"{hours:.2f}h ({h}h {m}m)"
 
 
+def _missing_rows(
+    missing_counts: Dict[str, int],
+    total_rows: int,
+    dtypes: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, str]]:
+    dtypes = dtypes or {}
+    rows = []
+    for column, missing in missing_counts.items():
+        pct = (missing / total_rows * 100.0) if total_rows else 0.0
+        rows.append(
+            {
+                "column": column,
+                "missing": str(missing),
+                "missing_percent": f"{pct:.3f}",
+                "dtype": dtypes.get(column, ""),
+            }
+        )
+    rows.sort(key=lambda row: (-int(row["missing"]), row["column"]))
+    return rows
+
+
+def _read_parquet_missing_summary(path: Path) -> Tuple[List[Dict[str, str]], int]:
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    parquet_file = pq.ParquetFile(path)
+    schema = parquet_file.schema_arrow
+    missing_counts = {name: 0 for name in schema.names}
+    dtypes = {field.name: str(field.type) for field in schema}
+    total_rows = 0
+
+    for batch in parquet_file.iter_batches(batch_size=MISSING_VALUE_BATCH_SIZE):
+        total_rows += batch.num_rows
+        for idx, column in enumerate(batch.schema.names):
+            array = batch.column(idx)
+            missing = int(array.null_count)
+            field_type = batch.schema.field(idx).type
+            if pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
+                empty_mask = pc.equal(array, "")
+                empty_count = pc.sum(pc.fill_null(empty_mask, False)).as_py()
+                missing += int(empty_count or 0)
+            missing_counts[column] += missing
+
+    return _missing_rows(missing_counts, total_rows, dtypes), total_rows
+
+
+def _read_csv_missing_summary(path: Path) -> Tuple[List[Dict[str, str]], int]:
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        columns = reader.fieldnames or []
+        missing_counts = {column: 0 for column in columns}
+        total_rows = 0
+        for row in reader:
+            total_rows += 1
+            for column in columns:
+                value = row.get(column)
+                if value is None or str(value).strip() == "":
+                    missing_counts[column] += 1
+    return _missing_rows(missing_counts, total_rows), total_rows
+
+
+def _read_missing_summary(podcasts_path: Path) -> Tuple[List[Dict[str, str]], Optional[Path], int]:
+    parquet_path = podcasts_path / "balalaika.parquet"
+    if parquet_path.exists():
+        try:
+            rows, total_rows = _read_parquet_missing_summary(parquet_path)
+            return rows, parquet_path, total_rows
+        except Exception as exc:
+            logger.warning(f"Failed to read missing values from {parquet_path}: {exc}")
+
+    csv_path = podcasts_path / "balalaika.csv"
+    if csv_path.exists():
+        try:
+            rows, total_rows = _read_csv_missing_summary(csv_path)
+            return rows, csv_path, total_rows
+        except Exception as exc:
+            logger.warning(f"Failed to read missing values from {csv_path}: {exc}")
+
+    return [], None, 0
+
+
+def _append_missing_values_section(
+    lines: List[str],
+    missing_rows: List[Dict[str, str]],
+    missing_source: Optional[Path],
+    total_rows: int,
+) -> None:
+    lines.extend(["", "---", "", "## Missing values by column", ""])
+    if not missing_source:
+        lines.append("_No `balalaika.parquet` or `balalaika.csv` found for missing-values summary._")
+        return
+
+    lines.append(
+        f"Source: `{missing_source}`; rows: {total_rows:,}. Empty strings are counted as missing."
+    )
+    lines.append("")
+    lines.append("| Column | Missing | Missing, % | Dtype |")
+    lines.append("|--------|--------:|-----------:|-------|")
+    for row in missing_rows:
+        dtype = row.get("dtype") or "-"
+        lines.append(
+            f"| `{row['column']}` | {int(row['missing']):,} | {float(row['missing_percent']):.3f}% | `{dtype}` |"
+        )
+
+
 def _stage_sort_key(stage: str) -> int:
     try:
         return STAGE_ORDER.index(stage)
@@ -62,13 +170,23 @@ def _stage_sort_key(stage: str) -> int:
         return len(STAGE_ORDER) + hash(stage) % 1000
 
 
-def build_report(rows: List[Dict[str, str]]) -> str:
+def build_report(
+    rows: List[Dict[str, str]],
+    missing_rows: Optional[List[Dict[str, str]]] = None,
+    missing_source: Optional[Path] = None,
+    missing_total_rows: int = 0,
+) -> str:
     if not rows:
-        return (
-            "# Balalaika filter report\n\n"
-            "_No `filter_summary.csv` rows found yet._\n\n"
-            "Run the pipeline first; each filter stage will append its summary.\n"
-        )
+        lines = [
+            "# Balalaika filter report",
+            "",
+            "_No `filter_summary.csv` rows found yet._",
+            "",
+            "Run the pipeline first; each filter stage will append its summary.",
+        ]
+        _append_missing_values_section(lines, missing_rows or [], missing_source, missing_total_rows)
+        lines.append("")
+        return "\n".join(lines)
 
     rows.sort(key=lambda r: r["timestamp"])
 
@@ -159,6 +277,7 @@ def build_report(rows: List[Dict[str, str]]) -> str:
             f"{float(r['hours_in']):.2f} | {float(r['hours_out']):.2f} | "
             f"{float(r['hours_removed']):.2f} | {params_str} |"
         )
+    _append_missing_values_section(lines, missing_rows or [], missing_source, missing_total_rows)
     lines.append("")
     return "\n".join(lines)
 
@@ -182,11 +301,12 @@ def main(args):
     podcasts_path = _resolve_podcasts_path(args)
     summary_path = audit_path(podcasts_path)
     rows = _read_summary(summary_path)
+    missing_rows, missing_source, missing_total_rows = _read_missing_summary(podcasts_path)
 
     if not rows:
         logger.warning(f"No rows found in {summary_path}; report will be a placeholder.")
 
-    report_md = build_report(rows)
+    report_md = build_report(rows, missing_rows, missing_source, missing_total_rows)
 
     output = Path(args.output) if args.output else (podcasts_path / "filter_report.md")
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -40,6 +40,7 @@ CORE_METRICS = (
     "max_silence_duration",
     "total_duration",
     "speech_words_per_min",
+    "asr_consistency_percent",
 )
 
 
@@ -279,16 +280,25 @@ def save_metric_quantiles(
     return result
 
 
+def missing_like_mask(series: pd.Series) -> pd.Series:
+    mask = series.isna()
+    if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+        mask = mask | series.astype("string").str.strip().eq("").fillna(False)
+    return mask
+
+
 def save_missing_summary(df: pd.DataFrame, tables_dir: Path) -> pd.DataFrame:
+    masks = {col: missing_like_mask(df[col]) for col in df.columns}
+    missing_counts = pd.Series({col: int(mask.sum()) for col, mask in masks.items()})
     missing = pd.DataFrame(
         {
             "column": df.columns,
-            "missing": df.isna().sum().values,
-            "missing_percent": (df.isna().mean().values * 100).round(3),
+            "missing": [missing_counts[col] for col in df.columns],
+            "missing_percent": [round(float(masks[col].mean() * 100), 3) for col in df.columns],
             "dtype": [str(dtype) for dtype in df.dtypes],
             "unique": [df[col].nunique(dropna=True) for col in df.columns],
         }
-    ).sort_values("missing_percent", ascending=False)
+    ).sort_values(["missing_percent", "column"], ascending=[False, True])
     missing.to_csv(tables_dir / "missing_values.csv", index=False)
     return missing
 
@@ -625,6 +635,22 @@ def write_report(
                 f"- P10 words/minute: {speech.quantile(0.10):.2f}",
                 f"- P90 words/minute: {speech.quantile(0.90):.2f}",
             ]
+        )
+
+    report.extend(
+        [
+            "",
+            "## Missing Values By Column",
+            "",
+            "NaN values and empty strings are counted as missing.",
+            "",
+            "| Column | Missing | Missing, % | Dtype |",
+            "|--------|--------:|-----------:|-------|",
+        ]
+    )
+    for _, row in missing.iterrows():
+        report.append(
+            f"| `{row['column']}` | {int(row['missing']):,} | {row['missing_percent']:.3f}% | `{row['dtype']}` |"
         )
 
     (output_dir / "analysis_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
