@@ -95,6 +95,9 @@ runtime:
   cpu_affinity: "0-80"
   # Default directory for per-stage rotating log files. CLIs accept --log_dir.
   log_dir: ./logs
+  # Minimum log level for console and per-stage files. Use DEBUG to include
+  # per-file load/save timings and per-batch inference/DataLoader wait timings.
+  log_level: INFO
   # Source for stage audio file lists: auto prefers balalaika.csv and falls back
   # to rglob when the CSV is missing/empty; csv never scans and requires an
   # existing balalaika.csv; rglob always scans.
@@ -111,7 +114,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -121,7 +124,20 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  # raw: diarize long-form audio, cut chunks, and write metadata.
+  # existing_chunks: do not cut or rewrite audio; diarize every existing audio
+  #   file and backfill the same metadata columns that raw preprocess writes
+  #   (speaker_id, start/end, total_duration, playlist_id/podcast_id,
+  #   silence_percent, max_silence_duration, is_single_speaker).
+  input_mode: existing_chunks
+  # Used only with input_mode: existing_chunks. Defaults to auto so a fresh
+  # pre-chunked dataset can be discovered even when runtime.audio_paths_source
+  # is set to csv for later stages.
+  existing_chunks_audio_paths_source: auto
+  # Used only with input_mode: existing_chunks. false skips rows that already
+  # have all preprocess metadata columns; true recomputes and overwrites them.
+  existing_chunks_overwrite: false
   # Maximum duration of each output segment in seconds.
   
   duration: 15
@@ -188,7 +204,7 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
 
   music_detect:
     # Inference batch size for music classifier.
@@ -233,7 +249,7 @@ separation:
     use_tensorrt: False
 
 transcription:
-  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   model_names:
     - gigaam-v3-e2e-ctc
     - giga_ctc
@@ -247,20 +263,20 @@ transcription:
   use_rover: True
   # CPU processes for ROVER shard aggregation.
   rover_workers: 4
-  batch_size: 16
-  num_workers: 16
+  batch_size: 8
+  num_workers: 4
   prefetch_factor: 2
   retry_empty_outputs: True
 
 punctuation:
-  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -269,12 +285,12 @@ accent:
   use_tensorrt: False
 
 phonemizer:
-  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   num_workers: 1
 
 denoising:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   # MossFormer2_SE_48K dynamic ONNX. If missing, it is downloaded from Hugging Face.
   onnx_path: ./models/MossFormer2_SE_48K_dynamic_fp32.onnx
   # Fill after uploading the ONNX model.
@@ -288,7 +304,7 @@ denoising:
   use_tensorrt: True
 
 export:
-  podcasts_path: /mnt/drive2_8tb/RuYoutube/raid/nanosemantics/nextcloud/sova_done
+  podcasts_path: /mnt/hdd_6tb_1/yandex_data
   # Parallel processes writing WebDataset shards.
   num_workers: 1
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.

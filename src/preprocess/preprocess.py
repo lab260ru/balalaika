@@ -663,6 +663,19 @@ def main(args):
         login(token=hf_key)
 
     config = load_config(args.config_path, 'preprocess')
+    input_mode = str(config.get("input_mode", "raw")).strip().lower().replace("-", "_")
+    if input_mode in {"existing_chunks", "prechunked", "pre_chunked", "chunks"}:
+        logger.info("preprocess.input_mode=existing_chunks; backfilling chunk metadata without cutting audio.")
+        from src.preprocess.preprocess_existing_chunks import main as existing_chunks_main
+
+        existing_chunks_main(args, config=config, logging_configured=True)
+        return
+    if input_mode not in {"raw", "chunking"}:
+        raise ValueError(
+            "Unsupported preprocess.input_mode="
+            f"{config.get('input_mode')!r}; expected 'raw' or 'existing_chunks'."
+        )
+
     podcasts_path = Path(config.get('podcasts_path', '../../../podcasts'))
     num_workers_per_gpu = config.get('num_workers', 1)
 
