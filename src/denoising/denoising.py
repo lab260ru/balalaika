@@ -490,7 +490,7 @@ def main():
     )
 
     write_stage_status(
-        stage=10,
+        stage=11,
         stage_name="denoising",
         log_dir=args.log_dir or "./logs",
         processed=processed.value,

@@ -1,4 +1,4 @@
-"""Stage 8 — RUAccent stress restoration on ``*_punct.txt`` sidecars."""
+"""Stage 9 — RUAccent stress restoration on ``*_punct.txt`` sidecars."""
 import argparse
 import multiprocessing
 from pathlib import Path
@@ -76,7 +76,7 @@ def main(args):
         desc="Accents",
     )
     write_stage_status(
-        stage=8,
+        stage=9,
         stage_name="accents",
         log_dir=args.log_dir or "./logs",
         processed=len(pending_files) - error_count,

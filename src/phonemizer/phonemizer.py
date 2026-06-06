@@ -1,4 +1,4 @@
-"""Stage 9 — TryIParu G2P phonemization on ``*_rover.txt`` sidecars."""
+"""Stage 10 — TryIParu G2P phonemization on ``*_rover.txt`` sidecars."""
 import argparse
 import multiprocessing
 from pathlib import Path
@@ -62,7 +62,7 @@ def main(args):
         desc="Phonemizer",
     )
     write_stage_status(
-        stage=9,
+        stage=10,
         stage_name="phonemizer",
         log_dir=args.log_dir or "./logs",
         processed=len(pending_files) - error_count,

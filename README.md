@@ -36,7 +36,7 @@ Edit `configs/config.yaml`:
 - set model paths under `preprocess`, `separation`, etc.;
 - tune `runtime:` (`venv_path`, `cpu_affinity`, `log_dir`, TensorRT cache).
 
-Run the default pipeline (stages 1..9):
+Run the default tail of the pipeline (stages 11..14):
 
 ```bash
 bash base.sh --config_path configs/config.yaml
@@ -49,10 +49,10 @@ Run only a range of stages:
 bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
 
 # Transcription only
-bash base.sh --config_path configs/config.yaml --stage 6 --stop_stage 6
+bash base.sh --config_path configs/config.yaml --stage 7 --stop_stage 7
 
 # Regenerate the filtering report only
-bash base.sh --config_path configs/config.yaml --stage 13 --stop_stage 13
+bash base.sh --config_path configs/config.yaml --stage 14 --stop_stage 14
 ```
 
 ---
@@ -68,15 +68,16 @@ bash base.sh --config_path configs/config.yaml --stage 13 --stop_stage 13
 | 4 | Separation: music detection | `src.separation.music_detect` |
 | 5 | Separation: DistillMOS scoring | `src.separation.distillmos_process` |
 | 5.5 | Separation: DistillMOS filter | `src.separation.distillmos_filter` |
-| 5.6 | Separation: anti-spoofing | `src.separation.antispoofing` |
-| 6 | Transcription + ROVER | `src.transcription.transcription` |
-| 7 | Punctuation | `src.punctuation.punctuation` |
-| 8 | Stress marks / accents | `src.accents.accents` |
-| 9 | Phonemization | `src.phonemizer.phonemizer` |
-| 10 | Denoising / enhancement | `src.denoising.denoising` |
-| 11 | Collate to Parquet | `src.collate` |
-| 12 | Export to WebDataset | `src.to_webdataset` |
-| 13 | Filtering report | `src.report` |
+| 6 | Separation: Spectra-0 raw scoring | `src.separation.antispoofing` |
+| 6.5 | Separation: anti-spoofing filter | `src.separation.antispoofing_filter` |
+| 7 | Transcription + ROVER | `src.transcription.transcription` |
+| 8 | Punctuation | `src.punctuation.punctuation` |
+| 9 | Stress marks / accents | `src.accents.accents` |
+| 10 | Phonemization | `src.phonemizer.phonemizer` |
+| 11 | Denoising / enhancement | `src.denoising.denoising` |
+| 12 | Collate to Parquet | `src.collate` |
+| 13 | Export to WebDataset | `src.to_webdataset` |
+| 14 | Filtering report | `src.report` |
 
 `base.sh --help` prints the same map.
 

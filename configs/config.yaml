@@ -243,10 +243,15 @@ separation:
     batch_size: 8
     num_workers: 4
     prefetch_factor: 2
-    # Generated-speech probability threshold. If prob > threshold, file is deleted.
-    threshold: 0.5
     # TensorRT is supported when the exported ONNX has compatible dynamic batch profile.
     use_tensorrt: False
+
+  antispoofing_filter:
+    # Delete when score_spoof - score_bonafide > threshold.
+    # 0.0 is the raw model argmax decision; null enables interactive selection.
+    threshold: 0.0
+    # Parallel CPU workers used only for deleting selected files.
+    num_workers: 8
 
 transcription:
   podcasts_path: /mnt/hdd_6tb_1/yandex_data

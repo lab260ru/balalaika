@@ -2,7 +2,7 @@
 
 Quality filtering and quality annotation on chunked clips. Speaker diarization
 is handled in **preprocess** (Sortformer), not here. The separation package
-currently contains four model/filter stages:
+currently contains five model/filter stages:
 
 1. **Music detection** — WavLM backbone + fine-tuned head at
    `separation.music_detect.music_detect_model`. For every processed clip the
@@ -14,10 +14,13 @@ currently contains four model/filter stages:
 3. **DistillMOS filter** — deletes clips below
    `separation.distillmos_filter.threshold` after scoring and records an audit
    row in `filter_summary.csv`.
-4. **Anti-spoofing** — [Spectra-0](https://huggingface.co/lab260/spectra_0) ONNX classifier.
-   It estimates generated/spoofed speech probability,
-   writes `antispoof_score` and `antispoof_generated_prob`, deletes clips above
-   `separation.antispoofing.threshold`, and records an `antispoofing` audit row.
+4. **Anti-spoofing scoring** — [Spectra-0](https://huggingface.co/lab260/spectra_0)
+   ONNX classifier. It writes the untouched model outputs as `score_spoof`
+   (output index 0) and `score_bonafide` (output index 1). No deletion occurs.
+5. **Anti-spoofing filter** — computes
+   `score_spoof - score_bonafide`, deletes clips above
+   `separation.antispoofing_filter.threshold`, and records an
+   `antispoofing_filter` audit row.
 
 Every script writes a rotating, timestamped log file under `BALALAIKA_LOG_DIR`
 (default `./logs`).
@@ -33,8 +36,8 @@ Every script writes a rotating, timestamped log file under `BALALAIKA_LOG_DIR`
 ## Run
 
 ```bash
-# Stages 4..5.6 of the main runner:
-bash base.sh --config_path configs/config.yaml --stage 4 --stop_stage 5.6
+# Stages 4..6.5 of the main runner:
+bash base.sh --config_path configs/config.yaml --stage 4 --stop_stage 6.5
 
 # Or the legacy wrapper for music + DistillMOS scoring only:
 bash src/separation/separation_yaml.sh configs/config.yaml
@@ -43,7 +46,8 @@ bash src/separation/separation_yaml.sh configs/config.yaml
 python -m src.separation.music_detect       --config_path configs/config.yaml
 python -m src.separation.distillmos_process --config_path configs/config.yaml
 python -m src.separation.distillmos_filter  --config_path configs/config.yaml
-python -m src.separation.antispoofing       --config_path configs/config.yaml
+python -m src.separation.antispoofing        --config_path configs/config.yaml
+python -m src.separation.antispoofing_filter --config_path configs/config.yaml
 ```
 
 ## Parameters
@@ -57,9 +61,10 @@ Documented under **`separation`** in `configs/config.yaml`:
 | `distillmos.*` | DistillMOS batch/DataLoader settings. |
 | `distillmos_filter.*` | Threshold and deletion worker count. |
 | `antispoofing.onnx_path` | Local Spectra-0 ONNX path. Missing file is downloaded from HF. |
-| `antispoofing.batch_size`, `num_workers`, `prefetch_factor` | Anti-spoofing batching and DataLoader settings. |
-| `antispoofing.threshold` | Generated/spoofed probability above which a clip is deleted. |
+| `antispoofing.batch_size`, `num_workers`, `prefetch_factor` | Spectra-0 batching and DataLoader settings. |
 | `antispoofing.use_tensorrt` | Enable TensorRT EP when the ONNX/profile supports it. |
+| `antispoofing_filter.threshold` | Delete when `score_spoof - score_bonafide` exceeds this raw-score margin. |
+| `antispoofing_filter.num_workers` | Parallel CPU deletion workers. |
 
 ## `balalaika.csv` columns added here
 
@@ -67,8 +72,8 @@ Documented under **`separation`** in `configs/config.yaml`:
 |--------|-------------|
 | `music_prob` | Music classifier probability (0-1). Row removed if file deleted. |
 | `DistillMOS` | Predicted MOS score. |
-| `antispoof_score` | Anti-spoofing score written by the pipeline. |
-| `antispoof_generated_prob` | Deletion score compared with `antispoofing.threshold`. |
+| `score_bonafide` | Raw Spectra-0 output at class index 1. |
+| `score_spoof` | Raw Spectra-0 output at class index 0. |
 
 ## Filter summary rows emitted here
 
@@ -76,7 +81,7 @@ Documented under **`separation`** in `configs/config.yaml`:
 |---------|-------|
 | `music_detect` | Files / hours kept vs. dropped at `music_detect.threshold`. |
 | `distillmos_filter` | Files / hours kept vs. dropped at `distillmos_filter.threshold`. |
-| `antispoofing` | Files / hours kept vs. dropped at `antispoofing.threshold`. |
+| `antispoofing_filter` | Files / hours kept vs. dropped at the configured raw-score margin. |
 
 ## Resume / Interrupt Safety
 
@@ -85,7 +90,7 @@ All long-running sub-stages use `src.utils.csv_manager`:
 - **Atomic writes** of `balalaika.csv` through tmp file + rename.
 - **Auto-bootstrap** from the audio tree if the CSV is missing.
 - **Incremental partial CSVs** such as `music_part_<rank>.csv`,
-  `distillmos_part_<rank>.csv`, and `antispoof_part_<rank>.csv`.
+  `distillmos_part_<rank>.csv`, `antispoof_part_<rank>.csv`, and `antispoof_filter_part_<rank>.csv`.
 - **Disk-backed work shards** under `.balalaika_work/<stage>/`, so workers
   claim bounded shard files instead of unpickling millions of paths at start.
 - **Resume on next run** by absorbing leftovers and scheduling only files still

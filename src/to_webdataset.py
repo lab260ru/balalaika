@@ -200,7 +200,7 @@ def main(config, config_path: str | None = None):
     logger.success(f"Output directory: {wds_output_dir}")
 
     write_stage_status(
-        stage=12,
+        stage=13,
         stage_name="to_webdataset",
         log_dir=config.get("log_dir", "./logs"),
         processed=total_processed,

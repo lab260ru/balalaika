@@ -23,8 +23,8 @@ BASE_COLUMNS = (
     "loudness_normalized",
     "music_prob",
     "DistillMOS",
-    "antispoof_score",
-    "antispoof_generated_prob",
+    "score_bonafide",
+    "score_spoof",
     "denoised",
 )
 

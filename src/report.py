@@ -35,7 +35,7 @@ STAGE_ORDER = [
     "music_detect",
     "distillmos",
     "distillmos_filter",
-    "antispoofing",
+    "antispoofing_filter",
     "transcription",
     "punctuation",
     "accents",
@@ -317,7 +317,7 @@ def main(args):
         print(report_md)
 
     write_stage_status(
-        stage=13,
+        stage=14,
         stage_name="report",
         log_dir=args.log_dir or "./logs",
         processed=1,

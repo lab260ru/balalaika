@@ -20,15 +20,15 @@ idempotent — you can stop at any point and resume from where you left off.
 the Python venv, and calls each stage's Python module in order.
 
 ```bash
-bash base.sh --config_path configs/config.yaml                   # Default core pipeline (stages 1–9)
-bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 13  # Full local pipeline
+bash base.sh --config_path configs/config.yaml                   # Default tail pipeline (stages 11–14)
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 14  # Full local pipeline
 bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3  # Preprocess only
-bash base.sh --config_path configs/config.yaml --stage 6 --stop_stage 6  # Transcription only
+bash base.sh --config_path configs/config.yaml --stage 7 --stop_stage 7  # Transcription only
 ```
 
 ### How `base.sh` works internally
 
-1. Parses `--stage` (default 1) and `--stop_stage` (default 9).
+1. Parses `--stage` (default 11) and `--stop_stage` (default 14).
 2. Runs `python3 -m src.utils.runtime_env --config_path ...` which prints shell
    `export` statements (venv path, CPU affinity, log dir, TensorRT cache). The
    output is `eval`'d, setting environment variables like `BALALAIKA_VENV`,
@@ -247,38 +247,37 @@ and processing a round-robin shard of files.
 
 ---
 
-### Stage 5.6 — Anti-Spoofing (`src/separation/antispoofing.py`)
+### Stage 6 — Anti-Spoofing Scoring (`src/separation/antispoofing.py`)
 
-**Purpose:** Detect and remove generated / spoofed speech clips.
+**Purpose:** Annotate clips with raw Spectra-0 class scores without filtering.
 
-**Input:** All audio files under `podcasts_path`.
+**Process:** Audio is converted to mono 16 kHz, preemphasized, and cropped or
+repeated to 64,600 samples. Batched ONNX Runtime inference writes output index 0
+as `score_spoof` and output index 1 as `score_bonafide`. No sigmoid or softmax
+is applied and no files are deleted.
 
-**Process:**
-1. Loads [Spectra-0](https://huggingface.co/lab260/spectra_0) ONNX model from `separation.antispoofing.onnx_path`;
-   if the file is missing, downloads `lab260/spectra_0/model.onnx` from
-   Hugging Face.
-2. Uses `AntiSpoofingDataset` to decode audio with
-   `torchaudio.load_with_torchcodec`, convert to mono, resample to 16 kHz,
-   apply preemphasis, then random-crop long clips or repeat short clips to
-   64,600 samples.
-3. Runs batched ONNX Runtime inference on each GPU.
-4. Writes `antispoof_score` and `antispoof_generated_prob` to `balalaika.csv`.
-5. Deletes clips whose generated probability exceeds `threshold`.
-
-**Output:**
-- `antispoof_score`, `antispoof_generated_prob` columns in `balalaika.csv`.
-- Generated/spoofed files deleted from disk and pruned from CSV.
-- Audit row in `filter_summary.csv` (stage: `antispoofing`).
-
-**Idempotency:** Same partial CSV/resume pattern as music detection:
-`ensure_main_csv`, `absorb_partial_csvs` for `antispoof_part_*.csv`, and
-`unprocessed_paths` on `antispoof_score`.
+**Idempotency:** `antispoof_part_*.csv` is absorbed on restart and work is
+scheduled from missing `score_spoof` values.
 
 **Config section:** `separation.antispoofing`
 
 ---
 
-### Stage 6 — Transcription (`src/transcription/transcription.py`)
+### Stage 6.5 — Anti-Spoofing Filter (`src/separation/antispoofing_filter.py`)
+
+**Purpose:** Remove clips classified as spoofed after the scoring stage.
+
+The stage computes `spoof_margin = score_spoof - score_bonafide`, prints its
+distribution and deletion preview, then deletes rows where the margin exceeds
+`separation.antispoofing_filter.threshold`. A threshold of `0.0` implements the
+raw model argmax decision. Deleted files are pruned from `balalaika.csv` and an
+`antispoofing_filter` row is appended to `filter_summary.csv`.
+
+**Config section:** `separation.antispoofing_filter`
+
+---
+
+### Stage 7 — Transcription (`src/transcription/transcription.py`)
 
 **Purpose:** Multi-model ASR via onnx-asr, with optional consensus skip, word-level
 timestamps, and ROVER aggregation.
@@ -317,7 +316,7 @@ existing `_rover.txt`.
 
 ---
 
-### Stage 7 — Punctuation (`src/punctuation/punctuation.py`)
+### Stage 8 — Punctuation (`src/punctuation/punctuation.py`)
 
 **Purpose:** Restore punctuation and capitalization on ROVER consensus text using
 RUPunct.
@@ -344,7 +343,7 @@ written atomically vial `Path.write_text()`.
 
 ---
 
-### Stage 8 — Accents / Stress Marks (`src/accents/accents.py`)
+### Stage 9 — Accents / Stress Marks (`src/accents/accents.py`)
 
 **Purpose:** Add lexical stress marks and normalize text using ruAccent.
 
@@ -366,7 +365,7 @@ out_derive=lambda p: replace_in_stem(p, "_punct", "_accent"))`.
 
 ---
 
-### Stage 9 — Phonemizer (`src/phonemizer/phonemizer.py`)
+### Stage 10 — Phonemizer (`src/phonemizer/phonemizer.py`)
 
 **Purpose:** Convert grapheme text to IPA phonemes using TryIParu.
 
@@ -388,7 +387,7 @@ out_derive=lambda p: p.with_name(f"{p.stem}_phonemes.txt"))`.
 
 ---
 
-### Stage 10 — Denoising / Speech Enhancement (`src/denoising/denoising.py`)
+### Stage 11 — Denoising / Speech Enhancement (`src/denoising/denoising.py`)
 
 **Purpose:** Enhance audio in place using a dynamic ONNX export of ClearerVoice-Studio MossFormer2_SE_48K.
 
@@ -418,7 +417,7 @@ out_derive=lambda p: p.with_name(f"{p.stem}_phonemes.txt"))`.
 
 ---
 
-### Stage 11 — Collate to Parquet (`src/collate.py`)
+### Stage 12 — Collate to Parquet (`src/collate.py`)
 
 **Purpose:** Merge all metadata and sidecar text files into a single Parquet file.
 
@@ -441,7 +440,7 @@ resume logic needed.
 
 ---
 
-### Stage 12 — Export to WebDataset (`src/to_webdataset.py`)
+### Stage 13 — Export to WebDataset (`src/to_webdataset.py`)
 
 **Purpose:** Pack audio bytes + metadata + text sidecars into WebDataset tar
 shards for efficient streaming training.
@@ -468,7 +467,7 @@ shard series.
 
 ---
 
-### Stage 13 — Filter Report (`src/report.py`)
+### Stage 14 — Filter Report (`src/report.py`)
 
 **Purpose:** Generate a human-readable Markdown report showing hours kept/removed
 at each filtering stage.
@@ -502,15 +501,16 @@ at each filtering stage.
 | 3 | All audio files | Normalized audio (in-place); `loudness_normalized` in CSV |
 | 4 | All audio files | Deleted music-heavy files; `music_prob` in CSV + audit |
 | 5 | All audio files | `DistillMOS` in CSV (annotation only) |
-| 5.6 | All audio files | Deleted generated speech; anti-spoofing scores in CSV + audit |
-| 6 | All audio files | `{stem}_{model}.txt` + `.tst` + `_rover.txt` |
-| 7 | `*_rover.txt` | `{stem}_punct.txt` |
-| 8 | `*_punct.txt` | `{stem}_accent.txt` |
-| 9 | `*_rover.txt` | `{stem}_rover_phonemes.txt` |
-| 10 | All audio files | Denoised 48 kHz audio in place; `denoised` in CSV |
-| 11 | `balalaika.csv` + sidecars | `balalaika.parquet` |
-| 12 | Audio + `balalaika.csv` | WebDataset `.tar` shards |
-| 13 | `filter_summary.csv` | `filter_report.md` |
+| 6 | All audio files | Raw `score_spoof` and `score_bonafide` in CSV |
+| 6.5 | Scored audio files | Deleted generated speech + audit |
+| 7 | All audio files | `{stem}_{model}.txt` + `.tst` + `_rover.txt` |
+| 8 | `*_rover.txt` | `{stem}_punct.txt` |
+| 9 | `*_punct.txt` | `{stem}_accent.txt` |
+| 10 | `*_rover.txt` | `{stem}_rover_phonemes.txt` |
+| 11 | All audio files | Denoised 48 kHz audio in place; `denoised` in CSV |
+| 12 | `balalaika.csv` + sidecars | `balalaika.parquet` |
+| 13 | Audio + `balalaika.csv` | WebDataset `.tar` shards |
+| 14 | `filter_summary.csv` | `filter_report.md` |
 
 ---
 
@@ -522,12 +522,12 @@ and resumed safely. The resume system has four layers.
 ### Layer 1: Stage-level control
 
 `base.sh --stage N --stop_stage M` lets you run any contiguous subset of stages.
-If the pipeline fails at stage 6, re-run `--stage 6` to continue from there.
+If the pipeline fails at stage 7, re-run `--stage 7` to continue from there.
 
 ### Layer 2: CSV state with atomic writes (`balalaika.csv`)
 
-Used by stages 2–5 and 10 (crest factor, loudness, music detection,
-DistillMOS, denoising) via `src/utils/csv_manager.py`.
+Used by stages 2–6 and 11 (crest factor, loudness, music detection,
+DistillMOS, anti-spoofing scoring/filtering, denoising) via `src/utils/csv_manager.py`.
 
 **`ensure_main_csv(podcasts_path, audio_paths)`**
 - If `balalaika.csv` doesn't exist, creates it from the audio tree with all
@@ -565,21 +565,21 @@ Step 4: mp.spawn() / run_workers()  # Process only pending files
 Step 5: absorb_partial_csvs()       # Merge new results (also on Ctrl+C)
 ```
 
-### Layer 3: Sidecar file checks (stages 6–9)
+### Layer 3: Sidecar file checks (stages 7–10)
 
-Stages 6–9 (transcription, punctuation, accents, phonemizer) don't use
+Stages 7–10 (transcription, punctuation, accents, phonemizer) don't use
 `balalaika.csv` at all. Instead, they check for the existence of output files:
 
-- **Transcription (Stage 6):** Checks `{stem}_{model}.txt` per model. Files
+- **Transcription (Stage 7):** Checks `{stem}_{model}.txt` per model. Files
   with existing output are skipped. Also uses `consensus_num`: if enough
   earlier models agree on normalized text, later models skip that file
   entirely.
-- **Punctuation (Stage 7):** `pending_audio_to_sidecar(in_suffix="_rover.txt",
+- **Punctuation (Stage 8):** `pending_audio_to_sidecar(in_suffix="_rover.txt",
   out_suffix="_punct.txt")` — finds only audio chunks that have `_rover.txt`
   but lack `_punct.txt`.
-- **Accents (Stage 8):** `pending_sidecar_chain(in_suffix="_punct.txt",
+- **Accents (Stage 9):** `pending_sidecar_chain(in_suffix="_punct.txt",
   out_derive=...)` — finds only `_punct.txt` files missing `_accent.txt`.
-- **Phonemizer (Stage 9):** `pending_sidecar_chain(in_suffix="_rover.txt",
+- **Phonemizer (Stage 10):** `pending_sidecar_chain(in_suffix="_rover.txt",
   out_derive=...)` — finds only `_rover.txt` files missing
   `_rover_phonemes.txt`.
 
@@ -633,7 +633,7 @@ rows over multiple pipeline runs.
 
 ### Filter Report (`filter_report.md`)
 
-Stage 13 (`src/report.py`) reads `filter_summary.csv` and generates a Markdown
+Stage 14 (`src/report.py`) reads `filter_summary.csv` and generates a Markdown
 report at `<podcasts_path>/filter_report.md` with three sections:
 
 1. **Per-stage summary table:** For the latest run of each stage, shows the
@@ -648,7 +648,7 @@ report at `<podcasts_path>/filter_report.md` with three sections:
 
 Example usage:
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 13 --stop_stage 13
+bash base.sh --config_path configs/config.yaml --stage 14 --stop_stage 14
 ```
 
 ### Per-Stage Log Files
@@ -672,13 +672,13 @@ Each stage reads only its own YAML section via `load_config(config_path, SECTION
 | `runtime` | Orchestration: venv path, CPU affinity, log dir, TensorRT cache |
 | `download` | Yandex Music downloader |
 | `preprocess` | Diarization, crest filter, loudness (stages 1–3) |
-| `separation` | Music detection + DistillMOS (stages 4–5) |
-| `transcription` | onnx-asr ASR + ROVER (stage 6) |
-| `punctuation` | RUPunct (stage 7) |
-| `accent` | ruAccent (stage 8) — note: singular `accent` |
-| `phonemizer` | TryIParu G2P (stage 9) |
-| `denoising` | MossFormer2_SE_48K ONNX Runtime / TensorRT enhancement (stage 10) |
-| `export` | WebDataset shard export (stage 12) |
+| `separation` | Music detection, DistillMOS, and anti-spoofing (stages 4–6.5) |
+| `transcription` | onnx-asr ASR + ROVER (stage 7) |
+| `punctuation` | RUPunct (stage 8) |
+| `accent` | ruAccent (stage 9) — note: singular `accent` |
+| `phonemizer` | TryIParu G2P (stage 10) |
+| `denoising` | MossFormer2_SE_48K ONNX Runtime / TensorRT enhancement (stage 11) |
+| `export` | WebDataset shard export (stage 13) |
 
 ### `runtime` block keys
 
@@ -694,7 +694,7 @@ Each stage reads only its own YAML section via `load_config(config_path, SECTION
 | `trt_fp16` | `True` | FP16 for TensorRT |
 
 ### Important note
-`src/collate.py` (Stage 11) reads the **`download`** section for
+`src/collate.py` (Stage 12) reads the **`download`** section for
 `podcasts_path` and `num_workers`, so keep `download.podcasts_path` aligned
 with the rest of the pipeline even if you don't use Stage 0.
 
@@ -725,9 +725,9 @@ balalaika/
 ├── base.sh                          # Main orchestrator (--stage / --stop_stage)
 ├── src/
 │   ├── __init__.py
-│   ├── collate.py                   # Stage 11: Parquet collation
-│   ├── to_webdataset.py             # Stage 12: WebDataset export
-│   ├── report.py                    # Stage 13: Filter report
+│   ├── collate.py                   # Stage 12: Parquet collation
+│   ├── to_webdataset.py             # Stage 13: WebDataset export
+│   ├── report.py                    # Stage 14: Filter report
 │   ├── recovery_from_meta.py        # Reconstruct chunks from parquet metadata
 │   ├── stage_runner.sh              # Shared shell bootstrap
 │   │
@@ -760,23 +760,24 @@ balalaika/
 │   ├── separation/
 │   │   ├── music_detect.py          # Stage 4: WavLM music detection filter
 │   │   ├── distillmos_process.py    # Stage 5: DistillMOS scoring
-│   │   └── antispoofing.py          # Stage 5.6: Spectra-0 generated speech filter
+│   │   ├── antispoofing.py          # Stage 6: Spectra-0 raw scoring
+│   │   └── antispoofing_filter.py   # Stage 6.5: raw-score margin filter
 │   │
 │   ├── transcription/
-│   │   ├── transcription.py         # Stage 6: Multi-model ASR via onnx-asr
+│   │   ├── transcription.py         # Stage 7: Multi-model ASR via onnx-asr
 │   │   └── rover.py                 # ROVER aggregation (crowd-kit)
 │   │
 │   ├── punctuation/
-│   │   └── punctuation.py           # Stage 7: RUPunct punctuation restoration
+│   │   └── punctuation.py           # Stage 8: RUPunct punctuation restoration
 │   │
 │   ├── accents/
-│   │   └── accents.py               # Stage 8: ruAccent stress marks
+│   │   └── accents.py               # Stage 9: ruAccent stress marks
 │   │
 │   ├── phonemizer/
-│   │   └── phonemizer.py            # Stage 9: TryIParu G2P
+│   │   └── phonemizer.py            # Stage 10: TryIParu G2P
 │   │
 │   ├── denoising/
-│   │   └── denoising.py             # Stage 10: MossFormer2_SE_48K ONNX/TRT
+│   │   └── denoising.py             # Stage 11: MossFormer2_SE_48K ONNX/TRT
 │   │
 │   └── libs/
 │       └── smart_turn/

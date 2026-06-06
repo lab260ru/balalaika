@@ -68,8 +68,8 @@ BASE_COLUMNS: Tuple[str, ...] = (
     "loudness_normalized",
     "music_prob",
     "DistillMOS",
-    "antispoof_score",
-    "antispoof_generated_prob",
+    "score_bonafide",
+    "score_spoof",
     "denoised",
 )
 

@@ -1,4 +1,4 @@
-"""Stage 7 — RUPunct punctuation restoration on ``*_rover.txt`` sidecars."""
+"""Stage 8 — RUPunct punctuation restoration on ``*_rover.txt`` sidecars."""
 import argparse
 import multiprocessing
 from pathlib import Path
@@ -80,7 +80,7 @@ def main(args):
         desc="Punctuation",
     )
     write_stage_status(
-        stage=7,
+        stage=8,
         stage_name="punctuation",
         log_dir=args.log_dir or "./logs",
         processed=len(pending_files) - error_count,

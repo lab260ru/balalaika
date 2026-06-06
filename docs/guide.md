@@ -94,23 +94,27 @@ clips below `separation.distillmos_filter.threshold`. If the threshold is
 interactively. Deletions are streamed through partial CSV files and recorded in
 `filter_summary.csv` as `distillmos_filter`.
 
-#### 3.4. Anti-spoofing (`antispoofing.py`)
+#### 3.4. Anti-spoofing scoring (`antispoofing.py`)
 Runs the **[Spectra-0](https://huggingface.co/lab260/spectra_0)** ONNX classifier on fixed 16 kHz / 64,600-sample batches.
 Audio preparation follows the official repo after decoding with
 `torchaudio.load_with_torchcodec`: mono mixdown, 16 kHz resampling,
 preemphasis, then random crop for long clips or repeat for short clips. The
-stage writes `antispoof_score` and
-`antispoof_generated_prob` to `balalaika.csv`, deletes clips above
-`separation.antispoofing.threshold`, and records deletions in
-`filter_summary.csv` as `antispoofing`.
+stage stores raw model outputs only: `score_spoof` is output index 0 and
+`score_bonafide` is output index 1. No sigmoid, softmax, or deletion is applied.
+
+#### 3.5. Anti-spoofing filter (`antispoofing_filter.py`)
+Prints the distribution of `score_spoof - score_bonafide` and deletes clips
+whose margin is above `separation.antispoofing_filter.threshold`. A threshold
+of `0.0` is the raw model argmax decision. Deletions are recorded in
+`filter_summary.csv` as `antispoofing_filter`.
 
 **Configuration**: `config.yaml` → `separation` section
 - `music_detect.bs`, `num_workers`, `music_detect_model`, `threshold`, optional
   `base_model` / `cache_path`
 - `distillmos.batch_size`, `distillmos.num_workers`, `distillmos.prefetch_factor`
 - `distillmos_filter.threshold`, `distillmos_filter.num_workers`
-- `antispoofing.onnx_path`, `threshold`, `batch_size`, `num_workers`,
-  `use_tensorrt`
+- `antispoofing.onnx_path`, `batch_size`, `num_workers`, `use_tensorrt`
+- `antispoofing_filter.threshold`, `antispoofing_filter.num_workers`
 
 ---
 
@@ -194,8 +198,8 @@ the chunked container is preserved end-to-end (no extra encode at export).
 **Run**:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 11 --stop_stage 11
 bash base.sh --config_path configs/config.yaml --stage 12 --stop_stage 12
+bash base.sh --config_path configs/config.yaml --stage 13 --stop_stage 13
 ```
 
 ---
@@ -204,8 +208,8 @@ bash base.sh --config_path configs/config.yaml --stage 12 --stop_stage 12
 
 After filtering stages finish, `src.report` reads `filter_summary.csv` and
 writes `<podcasts_path>/filter_report.md` summarising hours filtered at every
-stage. It is stage 13 in `base.sh`; it runs only when your selected
-`--stage`/`--stop_stage` range includes 13.
+stage. It is stage 14 in `base.sh`; it runs only when your selected
+`--stage`/`--stop_stage` range includes 14.
 
 ---
 
@@ -213,8 +217,8 @@ stage. It is stage 13 in `base.sh`; it runs only when your selected
 
 `base.sh` is a Kaldi-style orchestrator with numbered stages
 (`--stage` / `--stop_stage` like CosyVoice's `run.sh`). With no stage flags it
-runs stages 1..9: chunking through phonemization, skipping download, parquet
-collation, WebDataset export, and the final report.
+runs stages 11..14: denoising, parquet collation, WebDataset export, and
+the final report.
 
 ```bash
 bash base.sh --config_path configs/config.yaml
@@ -224,13 +228,13 @@ Run all local processing stages, including denoising, parquet, WebDataset export
 report:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 13
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 14
 ```
 
 Include Yandex Music download as well:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 13
+bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 14
 ```
 
 Run a contiguous subrange (e.g. preprocess only):
@@ -242,7 +246,7 @@ bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
 Run a single stage (e.g. transcription) after data is already chunked:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 6 --stop_stage 6
+bash base.sh --config_path configs/config.yaml --stage 7 --stop_stage 7
 ```
 
 Stage map:
@@ -256,15 +260,16 @@ Stage map:
 | 4 | Separation: music detection | `src.separation.music_detect` |
 | 5 | Separation: DistillMOS | `src.separation.distillmos_process` |
 | 5.5 | Separation: DistillMOS filter | `src.separation.distillmos_filter` |
-| 5.6 | Separation: anti-spoofing | `src.separation.antispoofing` |
-| 6 | Transcription | `src.transcription.transcription` |
-| 7 | Punctuation | `src.punctuation.punctuation` |
-| 8 | Accents | `src.accents.accents` |
-| 9 | Phonemizer | `src.phonemizer.phonemizer` |
-| 10 | Denoising / enhancement | `src.denoising.denoising` |
-| 11 | Collate (parquet) | `src.collate` |
-| 12 | Export (WebDataset) | `src.to_webdataset` |
-| 13 | Filter report | `src.report` |
+| 6 | Separation: Spectra-0 raw scoring | `src.separation.antispoofing` |
+| 6.5 | Separation: anti-spoofing filter | `src.separation.antispoofing_filter` |
+| 7 | Transcription | `src.transcription.transcription` |
+| 8 | Punctuation | `src.punctuation.punctuation` |
+| 9 | Accents | `src.accents.accents` |
+| 10 | Phonemizer | `src.phonemizer.phonemizer` |
+| 11 | Denoising / enhancement | `src.denoising.denoising` |
+| 12 | Collate (parquet) | `src.collate` |
+| 13 | Export (WebDataset) | `src.to_webdataset` |
+| 14 | Filter report | `src.report` |
 
 `base.sh` reads runtime parameters (venv path, CPU affinity, log dir, TRT cache
 and workspace) from the **`runtime`** block in the YAML via
@@ -442,6 +447,7 @@ python -m src.separation.music_detect         --config_path configs/config.yaml
 python -m src.separation.distillmos_process   --config_path configs/config.yaml
 python -m src.separation.distillmos_filter    --config_path configs/config.yaml
 python -m src.separation.antispoofing         --config_path configs/config.yaml
+python -m src.separation.antispoofing_filter  --config_path configs/config.yaml
 python -m src.transcription.transcription     --config_path configs/config.yaml
 python -m src.punctuation.punctuation         --config_path configs/config.yaml
 python -m src.accents.accents                 --config_path configs/config.yaml

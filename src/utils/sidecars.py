@@ -1,6 +1,6 @@
 """Sidecar-text helpers (``*_rover.txt``, ``*_punct.txt``, …).
 
-Pipeline stages 6-9 (transcription, punctuation, accents, phonemizer) all
+Pipeline stages 7-10 (transcription, punctuation, accents, phonemizer) all
 work by reading one ``.txt`` file and writing another next to the audio. The
 resume / skip-already-done logic for those stages is the same: enumerate
 candidates, derive the expected output path, keep only candidates whose

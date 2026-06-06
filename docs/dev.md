@@ -18,15 +18,16 @@ The main entrypoint is `base.sh`. It runs numbered stages from
 | 4 | `src.separation.music_detect` | Music probability filtering. |
 | 5 | `src.separation.distillmos_process` | DistillMOS quality scoring. |
 | 5.5 | `src.separation.distillmos_filter` | DistillMOS threshold filtering. |
-| 5.6 | `src.separation.antispoofing` | Generated speech filtering. |
-| 6 | `src.transcription.transcription` | ASR with `onnx-asr` and optional ROVER. |
-| 7 | `src.punctuation.punctuation` | Punctuation restoration. |
-| 8 | `src.accents.accents` | Accent restoration. |
-| 9 | `src.phonemizer.phonemizer` | G2P / phonemization. |
-| 10 | `src.denoising.denoising` | ONNX Runtime / TensorRT denoising / speech enhancement. |
-| 11 | `src.collate` | Merge sidecars into parquet. |
-| 12 | `src.to_webdataset` | Export WebDataset shards. |
-| 13 | `src.report` | Build filter report. |
+| 6 | `src.separation.antispoofing` | Store raw Spectra-0 class scores. |
+| 6.5 | `src.separation.antispoofing_filter` | Filter by spoof-vs-bonafide score margin. |
+| 7 | `src.transcription.transcription` | ASR with `onnx-asr` and optional ROVER. |
+| 8 | `src.punctuation.punctuation` | Punctuation restoration. |
+| 9 | `src.accents.accents` | Accent restoration. |
+| 10 | `src.phonemizer.phonemizer` | G2P / phonemization. |
+| 11 | `src.denoising.denoising` | ONNX Runtime / TensorRT denoising / speech enhancement. |
+| 12 | `src.collate` | Merge sidecars into parquet. |
+| 13 | `src.to_webdataset` | Export WebDataset shards. |
+| 14 | `src.report` | Build filter report. |
 
 Run a single stage:
 
@@ -40,8 +41,8 @@ Run from a checkpoint:
 bash base.sh --config_path configs/config.yaml --stage 4
 ```
 
-By default, `base.sh` runs stages 1..9. Use `--stop_stage 13` when you also
-want denoising, parquet collation, WebDataset export, and the final report. Use
+By default, `base.sh` runs stages 11..14. Use `--stage 1 --stop_stage 14`
+to run the full local pipeline from preprocessing through the final report. Use
 `--strict` when the orchestrator should abort after any stage writes a status
 file with non-zero errors.
 
