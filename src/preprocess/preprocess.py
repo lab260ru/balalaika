@@ -879,6 +879,7 @@ def main(args):
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=chunk_value_columns,
+        preserve_existing=True,
     )
     if absorbed:
         logger.info(
@@ -906,6 +907,7 @@ def main(args):
             podcasts_path,
             prefix=PARTIAL_PREFIX,
             value_columns=chunk_value_columns,
+            preserve_existing=True,
             **csv_settings,
         ):
             with ThreadPoolExecutor(max_workers=max(1, num_gpus)) as thread_executor:
@@ -948,6 +950,7 @@ def main(args):
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=chunk_value_columns,
+        preserve_existing=True,
     )
     if final_absorbed:
         logger.success(

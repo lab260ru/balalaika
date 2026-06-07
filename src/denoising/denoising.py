@@ -413,6 +413,7 @@ def main():
         PARTIAL_PREFIX,
         value_columns=[PROCESSED_COLUMN],
         bootstrap_audio_paths=audio_paths,
+        preserve_existing=True,
     )
     if absorbed:
         logger.info(
@@ -467,6 +468,7 @@ def main():
             podcasts_path,
             prefix=PARTIAL_PREFIX,
             value_columns=[PROCESSED_COLUMN],
+            preserve_existing=True,
             **csv_settings,
         ):
             worker_errors, _ = run_per_gpu_processes(
@@ -487,6 +489,7 @@ def main():
         PARTIAL_PREFIX,
         value_columns=[PROCESSED_COLUMN],
         bootstrap_audio_paths=audio_paths,
+        preserve_existing=True,
     )
 
     write_stage_status(

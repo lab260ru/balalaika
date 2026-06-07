@@ -318,6 +318,7 @@ _, absorbed = absorb_partial_csvs(
     PARTIAL_PREFIX,
     value_columns=[COLUMN],
     bootstrap_audio_paths=audio_paths,
+    preserve_existing=True,
 )
 
 pending = unprocessed_paths(podcasts_path, COLUMN, audio_paths)
@@ -328,8 +329,23 @@ absorb_partial_csvs(
     podcasts_path,
     PARTIAL_PREFIX,
     value_columns=[COLUMN],
+    preserve_existing=True,
 )
 ```
+
+Partial CSV merges are sparse updates. They must never clear values for
+filepaths absent from the partial:
+
+- `preserve_existing=True` is the default for `upsert_columns()`,
+  `absorb_partial_csvs()`, and `PeriodicCsvMerger`. Non-null incoming values
+  update matching rows, while null incoming values cannot erase existing
+  metadata.
+- `preserve_existing=False` is reserved for an explicit recompute/overwrite.
+  It may clear or replace values only for matching incoming filepaths.
+
+Use `preserve_existing=True` explicitly in normal scoring, filtering, and
+metadata-backfill stages so the retention requirement is visible at the call
+site.
 
 For filtering stages that delete files, pass `drop_missing_files=True` when
 absorbing or upserting results.

@@ -258,6 +258,7 @@ def main():
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=[COLUMN],
+        preserve_existing=True,
     )
     if absorbed:
         logger.info(
@@ -315,6 +316,7 @@ def main():
             podcasts_path,
             prefix=PARTIAL_PREFIX,
             value_columns=[COLUMN],
+            preserve_existing=True,
             **csv_settings,
         ):
             mp.spawn(
@@ -333,6 +335,7 @@ def main():
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=[COLUMN],
+        preserve_existing=True,
     )
 
     write_stage_status(

@@ -337,7 +337,7 @@ def upsert_columns(
     *,
     drop_missing_files: bool = False,
     bootstrap_audio_paths: Optional[Iterable[os.PathLike | str]] = None,
-    preserve_existing: bool = False,
+    preserve_existing: bool = True,
 ) -> pd.DataFrame:
     """Merge ``results_df`` into ``balalaika.csv`` on ``filepath``.
 
@@ -354,9 +354,10 @@ def upsert_columns(
         bootstrap_audio_paths: optional list of audio paths to add to the
             CSV's universe before merging (so brand-new files appear even if
             this stage didn't produce a row for them yet).
-        preserve_existing: when True, only non-null incoming values update the
-            main CSV and existing values outside results_df are kept. This
-            is useful for sparse metadata backfills such as audio durations.
+        preserve_existing: existing values outside ``results_df`` are always
+            retained. When True, null incoming values also cannot erase a
+            value already stored for the same filepath. When False, incoming
+            rows replace matching values, including with null.
 
     Returns the resulting DataFrame after the atomic write.
     """
@@ -391,25 +392,32 @@ def upsert_columns(
             results = results[["filepath", *present]].drop_duplicates(
                 subset="filepath", keep="last"
             )
-            if preserve_existing:
-                df = df.merge(
-                    results,
-                    on="filepath",
-                    how="outer",
-                    suffixes=("", "__incoming"),
-                )
-                for col in present:
-                    incoming_col = f"{col}__incoming"
-                    if incoming_col not in df.columns:
-                        continue
-                    if col in df.columns:
-                        df[col] = df[incoming_col].combine_first(df[col])
-                        df = df.drop(columns=[incoming_col])
-                    else:
-                        df = df.rename(columns={incoming_col: col})
-            else:
-                df = df.drop(columns=present, errors="ignore")
-                df = df.merge(results, on="filepath", how="outer")
+            existing_columns = set(df.columns)
+            incoming_marker = "__balalaika_incoming_row__"
+            while incoming_marker in existing_columns or incoming_marker in results.columns:
+                incoming_marker = f"_{incoming_marker}"
+            results[incoming_marker] = True
+            df = df.merge(
+                results,
+                on="filepath",
+                how="outer",
+                suffixes=("", "__incoming"),
+            )
+            incoming_rows = df[incoming_marker].eq(True)
+
+            for col in present:
+                if col not in existing_columns:
+                    continue
+                incoming_col = f"{col}__incoming"
+                if preserve_existing:
+                    df[col] = df[incoming_col].combine_first(df[col])
+                else:
+                    updated = df[col].astype(object)
+                    updated.loc[incoming_rows] = df.loc[incoming_rows, incoming_col]
+                    df[col] = updated.infer_objects(copy=False)
+                df = df.drop(columns=[incoming_col])
+
+            df = df.drop(columns=[incoming_marker])
 
         if drop_missing_files and not df.empty:
             before = len(df)
@@ -552,7 +560,7 @@ def absorb_partial_csvs(
     *,
     drop_missing_files: bool = False,
     bootstrap_audio_paths: Optional[Iterable[os.PathLike | str]] = None,
-    preserve_existing: bool = False,
+    preserve_existing: bool = True,
 ) -> Tuple[pd.DataFrame, int]:
     """Merge any leftover partials into the main CSV and delete them.
 
@@ -812,7 +820,7 @@ class PeriodicCsvMerger:
         flush_every_seconds: float = DEFAULT_FLUSH_EVERY_SECONDS,
         drop_missing_files: bool = False,
         bootstrap_audio_paths: Optional[Iterable[os.PathLike | str]] = None,
-        preserve_existing: bool = False,
+        preserve_existing: bool = True,
         poll_interval: float = 30.0,
     ) -> None:
         self.podcasts_path = Path(podcasts_path)

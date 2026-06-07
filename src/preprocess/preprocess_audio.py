@@ -295,6 +295,7 @@ def main(args):
         PARTIAL_PREFIX,
         value_columns=[NORMALIZED_COLUMN],
         bootstrap_audio_paths=audio_paths,
+        preserve_existing=True,
     )
     if absorbed:
         logger.info(
@@ -347,6 +348,7 @@ def main(args):
             podcasts_path,
             prefix=PARTIAL_PREFIX,
             value_columns=[NORMALIZED_COLUMN],
+            preserve_existing=True,
             **csv_settings,
         ):
             if num_processes > 1:
@@ -393,6 +395,7 @@ def main(args):
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=[NORMALIZED_COLUMN],
+        preserve_existing=True,
     )
 
     write_stage_status(
