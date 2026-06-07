@@ -1,8 +1,10 @@
 """Preprocess metadata backfill for datasets that are already chunked.
 
-This stage does not cut or rewrite audio. It diarizes each existing audio file
-and writes the same metadata columns that the normal preprocess chunking stage
-produces:
+The default path does not cut or rewrite audio. It diarizes each existing
+audio file and writes the same metadata columns that the normal preprocess
+chunking stage produces. When ``fuse_audio_preprocessing`` is enabled, it also
+does one native-rate read for crest filtering plus LUFS normalization and
+rewrites each kept file at most once.
 
 * speaker_id
 * start / end
@@ -23,11 +25,17 @@ from typing import Iterable, List, Mapping, Sequence, Set
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
+import torchaudio
 from loguru import logger
 from tqdm import tqdm
 
+from src.preprocess.audio_postprocessing import (
+    fused_audio_preprocessing_enabled,
+    postprocess_audio_tensor,
+)
 from src.preprocess.preprocess import (
     DEFAULT_CHUNK_DURATION_S,
+    FUSED_PARTIAL_FIELDS,
     PARTIAL_FIELDS,
     PARTIAL_PREFIX,
     diarize_audio,
@@ -57,7 +65,8 @@ from src.utils.work_shards import (
     read_work_shard,
 )
 
-VALUE_COLUMNS = [column for column in PARTIAL_FIELDS if column != "filepath"]
+METADATA_VALUE_COLUMNS = [column for column in PARTIAL_FIELDS if column != "filepath"]
+VALUE_COLUMNS = [column for column in FUSED_PARTIAL_FIELDS if column != "filepath"]
 DEFAULT_AUDIO_PATHS_SOURCE = "auto"
 
 CHUNK_STEM_PREFIX_RE = re.compile(
@@ -97,6 +106,7 @@ def pending_metadata_paths(
     audio_paths: Iterable[str],
     *,
     overwrite: bool = False,
+    required_columns: Sequence[str] = METADATA_VALUE_COLUMNS,
 ) -> List[str]:
     paths = [normalize_path_string(path) for path in audio_paths if str(path).strip()]
     if overwrite:
@@ -106,7 +116,7 @@ def pending_metadata_paths(
     if df.empty:
         return paths
 
-    done_mask = _metadata_complete_mask(df, VALUE_COLUMNS)
+    done_mask = _metadata_complete_mask(df, required_columns)
     done = set(df.loc[done_mask, "filepath"].astype(str).map(normalize_path_string))
     pending = [path for path in paths if path not in done]
     logger.info(
@@ -206,7 +216,7 @@ def metadata_for_chunk(
     }
 
 
-def _increment(counter, amount: int = 1) -> None:
+def _increment(counter, amount: float = 1) -> None:
     if counter is None:
         return
     try:
@@ -214,6 +224,66 @@ def _increment(counter, amount: int = 1) -> None:
             counter.value += amount
     except AttributeError:
         counter.value += amount
+
+
+def _postprocess_existing_chunk(
+    path_audio: str,
+    config: Mapping[str, object],
+) -> tuple[bool, float, bool, float, bool]:
+    load_started_at = time.perf_counter()
+    native_audio, native_sr = torchaudio.load_with_torchcodec(path_audio)
+    native_audio = native_audio.to(dtype=torch.float32).contiguous()
+    logger.debug(
+        f"perf audio_load stage=preprocess_existing_chunks path={path_audio} "
+        f"seconds={time.perf_counter() - load_started_at:.6f} "
+        f"sample_rate={int(native_sr)} frames={int(native_audio.shape[-1])}"
+    )
+
+    result = postprocess_audio_tensor(
+        native_audio,
+        int(native_sr),
+        crest_threshold=float(
+            config.get("crest_threshold", config.get("crest_treshold", 10.0))
+        ),
+        peak=float(config.get("peak", -1.0)),
+        loudness=float(config.get("loudness", -23.0)),
+        block_size=float(config.get("block_size", 0.400)),
+    )
+    duration_s = float(native_audio.shape[-1]) / float(native_sr)
+
+    if not result.keep:
+        Path(path_audio).unlink()
+        logger.debug(
+            f"Deleted {path_audio} before rewrite "
+            f"(crest_factor={result.crest_factor:.2f})"
+        )
+        return False, result.crest_factor, False, duration_s, False
+
+    if result.loudness_normalized:
+        try:
+            save_started_at = time.perf_counter()
+            torchaudio.save_with_torchcodec(path_audio, result.samples, int(native_sr))
+            logger.debug(
+                f"perf audio_save stage=preprocess_existing_chunks path={path_audio} "
+                f"seconds={time.perf_counter() - save_started_at:.6f} "
+                f"sample_rate={int(native_sr)} frames={int(result.samples.shape[-1])}"
+            )
+        except Exception as exc:
+            logger.error(f"Fused audio write failed for {path_audio}: {exc}")
+            return True, result.crest_factor, False, duration_s, True
+    elif result.loudness_error:
+        logger.error(
+            f"Fused loudness normalization failed for {path_audio}: "
+            f"{result.loudness_error}; leaving the original audio unchanged."
+        )
+
+    return (
+        True,
+        result.crest_factor,
+        result.loudness_normalized,
+        duration_s,
+        bool(result.loudness_error),
+    )
 
 
 def _process_files(
@@ -226,7 +296,13 @@ def _process_files(
     processed_counter,
     skipped_counter,
     errors_counter,
+    crest_files_in,
+    crest_files_out,
+    crest_duration_in,
+    crest_duration_out,
 ) -> None:
+    fuse_audio = fused_audio_preprocessing_enabled(config)
+    partial_fields = FUSED_PARTIAL_FIELDS if fuse_audio else PARTIAL_FIELDS
     pending_files = []
     for path in files:
         resolved = normalize_path_string(path)
@@ -265,7 +341,24 @@ def _process_files(
 
             try:
                 row = metadata_for_chunk(str(path_audio), audio, sr, podcasts_path, config)
-                writer.write({column: row.get(column, "") for column in PARTIAL_FIELDS})
+                if fuse_audio:
+                    keep, crest_factor, normalized, duration_s, postprocess_error = (
+                        _postprocess_existing_chunk(str(path_audio), config)
+                    )
+                    if postprocess_error:
+                        _increment(errors_counter)
+                    _increment(crest_files_in)
+                    _increment(crest_duration_in, duration_s)
+                    if not keep:
+                        already_done.add(resolved)
+                        _increment(processed_counter)
+                        continue
+                    _increment(crest_files_out)
+                    _increment(crest_duration_out, duration_s)
+                    row["crest_factor"] = round(crest_factor, 4)
+                    row["loudness_normalized"] = True if normalized else ""
+
+                writer.write({column: row.get(column, "") for column in partial_fields})
                 already_done.add(resolved)
                 _increment(processed_counter)
             except Exception as exc:
@@ -284,13 +377,22 @@ def run_worker(
     processed_counter,
     skipped_counter,
     errors_counter,
+    crest_files_in,
+    crest_files_out,
+    crest_duration_in,
+    crest_duration_out,
 ) -> None:
     podcasts_path = Path(podcasts_path_str)
     init_models(rank, dict(config), config_path)
 
     claimed = 0
+    partial_fields = (
+        FUSED_PARTIAL_FIELDS
+        if fused_audio_preprocessing_enabled(config)
+        else PARTIAL_FIELDS
+    )
     with PartialCsvWriter(
-        podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
+        podcasts_path, PARTIAL_PREFIX, rank, fieldnames=partial_fields
     ) as writer:
         already_done = writer.already_done()
         if already_done:
@@ -318,6 +420,10 @@ def run_worker(
                 processed_counter,
                 skipped_counter,
                 errors_counter,
+                crest_files_in,
+                crest_files_out,
+                crest_duration_in,
+                crest_duration_out,
             )
             mark_work_shard_done(shard_path)
 
@@ -332,6 +438,8 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
     podcasts_path = Path(config.get("podcasts_path", "../../../podcasts"))
     overwrite = _truthy(config.get("existing_chunks_overwrite", False))
     source = str(config.get("existing_chunks_audio_paths_source", DEFAULT_AUDIO_PATHS_SOURCE))
+    fuse_audio = fused_audio_preprocessing_enabled(config)
+    logger.info(f"Fused crest/loudness preprocessing: {fuse_audio}")
 
     audio_paths = discover_audio_paths(
         podcasts_path,
@@ -356,6 +464,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
         PARTIAL_PREFIX,
         value_columns=VALUE_COLUMNS,
         bootstrap_audio_paths=audio_paths,
+        drop_missing_files=fuse_audio,
         preserve_existing=not overwrite,
     )
     if absorbed:
@@ -368,6 +477,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
         podcasts_path,
         audio_paths,
         overwrite=overwrite,
+        required_columns=(VALUE_COLUMNS if fuse_audio else METADATA_VALUE_COLUMNS),
     )
     skipped_initial = len(audio_paths) - len(pending)
     if not pending:
@@ -408,6 +518,10 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
     processed = mp.Value("i", 0)
     skipped = mp.Value("i", skipped_initial)
     errors = mp.Value("i", 0)
+    crest_files_in = mp.Value("i", 0)
+    crest_files_out = mp.Value("i", 0)
+    crest_duration_in = mp.Value("d", 0.0)
+    crest_duration_out = mp.Value("d", 0.0)
     csv_settings = load_csv_settings(args.config_path)
 
     try:
@@ -416,6 +530,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
             prefix=PARTIAL_PREFIX,
             value_columns=VALUE_COLUMNS,
             bootstrap_audio_paths=audio_paths,
+            drop_missing_files=fuse_audio,
             preserve_existing=not overwrite,
             **csv_settings,
         ):
@@ -430,6 +545,10 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
                     processed,
                     skipped,
                     errors,
+                    crest_files_in,
+                    crest_files_out,
+                    crest_duration_in,
+                    crest_duration_out,
                 ),
                 nprocs=num_gpus,
                 join=True,
@@ -442,6 +561,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
         PARTIAL_PREFIX,
         value_columns=VALUE_COLUMNS,
         bootstrap_audio_paths=audio_paths,
+        drop_missing_files=fuse_audio,
         preserve_existing=not overwrite,
     )
 
@@ -459,15 +579,32 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
         podcasts_path=podcasts_path,
         stage="preprocess",
         files_in=work_plan.total_items,
-        files_out=int(processed.value),
-        hours_in=hours,
+        files_out=(int(crest_files_out.value) if fuse_audio else int(processed.value)),
+        hours_in=(crest_duration_in.value / 3600.0 if fuse_audio else hours),
         hours_out=hours,
         params={
             "input_mode": "existing_chunks",
             "overwrite": overwrite,
             "audio_paths_source": source,
+            "fuse_audio_preprocessing": fuse_audio,
         },
     )
+
+    if fuse_audio and crest_files_in.value:
+        record_stage_summary(
+            podcasts_path=podcasts_path,
+            stage="crest_factor",
+            files_in=crest_files_in.value,
+            files_out=crest_files_out.value,
+            hours_in=crest_duration_in.value / 3600.0,
+            hours_out=crest_duration_out.value / 3600.0,
+            params={
+                "threshold": config.get(
+                    "crest_threshold", config.get("crest_treshold", 10.0)
+                ),
+                "fused": True,
+            },
+        )
 
     write_stage_status(
         stage=1,

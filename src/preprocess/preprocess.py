@@ -39,6 +39,10 @@ from torchcodec.encoders import AudioEncoder
 from tqdm import tqdm
 
 from src.libs.smart_turn.offline_svad import SmartVAD
+from src.preprocess.audio_postprocessing import (
+    fused_audio_preprocessing_enabled,
+    postprocess_audio_tensor,
+)
 from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.csv_manager import (
     PartialCsvWriter,
@@ -77,6 +81,7 @@ PARTIAL_FIELDS = (
     "max_silence_duration",
     "is_single_speaker",
 )
+FUSED_PARTIAL_FIELDS = PARTIAL_FIELDS + ("crest_factor", "loudness_normalized")
 
 sortformer_model = None
 smart_vad = None
@@ -372,6 +377,46 @@ def _save_audio_chunk(out_path: str, segment: torch.Tensor, sr: int, fmt: str) -
     )
 
 
+def _new_crest_audit() -> Dict[str, float]:
+    return {
+        "files_in": 0.0,
+        "files_out": 0.0,
+        "duration_in_s": 0.0,
+        "duration_out_s": 0.0,
+        "write_errors": 0.0,
+        "postprocess_errors": 0.0,
+    }
+
+
+def _merge_crest_audit(target: Dict[str, float], source: Dict[str, float]) -> None:
+    for key in target:
+        target[key] += float(source.get(key, 0.0))
+
+
+def _postprocess_chunk(
+    segment: torch.Tensor,
+    sample_rate: int,
+    config: Dict[str, Any],
+    path_label: str,
+):
+    result = postprocess_audio_tensor(
+        segment,
+        sample_rate,
+        crest_threshold=float(
+            config.get("crest_threshold", config.get("crest_treshold", 10.0))
+        ),
+        peak=float(config.get("peak", -1.0)),
+        loudness=float(config.get("loudness", -23.0)),
+        block_size=float(config.get("block_size", 0.400)),
+    )
+    if result.loudness_error:
+        logger.error(
+            f"Fused loudness normalization failed for {path_label}: "
+            f"{result.loudness_error}; saving without normalization."
+        )
+    return result
+
+
 def cut_audio(
     source_path: str,
     final_segments: List[Tuple[float, float, int]],
@@ -382,6 +427,8 @@ def cut_audio(
     fmt: str = 'flac',
     max_duration: float = 15.0,
     min_save_duration: float = DEFAULT_MIN_SAVE_DURATION_S,
+    config: Optional[Dict[str, Any]] = None,
+    crest_audit: Optional[Dict[str, float]] = None,
 ) -> List[Dict]:
     """Cut chunks from ``source_path`` lazily, in the source's native SR.
 
@@ -394,6 +441,9 @@ def cut_audio(
     """
     os.makedirs(output_folder, exist_ok=True)
     results: List[Dict] = []
+    config = config or {}
+    fuse_audio = fused_audio_preprocessing_enabled(config)
+    crest_audit = crest_audit if crest_audit is not None else _new_crest_audit()
 
     try:
         decoder = AudioDecoder(source_path)
@@ -426,6 +476,8 @@ def cut_audio(
                 start_seconds=float(start), stop_seconds=float(clamped_end)
             )
         except Exception as exc:
+            if fuse_audio:
+                crest_audit["write_errors"] += 1
             logger.error(
                 f"Failed to decode {start:.2f}-{clamped_end:.2f}s from {source_path}: {exc}"
             )
@@ -435,17 +487,42 @@ def cut_audio(
         if segment.ndim == 1:
             segment = segment.unsqueeze(0)
         if segment.shape[-1] == 0:
+            if fuse_audio:
+                crest_audit["write_errors"] += 1
             continue
 
         fname = f"{start:.2f}_{end:.2f}_{album_id}_{episode_id}.{fmt}"
         out_path = os.path.join(output_folder, fname)
+        crest_factor = None
+        loudness_normalized = None
+        duration_s = float(segment.shape[-1]) / float(native_sr)
+        if fuse_audio:
+            crest_audit["files_in"] += 1
+            crest_audit["duration_in_s"] += duration_s
+            postprocessed = _postprocess_chunk(segment, native_sr, config, out_path)
+            if postprocessed.loudness_error:
+                crest_audit["postprocess_errors"] += 1
+            crest_factor = round(postprocessed.crest_factor, 4)
+            if not postprocessed.keep:
+                logger.debug(
+                    f"Rejected {out_path} before write "
+                    f"(crest_factor={postprocessed.crest_factor:.2f})"
+                )
+                continue
+            segment = postprocessed.samples
+            loudness_normalized = postprocessed.loudness_normalized
+            crest_audit["files_out"] += 1
+            crest_audit["duration_out_s"] += duration_s
+
         try:
             _save_audio_chunk(out_path, segment, native_sr, fmt)
         except Exception as exc:
+            if fuse_audio:
+                crest_audit["write_errors"] += 1
             logger.error(f"Failed to write chunk {out_path}: {exc}")
             continue
 
-        results.append({
+        row = {
             'filepath': os.path.abspath(out_path),
             'speaker_id': spk,
             'start': round(start, 2),
@@ -456,7 +533,11 @@ def cut_audio(
             'silence_percent': sil_pct,
             'max_silence_duration': max_sil,
             'is_single_speaker': unique_spk == 1,
-        })
+        }
+        if fuse_audio:
+            row["crest_factor"] = crest_factor
+            row["loudness_normalized"] = True if loudness_normalized else ""
+        results.append(row)
     return results
 
 
@@ -473,6 +554,8 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
     min_segment_dur = float(config.get('min_segment_duration', DEFAULT_MIN_SEGMENT_DURATION_S))
     min_save_dur = float(config.get('min_save_duration', DEFAULT_MIN_SAVE_DURATION_S))
     max_merge_gap = float(config.get('max_merge_gap', DEFAULT_MAX_MERGE_GAP_S))
+    fuse_audio = fused_audio_preprocessing_enabled(config)
+    crest_audit = _new_crest_audit()
 
     p_audio = Path(path_audio)
     album_id, episode_id = p_audio.parent.name, p_audio.stem
@@ -488,14 +571,17 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
 
         raw_segments = diarize_audio(audio, sr, chunk_duration)
         if not raw_segments:
-            return {"segments": [], "source_duration_s": total_audio_duration}
+            return {
+                "segments": [],
+                "source_duration_s": total_audio_duration,
+                "crest_audit": crest_audit,
+            }
 
         if total_audio_duration <= limit_dur:
             sil_pct, max_sil, unique_spk = get_chunk_metrics(0.0, total_audio_duration, raw_segments)
             main_spk = raw_segments[0][2] if raw_segments else -1
 
-            return {
-                "segments": [{
+            row = {
                     'filepath': os.path.abspath(path_audio),
                     'speaker_id': main_spk,
                     'start': 0.0,
@@ -506,8 +592,50 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
                     'silence_percent': sil_pct,
                     'max_silence_duration': max_sil,
                     'is_single_speaker': unique_spk == 1,
-                }],
+                }
+
+            if fuse_audio:
+                decoder = AudioDecoder(str(p_audio))
+                native_sr = int(decoder.metadata.sample_rate)
+                native_audio = decoder.get_all_samples().data.to(dtype=torch.float32)
+                del decoder
+                if native_audio.ndim == 1:
+                    native_audio = native_audio.unsqueeze(0)
+                duration_s = float(native_audio.shape[-1]) / float(native_sr)
+                crest_audit["files_in"] = 1
+                crest_audit["duration_in_s"] = duration_s
+                postprocessed = _postprocess_chunk(
+                    native_audio, native_sr, config, str(p_audio)
+                )
+                if postprocessed.loudness_error:
+                    crest_audit["postprocess_errors"] += 1
+                row["crest_factor"] = round(postprocessed.crest_factor, 4)
+                if not postprocessed.keep:
+                    if p_audio.exists():
+                        os.remove(p_audio)
+                    return {
+                        "segments": [],
+                        "source_duration_s": total_audio_duration,
+                        "crest_audit": crest_audit,
+                    }
+                crest_audit["files_out"] = 1
+                crest_audit["duration_out_s"] = duration_s
+                if postprocessed.loudness_normalized:
+                    try:
+                        _save_audio_chunk(
+                            str(p_audio), postprocessed.samples, native_sr, chunk_fmt
+                        )
+                    except Exception:
+                        crest_audit["write_errors"] += 1
+                        raise
+                    row["loudness_normalized"] = True
+                else:
+                    row["loudness_normalized"] = ""
+
+            return {
+                "segments": [row],
                 "source_duration_s": total_audio_duration,
+                "crest_audit": crest_audit,
             }
 
         clean_segments = build_single_speaker_timeline(
@@ -519,7 +647,11 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
         )
 
         if not final_segments:
-            return {"segments": [], "source_duration_s": total_audio_duration}
+            return {
+                "segments": [],
+                "source_duration_s": total_audio_duration,
+                "crest_audit": crest_audit,
+            }
 
         seg_results = cut_audio(
             str(p_audio),
@@ -531,21 +663,42 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
             fmt=chunk_fmt,
             max_duration=limit_dur,
             min_save_duration=min_save_dur,
+            config=config,
+            crest_audit=crest_audit,
         )
 
         if seg_results:
             logger.success(
                 f"Processed {len(seg_results)} chunks ({chunk_fmt}) from: {p_audio.name}"
             )
+
+        completed_with_only_crest_rejections = (
+            fuse_audio
+            and crest_audit["files_in"] > 0
+            and crest_audit["files_out"] == 0
+            and crest_audit["write_errors"] == 0
+        )
+        source_processed = (
+            bool(seg_results)
+            and (not fuse_audio or crest_audit["write_errors"] == 0)
+        ) or completed_with_only_crest_rejections
+        if source_processed:
             if p_audio.exists():
-                pass
                 os.remove(p_audio)
 
-        return {"segments": seg_results, "source_duration_s": total_audio_duration}
+        return {
+            "segments": seg_results,
+            "source_duration_s": total_audio_duration,
+            "crest_audit": crest_audit,
+        }
 
     except Exception as e:
         logger.error(f"Processing error {path_audio}: {e}")
-        return {"segments": [], "source_duration_s": total_audio_duration}
+        return {
+            "segments": [],
+            "source_duration_s": total_audio_duration,
+            "crest_audit": crest_audit,
+        }
     finally:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -575,7 +728,7 @@ def _run_diarization_shard(
     config: Dict[str, Any],
     num_loader_workers: int,
     podcasts_path: str,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """Diarize a shard.
 
     Chunk metadata is streamed to ``preprocess_part_<gpu_id>.csv`` (one row per
@@ -585,6 +738,12 @@ def _run_diarization_shard(
     at the end. No retries, no respawns — keep this hot path simple.
     """
     results: List[Dict[str, Any]] = []
+    crest_audit = _new_crest_audit()
+    partial_fields = (
+        FUSED_PARTIAL_FIELDS
+        if fused_audio_preprocessing_enabled(config)
+        else PARTIAL_FIELDS
+    )
     dataloader = create_diarization_dataloader(
         gpu_files,
         batch_size=int(config.get("diarization_batch_size", 1)),
@@ -603,7 +762,7 @@ def _run_diarization_shard(
     )
 
     with PartialCsvWriter(
-        podcasts_path, PARTIAL_PREFIX, gpu_id, fieldnames=PARTIAL_FIELDS
+        podcasts_path, PARTIAL_PREFIX, gpu_id, fieldnames=partial_fields
     ) as writer:
         batch_wait_started_at = time.perf_counter()
         for batch_idx, batch in enumerate(tqdm(dataloader, total=len(dataloader), desc=f"GPU {gpu_id}", position=gpu_id)):
@@ -619,10 +778,13 @@ def _run_diarization_shard(
                     continue
                 try:
                     res = process_audio_file(str(path_audio), audio, sr, config)
+                    _merge_crest_audit(
+                        crest_audit, res.get("crest_audit", _new_crest_audit())
+                    )
                     if res and res.get("segments"):
                         for seg in res["segments"]:
                             write_started_at = time.perf_counter()
-                            writer.write({k: seg.get(k, "") for k in PARTIAL_FIELDS})
+                            writer.write({k: seg.get(k, "") for k in partial_fields})
                             logger.debug(
                                 f"perf partial_write stage=preprocess rank={gpu_id} "
                                 f"seconds={time.perf_counter() - write_started_at:.6f} "
@@ -633,10 +795,10 @@ def _run_diarization_shard(
                     logger.error(f"Task error on GPU {gpu_id}: {e}")
             batch_wait_started_at = time.perf_counter()
 
-    return results
+    return {"segments": results, "crest_audit": crest_audit}
 
 
-def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any], config_path: str, num_workers_per_gpu: int, podcasts_path: str) -> List[Dict[str, Any]]:
+def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any], config_path: str, num_workers_per_gpu: int, podcasts_path: str) -> Dict[str, Any]:
     logger.info(f"GPU:{gpu_id} processing {len(gpu_files)} files...")
     with ProcessPoolExecutor(
         max_workers=1,
@@ -681,6 +843,8 @@ def main(args):
 
     chunk_format_cfg = config.get('chunk_format', 'auto')
     logger.info(f"Chunk format policy: '{chunk_format_cfg}' (lossless input stays lossless).")
+    fuse_audio = fused_audio_preprocessing_enabled(config)
+    logger.info(f"Fused crest/loudness preprocessing: {fuse_audio}")
 
     num_gpus = torch.cuda.device_count()
     total_workers = max(1, num_gpus * num_workers_per_gpu)
@@ -710,7 +874,7 @@ def main(args):
     # Make sure balalaika.csv exists; absorb any leftover partials from a prior
     # interrupted run so resume picks up where things left off.
     ensure_main_csv(podcasts_path)
-    chunk_value_columns = [c for c in PARTIAL_FIELDS if c != "filepath"]
+    chunk_value_columns = [c for c in FUSED_PARTIAL_FIELDS if c != "filepath"]
     _, absorbed = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
@@ -723,6 +887,7 @@ def main(args):
         )
 
     all_results: List[Dict[str, Any]] = []
+    crest_audit = _new_crest_audit()
     files_per_gpu: List[List[Path]] = (
         [[] for _ in range(num_gpus)] if num_gpus > 0 else [paths_to_process]
     )
@@ -764,7 +929,11 @@ def main(args):
 
                 for future in as_completed(gpu_futures):
                     try:
-                        all_results.extend(future.result())
+                        batch_result = future.result()
+                        all_results.extend(batch_result["segments"])
+                        _merge_crest_audit(
+                            crest_audit, batch_result["crest_audit"]
+                        )
                         processed += 1
                     except Exception as e:
                         logger.error(f"Failed to aggregate results from a GPU batch: {e}")
@@ -806,8 +975,30 @@ def main(args):
                 "min_save_duration", DEFAULT_MIN_SAVE_DURATION_S
             ),
             "max_merge_gap": config.get("max_merge_gap", DEFAULT_MAX_MERGE_GAP_S),
+            "fuse_audio_preprocessing": fuse_audio,
         },
     )
+
+    if fuse_audio and crest_audit["files_in"]:
+        record_stage_summary(
+            podcasts_path=podcasts_path,
+            stage="crest_factor",
+            files_in=int(crest_audit["files_in"]),
+            files_out=int(crest_audit["files_out"]),
+            hours_in=crest_audit["duration_in_s"] / 3600.0,
+            hours_out=crest_audit["duration_out_s"] / 3600.0,
+            params={
+                "threshold": config.get(
+                    "crest_threshold", config.get("crest_treshold", 10.0)
+                ),
+                "fused": True,
+            },
+        )
+
+    if fuse_audio:
+        errors += int(
+            crest_audit["write_errors"] + crest_audit["postprocess_errors"]
+        )
 
     write_stage_status(
         stage=1,

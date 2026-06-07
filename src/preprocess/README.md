@@ -11,7 +11,9 @@ normalization (ITU-R BS.1770-4).
    `chunk_duration`, overlap filtering, Smart VAD; writes
    `{start}_{end}_{playlist}_{podcast}.{ext}` (extension follows `chunk_format`,
    default `auto`), upserts rows into `balalaika.csv`; **deletes the original
-   long file** after successful chunking.
+   long file** after successful chunking. With `fuse_audio_preprocessing: true`,
+   crest filtering and LUFS normalization happen on each in-memory native-rate
+   chunk before its first and only write.
 2. **`crest_factor_remover`** — computes crest factor (peak/RMS) for every
    chunk from per-file scalar stats produced by loader workers, writes it to
    `balalaika.csv` as `crest_factor`, deletes files that exceed the threshold,
@@ -20,6 +22,11 @@ normalization (ITU-R BS.1770-4).
    (FLAC / WAV) are written through `soundfile` and stay lossless; lossy
    containers (MP3 / OGG / OPUS) round-trip through `torchaudio.save`. Marks
    each successfully normalized file with `loudness_normalized=True`.
+
+Stages 2 and 3 remain independently runnable. After a successful fused stage
+1 they are metadata-only no-ops because `crest_factor` and
+`loudness_normalized` are already populated. Set
+`fuse_audio_preprocessing: false` to retain the original three-pass workflow.
 
 Every script writes a rotating, timestamped log under `BALALAIKA_LOG_DIR`
 (default `./logs`); pass `--log_dir <path>` on the CLI to override per
@@ -39,7 +46,8 @@ invocation.
 
 See the **preprocess** block in `configs/config.yaml` for a line-by-line
 description (`podcasts_path`, `duration`, `chunk_duration`, `chunk_format`,
-`min_segment_duration`, `min_save_duration`, `num_workers`, `crest_treshold`,
+`min_segment_duration`, `min_save_duration`, `num_workers`,
+`fuse_audio_preprocessing`, `crest_treshold`,
 `peak`, `loudness`, `block_size`, `sortformer_model`, `use_tensorrt`,
 `vad_args.*`). TensorRT cache / workspace come from the global `runtime:` block.
 

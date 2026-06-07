@@ -24,17 +24,16 @@ CSV resilience:
 import argparse
 import time
 from pathlib import Path
-from typing import List, Set, Tuple
+from typing import List, Set
 
 import numpy as np
-import pandas as pd
-import pyloudnorm as pyln
 import torch
 import torch.multiprocessing as mp
 import torchaudio
 from loguru import logger
 from tqdm import tqdm
 
+from src.preprocess.audio_postprocessing import normalize_audio_loudness
 from src.utils.csv_manager import (
     PartialCsvWriter,
     PeriodicCsvMerger,
@@ -64,36 +63,6 @@ apply_torch_perf_defaults()
 NORMALIZED_COLUMN = "loudness_normalized"
 PARTIAL_PREFIX = "loudness"
 PARTIAL_FIELDS = ("filepath", NORMALIZED_COLUMN)
-_METER_CACHE: dict[Tuple[int, float], pyln.Meter] = {}
-
-
-def _get_meter(rate: int, block_size: float) -> pyln.Meter:
-    key = (int(rate), float(block_size))
-    meter = _METER_CACHE.get(key)
-    if meter is None:
-        meter = pyln.Meter(rate, block_size=block_size)
-        _METER_CACHE[key] = meter
-    return meter
-
-
-def normalize_audio_loudness(
-    audio: np.ndarray,
-    rate: int,
-    peak: float = -1.0,
-    loudness: float = -23.0,
-    block_size: float = 0.400,
-) -> np.ndarray:
-    """ITU-R BS.1770-4 loudness normalization.
-
-    The peak argument is kept for config compatibility; peak scaling before
-    LUFS normalization cancels out algebraically in the final waveform.
-    """
-    _ = peak
-    meter = _get_meter(rate, block_size)
-    measured = meter.integrated_loudness(audio)
-    return pyln.normalize.loudness(audio, measured, loudness)
-
-
 def _write_audio(audio_path: str, samples: np.ndarray, sample_rate: int) -> None:
     """Write samples shaped ``(channels, frames)`` using TorchCodec."""
     array = samples if samples.ndim == 2 else samples[np.newaxis, :]
@@ -306,6 +275,14 @@ def main(args):
     audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     if not audio_paths:
         logger.info("No audio files found for processing.")
+        write_stage_status(
+            stage=3,
+            stage_name="preprocess_audio",
+            log_dir=args.log_dir or "./logs",
+            processed=0,
+            skipped=0,
+            errors=0,
+        )
         return
 
     # 1) Make sure balalaika.csv exists; bootstrap from the audio tree if not.
@@ -335,6 +312,14 @@ def main(args):
 
     if not paths_to_process:
         logger.info("All audio files are already loudness-normalized.")
+        write_stage_status(
+            stage=3,
+            stage_name="preprocess_audio",
+            log_dir=args.log_dir or "./logs",
+            processed=0,
+            skipped=len(audio_paths),
+            errors=0,
+        )
         return
 
     shard_size = load_work_shard_size(args.config_path)

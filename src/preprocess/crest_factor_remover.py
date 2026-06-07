@@ -37,6 +37,7 @@ import torch.multiprocessing as mp
 from loguru import logger
 from tqdm import tqdm
 
+from src.preprocess.audio_postprocessing import fused_audio_preprocessing_enabled
 from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.csv_manager import (
     PartialCsvWriter,
@@ -264,6 +265,7 @@ def main(args):
     setup_logging("crest_factor", log_dir=args.log_dir)
 
     config = load_config(args.config_path, "preprocess")
+    fuse_audio = fused_audio_preprocessing_enabled(config)
 
     podcasts_path = config.get("podcasts_path")
     if not podcasts_path:
@@ -285,6 +287,14 @@ def main(args):
     audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     if not audio_paths:
         logger.info("No audio files found for processing.")
+        write_stage_status(
+            stage=2,
+            stage_name="crest_factor_remover",
+            log_dir=args.log_dir or "./logs",
+            processed=0,
+            skipped=0,
+            errors=0,
+        )
         return
 
     logger.info(f"Found {len(audio_paths)} audio files.")
@@ -313,19 +323,27 @@ def main(args):
     pending = unprocessed_paths(podcasts_path, COLUMN, audio_paths)
     if not pending:
         logger.success("All audio files already have a crest_factor entry. Skipping computation.")
-        # Still emit an audit row reflecting the state of the dataset.
-        audit = audit_from_filter_partials(leftover_partials)
-        if audit["files_in"] == 0:
-            audit["files_in"] = len(audio_paths)
-            audit["files_out"] = len(audio_paths)
-        record_stage_summary(
-            podcasts_path=podcasts_path,
-            stage="crest_factor",
-            files_in=audit["files_in"],
-            files_out=audit["files_out"],
-            hours_in=audit["hours_in"],
-            hours_out=audit["hours_out"],
-            params={"threshold": crest_threshold, "deleted": audit["files_deleted"]},
+        if not fuse_audio or absorbed:
+            audit = audit_from_filter_partials(leftover_partials)
+            if audit["files_in"] == 0:
+                audit["files_in"] = len(audio_paths)
+                audit["files_out"] = len(audio_paths)
+            record_stage_summary(
+                podcasts_path=podcasts_path,
+                stage="crest_factor",
+                files_in=audit["files_in"],
+                files_out=audit["files_out"],
+                hours_in=audit["hours_in"],
+                hours_out=audit["hours_out"],
+                params={"threshold": crest_threshold, "deleted": audit["files_deleted"]},
+            )
+        write_stage_status(
+            stage=2,
+            stage_name="crest_factor_remover",
+            log_dir=args.log_dir or "./logs",
+            processed=0,
+            skipped=len(audio_paths),
+            errors=0,
         )
         return
 

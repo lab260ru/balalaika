@@ -138,6 +138,11 @@ preprocess:
   # Used only with input_mode: existing_chunks. false skips rows that already
   # have all preprocess metadata columns; true recomputes and overwrites them.
   existing_chunks_overwrite: false
+  # Fuse chunk export, crest filtering, and LUFS normalization into stage 1.
+  # Raw mode processes each native-rate chunk before its first/only write.
+  # existing_chunks mode combines crest + LUFS in one native-rate read/write.
+  # Set false to keep stages 1, 2, and 3 fully independent.
+  fuse_audio_preprocessing: true
   # Maximum duration of each output segment in seconds.
   
   duration: 15
@@ -269,8 +274,8 @@ transcription:
   # CPU processes for ROVER shard aggregation.
   rover_workers: 4
   batch_size: 8
-  num_workers: 4
-  prefetch_factor: 2
+  num_workers: 16
+  prefetch_factor: 4
   retry_empty_outputs: True
 
 punctuation:
