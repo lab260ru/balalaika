@@ -21,6 +21,10 @@ def build_commands(modules: Sequence[str]) -> List[CommandSpec]:
 
 def base_mutator(config: Dict[str, Any], _: argparse.Namespace, work_dataset_path: Path) -> None:
     config["cache_path"] = str(work_dataset_path.parent / "cache")
+    # Fresh benchmark copies have no balalaika.csv yet; audio_paths_source=csv
+    # would make every stage exit with "No audio files found".
+    runtime = ensure_dict(config, "runtime")
+    runtime["audio_paths_source"] = "auto"
 
 
 def set_dataset_everywhere(config: Dict[str, Any], work_dataset_path: Path) -> None:

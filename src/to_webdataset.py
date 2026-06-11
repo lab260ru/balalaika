@@ -1,6 +1,7 @@
 import argparse
 import math
 import json
+import os
 import pandas as pd
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -42,11 +43,15 @@ TEXT_COLUMNS = {
 
 def load_metadata(csv_path: Path) -> Dict[str, dict]:
     """Загружает balalaika.csv и делает словарь с ключом по базовому имени файла."""
+    import os
+
     if not csv_path.exists():
         logger.warning(f"Metadata file {csv_path} not found!")
         return {}
-    
-    df = pd.read_csv(csv_path)
+
+    from src.utils.csv_manager import fast_read_csv
+
+    df = fast_read_csv(csv_path)
     drop_cols = [
         col
         for col in df.columns
@@ -56,14 +61,14 @@ def load_metadata(csv_path: Path) -> Dict[str, dict]:
     if drop_cols:
         logger.info(f"Dropping text columns from CSV metadata: {drop_cols}")
         df = df.drop(columns=drop_cols)
-    metadata_dict = {}
-    
-    for _, row in df.iterrows():
-        base_name = Path(row['filepath']).stem 
-        row_dict = row.to_dict()
-        row_dict.pop('filepath', None) 
-        metadata_dict[base_name] = row_dict
-        
+
+    # to_dict('records') + zip is ~30x faster than iterrows on large frames.
+    stems = [
+        os.path.splitext(os.path.basename(p))[0] for p in df["filepath"].astype(str)
+    ]
+    records = df.drop(columns=["filepath"]).to_dict("records")
+    metadata_dict = dict(zip(stems, records))
+
     logger.info(f"Loaded metadata for {len(metadata_dict)} files.")
     return metadata_dict
 
@@ -74,6 +79,7 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
     pattern = str(output_dir / f"shard_{worker_id:03d}_%04d.tar")
     samples_processed = 0
     errors_count = 0
+    dir_cache: Dict[str, set] = {}
 
     with wds.ShardWriter(pattern, maxsize=max_shard_size, maxcount=max_shard_count) as sink:
         for audio_str in tqdm(audio_paths, desc=f"Worker {worker_id}", position=worker_id):
@@ -95,7 +101,7 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
                 continue
 
             json_data = {}
-            
+
             if key in metadata_dict:
                 for k, v in metadata_dict[key].items():
                     k_str = str(k)
@@ -107,16 +113,36 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
                         json_data[k_str] = v.item()
                     else:
                         json_data[k_str] = v
-                
+
+            # One cached scandir per directory instead of two globs per FILE:
+            # directories hold hundreds of chunks, so the old pattern rescanned
+            # every directory listing 2x per chunk inside it.
             parent_dir = audio_path.parent
-            siblings = set(parent_dir.glob(f"{key}_*")).union(set(parent_dir.glob(f"{key}.*")))
-            
-            for sibling in siblings:
-                if not sibling.is_file() or sibling == audio_path:
-                    continue
-                
-                postfix_name = sibling.name[len(key):].lstrip('_.')
-                
+            parent_str = str(parent_dir)
+            dir_files = dir_cache.get(parent_str)
+            if dir_files is None:
+                if len(dir_cache) > 64:
+                    dir_cache.clear()  # keep worker memory bounded
+                try:
+                    with os.scandir(parent_str) as it:
+                        dir_files = {e.name for e in it if e.is_file()}
+                except OSError:
+                    dir_files = set()
+                dir_cache[parent_str] = dir_files
+
+            prefix_us = f"{key}_"
+            prefix_dot = f"{key}."
+            sibling_names = [
+                n
+                for n in dir_files
+                if (n.startswith(prefix_us) or n.startswith(prefix_dot))
+                and n != audio_path.name
+            ]
+
+            for sibling_name in sibling_names:
+                sibling = parent_dir / sibling_name
+                postfix_name = sibling_name[len(key):].lstrip('_.')
+
                 try:
                     text_content = sibling.read_text(encoding='utf-8').strip()
                     json_data[str(postfix_name)] = text_content
