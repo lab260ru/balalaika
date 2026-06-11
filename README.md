@@ -1,38 +1,18 @@
-# A Data-Centric Framework for Addressing Phonetic and Prosodic Challenges in Russian Speech Generative Models
+# Balalaika
 
-Russian speech synthesis presents distinctive challenges, including vowel reduction, consonant devoicing, variable stress patterns, homograph ambiguity, and unnatural intonation. This paper introduces Balalaika, a novel dataset comprising more than 2,000 hours of studio-quality Russian speech with comprehensive textual annotations, including punctuation and stress markings. Experimental results show that models trained on Balalaika significantly outperform those trained on existing datasets in both speech synthesis and enhancement tasks.
+Balalaika is an end-to-end speech data pipeline: download or ingest audio,
+diarize and chunk it, filter low-quality material, run multi-model ASR with
+ROVER, restore punctuation and stress marks, phonemize text, and export the
+result to Parquet / WebDataset.
 
----
-
-## Quick Start 👟
-```bash
-git clone https://github.com/mtuciru/balalaika && cd balalaika
-bash create_user_env.sh        # sets up venv + pip deps
-bash use_meta_500h.sh          # pick 100h / 500h / 1000h / 2000h as needed
-
-```
-
-## Table of Contents
-
-1. [Prerequisites](#prerequisites)
-2. [Installation](#installation)
-3. [Data Preparation](#data-preparation)
-   - [Quick Setup (Default Parameters)](#quick-setup)
-   - [Custom Metadata Download](#custom-metadata-download)
-4. [Running the Pipeline](#running-the-pipeline)
-   - [Basic Scenario (Local Processing)](#basic-scenario-local-processing)
-5. [Configuration](#configuration)
-6. [Environment Variables](#environment-variables)
-7. [Models](#models)
-8. [Citation](#citation)
-<!-- 9. [Acknowledgments](#acknowledgments) -->
-9. [License](#license)
+The current runner is stage-based (`--stage` / `--stop_stage`), so long jobs can
+be resumed from any point without editing shell scripts.
 
 ---
 
-## Prerequisites
+## Quick Start
 
-Ensure you have the following tools installed on your system:
+Install system tools and create the development environment:
 
 ```bash
 sudo apt update && sudo apt install -y \
@@ -44,284 +24,215 @@ sudo apt update && sudo apt install -y \
   python-is-python3
 wget -qO- https://astral.sh/uv/install.sh | sh
 
-```
-
----
-
-## Installation
-
-Clone the repository and set up the environment:
-
-```bash
 git clone https://github.com/mtuciru/balalaika
 cd balalaika
-# Use this if you want to annotate/modify the dataset
 bash create_dev_env.sh
-# Use this if you only want to use the pre-annotated dataset
-bash create_user_env.sh 
 ```
 
----
-
-## Data Preparation
-
-### Quick Setup (Default Parameters)
-
-To download and prepare the dataset with default settings, choose one of the preconfigured dataset sizes:
-
-* **100-hour dataset**
-  ```bash
-  bash use_meta_100h.sh
-  ```
-
-* **500-hour dataset**
-  ```bash
-  bash use_meta_500h.sh
-  ```
-
-* **1000-hour dataset**
-  ```bash
-  bash use_meta_1000h.sh
-  ```
-
-* **2000-hour dataset**
-  ```bash
-  bash use_meta_2000h.sh
-  ```
-
-All metadata can also be downloaded from [Hugging Face – MTUCI](https://huggingface.co/MTUCI).
-
-### Custom Metadata Download
-
-If you already have generated metadata files (`balalaika.parquet` and `balalaika.pkl`), place them in the project root and run:
-
-```bash
-bash use_meta.sh
-```
-
----
-
-## Running the Pipeline
-
-
-### Basic Scenario (Local Processing)
-
-
-This scenario will:
-
-1. Download datasets
-2. Split audio into semantic chunks
-3. Transcribe all segments
-4. Perform speaker segmentation
-5. Apply phonemization
-
-To execute locally, run:
-
-```bash
-bash base.sh configs/config.yaml
-```
-
-All output metadata will be saved in `podcasts/result.csv`.
-
----
-
-## Configuration
-
-The main configuration file is located at `configs/config.yaml`. This file is organized into several sections, each corresponding to a specific stage of the podcast processing pipeline. Below is a detailed explanation of the key parameters within each section.
-
----
-
-### Global Parameters
-
-* `podcasts_path`:  It specifies the **absolute path** to the directory where all downloaded podcast files will be stored and where subsequent processing (preprocessing, separation, transcription, etc.) will look for and save its output.
----
-
-### `download` Section
-
-This section controls how podcast episodes are downloaded.
-
-* `podcasts_path`: (As explained above) The directory where downloaded podcasts will be saved.
-* `episodes_limit`: This sets a **limit on the number of episodes** to download from a single podcast playlist.
-* `num_workers`: Specifies the **number of parallel processes** to use for downloading. A higher number can speed up downloads but will consume more system resources.
-* `podcasts_urls_file`: This parameter points to the **path of a `.pkl` file** that contains a list of podcast URLs to be downloaded.
-
----
-
-### `preprocess` Section
-
-This section handles the initial processing of downloaded audio files, such as chopping them into smaller segments.
-
-* `podcasts_path`: (As explained above) The directory containing the raw downloaded podcasts that need to be preprocessed.
-* `duration`: Defines the **maximum length in seconds** for each audio sample (segment).
-* `num_workers`: Specifies the **number of parallel processes** to use during preprocessing.
-* `whisper_model`: Specifies the **name or path of the Faster-Whisper compatible model** to be used for initial audio processing.
-* `compute_type`: Determines the **computation type** for the Whisper model, affecting performance and memory usage.
-* `beam_size`: This parameter is related to the **beam search algorithm** used in the Whisper model's decoding process.
-
----
-
-### `separation` Section
-
-This section calculates metrics for each audio
-
-* `podcasts_path`: (As explained above) The directory where the chopped podcasts (from the `preprocess` stage) are located.
-* `num_workers`: The **number of parallel processes** to use for audio separation.
-* `nisqa_config`: Specifies the **path to the configuration file for NISQA** 
-* `one_speaker`: A **boolean flag** (`True`/`False`) that, when enabled (`True`), instructs the system to download and process only those audio recordings that should contain a single speaker.
-
----
-
-### `transcription` Section
-
-This section is responsible for converting audio into text.
-
-* `podcasts_path`: (As explained above) The directory containing the processed audio files ready for transcription.
-* `model_name`: Specifies the **type of automatic speech recognition (ASR) model** to use. Options typically include `"ctc" or "rnnt"`.
-* `num_workers`: The **number of parallel processes per GPU** to use for transcription.
-* `with_timestamps`: A **boolean flag** (`True`/`False`) that, when enabled, allows the transcription process to generate timestamps for each word or segment. **it only works with ctc**
-* `lm_path`: Specifies the **path to a language model file (`.bin`)**. A language model can improve transcription accuracy by providing contextual information. 
-
----
-
-### `punctuation` Section
-
-This section focuses on adding proper punctuation to the transcribed text.
-
-* `podcasts_path`: (As explained above) The directory where the transcribed text files are located.
-* `model_name`: Specifies the **name of the RUPunct model** to be used for punctuation restoration. 
-* `num_workers`: The **number of parallel processes per GPU** to use for punctuation.
----
-
-### `accent` Section
-
-In the transcribed text this part is restored with accents.
-
-* `podcasts_path`: (As explained above) The directory containing the relevant podcast files.
-* `num_workers`: The **number of parallel processes per GPU** to use for accent processing.
-* `model_name`: Specifies the **name of the ruAccent model** to be used.
-
----
-
-### `phonemizer` Section
-
-This section is responsible for converting text into phonetic representations (phonemes).
-
-* `podcasts_path`: (As explained above) The directory where the text files (from transcription and punctuation stages) are located.
-* `num_workers`: The **number of parallel processes per GPU** to use for phonemization.
----
-
-### `classification` Section
-
-This section relates to global speaker clustering.
-
-* `podcasts_path`: (As explained above) The directory containing the podcast files relevant for classification.
-* `num_workers`: The **number of parallel processes per GPU** to use for classification.
-* `threshold`: This is the **speaker classification confidence threshold**. Values typically range from `0.6` to `0.9`. A higher threshold means the model needs to be more confident in its classification to assign a label. 
-* `model_path`: Specifies the **path to the pretrained speaker classification model** in `.pt` format.
----
-
-### Execution Scripts
-
-Each processing script (`*_yaml.sh` and `*_args.sh`) offers flexibility in how parameters are provided:
-
-* `*_yaml.sh`: These scripts read all necessary parameters directly from the main `config.yaml` file, ensuring consistency across different stages.
-* `*_args.sh`: These scripts allow for hardcoded arguments directly within the shell script itself, which can be useful for quick tests or specific overrides without modifying the main configuration file.
-
-## Environment Variables
-
-Create a `.env` file in the project root with the following:
+Create `.env` in the repo root:
 
 ```ini
 HF_TOKEN=<your_huggingface_token>
 YANDEX_KEY=<your_yandex_music_token>
 ```
 
-* `HF_TOKEN`: Required for speaker count estimation.
-* `YANDEX_KEY`: Required for dataset downloads.
+Edit `configs/config.yaml`:
+
+- set `podcasts_path` in every stage you plan to run;
+- set model paths under `preprocess`, `separation`, etc.;
+- tune `runtime:` (`venv_path`, `cpu_affinity`, `log_dir`, TensorRT cache).
+
+Run the default tail of the pipeline (stages 11..14):
+
+```bash
+bash base.sh --config_path configs/config.yaml
+```
+
+Run only a range of stages:
+
+```bash
+# Preprocess only: chunking -> crest filter -> loudness normalization
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
+
+# Transcription only
+bash base.sh --config_path configs/config.yaml --stage 7 --stop_stage 7
+
+# Regenerate the filtering report only
+bash base.sh --config_path configs/config.yaml --stage 14 --stop_stage 14
+```
 
 ---
 
-## Important Notes
+## Stage Map
 
-- All scripts must be executed from the **project root directory**.
-- Paths in the config file must be **absolute**.
-- The processing scripts (punctuation, accents) should be run **sequentially**.
-- You’ll need:
-  - Yandex Music API key ([How to get one](https://yandex-music.readthedocs.io/en/main/token.html)) 
-  - Hugging Face token
+| ID | Stage | Module |
+|----|-------|--------|
+| 0 | Download from Yandex Music | `src.download.download` |
+| 1 | Preprocess: diarization + chunking | `src.preprocess.preprocess` |
+| 2 | Preprocess: crest-factor filter | `src.preprocess.crest_factor_remover` |
+| 3 | Preprocess: loudness normalization | `src.preprocess.preprocess_audio` |
+| 4 | Separation: music detection | `src.separation.music_detect` |
+| 5 | Separation: DistillMOS scoring | `src.separation.distillmos_process` |
+| 5.5 | Separation: DistillMOS filter | `src.separation.distillmos_filter` |
+| 6 | Separation: Spectra-0 raw scoring | `src.separation.antispoofing` |
+| 6.5 | Separation: anti-spoofing filter | `src.separation.antispoofing_filter` |
+| 7 | Transcription + ROVER | `src.transcription.transcription` |
+| 8 | Punctuation | `src.punctuation.punctuation` |
+| 9 | Stress marks / accents | `src.accents.accents` |
+| 10 | Phonemization | `src.phonemizer.phonemizer` |
+| 11 | Denoising / enhancement | `src.denoising.denoising` |
+| 12 | Collate to Parquet | `src.collate` |
+| 13 | Export to WebDataset | `src.to_webdataset` |
+| 14 | Filtering report | `src.report` |
 
-## Models
+`base.sh --help` prints the same map.
 
-Place all required models under the `models/` directory with the following structure:
+---
 
+## Runtime Configuration
+
+Shell-level values live in `configs/config.yaml` under `runtime:` instead of
+being hardcoded in `base.sh`:
+
+```yaml
+runtime:
+  venv_path: .dev_venv
+  cpu_affinity: "0-24"          # empty string disables taskset
+  log_dir: ./logs
+  audio_paths_source: csv        # csv avoids repeated rglob after balalaika.csv exists
+  work_shard_size: 10000         # file paths per on-disk multiprocessing shard
+  trt_cache_path: ./cache/trt
+  trt_workspace_bytes: 4294967296
+  trt_fp16: True
 ```
-models/
-├── voxblink_resnet/        # Speaker classification model
-│   └── ...
-└── nisqa_s.tar             # Audio quality assessment model
+
+`base.sh` reads this block through `src.utils.runtime_env` and exports
+`BALALAIKA_*` variables before running stages. Python modules use the same
+values for logging, TensorRT provider setup, CSV-backed file discovery, and
+on-disk work-shard sizing. Heavy stages write work queues under
+`<podcasts_path>/.balalaika_work/<stage>/` so multiprocessing workers claim
+small shard files instead of receiving millions of paths through pickle.
+
+---
+
+## Audio Quality
+
+Balalaika avoids silent quality degradation:
+
+- `preprocess.chunk_format: auto` preserves the source container when chunking
+  (`.flac` input produces `.flac` chunks, `.wav` stays `.wav`).
+- Set `preprocess.chunk_format` to `flac`, `wav`, `mp3`, `ogg`, or `opus` only
+  when you explicitly want a fixed output container.
+- Loudness normalization writes FLAC/WAV through `soundfile` as lossless
+  containers. Lossy formats are handled by `torchaudio.save`.
+- Denoising uses a dynamic ONNX export of ClearerVoice-Studio
+  `MossFormer2_SE_48K`, converts clips to 48 kHz mono, and overwrites audio
+  in place before export.
+- WebDataset export copies the produced audio bytes as-is.
+
+---
+
+## Logs And Filtering Report
+
+Every stage writes a timestamped log file:
+
+```text
+<runtime.log_dir>/<stage>_YYYYMMDD-HHMMSS.log
 ```
 
-Supported models:
+Filtering stages append audit rows to:
 
-- [NISQA](https://github.com/deepvk/NISQA-s)  – Audio quality assessment.
-- [GigaAM](https://github.com/salute-developers/GigaAM)  – ASR.
-- [ruAccent](https://github.com/Den4ikAI/ruaccent)  – Accent restoration.
-- [RUPunct](https://huggingface.co/RUPunct/RUPunct_big)  – Punctuation restoration.
-- [VoxBlink ResNet](https://github.com/wenet-e2e/wespeaker)  – Speaker classification.
-- [TryIPaG2P](https://github.com/NikiPshg/TryIPaG2P)  – Phonemization.
-- [Speaker Diarization](https://github.com/pyannote/pyannote-audio)  – Speaker diarization.
-- [Whisper](https://github.com/SYSTRAN/faster-whisper)  – ASR + segmentation
+```text
+<podcasts_path>/filter_summary.csv
+```
+
+The final report stage reads this CSV and writes:
+
+```text
+<podcasts_path>/filter_report.md
+```
+
+The report shows files and hours kept / removed at each filtering step.
+
+---
+
+## Outputs
+
+Main dataset-level files:
+
+| File | Purpose |
+|------|---------|
+| `balalaika.csv` | Per-chunk metadata and quality scores |
+| `filter_summary.csv` | Machine-readable filtering audit |
+| `filter_report.md` | Human-readable filtering report in hours |
+| `balalaika.parquet` | Aggregated metadata for downstream training |
+| WebDataset shards | Audio + JSON samples for large-scale loading |
+
+Per-chunk sidecars include model ASR text, optional timestamps, ROVER output,
+punctuated text, accent-marked text, and phonemes.
+
+---
+
+## Documentation
+
+- [Preparing your dataset](docs/preparing.md) — expected folder layout and setup.
+- [Usage Guide](docs/guide.md) — detailed stage behavior and commands.
+- [example/README.md](example/README.md) — loading exported WebDataset shards.
+
+Per-module notes live under `src/*/README.md`.
+
+---
+
+## Models & Tooling
+
+| Piece | Role |
+|-------|------|
+| Sortformer (ONNX) | streaming diarization and speaker turns |
+| Smart Turn (`smart-turn-v3.0.onnx`) | end-of-turn refinement |
+| WavLM music detector | removes music-heavy chunks |
+| DistillMOS | predicts speech quality score |
+| [Spectra-0 anti-spoofing](https://huggingface.co/lab260/spectra_0) (ONNX) | removes generated / spoofed speech |
+| [onnx-asr](https://github.com/istupakov/onnx-asr) | ASR models and optional TensorRT |
+| RUPunct | punctuation restoration |
+| ruAccent | lexical stress marks |
+| TryIParu | grapheme-to-phoneme conversion |
+| [ClearerVoice-Studio MossFormer2_SE_48K](https://huggingface.co/alibabasglab/MossFormer2_SE_48K) (ONNX export in pipeline) | denoising / speech enhancement |
 
 ---
 
 ## Citation
 
-If you use this pipeline in your research or production, please cite:
-```
-@misc{borodin2025datacentricframeworkaddressingphonetic,
-      title={A Data-Centric Framework for Addressing Phonetic and Prosodic Challenges in Russian Speech Generative Models}, 
-      author={Kirill Borodin and Nikita Vasiliev and Vasiliy Kudryavtsev and Maxim Maslov and Mikhail Gorodnichev and Oleg Rogov and Grach Mkrtchian},
-      year={2025},
-      eprint={2507.13563},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2507.13563}, 
+```bibtex
+@article{borodin2025datacentric,
+  title={A Data-Centric Framework for Addressing Phonetic and Prosodic Challenges in Russian Speech Generative Models},
+  author={Borodin, Kirill and Vasiliev, Nikita and Kudryavtsev, Vasiliy and Maslov, Maxim and Gorodnichev, Mikhail and Rogov, Oleg and Mkrtchian, Grach},
+  journal={arXiv preprint arXiv:2507.13563},
+  year={2025}
 }
 ```
 
+**Paper**: [arXiv:2507.13563](https://arxiv.org/abs/2507.13563)  
+**DOI**: [10.48550/arXiv.2507.13563](https://doi.org/10.48550/arXiv.2507.13563)
+
 ---
 
-<!-- ## References and Acknowledgements
+## Models & tooling
 
-Thanks to all the developers and contributors who made this project possible.
+| Piece | Role |
+|--------|------|
+| **Sortformer** (ONNX) | streaming diarization, single-speaker slices |
+| **[Smart Turn](https://github.com/pipecat-ai/smart-turn)** (`smart-turn-v3.0.onnx`) | end-of-speech / turn boundaries |
+| **Music detector** (`music_detection.safetensors`) | drop music-heavy chunks |
+| **DistillMOS** | predicted MOS in `balalaika.csv` |
+| **[onnx-asr](https://github.com/istupakov/onnx-asr)** | GigaAM v3 CTC/RNNT, Vosk, T-one, Parakeet, Canary, Whisper, … |
+| **[RUPunct](https://huggingface.co/RUPunct/RUPunct_big)** | punctuation |
+| **[ruAccent](https://github.com/Den4ikAI/ruaccent)** | stress marks |
+| **TryIParu** (`tryiparu`) | grapheme → IPA |
+| **[Spectra-0](https://huggingface.co/lab260/spectra_0)** | generated / spoofed speech detection |
+| **[MossFormer2_SE_48K](https://huggingface.co/alibabasglab/MossFormer2_SE_48K)** | 48 kHz denoising / speech enhancement via ONNX Runtime |
 
-<a href="https://github.com/mtuciru/balalaika/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=yeongpin/balalaikap&preview=true&max=&columns=" />
-</a> -->
-
+---
 
 ## License
 
-
-### Dataset: Balalaika  
-- **CC BY-NC-ND 4.0** – non-commercial, no derivatives, research use only.  
-- Cite the corpus and do **not** redistribute files without written permission.
-
-### Code  
-- **CC BY-NC-SA 3.0** – You may use, modify, and share the material for academic, non-commercial purposes only.
--You must retain the copyright and license notices; contact the authors for commercial use.
-
-
-### Third-Party Models & Libraries  
-Comply with each component’s original license in addition to the above:
-
-| Component | License |
-|-----------|---------|
-| NISQA-s | Apache 2.0 |
-| GigaAM | MIT |
-| ruAccent | CC BY-NC-ND 4.0 |
-| RUPunct | CC BY-NC-ND 4.0 |
-| VoxBlink ResNet | Apache 2.0 |
-| TryIPaG2P | MIT |
-| pyannote-audio | MIT |
-| Faster-Whisper | MIT |
+See [LICENSE](LICENSE).

@@ -19,4 +19,4 @@ activate_venv "$VENV_PATH"
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-python3 -m src.recovery_from_meta --podcasts_path $PODCASTS_PATH --parquet_path $PARQUET_PATH --num_workers $NUM_WORKERS
+taskset -с 0-24  python3 -m src.recovery_from_meta --podcasts_path $PODCASTS_PATH --parquet_path $PARQUET_PATH --num_workers $NUM_WORKERS

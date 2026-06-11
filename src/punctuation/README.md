@@ -1,44 +1,42 @@
-## Usage/Examples
+## Punctuation (RUPunct)
 
-### Running the Code via Command-Line Arguments
-You can modify the parameters directly in the shell script (`punctuation/punctuation_args.sh`) and then run it:
-```sh
-sh punctuation/punctuation_args.sh
+Restores punctuation and capitalization from **`{stem}_rover.txt`**.
+
+Multi-GPU pool orchestration, sidecar discovery, and skip-already-done
+filtering all come from `src/utils` — the stage script is just `init_process`
++ `make_punct_txt` + a `main()` glue that calls
+`src.utils.parallel.run_per_gpu_pool` once.
+
+## Run
+
+```bash
+bash src/punctuation/punctuation_yaml.sh configs/config.yaml
 ```
 
-### Running the Code via Config File
-Example:
-```sh
-bash punctuation/punctuation_yaml.sh config_path
+## Parameters
+
+See **`punctuation`** in `configs/config.yaml` (`podcasts_path`, `model_name`, `num_workers`).
+
+## Output
+
+For each `{stem}_rover.txt`, writes **`{stem}_punct.txt`**.
+
+```text
+{podcasts_path}/
+└── {playlist_id}/
+    └── {podcast_id}/
+        ├── {stem}.mp3
+        ├── {stem}_rover.txt   # input
+        └── {stem}_punct.txt   # output
 ```
 
-## Explanation of Parameters
+WebDataset packs this as `punct.txt` inside `json` (`src/to_webdataset.py`).
 
-- `--config_path`: Path to the YAML configuration file.
-- `--podcasts_path`: Root directory containing text files for processing (default: "../../../podcasts").
-- `--model_name`: Name of the punctuation model (default: "RUPunct/RUPunct_big").
-- `--num_workers`: Number of worker processes per GPU for parallel processing (default: 4).
+## Resume / interrupt safety
 
-## Output Structure
-
-For each transcribed audio file, a new file with restored punctuation will be created:
-
-```
-podcasts/
-└── {album_id}/
-    └── {episode_id}/
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}.mp3
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_giga.txt
-        └── {start_time}_{end_time}_{album_id}_{episode_id}_punct.txt
-```
-
-### File Descriptions
-- `.mp3`: Original audio file
-- `_giga.txt`: Transcribed text without punctuation (input file)
-- `_punct.txt`: Text with restored punctuation using the RUPunct model
-
-The script processes all `_giga.txt` files found in the directory structure and creates corresponding `_punct.txt` files with restored punctuation. Processing is done in parallel using available GPUs for better performance.
-
-## Important Notice
-The punctuation and yofication scripts must be executed sequentially!
-
+Pending work is rediscovered each run via
+`src.utils.sidecars.pending_audio_to_sidecar(in_suffix="_rover.txt",
+out_suffix="_punct.txt")`, which only returns chunks whose `_punct.txt` is
+missing. Because the output file is written atomically per chunk, a forced
+stop never leaves a half-written sidecar that would be mistakenly skipped on
+the next run.

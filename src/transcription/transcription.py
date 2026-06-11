@@ -1,254 +1,420 @@
 import argparse
-import multiprocessing
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
+import multiprocessing as mp
+from collections import Counter
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional
 
-import gigaam
-import pyctcdecode
+import onnx_asr
 import torch
-import torchaudio
 from loguru import logger
 from tqdm import tqdm
 
-from src.utils import get_audio_paths, load_config
+from src.utils.audio_durations import (
+    duration_bucket_settings,
+    duration_probe_workers,
+    ensure_audio_durations,
+)
+from src.utils.datasets.transcription import create_transcription_dataloader, recognize_batch
+from src.utils.gpu import get_onnx_providers
+from src.utils.logging_setup import setup_logging
+from src.utils.parallel import run_per_gpu_processes
+from src.utils.csv_manager import discover_audio_paths
+from src.utils.sidecars import text_sidecar_complete
+from src.utils.stage_status import write_stage_status
+from src.utils.utils import load_config, read_file_content
+from src.utils.work_shards import (
+    claim_work_shard,
+    load_work_shard_size,
+    mark_work_shard_done,
+    prepare_length_bucketed_work_shards,
+    read_work_shard,
+)
 
-# Global variables for each worker process
-model = None
-decoder = None
-# Frame size in milliseconds for the GigaAM model, crucial for timestamp calculation
-GIGA_AM_FRAME_SIZE_MS = 40
+MODEL_MAP = {
+    'giga_rnnt': 'gigaam-v3-rnnt',
+    'giga_ctc': 'gigaam-v3-ctc',
+    'giga_ctc_lm': 'gigaam-v3-ctc',
+    'tone': 't-tech/t-one',
+    'vosk': 'alphacep/vosk-model-ru',
+    'vosk_small': 'alphacep/vosk-model-small-ru',
+    'parakeet_v2': 'nemo-parakeet-tdt-0.6b-v2',
+    'parakeet_v3': 'nemo-parakeet-tdt-0.6b-v3',
+    'canary': 'nemo-canary-1b-v2',
+    'whisper_base': 'whisper-base',
+    'whisper_turbo': 'onnx-community/whisper-large-v3-turbo',
+    'gigaam-v3-e2e-ctc': 'gigaam-v3-e2e-ctc'
+}
+
+SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
+TARGET_SAMPLE_RATE = 16_000
 
 
-def init_process(
-    model_name: str,
-    device_str: str,
-    lm_path: str,
-    with_timestamps: bool,
-):
-    """
-    Initializes the model and, if needed, the CTC decoder for each worker process.
-    """
-    global model, decoder
-    logger.info(f"Initializing worker on {device_str}...")
-    if not (with_timestamps and 'ctc' in model_name):
-        logger.info("Timestamp generation requested CTC model. Decoder will not be initialized.")
-        with_timestamps=False
+def format_length_range(lengths: torch.Tensor, sample_rate: int) -> str:
+    if lengths.numel() == 0:
+        return "empty"
+    seconds = lengths.to(dtype=torch.float32) / float(sample_rate)
+    return f"min={seconds.min().item():.2f}s max={seconds.max().item():.2f}s"
 
-    model = gigaam.load_model(model_name, device=device_str)
 
-    if with_timestamps:
-        if not lm_path:
-            logger.warning("Timestamp generation requested without an LM path. Decoder will not be initialized.")
-            decoder = None
-            return
+def save_results(paths: List[str], texts: List[Optional[str]], timestamps: Optional[List[Optional[str]]], model_suffix: str):
+    for i, (path_str, text) in enumerate(zip(paths, texts)):
+        path = Path(path_str)
 
-        logger.info(f"Building CTC decoder with LM: {lm_path}")
+        if text is None:
+            logger.debug(f"No transcript result for {path.name}; leaving sidecar unchanged")
+            continue
+
+        txt_path = path.with_name(f"{path.stem}_{model_suffix}.txt")
         try:
-            vocab = model.decoding.tokenizer.vocab
-            decoder = pyctcdecode.build_ctcdecoder(
-                vocab,
-                lm_path,
-                alpha=0.5, 
-                beta=1.0,
-            )
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
         except Exception as e:
-            logger.error(f"Failed to build CTC decoder: {e}")
-            decoder = None
+            logger.error(f"Write TXT failed {path.name}: {e}")
+
+        ts = timestamps[i] if timestamps and i < len(timestamps) else ''
+        if ts:
+            tst_path = path.with_name(f"{path.stem}_{model_suffix}.tst")
+            try:
+                with open(tst_path, "w", encoding="utf-8") as f:
+                    f.write(ts)
+            except Exception as e:
+                logger.error(f"Write TST failed {path.name}: {e}")
+
+def extract_text(result) -> str:
+    """Extract plain text from onnx-asr result (str or TimestampedResult)."""
+    if hasattr(result, 'text'):
+        return result.text
+    return str(result)
 
 
-def to_simple_timestamps(word_timestamps: List[Tuple[str, Tuple[int, int]]]) -> str:
-    output_lines = []
-    sec_per_frame = GIGA_AM_FRAME_SIZE_MS / 1000.0
-    for word, (start_frame, end_frame) in word_timestamps:
-        start_time = start_frame * sec_per_frame
-        end_time = end_frame * sec_per_frame
-        output_lines.append(f"{word} {start_time:.3f} {end_time:.3f}")
-    return "\n".join(output_lines)
+def format_timestamps(result) -> str:
+    """Format TimestampedResult as word-level TSV: start\\tend\\tword per line.
 
-
-def make_txt_and_tst(path: Path, with_timestamps: bool):
+    onnx-asr TimestampedResult has parallel arrays:
+      .tokens     = ['с', 'п', 'а', 'с', 'и', 'б', 'о', ' ', ...]
+      .timestamps = [0.39, 0.44, 0.51, 0.54, 0.57, 0.63, 0.66, 0.75, ...]
+    We group characters into words and produce word-level timestamps.
     """
-    Transcribes an audio file. If with_timestamps is True and the decoder is available,
-    it generates both a .txt (transcription) and a .tstt (timestamps) file.
-    Otherwise, it only generates the .txt file.
-    """
-    txt_path = path.with_name(f"{path.stem}_giga.txt")
-    tst_path = path.with_name(f"{path.stem}_giga.tst")
-    
-    if os.path.exists(txt_path):
-        return
+    tokens = getattr(result, 'tokens', None)
+    timestamps = getattr(result, 'timestamps', None)
 
-    # Timestamp-enabled path using the CTC decoder
-    if not (with_timestamps and decoder):
-        text = model.transcribe(str(path))
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(text)
-            return
+    if not tokens or not timestamps or len(tokens) != len(timestamps):
+        return ''
+
+    words = []
+    current_word = ''
+    word_start = None
+
+    for token, ts in zip(tokens, timestamps):
+        if token.strip() == '':
+            if current_word and word_start is not None:
+                words.append((word_start, ts, current_word))
+                current_word = ''
+                word_start = None
+        else:
+            if word_start is None:
+                word_start = ts
+            current_word += token
+
+    if current_word and word_start is not None:
+        words.append((word_start, timestamps[-1], current_word))
+
+    return '\n'.join(f"{start:.3f}\t{end:.3f}\t{word}" for start, end, word in words)
+
+
+def _process_files(cuda_id: int, model_name: str, files: List[str], model, config: dict,
+                   output_suffix: str, do_timestamps: bool, target_sample_rate: int,
+                   processed_counter=None, errors_counter=None, error_details=None):
+    batch_size = config.get('batch_size', 16)
+    num_loader_workers = int(config.get('num_workers', 4))
+    prefetch_factor = int(config.get('prefetch_factor', 2))
+
+    dataloader = create_transcription_dataloader(
+        files,
+        sample_rate=target_sample_rate,
+        batch_size=batch_size,
+        num_workers=num_loader_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    for paths, waveforms, lengths, load_errors in tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id):
+        for path_str, reason in load_errors:
+            logger.error(f"Audio load failed {path_str}: {reason}")
+            if errors_counter is not None:
+                errors_counter.value += 1
+            if error_details is not None:
+                error_details.append({"file": path_str, "model": model_name, "reason": reason})
+
+        if not paths:
+            continue
+
+        try:
+            results = recognize_batch(model, waveforms, lengths)
+        except Exception as e:
+            logger.error(
+                f"Batch failed for {model_name}: files={len(paths)}, "
+                f"lengths=({format_length_range(lengths, target_sample_rate)}): {e}. "
+                "Falling back to single-file mode."
+            )
+            results = []
+            for path_str, waveform, length in zip(paths, waveforms, lengths):
+                try:
+                    results.extend(recognize_batch(model, waveform[:length].unsqueeze(0).contiguous(), length.unsqueeze(0)))
+                except Exception as e2:
+                    seconds = float(length.item()) / float(target_sample_rate)
+                    logger.error(f"File failed for {model_name}: seconds={seconds:.2f}, file={path_str}: {e2}")
+                    results.append(None)
+                    if errors_counter is not None:
+                        errors_counter.value += 1
+                    if error_details is not None:
+                        error_details.append({"file": path_str, "model": model_name, "seconds": seconds, "reason": str(e2)})
+
+        if not isinstance(results, list):
+            results = [results]
+
+        texts = [None if r is None else extract_text(r) for r in results]
+        ts = [None if r is None else format_timestamps(r) for r in results] if do_timestamps else None
+
+        save_results(paths, texts, ts, output_suffix)
+
+        if processed_counter is not None:
+            processed_counter.value += len(paths)
+
+
+def run_worker(cuda_id: int, world_size: int, model_name: str,
+               work_dir: str, config: dict, config_path: Optional[str] = None,
+               processed_counter=None, errors_counter=None, error_details=None):
+    """Inference worker: loads onnx-asr model on a single GPU and claims file shards."""
+    torch.cuda.set_device(cuda_id)
+
+    batch_size = config.get('batch_size', 16)
+    use_trt = config.get('use_tensorrt', False)
+    quantization = config.get('quantization')
+
+    onnx_name = MODEL_MAP.get(model_name, model_name)
+    output_suffix = 'vosk' if 'vosk' in model_name else model_name
+    do_timestamps = config.get('with_timestamps', False) and model_name in SUPPORTED_TIMESTAMPS
+
+    local_path = config.get('vosk_path') if 'vosk' in model_name else config.get('model_path')
+
+    logger.info(
+        f"Worker {cuda_id}/{world_size}: {onnx_name} on cuda:{cuda_id}, "
+        f"claiming shards, batch={batch_size}, tensorrt={use_trt}"
+    )
+
     try:
-        wav, sr = torchaudio.load(path)
+        providers = get_onnx_providers(cuda_id, use_tensorrt=use_trt, config_path=config_path)
+        logger.info(f"ONNX providers for {model_name} on cuda:{cuda_id}: {providers}")
+        load_args = [onnx_name] + ([local_path] if local_path else [])
+        load_kwargs = {"providers": providers}
+        if quantization:
+            load_kwargs["quantization"] = quantization
 
-        if wav.shape[0] > 1:
-            wav = wav.mean(dim=0).unsqueeze(0) 
-        
-        wav = torchaudio.functional.resample(wav, sr, 16000)
-        length = torch.full([1], wav.shape[-1])
-        
-        encoded, _ = model.forward(wav.to(model._device), length.to(model._device))
-        logitst = model.head(encoded).squeeze(0).detach().cpu().numpy()
-        
-        # Use decode_beams to get timestamps
-        beams = decoder.decode_beams(logitst, beam_width=100)
-        
-        # The top beam result with timestamps is typically at index 0
-        best_beam = beams[0]
-        word_timestamps = best_beam[2]
+        model = onnx_asr.load_model(*load_args, **load_kwargs)
 
-        # 1. Save the plain text transcription to _giga.txt
-        plain_text = best_beam[0]
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(plain_text)
-        
-        # 2. Save the timestamps to _giga.tst
-        tst_content = to_simple_timestamps(word_timestamps)
-        with open(tst_path, "w", encoding="utf-8") as f:
-            f.write(tst_content)
+        if do_timestamps:
+            model = model.with_timestamps()
+
+        if config.get('use_vad', False):
+            vad_params = config.get('vad_params', {})
+            vad = onnx_asr.load_vad("silero", **vad_params)
+            model = model.with_vad(vad)
+
+        target_sample_rate = int(model.asr._get_sample_rate()) if hasattr(model, "asr") else TARGET_SAMPLE_RATE
+
+        claimed = 0
+        while True:
+            shard_path = claim_work_shard(work_dir, cuda_id)
+            if shard_path is None:
+                break
+            files = read_work_shard(shard_path)
+            claimed += 1
+            logger.info(f"Worker {cuda_id}: processing {len(files)} files from {shard_path.name}")
+            _process_files(
+                cuda_id,
+                model_name,
+                files,
+                model,
+                config,
+                output_suffix,
+                do_timestamps,
+                target_sample_rate,
+                processed_counter,
+                errors_counter,
+                error_details,
+            )
+            mark_work_shard_done(shard_path)
+
+        logger.info(f"Worker {cuda_id} finished {claimed} shard(s) for {model_name}.")
 
     except Exception as e:
-        logger.error(f"Error processing {path} with timestamps: {e}")
-        # Fallback to simple transcription if timestamping fails
-        text = model.transcribe(str(path))
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(text)
+        logger.exception(f"Worker {cuda_id} fatal error ({model_name}): {e}")
+        if errors_counter is not None:
+            errors_counter.value += 1
+        if error_details is not None:
+            error_details.append({"worker": cuda_id, "model": model_name, "reason": str(e)})
+
+def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int) -> bool:
+    texts = []
+    for mn in model_names:
+        suffix = 'vosk' if 'vosk' in mn else mn
+        tp = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
+        if text_sidecar_complete(tp):
+            try:
+                t = read_file_content(tp)
+                if t:
+                    texts.append(t.lower().strip())
+            except Exception:
+                pass
+    if len(texts) < consensus_num:
+        return False
+    return max(Counter(texts).values()) >= consensus_num
 
 
-def get_valid_audio_paths(src_path: str) -> List[Path]:
-    """
-    Getst all audio paths and filters out those that have already been transcribed.
-    """
-    all_audio_paths = get_audio_paths(src_path)
-    valid_paths = []
-    for audio_path in all_audio_paths:
-        giga_path = audio_path.with_name(audio_path.stem + "_giga.txt")
-        if not giga_path.exists():
-            valid_paths.append(audio_path)
-    return valid_paths
+def get_valid_paths(src_path: str, output_suffix: str,
+                    processed: List[str], consensus_num: int,
+                    retry_empty_outputs: bool = False,
+                    config_path: Optional[str] = None) -> List[str]:
+    all_paths = [Path(p) for p in discover_audio_paths(src_path, config_path=config_path)]
+    if not all_paths:
+        return []
+
+    valid = []
+    retry_empty_count = 0
+    for p in all_paths:
+        sidecar = p.with_name(f"{p.stem}_{output_suffix}.txt")
+        if text_sidecar_complete(sidecar, retry_empty=retry_empty_outputs):
+            continue
+        if retry_empty_outputs:
+            try:
+                if sidecar.exists() and sidecar.stat().st_size == 0:
+                    retry_empty_count += 1
+            except OSError:
+                pass
+        valid.append(p)
+
+    if retry_empty_count:
+        logger.info(f"Retrying {retry_empty_count} empty {output_suffix} sidecars")
+
+    if consensus_num > 0 and len(processed) >= consensus_num:
+        skipped = 0
+        filtered = []
+        for p in valid:
+            if check_consensus(p, processed, consensus_num):
+                skipped += 1
+            else:
+                filtered.append(p)
+        if skipped:
+            logger.info(f"Consensus reached for {skipped} files, skipping")
+        valid = filtered
+
+    return [str(p) for p in valid]
 
 
 def main(args):
+    setup_logging("transcription", log_dir=args.log_dir)
     config = load_config(args.config_path, 'transcription')
+    model_names = config.get('model_names', ['giga_rnnt'])
+    src_path = config.get('podcasts_path', '.')
+    consensus_num = config.get('consensus_num', 0)
+    retry_empty_outputs = bool(config.get('retry_empty_outputs', False))
 
-    model_name = args.model_name if args.model_name else config.get('model_name', 'rnnt')
-    num_workers_per_gpu = args.num_workers if args.num_workers else config.get('num_workers', 4)
-    src_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../balalaika')
-    lm_path = args.lm_path if args.lm_path else config.get('lm_path', 'ru.lm.bin')
-    with_timestamps = args.with_timestamps if args.with_timestamps else config.get('with_timestamps', 'False')
+    processed = mp.Value('i', 0)
+    errors = mp.Value('i', 0)
+    error_details_list = mp.Manager().list()
 
-    if with_timestamps and not lm_path:
-        raise ValueError("Language model path (--lm_path) is required when using --with_timestamps.")
+    num_gpus = torch.cuda.device_count()
 
-    all_audio_paths = get_valid_audio_paths(src_path)
-    logger.info(f"Found {len(all_audio_paths)} audio files to process.")
+    logger.info(f"{num_gpus} GPU(s) detected. Starting transcription pipeline.")
+    if consensus_num > 0:
+        logger.info(f"Consensus mode: {consensus_num} models must agree")
+    if retry_empty_outputs:
+        logger.info("Retry-empty mode enabled: zero-byte transcript sidecars will be reprocessed")
 
-    available_gpu_ids = list(range(torch.cuda.device_count()))
-    num_gpus = len(available_gpu_ids)
-    
-    if num_gpus == 0:
-        logger.error("No GPUs available. Exiting.")
-        return
+    for idx, model_name in enumerate(model_names):
+        logger.info(f"=== [{idx + 1}/{len(model_names)}] {model_name} ===")
 
-    logger.info(
-        f"""
-        Starting transcription with parameters:
-        Source Path: {src_path}
-        Model Name: {model_name}
-        Timestamps Enabled: {with_timestamps}
-        Language Model Path: {lm_path}
-        Number of GPUs: {num_gpus} (IDs: {available_gpu_ids})
-        Workers per GPU: {num_workers_per_gpu}
-        Total Worker Processes: {num_gpus * num_workers_per_gpu}
-        """
-    )
+        output_suffix = 'vosk' if 'vosk' in model_name else model_name
+        processed_names = model_names[:idx] if consensus_num > 0 else []
+        paths = get_valid_paths(src_path, output_suffix, processed_names, consensus_num, retry_empty_outputs, args.config_path)
 
-    files_for_each_gpu = [[] for _ in range(num_gpus)]
-    for i, path in enumerate(all_audio_paths):
-        gpu_assignment_index = i % num_gpus
-        files_for_each_gpu[gpu_assignment_index].append(path)
-
-    all_futures = []
-    executors = []
-
-    task_fn = partial(make_txt_and_tst, with_timestamps=with_timestamps)
-
-    for i, gpu_id in enumerate(available_gpu_ids):
-        device_str = f'cuda:{gpu_id}'
-        files_for_this_gpu = files_for_each_gpu[i]
-
-        if not files_for_this_gpu:
+        if not paths:
+            logger.info(f"No files to process for {model_name}")
             continue
 
-        logger.info(f"Creating ProcessPoolExecutor for {device_str} with {num_workers_per_gpu} workers for {len(files_for_this_gpu)} files.")
-        
-        executor = ProcessPoolExecutor(
-            max_workers=num_workers_per_gpu,
-            initializer=init_process,
-            initargs=(model_name, device_str, lm_path, with_timestamps),
+        shard_size = load_work_shard_size(args.config_path)
+        duration_workers = duration_probe_workers(config)
+        durations = ensure_audio_durations(
+            src_path,
+            paths,
+            num_workers=duration_workers,
         )
-        executors.append(executor)
+        bucket_seconds, max_bucket_duration = duration_bucket_settings(
+            args.config_path,
+            config,
+        )
+        work_plan = prepare_length_bucketed_work_shards(
+            src_path,
+            f"transcription_{output_suffix}",
+            paths,
+            durations,
+            shard_size=shard_size,
+            bucket_seconds=bucket_seconds,
+            max_duration=max_bucket_duration,
+        )
+        del paths
+        del durations
 
-        for path in files_for_this_gpu:
-            future = executor.submit(task_fn, path)
-            all_futures.append(future)
+        logger.info(
+            f"{work_plan.total_items} files to process for {model_name} "
+            f"in {work_plan.shard_count} shard(s)."
+        )
 
-    for future in tqdm(as_completed(all_futures), total=len(all_futures), desc="Overall Transcription Progress"):
+        worker_errors, worker_error_details = run_per_gpu_processes(
+            run_worker,
+            num_gpus=num_gpus,
+            args=(model_name, str(work_plan.work_dir), config, args.config_path, processed, errors, error_details_list),
+        )
+        if worker_errors:
+            errors.value += worker_errors
+            for detail in worker_error_details:
+                error_details_list.append({"model": model_name, **detail})
+
+    if config.get('use_rover', False):
+        logger.info("ROVER aggregation...")
         try:
-            future.result()
+            from src.transcription.rover import ROVERWrapper
+            ROVERWrapper(
+                podcasts_path=src_path,
+                model_names=model_names,
+                config_path=args.config_path,
+                shard_size=config.get('rover_shard_size'),
+                workers=config.get('rover_workers', 1),
+                retry_empty_outputs=retry_empty_outputs,
+            ).aggregate_and_save()
+            logger.info("ROVER done.")
+        except ImportError:
+            logger.warning("ROVER module not available, skipping")
         except Exception as e:
-            logger.error(f"A task processing encountered an error: {e}")
+            logger.error(f"ROVER failed: {e}")
 
-    for executor in executors:
-        executor.shutdown()
+    logger.info("Transcription pipeline complete!")
+
+    write_stage_status(
+        stage=7,
+        stage_name="transcription",
+        log_dir=args.log_dir or "./logs",
+        processed=processed.value,
+        skipped=0,
+        errors=errors.value,
+        error_details=list(error_details_list),
+    )
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn', force=True)
-    torchaudio.set_audio_backend('soundfile')
+    mp.set_start_method('spawn', force=True)
 
-    parser = argparse.ArgumentParser(
-        description="Transcribe audio files in parallel using multiple GPUs."
-    )
-    parser.add_argument(
-        "--config_path",
-        type=str,
-        help="Path to the configuration YAML file."
-    )
-    parser.add_argument(
-        "--podcasts_path",
-        type=str,
-        help="Path to the directory containing audio files (e.g., MP3s)."
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        help="Number of worker processes per GPU for parallel processing."
-    )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        help="Name of the model to use for transcription (e.g., 'rnnt', 'ctc')."
-    )
-    parser.add_argument(
-        "--lm_path",
-        type=str,
-        help="Path to the language model binary file (e.g., 'ru.lm.bin') required for timestamps."
-    )
-    parser.add_argument(
-        '--with_timestamps',
-        type=bool,
-        help="Enable to generate tst files with word timestamps."
-    )
-
-    args = parser.parse_args()
-    main(args)
+    parser = argparse.ArgumentParser(description="ASR Transcription (onnx-asr)")
+    parser.add_argument("--config_path", type=str, required=True)
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
+    main(parser.parse_args())

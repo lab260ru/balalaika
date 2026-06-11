@@ -5,16 +5,17 @@ import re
 from pathlib import Path
 import pickle
 
-import music_tag
-import requests
 from dotenv import load_dotenv
 from loguru import logger
-from yandex_music import Client
 
-from src.utils import load_config
+from src.utils.logging_setup import setup_logging
+from src.utils.stage_status import write_stage_status
+from src.utils.utils import load_config
 
 def init_client(client_key):
     try:
+        from yandex_music import Client
+
         client = Client(client_key).init()
         return client
     except Exception as e:
@@ -30,6 +31,9 @@ def extract_podcast_id(url):
 
 
 def download_episode(client, part, info_podcast, folder_podcast):
+    import music_tag
+    import requests
+
     track_info = client.tracks_download_info(
         track_id=part['id'], 
         get_direct_links=True
@@ -137,6 +141,7 @@ def download_podcast(client, url, podcasts_path, episodes_limit=None, num_worker
 
 
 def main(args):
+    setup_logging("download", log_dir=args.log_dir)
     load_dotenv()
     
     client_key = os.getenv("YANDEX_KEY")
@@ -147,9 +152,9 @@ def main(args):
     if not client:
         return
 
-    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path','../../../balalaika')
-    episodes_limit = args.episodes_limit if args.episodes_limit else config.get('episodes_limit',1)
-    urls_pickle_path = args.podcasts_urls_file if args.podcasts_urls_file else config.get('podcasts_urls_file','alboms.pkl')
+    podcasts_path = config.get('podcasts_path','../../../balalaika')
+    episodes_limit = config.get('episodes_limit',1)
+    urls_pickle_path = config.get('podcasts_urls_file','alboms.pkl')
 
     try:
         with open(urls_pickle_path, 'rb') as file:
@@ -171,6 +176,10 @@ def main(args):
     num_workers:{num_workers}
     """)
 
+    processed = 0
+    errors = 0
+    error_details: list[dict] = []
+
     for url in podcasts_urls:
         try:
             result = download_podcast(
@@ -181,10 +190,27 @@ def main(args):
                 num_workers=num_workers
             )
             logger.info(result)
+            processed += 1
         except Exception as e:
             logger.error(f"Error when downloading a podcast {url}: {e}")
+            errors += 1
+            error_details.append({"podcast": str(url), "reason": str(e)})
+
+    write_stage_status(
+        stage=0,
+        stage_name="download",
+        log_dir=args.log_dir or "./logs",
+        processed=processed,
+        skipped=0,
+        errors=errors,
+        error_details=error_details,
+    )
 
     
+
+
+    
+
 
 
 if __name__ == "__main__":
@@ -196,28 +222,8 @@ if __name__ == "__main__":
         default="./configs/config.yaml",
         help="Path to the configuration file"
     )
-    parser.add_argument(
-        "--podcasts_urls_file",
-        default=None,
-        help="Path to the pickle file with album urls"
-    )
-    parser.add_argument(
-        "--podcasts_path", 
-        default=None,
-        help="Path for saving podcasts"
-    )
-    parser.add_argument(
-        "--episodes_limit",
-        default=None,
-        type=int,
-        help="Limit for episodes to download"
-    )
-    parser.add_argument(
-        "--num_workers",
-        default=None,
-        type=int,
-        help="num workers"
-    )
-    
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
+    parser.add_argument("--num_workers", type=int, default=None, help="Override download worker count")
+
     args = parser.parse_args()
     main(args)

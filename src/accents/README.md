@@ -1,45 +1,38 @@
-## Usage/Examples
+## Accents (ruAccent)
 
-### Running the Code via Command-Line Arguments
-You can modify the parameters directly in the shell script (`accents/accents_args.sh`) and then run it:
-~~~sh
-sh accents/accents_args.sh
-~~~
+Lexical stress and text normalization from **`{stem}_punct.txt`**.
 
-### Running the Code via Config File
-Example:
-~~~sh
-bash accents/accents_yaml.sh config_path
-~~~
+Multi-GPU pool orchestration, sidecar discovery, and skip-already-done
+filtering come from `src/utils`; the stage script is just `init_process` +
+`process_file` + a `main()` glue that calls
+`src.utils.parallel.run_per_gpu_pool` once.
 
-## Explanation of Parameters
+## Run
 
-- `--config_path`: Path to the YAML configuration file.
-- `--podcasts_path`: Root directory containing the text files for accent restoration (default: "../../../podcasts").
-- `--num_workers`: Number of worker processes per GPU for parallel processing (default: 4).
-- `--model_name`: Model version to use with RUAccent (default: "turbo3.1").
-- `--device`: Device to run the model on (default: "cuda").
+```bash
+bash src/accents/accents_yaml.sh configs/config.yaml
+```
 
-## Output Structure
+## Parameters
 
-For each text file ending with `_punct.txt`, a corresponding `_accent.txt` file will be created:
+See **`accent`** in `configs/config.yaml` (`podcasts_path`, `model_name`, `num_workers`, `use_tensorrt`). The YAML section name is **`accent`**, not `accents`.
 
-~~~
-podcasts/
-└── {album_id}/
-    └── {episode_id}/
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}.mp3
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_giga.txt
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_punct.txt
-        └── {start_time}_{end_time}_{album_id}_{episode_id}_accent.txt
-~~~
+When `use_tensorrt: True`, providers are built by
+`src.utils.gpu.get_onnx_providers`, which reads the engine-cache root and
+workspace from the global `runtime:` block.
 
-### File Descriptions
-- `.mp3`: Original audio file
-- `_giga.txt`: Initial transcription without punctuation
-- `_punct.txt`: Text with restored punctuation (input file for accent restoration)
-- `_accent.txt`: Final text with restored accents, punctuation, and capitalization
+## Output
 
-The script processes all `_punct.txt` files found in the directory structure and creates corresponding `_accent.txt` files. Processing is done in parallel using available GPUs for better performance.
+```text
+{stem}_punct.txt  →  {stem}_accent.txt
+```
 
+WebDataset key: **`accent.txt`**.
 
+## Resume / interrupt safety
+
+Pending inputs are rediscovered via
+`src.utils.sidecars.pending_sidecar_chain(in_suffix="_punct.txt",
+out_derive=replace_in_stem(_, "_punct", "_accent"))`, which only returns
+files whose `_accent.txt` is missing. Output files are written via
+`Path.write_text`, so a forced stop never leaves a partial sidecar.

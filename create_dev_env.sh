@@ -7,7 +7,7 @@ create_venv_env() {
     
     if [ ! -d "$env_name" ]; then
         echo "Creating $env_name environment..."
-        uv venv "$env_name"
+        uv venv "$env_name" --python 3.12
     
         if [ -f "$env_name/Scripts/activate" ]; then
             source "$env_name/Scripts/activate"
@@ -19,6 +19,13 @@ create_venv_env() {
         fi
         
         uv pip install -r "$requirements_file"
+        
+        echo "Installing ONNX Runtime GPU (CUDA 13 nightly)..."
+        uv pip install coloredlogs flatbuffers numpy packaging protobuf sympy
+        uv pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
+        uv pip install tensorrt-cu13
+        uv pip install onnx-asr[gpu,hub]
+        
         deactivate
     else
         echo "Environment $env_name already exists"
@@ -40,16 +47,4 @@ create_venv_env() {
     fi
 }
 
-if ! command -v python &> /dev/null; then
-    echo "Python not found! Please install Python 3.10+"
-    exit 1
-fi
-
-python -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)" || {
-    echo "Requires Python 3.10 or newer!"
-    exit 1
-}
-
-# create_venv_env ".main_venv" "requirements_main.txt"
-# create_venv_env ".support_venv" "requirements_support.txt"
 create_venv_env ".dev_venv" "requirements_dev.txt"

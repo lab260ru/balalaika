@@ -1,45 +1,120 @@
-## Usage/Examples
+## Overview
 
-### Running the Code via Command-Line Arguments  
-You can modify the parameters directly in the shell script (`predprocess_args.sh`) and then run it:
-~~~ 
-sh predprocess/predprocess_args.sh
-~~~  
+Prepares long recordings for ASR/TTS: **Sortformer (ONNX)** diarization,
+**single-speaker** selection, **Smart Turn** end-of-segment refinement, chunk
+export and `balalaika.csv`, then **crest-factor** filtering and **loudness**
+normalization (ITU-R BS.1770-4).
 
-### Running the Code via Config File  
-Example:
-~~~ 
-sh predprocess/predprocess_yaml.sh config_path
-~~~  
+### Stage order (`preprocess_yaml.sh`)
 
-## Explanation of Parameters
+1. **`src.preprocess.preprocess`** — Sortformer in windows up to
+   `chunk_duration`, overlap filtering, Smart VAD; writes
+   `{start}_{end}_{playlist}_{podcast}.{ext}` (extension follows `chunk_format`,
+   default `auto`), upserts rows into `balalaika.csv`; **deletes the original
+   long file** after successful chunking. With `fuse_audio_preprocessing: true`,
+   crest filtering and LUFS normalization happen on each in-memory native-rate
+   chunk before its first and only write.
+2. **`crest_factor_remover`** — computes crest factor (peak/RMS) for every
+   chunk from per-file scalar stats produced by loader workers, writes it to
+   `balalaika.csv` as `crest_factor`, deletes files that exceed the threshold,
+   and records the kept/dropped totals (files + hours) to `filter_summary.csv`.
+3. **`preprocess_audio`** — peak + target LUFS. Lossless containers
+   (FLAC / WAV) are written through `soundfile` and stay lossless; lossy
+   containers (MP3 / OGG / OPUS) round-trip through `torchaudio.save`. Marks
+   each successfully normalized file with `loudness_normalized=True`.
 
-- `--config_path`: Path to the YAML configuration file (default: None).
-- `--podcasts_path`: Root directory containing podcast audio files (default: '../podcasts').
-- `--whisper_model`: Name of the Whisper model to use (default: 'large-v3').
-- `--compute_type`: Compute type for the model (default: 'float16').
-- `--beam_size`: Beam size for beam search decoding (default: 5).
-- `--duration`: Target duration in seconds for each audio segment (default: 15).
-- `--device`: Hardware accelerator for the Whisper model (default: 'cpu').
-- `--num_workers`: Number of parallel processes for audio processing (default: 1).
+Stages 2 and 3 remain independently runnable. After a successful fused stage
+1 they are metadata-only no-ops because `crest_factor` and
+`loudness_normalized` are already populated. Set
+`fuse_audio_preprocessing: false` to retain the original three-pass workflow.
 
-## Output Structure
+Every script writes a rotating, timestamped log under `BALALAIKA_LOG_DIR`
+(default `./logs`); pass `--log_dir <path>` on the CLI to override per
+invocation.
 
-After processing, the original audio file is segmented into shorter clips. The resulting structure will be:
+### Audio quality
 
-~~~ 
-podcasts/
-└── {album_id}/
-    ├── {episode_id}/
-    │   ├── start_time_end_time_{album_id}_{episode_id}.mp3
-    │   ├── start_time_end_time_{album_id}_{episode_id}_whisper.txt
-    │   └── ... (other segments)
-~~~
+* `chunk_format: auto` (default) preserves the source extension. FLAC input →
+  FLAC chunks, WAV → WAV, MP3 → MP3 (no extra encode pass at chunking).
+* Override with `chunk_format: flac | wav | mp3 | ogg | opus` to force a
+  specific container.
+* Loudness normalization keeps lossless inputs lossless. Lossy inputs
+  re-encode once during normalization (unavoidable, since libsndfile cannot
+  write MP3/OGG/OPUS).
 
-Each podcast episode (originally an `.mp3` file) is moved to its own folder named after the episode ID (within its album folder) and then segmented. For each segment, two files are created:
-- An audio file (`{start_time}_{end_time}_{album_id}_{episode_id}.mp3`) containing the audio segment
-- A text file (`{start_time}_{end_time}_{album_id}_{episode_id}_whisper.txt`) containing the transcription for that segment
+### Parameters (`configs/config.yaml` → `preprocess`)
 
-The `start_time` and `end_time` in the filenames represent the timestamp positions (in seconds) of the segment in the original audio file.
+See the **preprocess** block in `configs/config.yaml` for a line-by-line
+description (`podcasts_path`, `duration`, `chunk_duration`, `chunk_format`,
+`min_segment_duration`, `min_save_duration`, `num_workers`,
+`fuse_audio_preprocessing`, `crest_treshold`,
+`peak`, `loudness`, `block_size`, `sortformer_model`, `use_tensorrt`,
+`vad_args.*`). TensorRT cache / workspace come from the global `runtime:` block.
 
-If the segmentation is successful, the original file is deleted.
+## Run
+
+```bash
+# All preprocess sub-stages via the orchestrator (stages 1..3):
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
+
+# Or the legacy per-folder wrapper:
+bash src/preprocess/preprocess_yaml.sh configs/config.yaml
+```
+
+## Output layout
+
+```text
+{podcasts_path}/
+├── balalaika.csv
+├── filter_summary.csv
+└── {playlist_id}/
+    └── {podcast_id}/
+        ├── 12.50_26.30_{playlist_id}_{podcast_id}.flac
+        └── ...
+```
+
+Filename times are seconds in the **source** episode.
+
+## `balalaika.csv` columns after preprocess
+
+| Column | Added by |
+|--------|----------|
+| `filepath`, `speaker_id`, `start`, `end`, `total_duration`, `playlist_id`, `podcast_id`, `silence_percent`, `max_silence_duration`, `is_single_speaker` | `preprocess.py` |
+| `crest_factor` | `crest_factor_remover.py` (files above threshold are deleted and their rows removed) |
+| `loudness_normalized` | `preprocess_audio.py` (boolean flag set on success) |
+
+`DistillMOS`, `music_prob`, and transcription fields are added in
+**separation** / downstream stages.
+
+## Filter summary rows emitted by this stage
+
+| `stage` | Notes |
+|---------|-------|
+| `preprocess` | Counts long-form sources processed and total chunked hours kept. |
+| `crest_factor` | Files / hours kept vs. dropped at the crest-factor threshold. |
+
+The `loudness` step does not filter, so it does not append a row.
+
+## Resume / interrupt safety
+
+All three sub-stages funnel CSV state through `src.utils.csv_manager` so a
+forced stop never breaks the dataset:
+
+* **Atomic writes.** `balalaika.csv` is rewritten via tmp-file + rename, so a
+  kill mid-write cannot corrupt it; a stale `.tmp` is recovered on the next
+  run.
+* **Auto-bootstrap.** If `balalaika.csv` is missing at the start of any
+  sub-stage, it is created from the audio tree before work is scheduled.
+* **Incremental partial CSVs.** Each worker streams rows to its own
+  `<prefix>_part_<rank>.csv` (`crest_part_*`, `loudness_part_*`) row by row.
+  A `Ctrl+C` keeps everything that already landed on disk.
+* **Disk-backed work shards.** Crest-factor and loudness stages write pending
+  paths to `.balalaika_work/<stage>/shard_*.pending`; workers claim those
+  files instead of receiving giant Python lists through multiprocessing.
+* **Resume on next run.** At startup each sub-stage absorbs any leftover
+  partials into `balalaika.csv` (deleting rows for files that were removed
+  by the same stage, e.g. crest-factor deletions), then schedules only the
+  files still missing the relevant column.
+
+The behaviour is idempotent: re-running `preprocess` / `crest_factor` /
+`preprocess_audio` after a successful run is a no-op.

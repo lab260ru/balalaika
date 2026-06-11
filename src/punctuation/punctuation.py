@@ -1,161 +1,99 @@
+"""Stage 8 — RUPunct punctuation restoration on ``*_rover.txt`` sidecars."""
 import argparse
-import os
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import List
 
-import torch
 from loguru import logger
-from tqdm import tqdm
-from transformers import pipeline, AutoTokenizer
+from transformers import AutoTokenizer, pipeline
 
-from src.utils import load_config, get_audio_paths, process_token, read_file_content
+from src.utils.gpu import apply_torch_perf_defaults
+from src.utils.logging_setup import setup_logging
+from src.utils.parallel import run_per_gpu_pool
+from src.utils.sidecars import pending_audio_to_sidecar
+from src.utils.stage_status import write_stage_status
+from src.utils.utils import load_config, process_token, read_file_content
 
-model = None 
+apply_torch_perf_defaults()
 
-def init_process(
-    model_name: str,
-    device: str
-    ) -> None:
+model = None
+
+
+def init_process(model_name: str, device: str) -> None:
     global model
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         strip_accents=False,
-        add_prefix_space=True
+        add_prefix_space=True,
     )
-
     model = pipeline(
         "ner",
         model=model_name,
         tokenizer=tokenizer,
         aggregation_strategy="first",
-        device=device
+        device=device,
     )
 
-def make_punct_txt(
-    path: Path
-    ):
 
-    src_text = read_file_content(path)
-
-    punct_path = path.with_name(path.name.replace("_giga.txt", "_punct.txt"))
-
-    if str(path).endswith('_punct.txt') or str(path).endswith('_accent.txt') or os.path.exists(punct_path):
+def make_punct_txt(rover_path: Path) -> None:
+    rover_path = Path(rover_path)
+    punct_path = rover_path.with_name(rover_path.name.replace("_rover.txt", "_punct.txt"))
+    if punct_path.exists():
         return
-    
+
+    src_text = read_file_content(rover_path)
+    if not src_text:
+        return
+
     preds = model(src_text)
-
-    tokens = [
-        process_token(item["word"].strip(), item["entity_group"])
-        for item in preds
-    ]
-    
-    output = " ".join(tokens).strip()
-    
-    with open(punct_path, "w", encoding="utf-8") as f:
-        f.write(output)
-
-def get_valid_txt_paths(src_path: str) -> List[str]:
-    all_audio_paths = get_audio_paths(src_path)
-    
-    valid_paths = []
-    for audio_path in all_audio_paths:
-        giga_path = audio_path.with_name(audio_path.stem + "_giga.txt")
-        punct_path = audio_path.with_name(audio_path.stem + "_punct.txt")
-        
-        if os.path.exists(giga_path) and not os.path.exists(punct_path):
-            valid_paths.append(giga_path)
-    
-    return valid_paths
+    output = " ".join(
+        process_token(item["word"].strip(), item["entity_group"]) for item in preds
+    ).strip()
+    punct_path.write_text(output, encoding="utf-8")
 
 
 def main(args):
-    config = load_config(args.config_path, 'punctuation')
-    num_workers_per_gpu = args.num_workers if args.num_workers else config.get('num_workers', 4)
-    model_name = args.model_name if args.model_name else config.get('model_name', 'RUPunct/RUPunct_big')
-    podcasts_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../balalaika')
+    setup_logging("punctuation", log_dir=args.log_dir)
+    config = load_config(args.config_path, "punctuation")
 
-    all_text_files = get_valid_txt_paths(podcasts_path)
+    num_workers_per_gpu = config.get("num_workers", 4)
+    model_name = config.get("model_name", "RUPunct/RUPunct_big")
+    podcasts_path = config.get("podcasts_path", "../../../balalaika")
 
-    available_gpu_ids = list(range(torch.cuda.device_count()))
-    num_gpus = len(available_gpu_ids)
-
-    if num_gpus == 0:
-        logger.error("No GPUs available. Exiting.")
+    pending_files = pending_audio_to_sidecar(
+        podcasts_path,
+        in_suffix="_rover.txt",
+        out_suffix="_punct.txt",
+        config_path=args.config_path,
+    )
+    if not pending_files:
+        logger.success("No pending _rover.txt files; punctuation already up to date.")
         return
 
-    logger.info(
-        f"""
-        Starting punctuation restoration with parameters:
-        Source Path: {podcasts_path}
-        Model Name: {model_name}
-        Number of GPUs: {num_gpus} (IDs: {available_gpu_ids})
-        Workers per GPU: {num_workers_per_gpu}
-        Total Worker Processes: {num_gpus * num_workers_per_gpu}
-        """
+    logger.info(f"Found {len(pending_files)} _rover.txt files needing punctuation.")
+
+    error_count, error_details = run_per_gpu_pool(
+        pending_files,
+        work_fn=make_punct_txt,
+        initializer=init_process,
+        init_args_factory=lambda gpu_id: (model_name, f"cuda:{gpu_id}"),
+        num_workers_per_gpu=num_workers_per_gpu,
+        desc="Punctuation",
+    )
+    write_stage_status(
+        stage=8,
+        stage_name="punctuation",
+        log_dir=args.log_dir or "./logs",
+        processed=len(pending_files) - error_count,
+        skipped=0,
+        errors=error_count,
+        error_details=error_details,
     )
 
-    files_for_each_gpu = [[] for _ in range(num_gpus)]
-    for i, path in enumerate(all_text_files):
-        gpu_assignment_index = i % num_gpus
-        files_for_each_gpu[gpu_assignment_index].append(path)
-
-    all_futures = []
-    executors = []
-
-    for i, gpu_id in enumerate(available_gpu_ids):
-        device_str = f'cuda:{gpu_id}'
-        files_for_this_gpu = files_for_each_gpu[i]
-
-        if not files_for_this_gpu:
-            continue
-
-        logger.info(f"Creating ProcessPoolExecutor for {device_str} with {num_workers_per_gpu} workers for {len(files_for_this_gpu)} files.")
-        
-        executor = ProcessPoolExecutor(
-            max_workers=num_workers_per_gpu,
-            initializer=init_process,
-            initargs=(model_name, device_str)
-        )
-        executors.append(executor)
-
-        for path in files_for_this_gpu:
-            future = executor.submit(make_punct_txt, path)
-            all_futures.append(future)
-
-    logger.info(f"Submitted all {len(all_futures)} tasks across {len(executors)} GPU(s). Waiting for completion...")
-
-    for future in tqdm(as_completed(all_futures), total=len(all_futures), desc="Overall Punctuation Progress"):
-        try:
-            future.result()
-        except Exception as e:
-            logger.error(f"A task processing encountered an error (already logged by worker): {e}")
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn")
 
-    parser = argparse.ArgumentParser(description="Punctuation restoration script using multiple GPUs.")
-    parser.add_argument(
-        "--config_path",
-        type=str,
-        help="Path to the configuration file"
-        )
-    parser.add_argument(
-        "--podcasts_path",
-        type=str,
-        help="Path to the dataset directory containing .txt files"
-        )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        help="Number of worker processes per GPU"
-        )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        help="Hugging Face NER model name for punctuation"
-        )
-
-    args = parser.parse_args()
-    main(args)
+    parser = argparse.ArgumentParser(description="Multi-GPU punctuation restoration via RUPunct.")
+    parser.add_argument("--config_path", type=str, help="Path to the configuration file")
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
+    main(parser.parse_args())

@@ -1,4 +1,5 @@
 *.csv
+.torch_hub/*
 *.mp3
 *.wav
 test.py
@@ -7,7 +8,8 @@ chromadb
 cl_*.py
 *.ipynb
 *.bin
-
+temp/*
+models/*
 .env
 __pycache__/
 *.py[cod]
@@ -17,8 +19,9 @@ __pycache__/
 .support_venv
 .python-version
 *.parquet
-
+logs/
 *.so
+.dev_venv/
 
 .Python
 build/
@@ -71,3 +74,4 @@ ipython_config.py
 
 __pypackages__/
 venv/*
+cache

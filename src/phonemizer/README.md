@@ -1,41 +1,35 @@
-## Usage/Examples
+## Phonemizer (TryIParu)
 
-### Running the Code via Command-Line Arguments
-You can modify the parameters directly in the shell script (`phonemizer/phonemizer_args.sh`) and then run it:
-~~~sh
-sh phonemizer/phonemizer_args.sh
-~~~
+Grapheme → IPA from **`{stem}_rover.txt`** using **`tryiparu.G2PModel`**
+(workers call `load_dataset=True` at init).
 
-### Running the Code via Config File
-Example:
-~~~sh
-bash phonemizer/phonemizer_yaml.sh config_path
-~~~
+Multi-GPU pool orchestration, sidecar discovery, and skip-already-done
+filtering come from `src/utils`; the stage script is just `init_process` +
+`process_text` + a `main()` glue that calls
+`src.utils.parallel.run_per_gpu_pool` once.
 
-## Explanation of Parameters
+## Run
 
-- `--config_path`: Path to the YAML configuration file.
-- `--podcasts_path`: Root directory containing the text files for phoneme conversion (default: "../../../podcasts").
-- `--num_workers`: Number of worker processes per GPU for parallel processing (default: 8).
+```bash
+bash src/phonemizer/phonemizer_yaml.sh configs/config.yaml
+```
 
-## Output Structure
+## Parameters
 
-For each text file ending with `_giga.txt`, a corresponding `_phonemes.txt` file will be created:
+See **`phonemizer`** in `configs/config.yaml` (`podcasts_path`, `num_workers`).
 
-~~~
-podcasts/
-└── {album_id}/
-    └── {episode_id}/
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}.mp3
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_giga.txt
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_punct.txt
-        ├── {start_time}_{end_time}_{album_id}_{episode_id}_accent.txt
-        └── {start_time}_{end_time}_{album_id}_{episode_id}_giga_phonemes.txt
-~~~
+## Output
 
-### File Descriptions
-- `.mp3`: Original audio file
-- `_giga.txt`: Initial transcription without punctuation
-- `_punct.txt`: Text with restored punctuation
-- `_accent.txt`: Text with restored accents
-- `_giga_phonemes.txt`: Text converted to phonemes
+For each `{stem}_rover.txt`:
+
+- **`{stem}_rover_phonemes.txt`** — space-separated IPA symbols.
+
+WebDataset key: **`rover_phonemes.txt`**.
+
+## Resume / interrupt safety
+
+Pending inputs are rediscovered via
+`src.utils.sidecars.pending_sidecar_chain(in_suffix="_rover.txt",
+out_derive=lambda p: p.with_name(f"{p.stem}_phonemes.txt"))`, which only
+returns chunks whose `_rover_phonemes.txt` is missing. A forced stop is safe:
+on the next run, only un-phonemized chunks are scheduled.

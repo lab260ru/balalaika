@@ -1,151 +1,97 @@
+"""Stage 9 — RUAccent stress restoration on ``*_punct.txt`` sidecars."""
 import argparse
 import multiprocessing
-import os
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List
 
-import torch
 from loguru import logger
 from ruaccent import RUAccent
-from tqdm import tqdm
 
-from src.utils import load_config, get_txt_paths, read_file_content
+from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
+from src.utils.logging_setup import setup_logging
+from src.utils.parallel import run_per_gpu_pool
+from src.utils.sidecars import pending_sidecar_chain, replace_in_stem
+from src.utils.stage_status import write_stage_status
+from src.utils.utils import load_config, read_file_content
+
+apply_torch_perf_defaults()
 
 accentizer = None
 
-def init_process(
-    model_name: str,
-    device: str
-    ) -> None:
-    global accentizer
 
+def init_process(model_name: str, cuda_id: int, use_tensorrt: bool, config_path=None) -> None:
+    global accentizer
+    providers = get_onnx_providers(cuda_id, use_tensorrt=use_tensorrt, config_path=config_path)
+    logger.info(f"Initializing accent worker on GPU:{cuda_id} (TRT={use_tensorrt})")
     accentizer = RUAccent()
     accentizer.load(
         omograph_model_size=model_name,
         use_dictionary=True,
         tiny_mode=False,
-        device=device
+        providers=providers,
     )
 
 
-def process_file(path: Path):    
+def process_file(punct_path: Path) -> None:
     try:
-        new_path = path.with_name(path.stem.replace("_punct", "_accent") + ".txt")
-
-        if new_path.exists():
+        accent_path = replace_in_stem(punct_path, "_punct", "_accent")
+        if accent_path.exists():
             return
 
-        text = read_file_content(path)
-        
-        processed_text = accentizer.process_all(text)
-        
-        with open(new_path, "w", encoding="utf-8") as f:
-            f.write(processed_text)
+        text = read_file_content(punct_path)
+        if not text or not text.strip():
+            return
 
-    except Exception as e:
-        logger.error(f"Error processing {path}: {e}")
-        raise
+        accent_path.write_text(accentizer.process_all(text), encoding="utf-8")
+    except Exception as exc:
+        logger.error(f"Error processing {punct_path.name}: {exc}")
 
-def get_valid_txt_paths(path: str) -> List[str]:
-    all_punct_paths = get_txt_paths(path, "_punct.txt")
-    valid_paths = []
-
-    for punct_path in all_punct_paths:
-        accent_path = punct_path.with_name(punct_path.stem.replace("_punct", "_accent") + ".txt")
-        if not os.path.exists(accent_path):
-            valid_paths.append(punct_path)
-    return valid_paths
 
 def main(args):
-    config = load_config(args.config_path, 'accent')
-    num_workers = args.num_workers if args.num_workers else config.get('num_workers', 4)
-    model_name = args.model_name if args.model_name else config.get('model_name', 'turbo3.1')
-    podcast_path = args.podcasts_path if args.podcasts_path else config.get('podcasts_path', '../../../balalaika')
+    setup_logging("accents", log_dir=args.log_dir)
+    config = load_config(args.config_path, "accent")
 
-    available_gpu_ids = list(range(torch.cuda.device_count()))
-    num_gpus = len(available_gpu_ids)
+    num_workers_per_gpu = config.get("num_workers", 1)
+    model_name = config.get("model_name", "turbo3.1")
+    podcast_path = config.get("podcasts_path", "./data")
+    use_tensorrt = config.get("use_tensorrt", False)
 
-    if num_gpus == 0:
-        logger.error("No GPUs available. Exiting.")
+    pending_files = pending_sidecar_chain(
+        podcast_path,
+        in_suffix="_punct.txt",
+        out_derive=lambda p: replace_in_stem(p, "_punct", "_accent"),
+        config_path=args.config_path,
+    )
+    if not pending_files:
+        logger.success("No pending _punct.txt files; accents already up to date.")
         return
-    
-    logger.info(
-        f"""
-        Using parms 
-        podcast_path:{podcast_path} 
-        num_workers:{num_workers} 
-        model_name:{model_name} 
-        devices:{available_gpu_ids}
-        """)
 
-    valid_text_files = get_valid_txt_paths(podcast_path)
+    logger.info(f"Found {len(pending_files)} files to process.")
 
-    files_for_each_gpu = [[] for _ in range(num_gpus)]
-    for i, path in enumerate(valid_text_files):
-        gpu_assignment_index = i % num_gpus
-        files_for_each_gpu[gpu_assignment_index].append(path)
+    error_count, error_details = run_per_gpu_pool(
+        pending_files,
+        work_fn=process_file,
+        initializer=init_process,
+        init_args_factory=lambda gpu_id: (model_name, gpu_id, use_tensorrt, args.config_path),
+        num_workers_per_gpu=num_workers_per_gpu,
+        desc="Accents",
+    )
+    write_stage_status(
+        stage=9,
+        stage_name="accents",
+        log_dir=args.log_dir or "./logs",
+        processed=len(pending_files) - error_count,
+        skipped=0,
+        errors=error_count,
+        error_details=error_details,
+    )
 
-    logger.info(f"Found {len(valid_text_files)} files to process")
-
-    all_futures = []
-    executors = []
-
-    for i, gpu_id in enumerate(available_gpu_ids):
-        device_str = f'cuda:{gpu_id}'
-        files_for_this_gpu = files_for_each_gpu[i]
-
-        if not files_for_this_gpu:
-            continue
-
-        logger.info(f"Creating ProcessPoolExecutor for {device_str} with {num_workers} workers for {len(files_for_this_gpu)} files.")
-        
-        executor = ProcessPoolExecutor(
-            max_workers=num_workers,
-            initializer=init_process,
-            initargs=(model_name, device_str)
-        )
-        executors.append(executor)
-
-        for path in files_for_this_gpu:
-            future = executor.submit(process_file, path)
-            all_futures.append(future)
-
-    logger.info(f"Submitted all {len(all_futures)} tasks across {len(executors)} GPU(s). Waiting for completion...")
-
-    for future in tqdm(as_completed(all_futures), total=len(all_futures), desc="Overall Punctuation Progress"):
-        try:
-            future.result()
-        except Exception as e:
-            logger.error(f"A task processing encountered an error (already logged by worker): {e}")
-
-    logger.info("Processing completed")
+    logger.success("Accent restoration completed!")
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn")
+    multiprocessing.set_start_method("spawn", force=True)
 
-    parser = argparse.ArgumentParser(description="Accent restoration script.")
-    parser.add_argument(
-        "--config_path",
-        type=str,
-        help="Path to config"
-        )
-    parser.add_argument(
-        "--podcasts_path",
-        type=str,
-        help="Path to dataset directory"
-        )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        help="Number of worker processes"
-        )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        help="Model version"
-        )
-    
-    args = parser.parse_args()
-    main(args)
+    parser = argparse.ArgumentParser(description="Multi-GPU accent restoration via RUAccent.")
+    parser.add_argument("--config_path", type=str, required=True, help="Path to YAML config")
+    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
+    main(parser.parse_args())
