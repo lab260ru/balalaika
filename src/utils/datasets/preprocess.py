@@ -218,6 +218,12 @@ def diarization_collate(batch):
     return batch
 
 
+def diarization_worker_init(_: int) -> None:
+    # Pin each decode worker to a single thread so they don't each grab all
+    # cores (the source decode happens inside loader workers when enabled).
+    torch.set_num_threads(1)
+
+
 def create_diarization_dataloader(
     file_paths: List[str],
     batch_size: int,
@@ -238,5 +244,10 @@ def create_diarization_dataloader(
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = prefetch_factor
+        # torch requires prefetch_factor >= 1 when workers > 0; the config
+        # default of 0 (used only with workers=0) would crash otherwise, so
+        # floor it. Index order is unchanged (shuffle=False), so any worker
+        # count produces the same batch sequence and identical outputs.
+        loader_kwargs["prefetch_factor"] = max(1, prefetch_factor)
+        loader_kwargs["worker_init_fn"] = diarization_worker_init
     return DataLoader(dataset, **loader_kwargs)
