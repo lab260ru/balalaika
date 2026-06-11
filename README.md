@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1001611309.svg)](https://doi.org/10.5281/zenodo.20650137)
+
 # Balalaika
 
 Balalaika is an end-to-end speech data pipeline: download or ingest audio,
