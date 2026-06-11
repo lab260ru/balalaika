@@ -142,6 +142,18 @@ def add_denoising_trt_profile_options(
     return patched
 
 
+def _onnx_first_input_name(model_path: Path) -> str:
+    """First graph input name, without instantiating an InferenceSession."""
+    import onnx
+
+    model = onnx.load(str(model_path), load_external_data=False)
+    initializers = {init.name for init in model.graph.initializer}
+    for graph_input in model.graph.input:
+        if graph_input.name not in initializers:
+            return graph_input.name
+    raise ValueError(f"No graph inputs found in {model_path}")
+
+
 def create_session(
     model_path: Path,
     rank: int,
@@ -158,13 +170,10 @@ def create_session(
     sess_options.intra_op_num_threads = ORT_THREADS
     sess_options.add_session_config_entry("session.set_denormal_as_zero", "1")
 
-    probe = ort.InferenceSession(
-        str(model_path),
-        sess_options=sess_options,
-        providers=["CPUExecutionProvider"],
-    )
-    input_name = probe.get_inputs()[0].name
-    del probe
+    # Read the input name from graph metadata instead of building a throwaway
+    # CPU InferenceSession (which loaded and optimized the full model once per
+    # worker just to learn one string).
+    input_name = _onnx_first_input_name(model_path)
 
     use_tensorrt = bool(cfg.get("use_tensorrt", True))
     providers = get_onnx_providers(rank, use_tensorrt=use_tensorrt, config_path=config_path)

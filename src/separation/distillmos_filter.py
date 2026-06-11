@@ -193,14 +193,20 @@ def print_preview(df: pd.DataFrame, threshold: float) -> tuple[int, float, int, 
 
 def run_worker(
     rank: int,
-    my_paths: List[str],
+    my_items: List[tuple],
     threshold: float,
     podcasts_path_str: str,
     processed_counter,
     deleted_counter,
     errors_counter,
 ) -> None:
-    """Worker process: delete files with DistillMOS < threshold, write partial CSV."""
+    """Worker process: delete files with DistillMOS < threshold, write partial CSV.
+
+    ``my_items`` is a list of ``(path, mos, duration_s)`` tuples prepared by
+    the parent from ONE read of balalaika.csv. Workers no longer load the
+    whole multi-GB CSV each — that multiplied both startup time and RAM by
+    the worker count, which could OOM low-memory nodes.
+    """
     podcasts_path = Path(podcasts_path_str)
     threshold_f = float(threshold)
 
@@ -214,31 +220,15 @@ def run_worker(
                     f"Worker {rank}: {len(already_done)} files already in partial; skipping."
                 )
 
-            df = load_main_csv(podcasts_path)
-            df_indexed = df.set_index("filepath") if "filepath" in df.columns else None
-
-            for path_str in my_paths:
+            for path_str, mos_val, duration_s in my_items:
                 resolved = resolve_path(path_str)
 
                 if resolved in already_done:
                     continue
 
-                mos_val = None
-                duration_s = 0.0
-
-                if df_indexed is not None and resolved in df_indexed.index:
-                    row = df_indexed.loc[resolved]
-                    if isinstance(row, pd.DataFrame):
-                        row = row.iloc[0]
-                    mos_val = row.get(COLUMN)
-                    if pd.notna(mos_val):
-                        mos_val = float(mos_val)
-                    dur = row.get("total_duration")
-                    if pd.notna(dur):
-                        duration_s = float(dur)
-
                 if mos_val is None or pd.isna(mos_val):
                     continue
+                mos_val = float(mos_val)
 
                 deleted = False
                 if mos_val < threshold_f:
@@ -288,14 +278,36 @@ def run_deletion_workers(
         logger.warning("No audio files found.")
         return 0, 0, 0
 
-    # Split paths into shards
+    # ONE main-CSV read in the parent; workers receive (path, mos, duration)
+    # tuples for their shard instead of each re-reading the whole CSV.
+    df = load_main_csv(podcasts_path)
+    mos_by_path: dict = {}
+    dur_by_path: dict = {}
+    if "filepath" in df.columns and COLUMN in df.columns:
+        mos_by_path = dict(zip(df["filepath"], df[COLUMN]))
+        if "total_duration" in df.columns:
+            dur_by_path = dict(zip(df["filepath"], df["total_duration"]))
+    del df
+
+    items = []
+    for path in audio_paths:
+        mos = mos_by_path.get(path)
+        if mos is None or pd.isna(mos):
+            continue
+        dur = dur_by_path.get(path)
+        dur = float(dur) if dur is not None and pd.notna(dur) else 0.0
+        items.append((path, float(mos), dur))
+    del mos_by_path, dur_by_path
+
+    # Split items into shards
     shards = []
     for i in range(num_workers):
-        shard = audio_paths[i::num_workers]
+        shard = items[i::num_workers]
         if shard:
             shards.append(shard)
 
     if not shards:
+        logger.info("No scored files to filter.")
         return 0, 0, 0
 
     logger.info(f"Deletion phase: {len(audio_paths)} files, {num_workers} workers, threshold={threshold}")
