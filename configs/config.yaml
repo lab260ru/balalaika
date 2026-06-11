@@ -134,6 +134,16 @@ download:
   num_workers: 4
   # Optional pickle path with podcast / episode URLs (see download module).
   podcasts_urls_file: ''
+  # --- collate (stage 12) reads this section too (see note above) ---
+  # Rows per streamed parquet slab. Collate reads sidecars and writes row-groups
+  # one slab at a time, so peak RAM is ~O(slab) instead of O(whole dataset) —
+  # this is what keeps stage 12 off the OOM line at multi-million-row scale.
+  # Lower on very low-RAM nodes; raise to trade RAM for fewer row-groups.
+  collate_slab_rows: 200000
+  # Compression for balalaika.parquet. zstd is ~2x smaller than the default
+  # snappy on the text-heavy sidecar columns (fewer HDD write bytes); set to
+  # 'snappy' or 'none' if you need the old codec.
+  collate_parquet_compression: zstd
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
