@@ -304,9 +304,9 @@ def main(args):
     # only one slab's sidecar text is resident at a time. Lower it on very
     # low-RAM nodes; raise it to trade RAM for fewer parquet row-groups.
     slab_rows = int(config.get('collate_slab_rows', 200_000))
-    # Parquet compression for balalaika.parquet (zstd ~2x smaller than the
-    # pandas/pyarrow default snappy on text-heavy frames = fewer HDD bytes).
-    parquet_compression = config.get('collate_parquet_compression', 'zstd')
+    # Parquet compression for balalaika.parquet. snappy = old default; zstd
+    # is ~2x smaller on text-heavy frames (fewer HDD bytes) when readers allow.
+    parquet_compression = config.get('collate_parquet_compression', 'snappy')
     file_types = sidecar_specs(model_names)
     sidecar_columns = set(file_types.keys()) | transcription_sidecar_columns(model_names)
     logger.info(

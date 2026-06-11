@@ -140,10 +140,10 @@ download:
   # this is what keeps stage 12 off the OOM line at multi-million-row scale.
   # Lower on very low-RAM nodes; raise to trade RAM for fewer row-groups.
   collate_slab_rows: 200000
-  # Compression for balalaika.parquet. zstd is ~2x smaller than the default
-  # snappy on the text-heavy sidecar columns (fewer HDD write bytes); set to
-  # 'snappy' or 'none' if you need the old codec.
-  collate_parquet_compression: zstd
+  # Compression for balalaika.parquet. snappy is the old default; zstd is
+  # ~2x smaller on the text-heavy sidecar columns (fewer HDD write bytes) —
+  # recommended once downstream parquet readers are confirmed zstd-capable.
+  collate_parquet_compression: snappy
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
