@@ -66,11 +66,73 @@ def load_metadata(csv_path: Path) -> Dict[str, dict]:
     stems = [
         os.path.splitext(os.path.basename(p))[0] for p in df["filepath"].astype(str)
     ]
-    records = df.drop(columns=["filepath"]).to_dict("records")
+    records = _sanitize_records(df.drop(columns=["filepath"]))
     metadata_dict = dict(zip(stems, records))
 
     logger.info(f"Loaded metadata for {len(metadata_dict)} files.")
     return metadata_dict
+
+
+def _sanitize_record_value(v):
+    """Exact per-cell sanitisation used by the old worker hot loop.
+
+    Kept as the column-fallback path for object columns that may hold a mix
+    of types (datetime scalars, numpy scalars, strings); identical result to
+    the inline branch the worker used to run per cell.
+    """
+    if pd.isna(v) or (isinstance(v, float) and math.isnan(v)):
+        return None
+    if isinstance(v, (pd.Timestamp, pd.Timedelta)):
+        return str(v)
+    if hasattr(v, "item"):
+        return v.item()
+    return v
+
+
+def _sanitize_records(df: pd.DataFrame) -> List[dict]:
+    """Vectorised, JSON-ready records.
+
+    Reproduces the old worker's per-cell branch (NaN/NaT -> None,
+    Timestamp/Timedelta -> str, numpy scalar -> .item(), else passthrough)
+    but computes the null mask and per-column conversion once instead of
+    dispatching ``pd.isna``/``isinstance``/``hasattr`` per value per file.
+    Column keys are ``str(col)`` to match the old ``str(k)``.
+    """
+    import numpy as np
+    import pandas.api.types as ptypes
+
+    n = len(df)
+    columns = list(df.columns)
+    per_col_values: Dict[str, list] = {}
+    for col in columns:
+        s = df[col]
+        null_mask = s.isna().to_numpy()
+        if ptypes.is_datetime64_any_dtype(s) or ptypes.is_timedelta64_dtype(s):
+            # Timestamp/Timedelta -> str(v); NaT -> None.
+            strs = s.astype(object).astype(str)
+            vals = [None if null_mask[i] else strs.iloc[i] for i in range(n)]
+        elif ptypes.is_integer_dtype(s):
+            # Native ints; integer columns cannot hold NaN.
+            arr = s.to_numpy()
+            vals = [int(x) for x in arr.tolist()]
+        elif ptypes.is_float_dtype(s):
+            arr = s.to_numpy()
+            pylist = arr.tolist()  # numpy float64 -> python float
+            vals = [None if null_mask[i] else pylist[i] for i in range(n)]
+        elif ptypes.is_bool_dtype(s):
+            arr = s.to_numpy()
+            vals = [bool(x) for x in arr.tolist()]
+        else:
+            # Object/mixed column: fall back to the exact per-cell transform.
+            raw = s.tolist()
+            vals = [_sanitize_record_value(raw[i]) for i in range(n)]
+        per_col_values[str(col)] = vals
+
+    str_cols = [str(c) for c in columns]
+    return [
+        {c: per_col_values[c][i] for c in str_cols}
+        for i in range(n)
+    ]
 
 def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata_dict: Dict[str, dict], max_shard_size: int, max_shard_count: int):
     if not audio_paths:
@@ -103,19 +165,12 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
                 errors_count += 1
                 continue
 
-            json_data = {}
-
-            if key in metadata_dict:
-                for k, v in metadata_dict[key].items():
-                    k_str = str(k)
-                    if pd.isna(v) or (isinstance(v, float) and math.isnan(v)):
-                        json_data[k_str] = None
-                    elif isinstance(v, (pd.Timestamp, pd.Timedelta)):
-                        json_data[k_str] = str(v)
-                    elif hasattr(v, 'item'):
-                        json_data[k_str] = v.item()
-                    else:
-                        json_data[k_str] = v
+            # Metadata cells were sanitised once, vectorised, in load_metadata
+            # (NaN -> None, Timestamp/Timedelta -> str, numpy scalar -> .item()),
+            # so the worker just copies its chunk's record — no per-cell pd.isna /
+            # isinstance / hasattr dispatch in the hot loop.
+            meta = metadata_dict.get(key)
+            json_data = dict(meta) if meta is not None else {}
 
             # One cached scandir per directory instead of two globs per FILE:
             # directories hold hundreds of chunks, so the old pattern rescanned
