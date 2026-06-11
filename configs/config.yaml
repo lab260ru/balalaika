@@ -310,6 +310,25 @@ transcription:
   # Numba-accelerated ROVER aggregation (identical outputs, ~12x faster;
   # pinned by tests/test_fast_rover.py). False falls back to crowd-kit.
   use_fast_rover: True
+  # Batched stateful RNN-T greedy decode for transducer models (giga_rnnt
+  # and the vosk Kaldi adapter). Stock onnx-asr decodes RNN-T utterances
+  # one at a time, firing 200+ sequential batch-1 ONNX decoder/joiner calls
+  # per file — the stage critical path (~7 it/s vs ~60 for CTC). The fast
+  # path runs the decoder/joiner across all utterances of a batch in
+  # lockstep (one batched ONNX call per greedy step), with per-sequence
+  # blank/emit/max-tokens bookkeeping identical to stock. Token- AND
+  # timestamp-identical to stock decode at batch sizes 1/4/8 on the 250
+  # real-wav bench (giga_rnnt + vosk, CPU EP, 0/250; plus a GPU-1 spot
+  # check, 0/50); pinned by tests/test_fast_rnnt.py. CTC / non-transducer /
+  # unknown topologies and any build error fall back to stock decode
+  # automatically. Works in both share_decode modes. The win is on GPU,
+  # where the per-step ONNX launches dominate: giga_rnnt at batch 8 went
+  # 9.5 -> 23.2 it/s (2.4x) on the contended GPU. It needs batch > 1 to
+  # help — at batch 1 it is parity-to-slightly-slower (two rebuilt
+  # decoder/joiner graphs add ~110 ms one-time worker init and no batching
+  # benefit), so keep transcription.batch_size >= 4 for giga_rnnt (the node
+  # profile already picks 8). Set False to force stock per-utterance decode.
+  use_fast_rnnt: True
   # Intra-bucket work-shard order. "duration" reproduces the old flow
   # bit-for-bit. "path" reads audio in directory order — on HDD datasets this
   # removes ~1 random seek per file per model pass — but changes ASR batch

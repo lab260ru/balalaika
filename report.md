@@ -362,6 +362,77 @@ bit-exact — left as a knob-gated option, not taken.
 | WebDataset workers now receive **only their chunk's metadata** | full dict is GBs at 2 M rows, was pickled once per worker | stage 13; **this corrects §8 below** — the prior report claimed it was already done, but commit 5c124e5 only vectorized the load; now actually implemented |
 | Spawned workers honor the configured log level (`BALALAIKA_LOG_LEVEL` exported; DataLoader `worker_init_fn`) | emitted debug line 36.5 µs → 0.9 µs suppressed; stage/loader workers previously ran loguru's default DEBUG-to-stderr sink | every per-file `logger.debug` in dataset `__getitem__` at production scale (≈2 CPU-min per million files per call site, plus stderr noise) |
 
+### 4.14 Batched stateful RNN-T greedy decode (stage 7) — giga_rnnt 9.5→23.2 it/s on GPU
+
+`onnx_asr` decodes RNN-T utterances strictly one at a time
+(`_AsrWithTransducerDecoding._decoding` loops `for encodings in
+encoder_out`), and within each utterance fires a *batch-1* decoder/joiner
+ONNX call per greedy step — for `gigaam-v3-rnnt` 200+ sequential ONNX
+`Run` calls per file, which is why it sat at ~7 it/s vs ~60 for the CTC
+models and set the stage-7 critical path (§9.1). `src/transcription/fast_rnnt.py`
+keeps the **exact** stock greedy algorithm (same weights, vocab,
+`max_tokens_per_step` semantics, blank handling, fp32 numerics, and emitted
+`(tokens, timestamps, logprobs)` tuples) but runs the decoder and joiner
+across **all utterances of a batch in lockstep** — one batched ONNX call
+per greedy step instead of B sequential ones — with exact per-sequence
+blank/emit/frame-advance bookkeeping (the GigaAM predictor-advances-on-emit
+state cache; the Kaldi shared per-context decoder-out cache).
+
+Both transducer topologies in the model list are covered, detected at patch
+time, anything else (CTC, NeMo, Whisper) left on stock decode automatically:
+
+- **GigaAM v2/v3 RNN-T** (`giga_rnnt`): the LSTM-predictor decoder/joiner
+  ONNX graphs hardcode batch dim 1. We relabel just that axis to a free
+  symbol in-memory and build fresh dynamic-batch sessions reusing the stock
+  sessions' providers (~110 ms one-time per worker). Verified the rebuilt
+  decoder output is bit-identical and the joiner < 4e-6 vs the stock B=1
+  graph (fp32 GEMM reassociation; argmax unaffected).
+- **Kaldi / Vosk transducer** (`vosk`): the graphs already carry a dynamic
+  batch dim, so no rewrite — verified bit-identical batched vs single.
+
+Knob: `transcription.use_fast_rnnt` (default **True** — equivalence is
+exact). Plugs into **both** `share_decode` modes (sequential `run_worker`
+and grouped `run_group_worker`) via a one-line patch right after model
+construction; the timestamp adapter shares the same `asr` object so one
+patch covers it. Any unexpected topology or build error falls back to stock.
+
+`benchmarking/micro/bench_rnnt.py`, 250 / 50 real wavs, with timestamps:
+
+| Model | leg | stock | fast | speedup |
+|---|---|---|---|---|
+| giga_rnnt | **GPU 1 (contended), batch 8, full pass** | **9.5 it/s** | **23.2 it/s** | **2.44×** |
+| giga_rnnt | GPU 1 (contended), batch 8, decode-only | 76.3 ms/file | 30.6 ms/file | **2.49×** |
+| giga_rnnt | GPU 1 (contended), batch 1 | 5.2 it/s | 4.8 it/s | 0.92× (no batching) |
+| giga_rnnt | CPU, batch 8, full pass | 10.0 it/s | 11.4 it/s | 1.13× |
+| giga_rnnt | CPU, batch 8, decode-only | 10.8 ms/file | 8.4 ms/file | 1.29× |
+| vosk | CPU, batch 8, full pass | 16.9 it/s | 17.5 it/s | 1.04× |
+
+The win lives on GPU, where the per-step ONNX launch latency (worse on this
+shared GPU) dominates the decode — exactly the §9.1 bottleneck. On CPU the
+encoder is compute-bound and dominates the recognize pass (~88% at batch 8),
+so batching the decode is a smaller end-to-end win there; at batch 1 the fast
+path is parity-to-slightly-slower (rebuild overhead, no batching benefit), so
+keep `transcription.batch_size >= 4` for giga_rnnt (the node profile picks 8).
+**Projected stage effect:** giga_rnnt was the slowest grouped model at ~7 it/s;
+lifting it to ~23 it/s on GPU removes it as the shared-decode group's pacing
+model, so the grouped pass runs at roughly the CTC models' rate.
+
+**Proof of unchanged outputs**: on the 250 real wavs (OpenSTT), stock vs
+fast at batch sizes **1, 4, 8** on CPU EP are **0/250 different in text,
+0/250 in timestamps, and 0/250 in full token streams** for both giga_rnnt
+and vosk; a GPU-1 spot check (50 files, batch 1 and 8) is **0/50** on all
+three. The batched decode is exactly stock decode given the same encoder
+output — the per-sequence padding/masking is exact (ragged lengths bound by
+`encoder_out_lens`). (Cross-*batch-size* differences exist for stock too,
+from the encoder's padding sensitivity — the same bounded class as the
+giga_ctc padding divergence in §11.1 — and are not introduced by this
+change.) Pinned by 40 tests in `tests/test_fast_rnnt.py`: deterministic
+synthetic GigaAM- and Kaldi-shaped transducers drive the *real* stock
+`_decoding` loop and are compared token/timestamp-for-token against the
+batched loops (random + adversarial encoder outputs, every
+`max_tokens_per_step`, ragged batches, logprobs), plus patch-safety
+(non-transducer untouched, idempotent, fallback-on-broken-backend).
+
 ## 5. End-to-end validation on real audio (proof nothing broke)
 
 250 real Russian wavs (OpenSTT), old commit `410de9b` in a worktree vs HEAD,
@@ -471,13 +542,14 @@ anyway, and the warmup sweep uses CUDA EP so it finishes in minutes, not hours.
 absent on this node or larger refactors)
 
 1. ~~**Transcription stage restructure**: decode/resample each file once and
-   share across the ASR models.~~ Done — see §4.10 (1.39×). Remaining ideas
-   for stage 7: keep DataLoader workers alive across shards (GPU idles a few
-   seconds per 10 k-file shard), and the **RNNT decode loop** — giga_rnnt runs
-   200+ sequential batch-1 ONNX decoder calls per file inside onnx-asr (why it
-   sits at 7 it/s vs ~60 for CTC and sets the stage critical path); fixing it
-   means batched/stateful decode inside the onnx-asr Kaldi adapter (upstream
-   surgery, high effort, high payoff).
+   share across the ASR models.~~ Done — see §4.10 (1.39×). ~~The **RNNT
+   decode loop** — giga_rnnt runs 200+ sequential batch-1 ONNX decoder calls
+   per file inside onnx-asr (why it sits at 7 it/s vs ~60 for CTC and sets
+   the stage critical path).~~ Done — see §4.14 (`src/transcription/fast_rnnt.py`,
+   batched stateful decode for both the GigaAM RNN-T and Kaldi/Vosk adapters;
+   giga_rnnt 9.5→23.2 it/s on GPU at batch 8, 0/250 text+timestamp+token
+   divergence). Remaining idea for stage 7: keep DataLoader workers alive
+   across shards (GPU idles a few seconds per 10 k-file shard).
 2. **Sortformer/SmartTurn (stage 1)**: batch SmartVAD calls across segments; ORT
    IOBinding to kill per-window GPU→CPU→GPU round-trips; vectorize `_binarize`
    and spkcache compression (file:line details in `.claude/analysis/preprocess-*.json`).
@@ -520,6 +592,9 @@ python -m benchmarking.micro.bench_g2p --make-fixtures      # §4.9 (once)
 python -m benchmarking.micro.bench_g2p --impl fast --label check   # §4.9
 python -m benchmarking.micro.bench_rover --label check --impl both # §4.11 (also proves 0 mismatches)
 python -m benchmarking.micro.bench_loudness --label check          # §4.12 (also proves 0 mismatches)
+python -m benchmarking.micro.bench_rnnt --device cpu --label check  # §4.14 (CPU, proves 0/250 text+ts+tokens)
+CUDA_VISIBLE_DEVICES=1 python -m benchmarking.micro.bench_rnnt --device cuda \
+  --models giga_rnnt --impl fast --num-files 50 --label check        # §4.14 GPU spot check
 TARGET=transcription.stage DATASET=cache/bench_sample/audio NUM_SAMPLES=250 \
   REPEATS=2 GPU_IDS=1 benchmarking/run_benchmark.sh                # §4.10 stage legs
 python -m benchmarking.warmup --config_path configs/config.yaml   # §2 (per node)

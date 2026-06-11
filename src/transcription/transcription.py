@@ -15,6 +15,7 @@ from src.utils.audio_durations import (
     duration_probe_workers,
     ensure_audio_durations,
 )
+from src.transcription.fast_rnnt import patch_model as _patch_fast_rnnt
 from src.utils.datasets.transcription import (
     create_group_transcription_dataloader,
     create_transcription_dataloader,
@@ -54,6 +55,30 @@ MODEL_MAP = {
 
 SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
 TARGET_SAMPLE_RATE = 16_000
+
+
+def maybe_patch_fast_rnnt(model, config: dict):
+    """Install batched stateful RNN-T greedy decode on a loaded onnx-asr model.
+
+    No-op for CTC / non-transducer / unrecognized topologies and when
+    ``transcription.use_fast_rnnt`` is False. Plugs in transparently for
+    BOTH ``share_decode`` modes (sequential ``run_worker`` and grouped
+    ``run_group_worker``): it only replaces the per-utterance greedy decode
+    loop — the stage-7 critical path for ``giga_rnnt`` (200+ sequential
+    batch-1 ONNX calls/file) and the vosk Kaldi transducer — with a batched
+    equivalent that is token- and timestamp-identical to stock at batch
+    sizes 1/4/8 on 250 real wavs (report.md §9.1). Call after
+    ``with_timestamps`` / ``with_vad``; those adapters share the same
+    ``.asr`` object, so one patch covers the timestamp path too. Never
+    raises: any unexpected model is returned unpatched (stock decode).
+    """
+    if not config.get('use_fast_rnnt', True):
+        return model
+    try:
+        return _patch_fast_rnnt(model)
+    except Exception as exc:  # never let the fast path break a worker
+        logger.warning(f"fast_rnnt patch skipped ({exc}); using stock decode")
+        return model
 
 
 def format_length_range(lengths: torch.Tensor, sample_rate: int) -> str:
@@ -241,6 +266,8 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
             vad = onnx_asr.load_vad("silero", **vad_params)
             model = model.with_vad(vad)
 
+        model = maybe_patch_fast_rnnt(model, config)
+
         target_sample_rate = int(model.asr._get_sample_rate()) if hasattr(model, "asr") else TARGET_SAMPLE_RATE
 
         claimed = 0
@@ -303,6 +330,8 @@ def _load_group_model(model_name: str, config: dict, providers) -> _GroupModelSp
     if config.get('use_vad', False):
         vad = onnx_asr.load_vad("silero", **config.get('vad_params', {}))
         model = model.with_vad(vad)
+
+    model = maybe_patch_fast_rnnt(model, config)
 
     sample_rate = int(model.asr._get_sample_rate()) if hasattr(model, "asr") else TARGET_SAMPLE_RATE
     return _GroupModelSpec(
