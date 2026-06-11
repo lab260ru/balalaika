@@ -1035,7 +1035,15 @@ Tracks were developed in isolated worktrees off `claude` HEAD `26bc150` and
 merged one at a time, re-running each track's equivalence tests on the
 merged tree (the stage-7 file was touched by three tracks — loaders, RNN-T,
 session options — and its full pin set passes post-merge). Full suite on the
-final tree: see §10.
+final tree: **1387 passed, 0 failed** (§10).
+
+Closing stage-level number, same harness leg as §4.10 (250 real files ×
+5 models + ROVER, GPU 1 still shared with training, 1 repeat):
+**106.8 s wall (RTF 0.246, 4.06× realtime)** with shared decode +
+persistent loaders + fast RNN-T all active — vs 183.5 s after §4.10 alone
+(**1.72×** this pass) and 243.6 s before the second pass (**2.28×**
+cumulative). Contended ⇒ treat as indicative; the per-component
+equivalence proofs above are the rigorous part.
 
 ### 12.8 Reproduce (this pass)
 
