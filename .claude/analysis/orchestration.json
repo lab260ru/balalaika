@@ -1,0 +1,170 @@
+{
+  "area": "orchestration",
+  "data_flow": "The orchestration layer is thin and mostly correctness-critical glue rather than a compute hotspot, but several decisions here cost wall-clock and VRAM globally across every stage.\n\nEntry point base.sh (set -euo pipefail): parses --config_path/--stage/--stop_stage/--strict, realpaths the config, then runs `python3 -m src.utils.runtime_env --config_path ...` once and `eval`s its `export` lines to populate BALALAIKA_VENV/CPU_AFFINITY/LOG_DIR/LOG_LEVEL/TRT_* (base.sh:71-75). runtime_env.py:_load_runtime parses the YAML, merges over DEFAULTS, and prints shlex-quoted `export` lines (runtime_env.py:80-89). base.sh then sources the venv activate script and builds LD_LIBRARY_PATH by hand-listing nvidia/* and tensorrt_libs dirs (base.sh:90-97).\n\ncudf probe (base.sh:112-120): `python3 -c \"import cudf.pandas\"` runs once at startup (a multi-second import) purely to decide whether to set a launcher prefix. If available, EVERY stage is then launched via `python3 -c \"...cudf.pandas.install(); runpy.run_module(...)\"` (base.sh:138-149), i.e. the cudf/cuDF stack is imported in EVERY stage process, including pure-GPU multiprocessing stages (ASR, denoising, DistillMOS, music_detect) that spawn child workers and do little-to-no pandas in the parent.\n\nPer-stage launch (run_python, base.sh:123-160): builds the argv, optionally wraps with `taskset -c $BALALAIKA_CPU_AFFINITY`, prints a banner, and execs. Each stage process re-reads the YAML config itself (load_config), re-imports torch/onnxruntime, calls apply_torch_perf_defaults / get_onnx_providers from gpu.py, calls setup_logging (logging_setup.py) which wipes loguru sinks and attaches a stderr + rotating-file sink (200MB rotation, 10 retention, enqueue=True). Stages that spawn per-GPU workers use mp.set_start_method('spawn') so each child re-imports the whole stack (torch, ORT, and — because cudf.pandas.install() ran in the parent before spawn — potentially cudf too).\n\nstage_status.py.write_stage_status writes a small stage_N_status.json (capped 50 error_details) at end of each stage; base.sh:check_stage_status only inspects it under --strict by shelling out to a 3rd `python3 -c` to read JSON (base.sh:200-205). gpu.py.get_onnx_providers mkdir's a per-device TRT cache dir on every call.\n\nThe alternate path src/stage_runner.sh (used by the per-stage *_yaml.sh wrappers, not by base.sh) duplicates the runtime_env eval + venv activate + taskset logic but does NOT set up cudf and does NOT build the nvidia LD_LIBRARY_PATH — so running a stage via its *_yaml.sh wrapper has a different (and TRT-broken) library environment than running it via base.sh.",
+  "operations": [
+    {
+      "name": "config realpath + existence check",
+      "what": "base.sh:61-67 stat the config and realpath it",
+      "cost": "trivial"
+    },
+    {
+      "name": "runtime_env subprocess + eval",
+      "what": "base.sh:71-75 spawns python3 to parse YAML and print exports; runtime_env.py:80-89; full python interpreter start + yaml import for ~7 values",
+      "cost": "light"
+    },
+    {
+      "name": "venv activation + LD_LIBRARY_PATH build",
+      "what": "base.sh:78-100 sources activate, runs python3 to get version (base.sh:89), hand-builds nvidia/tensorrt lib path",
+      "cost": "light"
+    },
+    {
+      "name": "cudf availability probe",
+      "what": "base.sh:115 `python3 -c import cudf.pandas` — a heavy GPU-stack import done once just to set a flag",
+      "cost": "moderate"
+    },
+    {
+      "name": "cudf.pandas.install() per stage",
+      "what": "base.sh:138-149 every stage process imports + installs the cuDF pandas accelerator via runpy, even GPU-only stages doing no parent-side pandas",
+      "cost": "heavy"
+    },
+    {
+      "name": "taskset CPU pin",
+      "what": "base.sh:154-156 / stage_runner.sh:41-43 wrap each stage in `taskset -c 0-80`",
+      "cost": "trivial"
+    },
+    {
+      "name": "setup_logging per stage",
+      "what": "logging_setup.py:72-91 logger.remove + 2 logger.add with enqueue=True (adds a background queue thread), file rotation/retention bookkeeping",
+      "cost": "light"
+    },
+    {
+      "name": "apply_torch_perf_defaults per stage",
+      "what": "gpu.py:23-30 sets TF32 + flash/mem-eff SDP toggles after importing torch",
+      "cost": "trivial"
+    },
+    {
+      "name": "get_onnx_providers + TRT cache mkdir",
+      "what": "gpu.py:32-64 reads runtime_cfg (re-parses YAML each call) and mkdir's trt_cache_<id> per session/worker",
+      "cost": "light"
+    },
+    {
+      "name": "write_stage_status",
+      "what": "stage_status.py:29-46 json.dumps a tiny dict + write_text once per stage",
+      "cost": "trivial"
+    },
+    {
+      "name": "check_stage_status (strict only)",
+      "what": "base.sh:200-205 spawns a 3rd python3 just to read one int out of JSON; no-op return when not strict (base.sh:190-191)",
+      "cost": "trivial"
+    },
+    {
+      "name": "stage_to_units arithmetic per stage_active call",
+      "what": "base.sh:162-184 forks bash subshells via $(...) command substitution 3x per stage gate (stage, stop_stage, s)",
+      "cost": "trivial"
+    },
+    {
+      "name": "spawn child re-import of full stack",
+      "what": "stages use mp.set_start_method('spawn'); each per-GPU worker cold-imports torch/ORT (+cudf if installed in parent)",
+      "cost": "moderate"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Stop forcing cudf.pandas onto GPU-only stages",
+      "location": "base.sh:112-160",
+      "description": "cudf.pandas.install() is injected into EVERY stage via the runpy shim, but only a handful of stages do heavy parent-side pandas (collate, the CSV merge/upsert in csv_manager). GPU stages (ASR, denoising, DistillMOS, music_detect, antispoofing) spawn per-GPU workers and do trivial parent-side CSV work, yet still pay the multi-second cuDF import in the parent AND contend for the same GPU memory that ORT/torch needs. On this node the other 12-14GB is already used by a training job, so an extra cuDF CUDA context per stage process risks OOM. Gate the cudf prefix to only the CSV-bound stages (collate, filter stages), or make it opt-in per stage. The probe import at base.sh:115 is also wasted work when cudf ends up unused.",
+      "expected_gain": "Saves multi-second cuDF import per GPU stage; frees ~300-800MB VRAM of cuDF CUDA context per stage process; removes OOM risk on the contended GPU",
+      "risk": "low",
+      "low_resource_note": "Big win on low-RAM/low-VRAM nodes — cuDF import is pure overhead there and can tip a 31GB-RAM / shared-GPU node into OOM. Needs a knob: BALALAIKA_DISABLE_CUDF=1 already exists (base.sh:113) but a per-stage allowlist is better."
+    },
+    {
+      "title": "cuDF in parent before mp spawn leaks CUDA state to children",
+      "location": "base.sh:138-149",
+      "description": "When cudf.pandas.install() runs in the parent and the stage then does mp.set_start_method('spawn'), the import side effects (and a parent CUDA context) exist before fork/spawn. For spawn this means each child also re-imports cudf during module load, multiplying the import cost by num_workers and creating one extra CUDA context per child. Confirm whether children inherit the cudf hook; if they do, that is N extra cuDF imports per stage. Restricting cudf to non-multiprocessing CSV stages (see above) removes this.",
+      "expected_gain": "Removes num_workers x cuDF import + extra CUDA contexts on multiprocessing stages",
+      "risk": "low",
+      "low_resource_note": "Critical on single-GPU low-VRAM nodes: N child CUDA contexts can exhaust the ~2-4GB of headroom left by the training job."
+    },
+    {
+      "title": "cpu_affinity 0-80 over-subscribes and ignores NUMA",
+      "location": "configs/config.yaml:95 (consumed at base.sh:154-156, stage_runner.sh:41-43)",
+      "description": "The node has 48 threads (0-47) across 2 NUMA nodes, but affinity is set to 0-80. taskset -c with a RANGE silently clamps to existing CPUs (verified: exit 0), so it currently pins to all 48 cores and spans both NUMA nodes — defeating NUMA locality for memory-bound DataLoader/decode work and giving no benefit over no pinning. A single out-of-range CPU id would instead hard-fail. On weaker nodes with <48 threads the misleading value is harmless-but-wrong. Set affinity to the actual core count, and ideally pin GPU0 stages to NUMA node 0 cores and GPU1 stages to node 1 cores (per-worker affinity, not a single global range).",
+      "expected_gain": "NUMA-local pinning can cut audio decode/resample + DataLoader memory-stall time 5-15% on this 2-socket Haswell box; correctness of the config value",
+      "risk": "low",
+      "low_resource_note": "On weaker single-socket nodes, just set it to the node's real range or empty; over-range is silently tolerated but should be fixed to avoid confusion."
+    },
+    {
+      "title": "Avoid 3 python interpreter starts at orchestration startup",
+      "location": "base.sh:71, 89, 115",
+      "description": "Startup runs python3 three times before any stage: runtime_env export dump, sys.version probe, and the cudf import probe. Each is a full interpreter cold start. The version probe (base.sh:89) can be derived without python (it is only used to build the site-packages path), and the runtime_env + cudf-probe could be merged into one python invocation that prints both the exports and a CUDF_OK flag.",
+      "expected_gain": "Saves ~2-5s of interpreter/import startup per pipeline launch (one-off, not per file)",
+      "risk": "low",
+      "low_resource_note": "Minor but pure win everywhere; matters more on slow-disk weak nodes where interpreter cold-start is dominated by import IO."
+    },
+    {
+      "title": "get_onnx_providers re-parses YAML on every call",
+      "location": "src/utils/gpu.py:48 (runtime_cfg) and runtime_env.py:53-71",
+      "description": "Each TRT session build calls runtime_cfg(config_path) which re-opens and yaml.safe_load's the whole config file (runtime_env.py:57-58). With per-GPU workers each loading multiple ONNX sessions (transcription loads 5 model_names per worker at transcription.py:206), the config is parsed many times. Cache runtime_cfg per config_path (lru_cache) since it is read-only during a run.",
+      "expected_gain": "Eliminates redundant YAML parse + dict merge per session (dozens of times in ASR); trivial CPU but removes IO storms on the config file",
+      "risk": "low",
+      "low_resource_note": "Helps on slow-disk nodes; negligible CPU otherwise."
+    },
+    {
+      "title": "loguru enqueue=True spawns a background thread per stage and can reorder/buffer DEBUG timing",
+      "location": "src/utils/logging_setup.py:78,89",
+      "description": "Both sinks use enqueue=True, which starts a dedicated logging thread and routes all records through a queue. For the DEBUG per-batch timing logs that benchmarking relies on (distillmos_process.py / denoising.py emit per-batch perf_counter deltas), enqueue adds queue latency and the timestamps are emit-time not log-time, slightly skewing fine-grained measurements. Also enqueue means a hard crash can lose the last buffered lines. For benchmarking runs consider enqueue=False on the file sink, or accept the skew. Not a throughput issue, but a measurement-fidelity caveat.",
+      "expected_gain": "More accurate sub-millisecond timing logs during benchmarking; marginal",
+      "risk": "low",
+      "low_resource_note": "No resource impact; purely a benchmark-accuracy note."
+    },
+    {
+      "title": "check_stage_status spawns python just to read one JSON int",
+      "location": "base.sh:200-205",
+      "description": "Under --strict, each stage gate shells out to a fresh python3 to extract data.get('errors'). 15 stages = 15 interpreter starts in strict mode. A jq/grep or a tiny bash JSON read avoids it; or have write_stage_status also emit a trivial stage_N.errors sentinel file the shell can test directly.",
+      "expected_gain": "Saves ~15 interpreter cold-starts in strict runs (one-off)",
+      "risk": "low",
+      "low_resource_note": "Trivial everywhere; strict mode only."
+    },
+    {
+      "title": "Add CUDA_VISIBLE_DEVICES gating at orchestration level",
+      "location": "base.sh (absent) / configs/config.yaml runtime block",
+      "description": "Nothing in the orchestration sets CUDA_VISIBLE_DEVICES, so every stage calls torch.cuda.device_count() and spawns one worker PER visible GPU (e.g. denoising.py:394, distillmos:243, transcription:326). On the benchmark node GPU1 already has 12-14GB used by a training job, so spawning a heavy worker there risks OOM or contends with the neighbor's job. A runtime.visible_gpus knob exported as CUDA_VISIBLE_DEVICES would let weak/contended nodes pin the pipeline to a single free GPU without touching every stage's spawn logic.",
+      "expected_gain": "Avoids OOM/eviction on the contended GPU; lets operator confine pipeline to free GPU; can roughly halve VRAM pressure on shared nodes",
+      "risk": "medium",
+      "low_resource_note": "Essential for the single-GPU weak-node target: without it, stages assume they own all GPUs."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "gpu_count documented but never defined",
+      "location": "src/utils/gpu.py:11 (docstring) — no def anywhere in file",
+      "description": "The module docstring promises a gpu_count() helper ('small wrapper around torch.cuda.device_count') but no such function exists in gpu.py (grep across src/ finds zero definitions or callers). Dead/lying documentation; any future caller that trusts the docstring will hit AttributeError. Either implement it or remove the docstring bullet.",
+      "severity": "low"
+    },
+    {
+      "title": "cpu_affinity range exceeds physical CPUs (0-80 on a 48-thread node)",
+      "location": "configs/config.yaml:95",
+      "description": "cpu_affinity is '0-80' but the target node has 48 threads (0-47). taskset -c with a range silently clamps (does not error — verified exit 0), so it pins to all 48 cores spanning both NUMA nodes, which both defeats NUMA-local pinning and is a misleading config value. A scalar out-of-range id (e.g. '80') would hard-fail taskset and kill the stage. Set to the node's real core range and ideally per-NUMA.",
+      "severity": "medium"
+    },
+    {
+      "title": "stage_runner.sh lacks the nvidia/TensorRT LD_LIBRARY_PATH that base.sh builds",
+      "location": "src/stage_runner.sh:15-45 vs base.sh:88-98",
+      "description": "base.sh.activate_venv exports LD_LIBRARY_PATH pointing at site-packages/nvidia/*/lib and tensorrt_libs so ONNX Runtime can find cuDNN/cuBLAS/TensorRT. stage_runner.sh (sourced by every src/*/*_yaml.sh wrapper) activates the venv but never builds that path. A stage launched via its *_yaml.sh wrapper therefore runs with a different library environment than via base.sh and TensorRT EP (use_tensorrt: True for Sortformer, ASR, denoising) can fail to load or silently fall back to CUDA EP. Divergent two-codepath bootstrap.",
+      "severity": "high"
+    },
+    {
+      "title": "cudf prefix applied to GPU-multiprocessing stages risks VRAM OOM, not just overhead",
+      "location": "base.sh:115-160",
+      "description": "Because cudf.pandas.install() is injected into every stage, the GPU-heavy stages create a cuDF CUDA context in the parent (and possibly each spawned child). On this node GPU memory is already ~12-14GB consumed by another job; the extra cuDF context(s) can push ORT/torch session allocation into OOM. This is a correctness/stability bug on contended GPUs, not merely a perf cost. Workaround flag exists (BALALAIKA_DISABLE_CUDF=1) but the default is unsafe for the documented hardware.",
+      "severity": "medium"
+    },
+    {
+      "title": "Periodic-merger default vs documented default mismatch (latent footgun)",
+      "location": "src/utils/csv_manager.py:49 (DEFAULT_FLUSH_EVERY_ROWS=10_000) vs config.yaml:80 (flush_every_rows: 100000) and the docstring at config.yaml:78-79 which says '10 000 rows'",
+      "description": "The config comment block (config.yaml:78-79) describes the 10 000-row behavior and cost, but the actual value is set to 100000, and the code default if the csv block is absent is 10_000. Not a crash, but the comment lies about the active value, and on a low-RAM node a 100k-row flush threshold means up to 100k rows of work can be lost on SIGKILL and each flush is a larger pandas pass. Reconcile comment, default, and configured value.",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "Reusable for benchmarking:\n- DEBUG log level is the master knob: runtime.log_level: DEBUG (configs/config.yaml:100) is exported as BALALAIKA_LOG_LEVEL by runtime_env.py and consumed by logging_setup.py:65. Setting it to DEBUG unlocks per-batch timing across stages.\n- Per-batch timing already instrumented with time.perf_counter() in distillmos_process.py (batch_wait at :110/:152/:154, inference at :120-124, write at :132-141) and denoising.py (batch_wait :222/:249/:267, inference :254-258, save :285-296). These emit DataLoader-wait vs inference vs IO splits per batch — directly usable to find whether a stage is IO-bound or GPU-bound.\n- Per-stage status JSON (stage_status.py.write_stage_status) records processed/skipped/errors per stage in BALALAIKA_LOG_DIR/stage_N_status.json — usable for throughput accounting across stages.\n- Filter audit summaries: csv_manager.audit_from_filter_partials + the filter_summary.csv mentioned in config.yaml:50-54 give files_in/out and hours_in/out per filter stage.\n- The csv_manager copy/write/normalize passes all wrap tqdm progress bars (csv_manager.py:117,180,198,459,547) so CSV merge cost is observable at INFO level.\n- loguru file sink uses enqueue=True (logging_setup.py:78,89) — note for fine-grained timing that timestamps are emit-time and slightly buffered; consider enqueue=False on the file sink for the highest-fidelity benchmark runs.\n- Caveat: there is no end-to-end per-stage wall-clock timer in base.sh itself (only the colored banner at base.sh:158). A `date`/SECONDS wrapper around each run_python would give per-stage totals for free."
+}

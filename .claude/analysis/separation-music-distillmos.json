@@ -1,0 +1,220 @@
+{
+  "area": "separation-music-distillmos",
+  "data_flow": "All three stages share the same on-disk state machine in src/utils/csv_manager.py and src/utils/work_shards.py. Main process: load_config -> discover_audio_paths (config sets audio_paths_source=csv, so balalaika.csv filepath column is read, deduped, normalized) -> ensure_main_csv (bootstrap/backup-restore) -> absorb leftover *_part_*.csv into balalaika.csv -> unprocessed_paths (reads full CSV, builds done-set, filters) -> write per-shard work files (10k paths each) under .balalaika_work/<stage>/ -> mp.spawn one worker per CUDA device. Each worker: claims shards by atomic rename, reads the path list, builds a torch DataLoader that decodes+resamples audio in worker processes, runs the model on GPU, streams one row per file to its own partial CSV (flush() every row). A PeriodicCsvMerger daemon thread folds partials into balalaika.csv every 100k rows / 600s by re-reading ALL partials + the whole main CSV and doing a pandas outer-merge + full atomic rewrite. Post-stage: absorb partials again, compute audit, write filter_summary.csv row + stage status.\\n\\nmusic_detect (stage 4): plain (non-length-bucketed) work shards; per shard the worker calls ensure_audio_durations(...) to (re)build a {path: seconds} dict from the CSV total_duration cache (probing missing ones with a ProcessPoolExecutor), then LengthBasedBatchSampler groups the shard's files into 1s-wide duration bins and batches within each bin. WavLM head scores P(music); files above threshold (0.6) are os.remove'd and recorded with deleted=True.\\n\\ndistillmos (stage 5): up-front ensure_audio_durations over ALL unprocessed paths, then prepare_length_bucketed_work_shards groups files into 1s buckets up to 15s + overflow, each shard sorted by duration. Worker uses create_distillmos_dataloader -> sort_by_length (JSON-cached torchaudio.info pass) -> DistillMOSDataset (torchcodec decode, mono, resample to 16k) -> pad_sequence to batch max -> ConvTransformerSQAModel which internally pads/segments to 122880-sample windows (1 window for <=7.68s, up to 9 for 15s) concatenated along batch dim, predicts MOS 1..5.\\n\\ndistillmos_filter (stage 5.5): pure CPU/IO. Phase 1 reads whole CSV, prints distribution+histogram, picks threshold. Phase 2 splits audio_paths round-robin across num_workers plain multiprocessing.Process workers; EACH worker re-reads the ENTIRE balalaika.csv and set_index('filepath'), then for its shard looks up DistillMOS+duration and os.remove's files below threshold, streaming a partial CSV row each.",
+  "operations": [
+    {
+      "name": "discover_audio_paths (CSV mode)",
+      "what": "csv_manager.py:1027 _audio_paths_from_csv reads balalaika.csv usecols=[filepath]; then _dedupe_paths (csv_manager.py:1008) iterates every row in a Python loop with tqdm, Path(path).suffix check + normalize_path_string. O(N) pure-Python over the whole dataset, run once per stage main().",
+      "cost": "moderate"
+    },
+    {
+      "name": "ensure_main_csv + absorb_partial_csvs (startup)",
+      "what": "music_detect.py:274-285, distillmos_process.py:254-262, distillmos_filter.py:405-414. Each does a full pandas read of balalaika.csv (potentially multi-GB / tens of millions of rows), an outer merge, and a full atomic CSV rewrite with .bak copy (csv_manager.py:210-227). Runs even when there are zero leftover partials only if bootstrap given.",
+      "cost": "heavy"
+    },
+    {
+      "name": "unprocessed_paths",
+      "what": "csv_manager.py:444 loads full CSV again, builds done-set via df.loc[mask,'filepath'].tolist() into a Python set, then tqdm-loops every audio path checking membership. Two more full O(N) Python passes.",
+      "cost": "heavy"
+    },
+    {
+      "name": "ensure_audio_durations",
+      "what": "audio_durations.py:121. music_detect calls it PER SHARD (music_detect.py:125) -> re-reads the whole balalaika.csv each shard via _csv_duration_cache (audio_durations.py:52, full pandas read + tqdm zip loop over all rows), and upsert_columns writes back -> another full CSV rewrite. distillmos calls it once up-front over all paths.",
+      "cost": "heavy"
+    },
+    {
+      "name": "work shard write / claim / read",
+      "what": "work_shards.py:60-77 writes 10k-line text files; claim_work_shard (work_shards.py:224) sorted(glob('shard_*.pending')) on every claim -> O(shards) glob+sort per claim, O(shards^2) total across a stage. read_work_shard strips lines.",
+      "cost": "light"
+    },
+    {
+      "name": "DataLoader audio decode+resample (DistillMOS)",
+      "what": "separation.py:30-55 torchaudio.load_with_torchcodec full decode, mono slice, functional.resample to 16k, .contiguous(). Per file, in num_workers=8 subprocesses. Dominant CPU cost of the stage.",
+      "cost": "heavy"
+    },
+    {
+      "name": "sort_by_length pre-pass (DistillMOS)",
+      "what": "separation.py:78-115 estimate_audio_lengths runs torchaudio.info over every file (single-threaded tqdm loop, separation.py:64-75) unless JSON cache hits. This is a SECOND full duration probe in addition to ensure_audio_durations done in main() — duplicated metadata read.",
+      "cost": "moderate"
+    },
+    {
+      "name": "pad_sequence collate (DistillMOS)",
+      "what": "separation.py:58-61 pads each batch to the longest waveform in the batch. Combined with model-internal 122880 padding/segmentation (distillmos sqa.py forward), a single long clip in a batch inflates GPU work for all.",
+      "cost": "moderate"
+    },
+    {
+      "name": "DistillMOS model forward",
+      "what": "sqa.py ConvTransformerSQAModel.forward: pads <7.68s clips to 122880; for longer clips builds num_hops overlapping 122880 windows (4 at 10s, 9 at 15s) cat along batch dim, runs STFT+6-layer CNN+7-layer transformer, averages hops. Real GPU batch = sum(num_hops) not nominal batch_size. fp32.",
+      "cost": "dominant"
+    },
+    {
+      "name": "music_detect WavLM predict_proba",
+      "what": "music_detect.py:147 model.predict_proba(dataloader) runs the full WavLM-base-plus backbone + head over each batch on GPU, fp32. Dominant GPU cost of stage 4.",
+      "cost": "dominant"
+    },
+    {
+      "name": "host->device copy",
+      "what": "distillmos_process.py:119 batch.to(device, non_blocking=True) but loader pin_memory=False (separation.py:130) -> non_blocking is a silent no-op; transfer is synchronous and serializes with compute.",
+      "cost": "light"
+    },
+    {
+      "name": "per-row partial CSV write + flush",
+      "what": "csv_manager.py:652 PartialCsvWriter.write does csv.DictWriter.writerow + self._file.flush() for EVERY file. flush() forces a write() syscall per row (millions of fsync-adjacent syscalls). distillmos_process.py:133, music_detect.py:182, distillmos_filter.py:259.",
+      "cost": "moderate"
+    },
+    {
+      "name": "PeriodicCsvMerger flush",
+      "what": "csv_manager.py:846 _flush_once re-reads ALL partials + whole main CSV, pandas outer-merge, full atomic rewrite (+ .bak copy). Fires every 100k rows or 600s. On a large CSV each flush is a multi-GB read+write.",
+      "cost": "heavy"
+    },
+    {
+      "name": "distillmos_filter per-worker full CSV read",
+      "what": "distillmos_filter.py:217 EACH of num_workers=8 workers calls load_main_csv (full pandas read) + set_index('filepath'). 8x redundant full-CSV reads + 8x index builds for a stage that only needs a filepath->MOS lookup.",
+      "cost": "heavy"
+    },
+    {
+      "name": "safe_audio_duration fallback decode",
+      "what": "distillmos_filter.py:255 / music_detect.py:164 calls safe_audio_duration only when duration missing; torchaudio.info (no full decode) then soundfile fallback. Light per call, but on cold CSV can be per-file.",
+      "cost": "light"
+    },
+    {
+      "name": "safetensors model load",
+      "what": "music_detect.py:91 safe_open then dict-comprehension get_tensor per key on CPU, then .to(device). Once per worker. WavLM weights load.",
+      "cost": "light"
+    },
+    {
+      "name": "audit / histogram pandas",
+      "what": "distillmos_filter.py:83-115 print_histogram does 10 boolean-mask sums over the DistillMOS column; compute_statistics computes 7 quantiles. One-time, over the in-memory df.",
+      "cost": "trivial"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Enable fp16/autocast (or TRT) for DistillMOS and WavLM inference",
+      "location": "distillmos_process.py:121, music_detect.py:147",
+      "description": "Both models run pure fp32 on RTX 4060 Ti, which have strong fp16/bf16 throughput. Wrap inference in torch.autocast('cuda', dtype=torch.float16) (or convert the model to .half()) for the CNN+transformer (DistillMOS) and the WavLM backbone. apply_torch_perf_defaults already enables TF32 matmul but the conv/STFT/attention dominated paths benefit far more from fp16. MOS/prob outputs are robust to fp16 rounding for a thresholding use-case.",
+      "expected_gain": "1.5-2x GPU throughput on the inference-bound portion",
+      "risk": "medium",
+      "low_resource_note": "Helps everywhere (fp16 also halves activation VRAM, important since ~12-14GB is already used by another job). On a single weak GPU add an autocast on/off knob in config; default on for compute-capability >=7."
+    },
+    {
+      "title": "Set pin_memory=True so non_blocking H2D actually overlaps",
+      "location": "separation.py:130 (distillmos), separation.py:230 (antispoof), music_detect.py:85",
+      "description": "All DataLoaders use pin_memory=False, but distillmos_process.py:119 passes non_blocking=True, which is a no-op without pinned memory — the copy is synchronous and blocks the compute stream. Set pin_memory=True (gated on CUDA available) to let the H2D copy overlap with the previous batch's compute.",
+      "expected_gain": "5-15% on data-movement-bound batches",
+      "risk": "low",
+      "low_resource_note": "Pinned memory consumes non-pageable RAM; on the 31GB node cap it by keeping prefetch_factor modest. Expose pin_memory as a config knob defaulting to True only when not memory-constrained."
+    },
+    {
+      "title": "Avoid re-probing durations per shard in music_detect",
+      "location": "music_detect.py:125, audio_durations.py:52",
+      "description": "music_detect calls ensure_audio_durations inside _process_files for EVERY shard, and each call re-reads the entire balalaika.csv (audio_durations._csv_duration_cache full pandas read + a tqdm zip loop over all rows) and may upsert (full CSV rewrite). With many shards this is O(shards * full_CSV). Probe once in main() over all pending paths (like distillmos does at distillmos_process.py:281) and pass the dict (or a length-bucketed shard scheme) down, or have the worker read only its own shard's durations.",
+      "expected_gain": "Removes N_shards-1 full-CSV reads/writes; large on big datasets",
+      "risk": "low",
+      "low_resource_note": "Strongly helps low-RAM nodes (each full-CSV read materializes the whole frame). No knob needed."
+    },
+    {
+      "title": "Use length-bucketed shards for music_detect too (drop per-shard LengthBasedBatchSampler dependency)",
+      "location": "music_detect.py:313, work_shards.py:152",
+      "description": "music_detect uses prepare_work_shards (unsorted) then relies on LengthBasedBatchSampler within each 10k shard to group by length. Because each shard is a random length mix, batches still span 1s..30s+ bins and the WavLM forward pads to the batch max. Switching to prepare_length_bucketed_work_shards (already used by distillmos) makes each shard single-bucket, tightening batch padding and improving GPU utilization; the per-shard duration dict then only needs that bucket.",
+      "expected_gain": "10-30% fewer padded frames through WavLM",
+      "risk": "medium",
+      "low_resource_note": "Helps everywhere; bucket_seconds/max_bucket_duration already configurable via duration_bucket_settings."
+    },
+    {
+      "title": "Cap DistillMOS clip length / clamp the 122880 hop expansion",
+      "location": "distillmos_process.py:94, sqa.py forward (num_hops)",
+      "description": "DistillMOS forward turns one >7.68s clip into num_hops overlapping 122880-sample windows concatenated on the batch axis (4 at 10s, 9 at 15s, 24 at 30s). With max_bucket_duration default 15s, a nominal batch_size=8 of 15s clips becomes an effective batch of ~72 windows — the real driver of VRAM/compute. Lower max_bucket_duration (e.g. 8s so most clips are single-window), or pre-truncate/center-crop overly long clips in the dataset, or reduce batch_size for the long-clip overflow bucket. Since pipeline chunks are already <=15s (preprocess.duration=15), tuning max_bucket_duration down is the cheap lever.",
+      "expected_gain": "Up to ~Nx on long buckets; lets batch_size rise for short buckets",
+      "risk": "medium",
+      "low_resource_note": "Critical on the VRAM-constrained node — the hop expansion is what triggers OOM (handled at distillmos_process.py:145). Per-bucket batch sizing should be a config knob."
+    },
+    {
+      "title": "Batch / debounce PartialCsvWriter.flush()",
+      "location": "csv_manager.py:663",
+      "description": "write() does self._file.flush() after every single row across all three stages (millions of rows). That is one write() syscall per file processed. Flush every K rows or every T seconds (still crash-safe within K rows, matching the PeriodicCsvMerger's coarser guarantee) instead of every row.",
+      "expected_gain": "Removes ~1 syscall/file; a few % of wall time on IO-heavy small-file workloads",
+      "risk": "low",
+      "low_resource_note": "Pure win on SSD; expose flush_every_rows for the partial writer. On weak nodes keep K small (e.g. 64) to bound loss."
+    },
+    {
+      "title": "Eliminate duplicate duration probe in DistillMOS (sort_by_length vs ensure_audio_durations)",
+      "location": "separation.py:125, distillmos_process.py:281",
+      "description": "main() already computes durations for all unprocessed files via ensure_audio_durations (CSV-cached + ProcessPool). Then create_distillmos_dataloader -> sort_by_length runs estimate_audio_lengths, a SECOND single-threaded torchaudio.info pass over the same files (separation.py:64-75), only JSON-cache-shortcut. Pass the already-known durations dict into the dataloader so sort_by_length needs no probing, or reuse total_duration from the CSV.",
+      "expected_gain": "Removes a full single-threaded info pass per stage start",
+      "risk": "low",
+      "low_resource_note": "Helps everywhere; the existing JSON cache mitigates re-runs but not first run. No knob needed."
+    },
+    {
+      "title": "distillmos_filter: read CSV once and broadcast a filepath->MOS map instead of full read per worker",
+      "location": "distillmos_filter.py:217, distillmos_filter.py:284",
+      "description": "Each of 8 deletion workers calls load_main_csv (full pandas read) + set_index('filepath'). The filter only needs DistillMOS+total_duration per path. Read once in the parent, build a dict {filepath:(mos,dur)}, and pass each worker just its slice (or use a shared read-only structure). Avoids 8x multi-GB reads and 8x index builds.",
+      "expected_gain": "~8x less CSV IO/RAM in the filter deletion phase",
+      "risk": "low",
+      "low_resource_note": "Major on the 31GB node — 8 simultaneous full-CSV DataFrames can OOM. The dict slice is tiny. No knob needed."
+    },
+    {
+      "title": "Make claim_work_shard O(1)-ish instead of sorted-glob per claim",
+      "location": "work_shards.py:224",
+      "description": "Each shard claim does sorted(work_dir.glob('shard_*.pending')) and tries to rename the first. With S shards and W workers this is O(S) per claim -> O(S^2) directory scans per stage, a metadata storm on large shard counts. Use os.scandir without sorting (any pending shard is fine since work is order-independent), or maintain an index, or claim by trying a worker-striped name directly.",
+      "expected_gain": "Removes O(shards^2) directory scans; matters when shard_count is large",
+      "risk": "low",
+      "low_resource_note": "Helps SSD metadata pressure; ordering is irrelevant to correctness so sorting can simply be dropped."
+    },
+    {
+      "title": "Skip the .bak full-file copy on every atomic CSV write during periodic merges",
+      "location": "csv_manager.py:217-218",
+      "description": "_atomic_write_csv_unlocked copies the existing CSV to .bak (full byte copy with progress bar) before every write. The PeriodicCsvMerger triggers a full rewrite every 100k rows; each carries a full-file backup copy. For periodic (non-final) flushes the tmp+rename already gives atomicity — the extra .bak doubles IO. Keep .bak only for the final post-stage merge, or make it opt-in.",
+      "expected_gain": "Halves CSV-write IO on periodic flushes",
+      "risk": "medium",
+      "low_resource_note": "Big IO win on large CSVs; risk is reduced crash-recovery surface, so gate behind a config flag and keep .bak for the final write."
+    },
+    {
+      "title": "Increase music_detect batch_size beyond 8 / co-locate workers per GPU",
+      "location": "configs/config.yaml:216, music_detect.py:202",
+      "description": "music_detect.bs=8 and distillmos.batch_size=8 are conservative for WavLM-base/DistillMOS on 16GB cards (when not memory-pressured). With fp16 these can go substantially higher, improving GPU occupancy. Also one worker per GPU (rank=cuda:rank) means a single Python process per card; an autotuned batch size per node (the planned warmup script) should set these.",
+      "expected_gain": "Throughput scales with occupancy until memory-bound",
+      "risk": "low",
+      "low_resource_note": "Must be autotuned/knobbed — on the shared GPU (~12-14GB already used) large batches OOM. Keep config-driven; default low."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "music_detect duration lookup uses original path key while dict also keyed by str(path) — duration_s can be 0 then force a decode",
+      "location": "music_detect.py:162",
+      "description": "audio_lengths.get(str(path), 0.0): ensure_audio_durations returns a dict keyed by BOTH the original path string and its normalized form (audio_durations.py:174-178). The loop iterates `paths` returned by predict_proba, whose elements may be Path objects or normalized strings that differ from the original list entries fed to ensure_audio_durations. When the key misses, duration_s<=0 triggers a per-file safe_audio_duration decode (music_detect.py:164) — a silent extra torchaudio.info per file and potentially wrong/zero durations in the audit. Verify the key types align; if predict_proba returns Path, str(path) may not match the original str key.",
+      "severity": "low"
+    },
+    {
+      "title": "non_blocking=True H2D copy with pin_memory=False is a silent no-op",
+      "location": "distillmos_process.py:119",
+      "description": "batch.to(device, non_blocking=True) cannot run asynchronously because the source tensor is pageable (loader pin_memory=False at separation.py:130). The flag misleads readers into thinking transfer overlaps compute; it is fully synchronous. Not a correctness bug but a performance lie in the code.",
+      "severity": "low"
+    },
+    {
+      "title": "distillmos_filter deletion workers operate on ALL audio paths, not just scored/unprocessed ones",
+      "location": "distillmos_filter.py:286, distillmos_filter.py:220",
+      "description": "run_deletion_workers calls discover_audio_paths to get the full universe and round-robins it across workers; each worker then skips paths with no MOS (mos_val is None -> continue) but still writes a partial row for every path that HAS a MOS, including ones already deleted in a prior run. Re-running the filter re-reads the entire CSV per worker and re-streams rows for everything. The already_done partial-resume only helps within an interrupted single run, not across full re-runs (partials are absorbed+deleted at startup). Inefficient but not data-corrupting.",
+      "severity": "low"
+    },
+    {
+      "title": "Exception inside DistillMOS batch loop drops the whole batch silently",
+      "location": "distillmos_process.py:149",
+      "description": "A non-OOM exception while processing a batch logs a warning, increments errors, and `continue`s to the next batch — every file in that batch is silently skipped (never written to the partial, never scored). Because unprocessed_paths only looks at missing DistillMOS values, those files will be retried next run, so not permanent loss, but a flaky decode can cause repeated wasted work and the error count understates affected files (counts batches, not files).",
+      "severity": "low"
+    },
+    {
+      "title": "_pad_random uses random.randint at import-time seed -> nondeterministic antispoofing crops across DataLoader workers",
+      "location": "separation.py:160",
+      "description": "AntiSpoofingDataset._pad_random takes a random window for clips >= num_samples using the global random module. With num_workers>0 each worker has its own RNG state and no seeding, so antispoofing scores are nondeterministic run-to-run and worker-count-dependent. Not in the assigned music/distillmos path but in the assigned file; relevant for reproducible benchmarking.",
+      "severity": "low"
+    },
+    {
+      "title": "PeriodicCsvMerger row-count threshold counts cumulative rows, never resets on partial deletion",
+      "location": "csv_manager.py:877",
+      "description": "_count_partial_rows returns rows currently on disk; flush compares current_rows - _last_flushed_rows. Partials are NOT deleted by the merger (by design) so the count is monotonic within a stage — fine. But after the post-stage absorb_partial_csvs deletes partials, a subsequent stage reusing the same prefix would see the count drop; the guard current_rows > _last_flushed_rows prevents a spurious flush. Worth noting it relies on _last_flushed_rows being process-local; correct here but fragile if a merger instance is reused.",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "Rich loguru DEBUG perf hooks already exist and should be reused by benchmarks (enable via runtime.log_level=DEBUG in config.yaml:100). In distillmos_process.py: per-batch 'perf dataloader_wait' (distillmos_process.py:113, time between batches = loader starvation), 'perf model=distillmos event=inference' with seconds+items+frames (distillmos_process.py:122), 'perf partial_write' (distillmos_process.py:139), and 'perf dataloader_config' summarizing batch_size/workers/prefetch (distillmos_process.py:102). In music_detect.py: 'perf dataloader_config' (music_detect.py:139), 'perf model=music_detect event=predict_proba' total seconds (music_detect.py:148), 'perf audio_delete' per file (music_detect.py:171), 'perf partial_write' (music_detect.py:191). In separation.py: per-file 'dataloader_audio_load' with decode seconds + frames for both distillmos and antispoofing datasets (separation.py:50 and 184) — directly gives decode/resample cost distribution. run_inference_worker logs total shard wall time (distillmos_process.py:220). No CUDA-event-based timing (the time.perf_counter around model calls is wall-clock and includes async launch latency unless cuda.synchronize is added); benchmarks should add torch.cuda.synchronize() around the inference span for accurate GPU timing. record_stage_summary writes files_in/out + hours to filter_summary.csv for end-to-end throughput accounting."
+}
