@@ -563,9 +563,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config_path", type=str, default=str(REPO_ROOT / "configs" / "config.yaml"))
     ap.add_argument("--models", type=str, default="distillmos,antispoofing,denoising,transcription,punctuation,music_detect",
-                    help="comma list: distillmos,antispoofing,denoising,transcription,punctuation,music_detect")
+                    help=(
+                        "Comma-separated list of models/groups to probe. "
+                        "Top-level groups: distillmos, antispoofing, denoising, "
+                        "transcription (all ASR models in config), punctuation, music_detect. "
+                        "Individual ASR model names (e.g. 'tone', 'vosk', 'giga_ctc') are also "
+                        "accepted and select only that model from the transcription group."
+                    ))
     ap.add_argument("--device", type=int, default=None, help="CUDA index (default: most free VRAM)")
-    ap.add_argument("--max-batch", type=int, default=256)
+    ap.add_argument("--max-batch", type=int, default=512,
+                    help="Maximum batch size for the doubling ladder (default: 512). "
+                         "The VRAM guard and plateau detector still stop the sweep early when needed.")
     ap.add_argument("--probe-seconds", type=float, default=10.0,
                     help="synthetic clip duration for variable-length models")
     ap.add_argument("--audio-dir", type=str, default=None,
@@ -589,6 +597,32 @@ def main() -> int:
     punctuation_cfg = load_config(args.config_path, "punctuation") or {}
 
     wanted = {m.strip() for m in args.models.split(",") if m.strip()}
+
+    # Determine which ASR models to probe.
+    # "transcription" selects all model_names from config; individual names like
+    # "tone" or "vosk" select only that specific model (even without "transcription").
+    all_asr_names = list(transcription_cfg.get("model_names", []) or [])
+    known_groups = {"distillmos", "antispoofing", "denoising", "transcription", "punctuation", "music_detect"}
+    # Any token in `wanted` that is not a known group is treated as a specific ASR model name.
+    asr_name_filter: Optional[set] = None
+    individual_asr_wanted = wanted - known_groups
+    if individual_asr_wanted:
+        # Validate that any individual name is actually in the config's model_names.
+        unknown = individual_asr_wanted - set(all_asr_names)
+        if unknown:
+            logger.warning(
+                f"Unknown model name(s) in --models: {sorted(unknown)}. "
+                f"Known ASR models from config: {all_asr_names}"
+            )
+        asr_name_filter = individual_asr_wanted & set(all_asr_names)
+
+    # Include all ASR models if "transcription" is requested, OR if individual
+    # ASR names were specified (without requiring "transcription" explicitly).
+    probe_transcription = "transcription" in wanted or bool(asr_name_filter)
+    asr_names_to_probe = all_asr_names if "transcription" in wanted else (
+        [n for n in all_asr_names if n in (asr_name_filter or set())]
+    )
+
     plan: List[tuple[str, Callable[[], ProbeOutcome]]] = []
     if "distillmos" in wanted:
         plan.append(("distillmos", lambda: probe_distillmos(separation_cfg, device_index, args)))
@@ -596,8 +630,8 @@ def main() -> int:
         plan.append(("antispoofing", lambda: probe_antispoofing(separation_cfg, device_index, args)))
     if "denoising" in wanted:
         plan.append(("denoising", lambda: probe_denoising(denoising_cfg, device_index, args)))
-    if "transcription" in wanted:
-        for name in transcription_cfg.get("model_names", []) or []:
+    if probe_transcription:
+        for name in asr_names_to_probe:
             plan.append(
                 (f"transcription.{name}",
                  lambda name=name: probe_asr_model(name, transcription_cfg, device_index, args))
