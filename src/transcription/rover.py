@@ -11,7 +11,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from src.utils.csv_manager import discover_audio_paths
-from src.utils.sidecars import path_exists, text_sidecar_complete
+from src.utils.sidecars import DirNameCache
 from src.utils.utils import read_file_content
 from src.utils.work_shards import (
     claim_work_shard,
@@ -66,14 +66,17 @@ class ROVERWrapper:
     def _pending_audio_paths(self, audio_paths: Iterable[str]) -> List[str]:
         pending: List[str] = []
         total = len(audio_paths) if hasattr(audio_paths, "__len__") else None
+        # One scandir per directory replaces one _rover.txt stat per audio
+        # file. Built per-process: this runs in the orchestrator before shards
+        # are dispatched, never across the spawn boundary.
+        cache = DirNameCache()
         for raw_path in tqdm(audio_paths, total=total, desc="find_rover_pending"):
             audio_path = Path(raw_path)
             if any(pattern in audio_path.stem for pattern in self.excluded_patterns):
                 continue
-            if text_sidecar_complete(
+            if cache.sidecar_complete(
                 self._rover_output_path(audio_path),
                 retry_empty=self.retry_empty_outputs,
-                label="ROVER",
             ):
                 continue
             pending.append(str(audio_path))
@@ -82,6 +85,11 @@ class ROVERWrapper:
     def _records_for_audio_paths(self, audio_paths: Iterable[str]) -> pd.DataFrame:
         records = []
         total = len(audio_paths) if hasattr(audio_paths, "__len__") else None
+        # Per-shard cache: built fresh in whatever (possibly spawned) worker
+        # process owns this shard. A shard's files cluster in a handful of
+        # episode directories, so one scandir per directory amortizes across
+        # all model-suffix probes for every file in that directory.
+        cache = DirNameCache()
         for raw_path in tqdm(audio_paths, total=total, desc="load_rover_transcripts"):
             audio_path = Path(raw_path)
             if any(pattern in audio_path.stem for pattern in self.excluded_patterns):
@@ -91,9 +99,9 @@ class ROVERWrapper:
                 suffix = self._model_suffix(model_name)
                 transcript_path = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
 
-                if not path_exists(transcript_path, missing_on_too_long=True, label="Transcript"):
+                if not cache.exists(transcript_path):
                     continue
-                
+
                 try:
                     text = read_file_content(transcript_path)
                     if not text:

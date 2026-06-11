@@ -16,6 +16,7 @@ rewrites each kept file at most once.
 from __future__ import annotations
 
 import argparse
+import io
 import multiprocessing
 import re
 import time
@@ -229,14 +230,20 @@ def _increment(counter, amount: float = 1) -> None:
 def _postprocess_existing_chunk(
     path_audio: str,
     config: Mapping[str, object],
+    raw_bytes: bytes | None = None,
 ) -> tuple[bool, float, bool, float, bool]:
     load_started_at = time.perf_counter()
-    native_audio, native_sr = torchaudio.load_with_torchcodec(path_audio)
+    # Reuse the bytes the DataLoader already read from disk when available so the
+    # native-rate decode does not trigger a second cold-cache HDD read. torchcodec
+    # decodes a ``bytes`` source bit-identically to a path source.
+    decode_source = io.BytesIO(raw_bytes) if raw_bytes is not None else path_audio
+    native_audio, native_sr = torchaudio.load_with_torchcodec(decode_source)
     native_audio = native_audio.to(dtype=torch.float32).contiguous()
     logger.debug(
         f"perf audio_load stage=preprocess_existing_chunks path={path_audio} "
         f"seconds={time.perf_counter() - load_started_at:.6f} "
-        f"sample_rate={int(native_sr)} frames={int(native_audio.shape[-1])}"
+        f"sample_rate={int(native_sr)} frames={int(native_audio.shape[-1])} "
+        f"source={'bytes' if raw_bytes is not None else 'path'}"
     )
 
     result = postprocess_audio_tensor(
@@ -314,11 +321,25 @@ def _process_files(
     if not pending_files:
         return
 
+    # Pre-chunked inputs are short clips (the prior chunking stage caps them at
+    # ``duration``, default 15 s ≈ 0.5-2 MB each). When fusing crest/loudness we
+    # read each file's bytes once in the loader and reuse them for the native-rate
+    # decode, so each chunk leaves the HDD once. The cap (``existing_chunks_raw_bytes_max_s``,
+    # default 4x ``duration`` for headroom) keeps an unexpectedly long file from
+    # ballooning prefetch RAM; oversized files fall back to a second path decode.
+    if fuse_audio:
+        default_cap = 4.0 * float(config.get("duration", 15))
+        raw_bytes_max_duration_s = float(
+            config.get("existing_chunks_raw_bytes_max_s", default_cap)
+        )
+    else:
+        raw_bytes_max_duration_s = None
     dataloader = create_diarization_dataloader(
         pending_files,
         batch_size=int(config.get("diarization_batch_size", 1)),
         num_workers=int(config.get("diarization_loader_workers", 0)),
         prefetch_factor=int(config.get("diarization_prefetch_factor", 2)),
+        raw_bytes_max_duration_s=raw_bytes_max_duration_s,
     )
 
     batch_wait_started_at = time.perf_counter()
@@ -329,7 +350,7 @@ def _process_files(
             f"batch={batch_idx} seconds={batch_received_at - batch_wait_started_at:.6f} "
             f"items={len(batch)}"
         )
-        for path_audio, audio, sr, error in batch:
+        for path_audio, audio, sr, error, raw_bytes in batch:
             resolved = normalize_path_string(path_audio)
             if resolved in already_done:
                 _increment(skipped_counter)
@@ -343,7 +364,7 @@ def _process_files(
                 row = metadata_for_chunk(str(path_audio), audio, sr, podcasts_path, config)
                 if fuse_audio:
                     keep, crest_factor, normalized, duration_s, postprocess_error = (
-                        _postprocess_existing_chunk(str(path_audio), config)
+                        _postprocess_existing_chunk(str(path_audio), config, raw_bytes)
                     )
                     if postprocess_error:
                         _increment(errors_counter)

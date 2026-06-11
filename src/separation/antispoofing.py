@@ -178,6 +178,7 @@ def _process_files(
         prefetch_factor=prefetch_factor,
         sample_rate=MODEL_SAMPLE_RATE,
         num_samples=MODEL_NUM_SAMPLES,
+        ranged_decode=bool(cfg.get("ranged_decode", False)),
     )
     prefetch_batches = num_workers * prefetch_factor if num_workers > 0 else 0
     logger.debug(

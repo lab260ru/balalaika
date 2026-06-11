@@ -9,6 +9,7 @@ files, and workers atomically claim one shard at a time by renaming it.
 from __future__ import annotations
 
 import math
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,27 @@ from tqdm import tqdm
 
 DEFAULT_WORK_SHARD_SIZE = 10_000
 WORK_ROOT_NAME = ".balalaika_work"
+
+# Shard ordering knob. "path" (default) writes shard lines in lexicographic
+# path order so workers read the disk in directory-clustered order — on HDD
+# datasets this turns ~one random seek per file into ~one per directory.
+# "legacy" preserves the exact pre-2026-06 order (input order for plain
+# shards, duration order inside length buckets).
+WORK_SHARD_ORDER_ENV = "BALALAIKA_SHARD_ORDER"
+
+
+def _shard_order(explicit: Optional[str] = None) -> str:
+    value = explicit if explicit is not None else os.environ.get(WORK_SHARD_ORDER_ENV, "path")
+    value = str(value).strip().lower()
+    # Config-facing aliases for the old behavior.
+    value = {"duration": "legacy", "input": "legacy"}.get(value, value)
+    if value not in {"path", "legacy"}:
+        logger.warning(
+            f"Unknown shard order {value!r} (from "
+            f"{'argument' if explicit is not None else WORK_SHARD_ORDER_ENV}); using 'path'."
+        )
+        return "path"
+    return value
 
 
 @dataclass(frozen=True)
@@ -113,6 +135,7 @@ def prepare_work_shards(
     shard_size: int = DEFAULT_WORK_SHARD_SIZE,
     limit: Optional[int] = None,
     annotations: Optional[Mapping[str, str]] = None,
+    order: Optional[str] = None,
 ) -> WorkShardPlan:
     """Write work shards for ``paths`` and return a small plan object.
 
@@ -122,14 +145,23 @@ def prepare_work_shards(
 
     ``annotations`` optionally maps a path to a short string stored after a
     tab on the same line (read back with :func:`read_annotated_work_shard`).
+
+    ``order`` (default: ``$BALALAIKA_SHARD_ORDER`` or ``"path"``) controls
+    shard line ordering. ``"path"`` sorts lexicographically so HDD reads
+    cluster by directory; it holds one list of path references in RAM
+    (callers pass materialized lists anyway). ``limit`` keeps its original
+    meaning either way: the first ``limit`` items *of the input order* are
+    selected, then ordered. ``"legacy"`` streams in input order.
     """
     shard_size = max(1, int(shard_size or DEFAULT_WORK_SHARD_SIZE))
+    order = _shard_order(order)
     work_dir = stage_work_dir(podcasts_path, stage_name)
     _reset_work_dir(work_dir)
 
     total = 0
     shard_count = 0
     current: List[str] = []
+    collected: List[str] = []
     expected_total = (
         limit
         if limit is not None
@@ -152,14 +184,22 @@ def prepare_work_shards(
         path = str(raw).strip()
         if not path:
             continue
-        current.append(path)
         total += 1
+        if order == "path":
+            collected.append(path)
+            continue
+        current.append(path)
         if len(current) >= shard_size:
             flush(current, shard_count)
             shard_count += 1
             current = []
 
-    if current:
+    if order == "path":
+        collected.sort()
+        for start in range(0, len(collected), shard_size):
+            flush(collected[start:start + shard_size], shard_count)
+            shard_count += 1
+    elif current:
         flush(current, shard_count)
         shard_count += 1
 
@@ -181,6 +221,7 @@ def prepare_length_bucketed_work_shards(
     max_duration: float = 15.0,
     limit: Optional[int] = None,
     annotations: Optional[Mapping[str, str]] = None,
+    order: Optional[str] = None,
 ) -> WorkShardPlan:
     """Write work shards grouped by audio duration buckets.
 
@@ -195,10 +236,19 @@ def prepare_length_bucketed_work_shards(
     which models still need the file). Read such shards back with
     :func:`read_annotated_work_shard`; the plain :func:`read_work_shard`
     would return the raw tab-joined lines.
+
+    ``order`` (default: ``$BALALAIKA_SHARD_ORDER`` or ``"path"``): with
+    ``"path"``, lines inside each *bounded* bucket are sorted by path so HDD
+    reads cluster by directory — padding stays bounded by ``bucket_seconds``
+    because bucket membership is unchanged. The overflow bucket
+    (``> max_duration``, unbounded width) keeps the duration sort either
+    way. ``"legacy"`` keeps the duration sort in every bucket.
     """
     shard_size = max(1, int(shard_size or DEFAULT_WORK_SHARD_SIZE))
+    order = _shard_order(order)
     bucket_seconds = max(0.001, float(bucket_seconds or 1.0))
     max_duration = max(bucket_seconds, float(max_duration or bucket_seconds))
+    overflow_index = max(1, int(math.ceil(max_duration / bucket_seconds)))
     work_dir = stage_work_dir(podcasts_path, stage_name)
     _reset_work_dir(work_dir)
 
@@ -228,10 +278,13 @@ def prepare_length_bucketed_work_shards(
     shard_count = 0
     for bucket_index in sorted(buckets):
         label = _duration_bucket_label(bucket_index, bucket_seconds, max_duration)
-        bucket_paths = sorted(
-            buckets[bucket_index],
-            key=lambda p: float(durations.get(p, 0.0) or 0.0),
-        )
+        if order == "path" and bucket_index < overflow_index:
+            bucket_paths = sorted(buckets[bucket_index])
+        else:
+            bucket_paths = sorted(
+                buckets[bucket_index],
+                key=lambda p: float(durations.get(p, 0.0) or 0.0),
+            )
         for start in range(0, len(bucket_paths), shard_size):
             _write_labeled_shard(
                 work_dir,

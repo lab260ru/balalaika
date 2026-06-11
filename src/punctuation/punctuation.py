@@ -114,6 +114,9 @@ def main(args):
     if not pending_files:
         logger.success("No pending _rover.txt files; punctuation already up to date.")
         return
+    # Path order keeps sidecar reads directory-clustered on HDD datasets
+    # (pending order otherwise follows arbitrary CSV-row order).
+    pending_files.sort()
 
     logger.info(f"Found {len(pending_files)} _rover.txt files needing punctuation.")
 

@@ -25,7 +25,7 @@ from src.utils.logging_setup import setup_logging
 from src.utils.node_profile import resolve_batch_size
 from src.utils.parallel import run_per_gpu_processes
 from src.utils.csv_manager import discover_audio_paths
-from src.utils.sidecars import text_sidecar_complete
+from src.utils.sidecars import DirNameCache, text_sidecar_complete
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config, read_file_content
 from src.utils.work_shards import (
@@ -453,12 +453,14 @@ def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
             error_details.append({"worker": cuda_id, "model": ",".join(group_models), "reason": str(e)})
 
 
-def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int) -> bool:
+def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int,
+                    cache: Optional[DirNameCache] = None) -> bool:
     texts = []
     for mn in model_names:
         suffix = 'vosk' if 'vosk' in mn else mn
         tp = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
-        if text_sidecar_complete(tp):
+        complete = cache.sidecar_complete(tp) if cache is not None else text_sidecar_complete(tp)
+        if complete:
             try:
                 t = read_file_content(tp)
                 if t:
@@ -473,23 +475,32 @@ def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int
 def get_valid_paths(src_path: str, output_suffix: str,
                     processed: List[str], consensus_num: int,
                     retry_empty_outputs: bool = False,
-                    config_path: Optional[str] = None) -> List[str]:
+                    config_path: Optional[str] = None,
+                    cache: Optional[DirNameCache] = None) -> List[str]:
+    """Audio files still needing ``output_suffix`` transcription.
+
+    Existence/size probes go through one ``DirNameCache`` (one scandir per
+    directory instead of two stats per audio file). Pass a shared ``cache``
+    to reuse directory listings across several suffix sweeps (the grouped
+    shared-decode pass does this); otherwise a fresh per-call cache is built.
+    The cache lives in this process only — it must not cross the spawn
+    boundary into workers.
+    """
     all_paths = [Path(p) for p in discover_audio_paths(src_path, config_path=config_path)]
     if not all_paths:
         return []
+
+    if cache is None:
+        cache = DirNameCache()
 
     valid = []
     retry_empty_count = 0
     for p in all_paths:
         sidecar = p.with_name(f"{p.stem}_{output_suffix}.txt")
-        if text_sidecar_complete(sidecar, retry_empty=retry_empty_outputs):
+        if cache.sidecar_complete(sidecar, retry_empty=retry_empty_outputs):
             continue
-        if retry_empty_outputs:
-            try:
-                if sidecar.exists() and sidecar.stat().st_size == 0:
-                    retry_empty_count += 1
-            except OSError:
-                pass
+        if retry_empty_outputs and cache.exists(sidecar) and (cache.size(sidecar) or 0) == 0:
+            retry_empty_count += 1
         valid.append(p)
 
     if retry_empty_count:
@@ -499,7 +510,7 @@ def get_valid_paths(src_path: str, output_suffix: str,
         skipped = 0
         filtered = []
         for p in valid:
-            if check_consensus(p, processed, consensus_num):
+            if check_consensus(p, processed, consensus_num, cache):
                 skipped += 1
             else:
                 filtered.append(p)
@@ -546,13 +557,22 @@ def main(args):
         args.config_path,
         config,
     )
+    # Intra-bucket shard order. "duration" (default) reproduces the old flow
+    # bit-for-bit; "path" reads the disk in directory order — the big win on
+    # HDD datasets — at the cost of changed ASR batch composition (measured:
+    # ~15% of knife-edge bench transcripts shift by ~1 char, ~1.2% of chars).
+    shard_order = str(config.get('shard_order', 'duration'))
 
     if grouped_models:
         logger.info(f"=== shared-decode group: {grouped_models} ===")
         needed: Dict[str, List[str]] = {}
+        # One cache shared across the per-suffix sweeps: every grouped model
+        # walks the same audio tree, so the directory listings (and any size
+        # probes for retry_empty) are scanned once instead of once per model.
+        group_cache = DirNameCache()
         for model_name in grouped_models:
             output_suffix = 'vosk' if 'vosk' in model_name else model_name
-            for p in get_valid_paths(src_path, output_suffix, [], consensus_num, retry_empty_outputs, args.config_path):
+            for p in get_valid_paths(src_path, output_suffix, [], consensus_num, retry_empty_outputs, args.config_path, cache=group_cache):
                 needed.setdefault(p, []).append(model_name)
 
         if not needed:
@@ -575,6 +595,7 @@ def main(args):
                 bucket_seconds=bucket_seconds,
                 max_duration=max_bucket_duration,
                 annotations=annotations,
+                order=shard_order,
             )
             del union_paths
             del durations
@@ -621,6 +642,7 @@ def main(args):
             shard_size=shard_size,
             bucket_seconds=bucket_seconds,
             max_duration=max_bucket_duration,
+            order=shard_order,
         )
         del paths
         del durations

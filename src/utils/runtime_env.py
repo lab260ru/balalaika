@@ -15,6 +15,7 @@ Output keys (printed only when present / non-empty):
 * ``BALALAIKA_TRT_CACHE_PATH`` — TensorRT engine cache root
 * ``BALALAIKA_TRT_WORKSPACE``  — TensorRT workspace bytes (per session)
 * ``BALALAIKA_TRT_FP16``       — ``1`` / ``0`` toggle for fp16
+* ``BALALAIKA_IO_PROFILE``     — ``auto``/``hdd``/``ssd`` reader-concurrency profile
 
 The Python modules also read the same ``runtime`` block via :func:`runtime_cfg`
 so the values stay aligned between shell and Python.
@@ -37,6 +38,7 @@ DEFAULTS: Dict[str, Any] = {
     "trt_cache_path": "./cache/trt",
     "trt_workspace_bytes": 4 * 1024 ** 3,
     "trt_fp16": True,
+    "io_profile": "auto",
 }
 
 ENV_KEYS = {
@@ -47,6 +49,7 @@ ENV_KEYS = {
     "trt_cache_path": "BALALAIKA_TRT_CACHE_PATH",
     "trt_workspace_bytes": "BALALAIKA_TRT_WORKSPACE",
     "trt_fp16": "BALALAIKA_TRT_FP16",
+    "io_profile": "BALALAIKA_IO_PROFILE",
 }
 
 

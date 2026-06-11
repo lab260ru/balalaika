@@ -85,16 +85,19 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
         for audio_str in tqdm(audio_paths, desc=f"Worker {worker_id}", position=worker_id):
             audio_path = Path(audio_str)
             
-            key = audio_path.stem 
-            ext = audio_path.suffix.lstrip('.') 
-            
-            if not audio_path.exists():
-                continue
-            
+            key = audio_path.stem
+            ext = audio_path.suffix.lstrip('.')
+
             safe_key = key.replace('.', '_')
-            
+
+            # Read directly and let the exception path handle a missing file,
+            # avoiding a redundant exists() stat right before the open. A
+            # missing file is skipped silently (same as the old exists() guard);
+            # any other read error is logged and counted as before.
             try:
                 audio_bytes = audio_path.read_bytes()
+            except FileNotFoundError:
+                continue
             except Exception as e:
                 logger.warning(f"Error reading {audio_path}: {e}")
                 errors_count += 1

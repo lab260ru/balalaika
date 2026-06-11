@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from src.utils.audit import safe_audio_duration
 from src.utils.csv_manager import csv_path, normalize_path_string, upsert_columns
+from src.utils.io_profile import effective_workers, resolve_io_profile
 
 TOTAL_DURATION_COLUMN = "total_duration"
 DEFAULT_DURATION_PROBE_WORKERS = 4
@@ -141,6 +142,14 @@ def ensure_audio_durations(
         for _, normalized in requested
         if _positive_duration(durations_by_norm.get(normalized)) is None
     ]
+    # Header probes in path order sweep the disk directory-by-directory
+    # instead of seeking in CSV-row order; values are keyed by path, so the
+    # result is order-independent. HDD datasets also cap probe fan-out: more
+    # concurrent random readers on one spindle only multiply seeks.
+    missing.sort()
+    num_workers = effective_workers(
+        num_workers, resolve_io_profile(str(podcasts_path)), role="probe"
+    )
 
     probed = _probe_missing_durations(missing, num_workers=num_workers)
     positive_probed = {

@@ -64,6 +64,8 @@ def main(args):
     if not pending_files:
         logger.success("No pending _punct.txt files; accents already up to date.")
         return
+    # Path order keeps sidecar reads directory-clustered on HDD datasets.
+    pending_files.sort()
 
     logger.info(f"Found {len(pending_files)} files to process.")
 

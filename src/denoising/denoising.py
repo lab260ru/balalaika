@@ -457,6 +457,10 @@ def main():
         shard_size=shard_size,
         bucket_seconds=bucket_seconds,
         max_duration=max_bucket_duration,
+        # Denoising writes audio whose bytes can depend on batch composition
+        # (padded MossFormer2 batches); keep the duration order until the
+        # path-order divergence is measured on a node with the model.
+        order="legacy",
     )
     del pending
     del durations

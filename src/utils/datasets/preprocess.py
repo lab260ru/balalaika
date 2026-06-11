@@ -1,8 +1,11 @@
 import time
-from typing import List
+from pathlib import Path
+from typing import List, Optional
 
 import torch
 import torchaudio
+
+from src.utils.io_profile import clamp_loader_workers
 from loguru import logger
 from torch.utils.data import DataLoader, Dataset
 from torchcodec.decoders import AudioDecoder
@@ -75,6 +78,7 @@ def create_crest_factor_dataloader(
     prefetch_factor: int,
 ) -> DataLoader:
     dataset = CrestFactorDataset(file_paths)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,
@@ -126,6 +130,7 @@ def create_loudness_normalize_dataloader(
     prefetch_factor: int,
 ) -> DataLoader:
     dataset = LoudnessNormalizeDataset(file_paths)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,
@@ -144,13 +149,29 @@ class DiarizationDataset(Dataset):
 
     Sortformer and SmartVAD both run at 16 kHz, so we resample inside the
     decoder rather than carrying the native-rate (often 44.1/48 kHz) waveform
-    through VRAM. The native file is *not* touched here — chunk export reads
-    it lazily later via :class:`torchcodec.decoders.AudioDecoder`, so audio
-    cuts keep the source's original quality.
+    through VRAM. The native file is *not* re-read from disk here — the file's
+    raw encoded bytes are read **once** with :meth:`pathlib.Path.read_bytes`
+    and both the 16 kHz decode (here) and the downstream native-rate decode
+    (crest/LUFS postprocessing) consume the *same* bytes. ``torchcodec``
+    decodes identically from a ``bytes`` source and from a path source, so
+    outputs stay bit-identical while halving disk reads on cold-cache HDDs.
+
+    Shipping the raw bytes through the batch costs RAM, so it is gated on
+    ``raw_bytes_max_duration_s``: bytes are only carried back when the decoded
+    audio is no longer than that many seconds (chunks ~0.5-2 MB each). Longer
+    sources (e.g. multi-hour raw podcasts) decode from the path as before and
+    ship ``None`` so prefetch RAM stays bounded. ``None`` disables byte reuse
+    entirely (legacy path-only behavior).
     """
 
-    def __init__(self, file_paths: List[str]):
+    def __init__(
+        self,
+        file_paths: List[str],
+        *,
+        raw_bytes_max_duration_s: Optional[float] = None,
+    ):
         self.file_paths = [str(p) for p in file_paths]
+        self.raw_bytes_max_duration_s = raw_bytes_max_duration_s
 
     def __len__(self) -> int:
         return len(self.file_paths)
@@ -158,26 +179,39 @@ class DiarizationDataset(Dataset):
     def __getitem__(self, idx: int):
         path = self.file_paths[idx]
         started_at = time.perf_counter()
+        ship_bytes = self.raw_bytes_max_duration_s is not None
         try:
-            decoder = AudioDecoder(path, sample_rate=DIARIZATION_SAMPLE_RATE)
+            if ship_bytes:
+                raw_bytes = Path(path).read_bytes()
+                source = raw_bytes
+            else:
+                raw_bytes = None
+                source = path
+            decoder = AudioDecoder(source, sample_rate=DIARIZATION_SAMPLE_RATE)
             samples = decoder.get_all_samples()
             waveform = samples.data.to(dtype=torch.float32)
             if waveform.ndim == 1:
                 waveform = waveform.unsqueeze(0)
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
+            # Only carry bytes back when the decode is short enough to be cheap.
+            if ship_bytes:
+                duration_s = float(waveform.shape[-1]) / float(DIARIZATION_SAMPLE_RATE)
+                if duration_s > float(self.raw_bytes_max_duration_s):
+                    raw_bytes = None
             logger.debug(
                 f"dataloader_audio_load dataset=diarization path={path} "
                 f"seconds={time.perf_counter() - started_at:.6f} "
-                f"sample_rate={DIARIZATION_SAMPLE_RATE} frames={int(waveform.shape[-1])}"
+                f"sample_rate={DIARIZATION_SAMPLE_RATE} frames={int(waveform.shape[-1])} "
+                f"raw_bytes={'yes' if raw_bytes is not None else 'no'}"
             )
-            return path, waveform.contiguous(), DIARIZATION_SAMPLE_RATE, ""
+            return path, waveform.contiguous(), DIARIZATION_SAMPLE_RATE, "", raw_bytes
         except Exception as exc:
             logger.debug(
                 f"dataloader_audio_load dataset=diarization path={path} "
                 f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
             )
-            return path, torch.empty(0, dtype=torch.float32), 0, str(exc)
+            return path, torch.empty(0, dtype=torch.float32), 0, str(exc), None
 
 
 def diarization_collate(batch):
@@ -189,8 +223,12 @@ def create_diarization_dataloader(
     batch_size: int,
     num_workers: int,
     prefetch_factor: int,
+    raw_bytes_max_duration_s: Optional[float] = None,
 ) -> DataLoader:
-    dataset = DiarizationDataset(file_paths)
+    dataset = DiarizationDataset(
+        file_paths, raw_bytes_max_duration_s=raw_bytes_max_duration_s
+    )
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,

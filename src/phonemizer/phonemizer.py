@@ -69,6 +69,8 @@ def main(args):
     if not pending_files:
         logger.success("No pending _rover.txt files; phonemes already up to date.")
         return
+    # Path order keeps sidecar reads directory-clustered on HDD datasets.
+    pending_files.sort()
 
     logger.info(f"Found {len(pending_files)} text files to process.")
 

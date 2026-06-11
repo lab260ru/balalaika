@@ -1,7 +1,7 @@
 # Balalaika Pipeline Performance Report
 
-Date: 2026-06-11 (two passes; second pass = §4.10–4.13) · Branch: `claude` ·
-All numbers measured on this node.
+Date: 2026-06-11 (three passes; second pass = §4.10–4.13, HDD pass = §11) ·
+Branch: `claude` · All numbers measured on this node.
 
 ## 1. Node and environment
 
@@ -482,10 +482,11 @@ absent on this node or larger refactors)
    IOBinding to kill per-window GPU→CPU→GPU round-trips; vectorize `_binarize`
    and spkcache compression (file:line details in `.claude/analysis/preprocess-*.json`).
    Untestable here — the ONNX model files are not on this node. The 2026-06-11
-   second-pass audit additionally flagged: the ACTIVE existing_chunks+fuse path
-   decodes every chunk twice; diarization decode is fully serialized with GPU
-   inference (`diarization_loader_workers: 0`); raw mode accumulates all
-   chunk-row dicts in RAM. Full details: `.claude/analysis/audit2_findings.json`.
+   second-pass audit additionally flagged: ~~the ACTIVE existing_chunks+fuse path
+   decodes every chunk twice~~ (done — §11.5); diarization decode is fully
+   serialized with GPU inference (`diarization_loader_workers: 0`); raw mode
+   accumulates all chunk-row dicts in RAM. Full details:
+   `.claude/analysis/audit2_findings.json`.
 3. ~~**Phonemizer**: persist the word→phoneme cache across runs and batch
    `greedy_decode` over unique words.~~ Done — see §4.9.
 4. **tone batch size**: raise beyond 64 (still climbing at the sweep cap) once
@@ -497,10 +498,11 @@ absent on this node or larger refactors)
    rule-engine assets per worker, and re-runs OOV words per sentence. Batching
    inside ruAccent is upstream work; a word-level memo would change homograph
    handling (context-dependent) — needs a careful equivalence study first.
-7. **Antispoofing decode** (stage 6): the loader decodes + preemphasizes the
+7. ~~**Antispoofing decode** (stage 6): the loader decodes + preemphasizes the
    full clip then keeps a random 4.04 s window — a seek-bounded read would cut
    ~3× of that decode CPU; exactness depends on container seek semantics
-   (bit-exact for PCM wav/FLAC, needs verification per format).
+   (bit-exact for PCM wav/FLAC, needs verification per format).~~ Done —
+   §11.6 (`ranged_decode`, bit-exact for PCM wav/FLAC, 4.2× fewer bytes).
 8. **Collate RAM**: stage 12 holds every sidecar text ~3× over (records list →
    DataFrame → Arrow) while writing the parquet; chunked assembly would cap
    peak RSS on low-RAM nodes.
@@ -524,3 +526,223 @@ python -m benchmarking.warmup --config_path configs/config.yaml   # §2 (per nod
 python -m pytest tests/ -q                                  # 120+ behavior tests
 # stage-level before/after harness runs: benchmarking/reports/2026*/report.json
 ```
+
+## 11. HDD pass (third pass, 2026-06-11): the production disk is a spinning 6 TB drive
+
+Your production dataset lives on `/mnt/hdd_6tb_1` — ~100 random IOPS,
+8–12 ms per seek, 100–180 MB/s sequential. Almost everything above was tuned
+on SSD; this pass hunted the patterns that specifically murder HDDs: random
+read order, per-file stat storms, redundant reads of the same bytes, and
+many concurrent readers fighting over one spindle.
+
+**Methodology.** This node has no spinning disk (both devices are SSDs, no
+root for a throttled dm device), so every claim is pinned by one of:
+(a) syscall counts under `strace` (on HDD, cost ≈ stat/open/seek count),
+(b) an explicit seek model replaying the exact file-open order a stage
+produces (8 ms random seek, 0.5 ms near-neighbor, 16-file readahead window),
+(c) output equivalence measured with the real models (CPU — the GPUs were
+fully occupied by your training, and the batch-composition question is
+model math, not device behavior). A 64-agent audit (11 areas × adversarial
+verification) produced 53 confirmed findings; the fixes below cover all
+high-impact ones.
+
+### 11.1 Read order: duration-sorted shards scrambled the disk (all GPU stages)
+
+`prepare_length_bucketed_work_shards` sorted every bucket by *exact
+duration* — uncorrelated with on-disk layout, so each consecutive open was
+a fresh long seek. Buckets are only 1 s wide, so the duration sort bought
+nothing for padding that the bucket itself doesn't already guarantee.
+Within-bucket order is now **lexicographic path order** (the overflow
+`>15 s` bucket keeps its duration sort — its width is unbounded). The plain
+`prepare_work_shards` sorts by path too, and the text stages sort their
+sidecar pending lists (stages 8–10). Round-robin GPU sharding was examined
+and deliberately **kept**: over a path-sorted list, round-robin keeps all
+readers inside the same disk neighborhood at any moment, while contiguous
+blocks would park N readers in N distant regions.
+
+Seek model (`benchmarking/micro/bench_hdd_order.py`, 200 k files,
+80/dir):
+
+| Read order | random seeks | modeled seek time |
+|---|---|---|
+| bucketed, duration sort (old) | 199 969 | 26.7 min |
+| bucketed, path sort (new) | 72 994 | **10.8 min** |
+| plain stage, walk-order input | 1 | 1.7 min (sort is a no-op) |
+| plain stage, half-churned input, old | 99 983 | 14.2 min |
+| plain stage, half-churned input, new | **1** | **1.7 min** |
+
+Scales linearly: at 2 M files the duration sort costs ~4.5 h of pure seek
+time per bucketed stage pass; path order cuts ~2.5× (more when durations
+cluster — the uniform fixture is the worst case). A block-then-bucket
+variant was modeled (10.5 vs 10.8 min) and **rejected** — not worth the
+extra shard raggedness.
+
+Knobs: `BALALAIKA_SHARD_ORDER=legacy` restores the old order everywhere;
+`transcription.shard_order` (see §11.2); denoising pinned to the old order
+in code (writes audio; model absent here, so divergence is unmeasurable).
+
+**Proof of unchanged outputs** (real models, CPU, 250 OpenSTT wavs spread
+over 10 dirs, exact stage batch flow at batch 8):
+
+| Model | duration order vs path order |
+|---|---|
+| DistillMOS | 248/250 scores bit-identical, max raw delta < 1e-6, **0/250 differ at the `round(x,4)` the stage writes** |
+| giga_ctc / e2e-ctc | each order internally deterministic (0/250 across reruns); orders differ on **38–39/250 transcripts (~1 char each; 1.2–1.3 % of characters, max edit distance 7)** |
+| Antispoofing | invariant by construction — fixed 64 600-sample windows, no padding, batch size unchanged |
+| crest / loudness / music_detect / filters / ROVER | per-item math; order provably irrelevant (collates reduce per item; merges key on filepath) |
+
+Because the CTC divergence is real (knife-edge clips flip on padding
+changes), **transcription defaults to the old duration order** —
+`transcription.shard_order: path` opts in on HDD nodes with the tradeoff
+documented in the config. Everything else defaults to path order.
+
+### 11.2 Stage 7 + ROVER resume scans: per-file stat storms → DirNameCache
+
+`get_valid_paths` stat'ed every sidecar of every discovered file once per
+model (~10 M random stats at 2 M files × 5 models), `check_consensus`
+checked up to N sidecars per file, and ROVER re-stat'ed the tree plus 5
+sidecars per pending file in every worker. All of these now run through the
+proven `DirNameCache` (one `scandir` per directory; extended with a lazy
+per-directory size map so `retry_empty_outputs` zero-byte semantics are
+preserved), and the grouped-decode sweeps share **one** cache instead of
+re-walking the tree per model.
+
+Measured (strace, 4 800 files / 240 dirs fixture): existence scan
+**24 203 → 883 stat-class syscalls** (883 = interpreter import baseline —
+the scan itself went from 24 000 per-file stats to 240 scandirs, ~100×
+fewer seeks); `retry_empty` sweep ~4× with the shared cache. Equivalence
+pinned by 11 new tests (`tests/test_transcription_pending_scan.py`)
+comparing against verbatim copies of the old per-file logic, including
+0-byte sidecars, dangling symlinks, and consensus decisions;
+`test_transcription_share_decode.py` still passes byte-identically.
+
+### 11.3 Periodic CSV flush: full-tree scan removed from the hot loop
+
+For crest / music_detect / fused existing-chunks, every periodic flush ran
+`drop_missing_files` over the **whole** CSV — one `scandir` per audio
+directory of the dataset, dozens of times per long stage, interleaved with
+the loaders' audio reads on the same spindle. The periodic merger now never
+prunes; the post-stage `absorb_partial_csvs(drop_missing_files=True)` —
+which every pruning caller already runs — does it exactly once, so the
+final CSV is byte-identical (pinned by test).
+
+Measured per flush (10 k-row / 2 k-dir fixture, strace): **56 926 → 2 930
+syscalls** (50 000 stat-class + 3 996 directory reads eliminated; the
+remainder is the import/CSV baseline). At production scale that's millions
+of metadata seeks per stage removed from directly competing with audio
+reads.
+
+### 11.4 DistillMOS filter: touch only deletion candidates
+
+Stage 5.5 sharded **all** scored rows to deletion workers; every kept file
+(~95 %+) paid a `resolve_path` lstat chain, a header probe when its CSV row
+lacked `total_duration`, and a partial-CSV row that was then re-parsed and
+merged. Workers now receive only `(path, mos, duration)` tuples for rows
+with `DistillMOS < threshold` (parent reads the CSV once, as before);
+audit numbers come from the dataframe the stage already loads.
+
+Measured (5 k rows, 2 % candidates, 30 % missing durations): duration
+probes **1 502 → 33**; worker-phase syscalls touching audio files
+**14 648 → 381 (38×)**; `unlink` set identical. Deleted-file set, audit
+counts, and final CSV pinned identical by 9 tests. One documented behavior
+change: kept files with a missing `total_duration` are no longer
+back-filled by this stage (that duplication belonged to stage 1 /
+`audio_durations`; hours_in/out differ only in that abnormal case). Also
+fixed two latent crashes: `print_histogram`/`print_preview` raised
+`IndexingError` whenever any row had NaN MOS.
+
+### 11.5 existing_chunks: every chunk left the disk twice
+
+The active `existing_chunks + fuse` path decoded each kept chunk in the
+DataLoader at 16 kHz (for VAD/diarization) and then re-read and re-decoded
+the whole file at native rate in `_postprocess_existing_chunk` for
+crest/LUFS. The loader now reads the file's **bytes once**
+(`Path.read_bytes`), decodes 16 kHz from memory, and ships the same bytes
+through the batch for the native-rate pass (same decoder, same bytes →
+**bit-identical**, verified for torchcodec 0.7 on bytes vs path sources).
+The raw-mode short-file branch got the same treatment. RAM is bounded:
+only chunks ≤ `preprocess.existing_chunks_raw_bytes_max_s` (default
+4×`duration` ≈ 60 s) ship bytes; production existing-chunks config
+(`batch_size=1, loader_workers=0`) holds at most ~1 chunk's bytes.
+
+Measured (strace): **2 read opens per file → 1** (plus the unavoidable
+in-place rewrite when normalizing). 24 new tests pin bit-identical
+waveforms, rewritten file bytes, and the cap fallback.
+
+### 11.6 Antispoofing: read the 4 s window, not the whole clip
+
+Stage 6 decoded the full clip (≤15 s ≈ 480 KB PCM), ran preemphasis over
+all of it, then kept a random 64 600-sample window. With
+`separation.antispoofing.ranged_decode: true`, eligible clips (PCM
+wav/flac, already at 16 kHz, longer than the window) are read via
+`soundfile` seek+read of exactly the window plus one predecessor sample
+(so preemphasis reproduces the full-decode value at the window start).
+Measured: **545 580 → 129 298 bytes** streamed per 15 s clip (4.2×).
+Proven bit-exact (`torch.equal`) against full-decode-then-crop for PCM_16/
+24/32/FLOAT/DOUBLE and FLAC, mono and stereo, including the float32
+conversion conventions of torchcodec vs libsndfile (they match, verified
+to the -32768 edge); RNG consumption is identical so downstream random
+state is unchanged. Default **False** (a knob, because the decode backend
+changes for the fast path); recommended True on HDD. Non-eligible files
+fall back to the exact old path.
+
+### 11.7 One spindle, sixteen readers: the io_profile clamp
+
+`transcription.num_workers: 16` (and 8 in other stages) means up to 16
+processes issuing concurrent random reads against one disk — on HDD that
+multiplies seek distance, not throughput. New `src/utils/io_profile.py`
+resolves the disk type behind the dataset (sysfs rotational flag; walks
+partitions and dm/LVM stacks; unknown ⇒ ssd ⇒ no change) and every
+DataLoader factory clamps: **HDD ⇒ loader workers ≤ 4, probe pools ≤ 2**;
+SSD/unknown keeps configured values. Override:
+`runtime.io_profile: auto|hdd|ssd` (exported as `BALALAIKA_IO_PROFILE` by
+`base.sh` via `runtime_env`). Worker-count changes provably don't affect
+outputs (DataLoader batch sequence is index-deterministic with
+`shuffle=False`). The duration-probe pre-pass additionally probes in
+sorted path order (values are keyed by path — order-free).
+
+### 11.8 Small fixes from the same audit
+
+- `to_webdataset`: dropped the per-file `exists()` stat right before
+  `read_bytes()` (missing files now skip via the exception path —
+  identical semantics, one stat per file saved across the whole export).
+- `download.py`: each mp3 is written to `<name>.mp3.part`, tagged there,
+  then `os.replace`d — a crash can no longer leave a half-written/untagged
+  file at the final path, and resume never counts a `.part` as done.
+  (Honest note: music_tag's rewrite itself is inherent to tagging — the
+  doubled write bytes remain; the gain is crash safety + the read-back now
+  hits the just-written page cache.)
+- Text stages (8–10) process sidecars in path order; punctuation slabs and
+  G2P batching were already proven composition-independent in §4.4/§4.9.
+
+### 11.9 What was deliberately left alone
+
+- **Transcription/denoising default order** stays `duration` (see §11.1
+  measurements — flip `transcription.shard_order: path` on the HDD node;
+  ROVER-level washout of the ~1 % CTC divergence needs a GPU-idle node to
+  measure across all 5 models).
+- **Contiguous GPU sharding** and **block-then-bucket shards**: modeled,
+  rejected (no win or negative).
+- **Readahead hints** (`posix_fadvise WILLNEED`): low expected impact once
+  reads are path-ordered; not taken.
+- `recovery_from_meta` thread-pool stats and the downloader's flat
+  day-directory fanout: real but low-impact findings, documented in the
+  audit JSON (`.claude/analysis/` + the workflow result).
+
+### 11.10 Reproduce
+
+```bash
+source .dev_venv/bin/activate
+python -m benchmarking.micro.bench_hdd_order --files 200000   # §11.1 seek model
+python -m pytest tests/test_hdd_io_infra.py tests/test_transcription_pending_scan.py \
+  tests/test_existing_chunks_single_read.py tests/test_antispoofing_ranged_decode.py \
+  tests/test_distillmos_filter.py tests/test_to_webdataset_worker_io.py \
+  tests/test_download_episode.py -q                            # 93 tests
+python -m pytest tests/ -q                                     # full suite: 207 passed
+```
+
+On the production HDD node: set `runtime.io_profile: auto` (already the
+default — it will detect hdd), consider `transcription.shard_order: path`
+and `separation.antispoofing.ranged_decode: true`, and keep
+`BALALAIKA_SHARD_ORDER` unset (path order is the default for everything
+that's proven equivalent).

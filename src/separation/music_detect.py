@@ -41,6 +41,7 @@ from transformers import AutoFeatureExtractor
 
 from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.audio_durations import duration_probe_workers, ensure_audio_durations
+from src.utils.io_profile import clamp_loader_workers
 from src.utils.csv_manager import (
     PartialCsvWriter,
     PeriodicCsvMerger,
@@ -132,14 +133,14 @@ def _process_files(
             pending_files,
             num_workers=duration_probe_workers(cfg, config),
         )
+    loader_workers = clamp_loader_workers(int(cfg.get("num_workers", 4)), pending_files)
     dataloader = create_loader(
         pending_files,
         cfg.get("base_model", "microsoft/wavlm-base-plus"),
         resolve_batch_size("music_detect", cfg.get("bs"), 32),
-        cfg.get("num_workers", 4),
+        loader_workers,
         audio_lengths,
     )
-    loader_workers = int(cfg.get("num_workers", 4))
     batch_size = resolve_batch_size("music_detect", cfg.get("bs"), 32)
     logger.debug(
         f"perf dataloader_config stage=music_detect rank={rank} "

@@ -988,6 +988,15 @@ class PeriodicCsvMerger:
         """Read every partial in full and fold it into ``balalaika.csv``.
 
         Returns the number of partial rows merged (0 when there's nothing new).
+
+        ``drop_missing_files`` is deliberately NOT applied here even when the
+        caller requested it: pruning runs ``_paths_exist_mask`` over the whole
+        CSV, i.e. one ``scandir`` per audio directory of the dataset, on every
+        flush — a full metadata sweep of the HDD that competes with the
+        stage's own audio reads. Every caller that prunes already does a final
+        ``absorb_partial_csvs(drop_missing_files=True)`` after the stage, so
+        deferring the prune leaves the final CSV identical; only mid-stage
+        snapshots may briefly keep rows for files deleted during the run.
         """
         partials = read_partial_csvs(self.podcasts_path, self.prefix)
         if partials.empty and self.bootstrap_audio_paths is None:
@@ -996,7 +1005,7 @@ class PeriodicCsvMerger:
             self.podcasts_path,
             partials,
             value_columns=self.value_columns,
-            drop_missing_files=self.drop_missing_files,
+            drop_missing_files=False,
             bootstrap_audio_paths=self.bootstrap_audio_paths,
             preserve_existing=self.preserve_existing,
         )
@@ -1052,6 +1061,12 @@ class PeriodicCsvMerger:
                 f"Periodic CSV merger: every {self.flush_every_rows} rows or "
                 f"{self.flush_every_seconds}s (poll {self.poll_interval}s)."
             )
+            if self.drop_missing_files:
+                logger.info(
+                    "Periodic CSV merger: missing-file pruning is deferred to "
+                    "the final absorb (per-flush pruning would rescan every "
+                    "audio directory)."
+                )
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

@@ -541,12 +541,24 @@ def cut_audio(
     return results
 
 
-def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Dict[str, Any]) -> Dict[str, Any]:
+def process_audio_file(
+    path_audio: str,
+    audio: torch.Tensor,
+    sr: int,
+    config: Dict[str, Any],
+    raw_bytes: Optional[bytes] = None,
+) -> Dict[str, Any]:
     """Process a single source recording.
 
     Returns a dict with ``segments`` (list of metadata dicts for each chunk
     written) and ``source_duration_s`` so the parent process can build the
     audit summary without re-probing files.
+
+    ``raw_bytes`` carries the file's already-read encoded bytes from the loader
+    (only for short single-chunk sources). When present the fused single-chunk
+    branch decodes the native-rate waveform from those bytes instead of doing a
+    second cold-cache disk read — torchcodec decodes a ``bytes`` source
+    bit-identically to a path source.
     """
     limit_dur = config.get('duration', 15)
     chunk_duration = config.get('chunk_duration', DEFAULT_CHUNK_DURATION_S)
@@ -595,7 +607,11 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
                 }
 
             if fuse_audio:
-                decoder = AudioDecoder(str(p_audio))
+                # Reuse the loader's bytes for the native decode when available
+                # so this short source is not read from the HDD a second time.
+                decoder = AudioDecoder(
+                    raw_bytes if raw_bytes is not None else str(p_audio)
+                )
                 native_sr = int(decoder.metadata.sample_rate)
                 native_audio = decoder.get_all_samples().data.to(dtype=torch.float32)
                 del decoder
@@ -744,11 +760,22 @@ def _run_diarization_shard(
         if fused_audio_preprocessing_enabled(config)
         else PARTIAL_FIELDS
     )
+    # The native-rate re-decode only happens for short sources that fall into the
+    # single-chunk branch (``total_audio_duration <= duration``). Reuse the bytes
+    # the loader already read for exactly those — large multi-hour sources go down
+    # the lazy ``cut_audio`` window path and must NOT have their (100s of MB) bytes
+    # shipped through the batch, so the loader caps byte reuse at ``duration``.
+    raw_bytes_max_duration_s = (
+        float(config.get("duration", 15))
+        if fused_audio_preprocessing_enabled(config)
+        else None
+    )
     dataloader = create_diarization_dataloader(
         gpu_files,
         batch_size=int(config.get("diarization_batch_size", 1)),
         num_workers=int(config.get("diarization_loader_workers", num_loader_workers)),
         prefetch_factor=int(config.get("diarization_prefetch_factor", 2)),
+        raw_bytes_max_duration_s=raw_bytes_max_duration_s,
     )
     batch_size = int(config.get("diarization_batch_size", 1))
     loader_workers = int(config.get("diarization_loader_workers", num_loader_workers))
@@ -772,12 +799,14 @@ def _run_diarization_shard(
                 f"batch={batch_idx} seconds={batch_received_at - batch_wait_started_at:.6f} "
                 f"items={len(batch)}"
             )
-            for path_audio, audio, sr, error in batch:
+            for path_audio, audio, sr, error, raw_bytes in batch:
                 if error:
                     logger.error(f"Broken file {path_audio}: {error}")
                     continue
                 try:
-                    res = process_audio_file(str(path_audio), audio, sr, config)
+                    res = process_audio_file(
+                        str(path_audio), audio, sr, config, raw_bytes=raw_bytes
+                    )
                     _merge_crest_audit(
                         crest_audit, res.get("crest_audit", _new_crest_audit())
                     )

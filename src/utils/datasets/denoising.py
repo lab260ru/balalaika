@@ -9,6 +9,8 @@ import torchaudio
 from loguru import logger
 from torch.utils.data import DataLoader, Dataset
 
+from src.utils.io_profile import clamp_loader_workers
+
 
 DENOISING_SAMPLE_RATE = 48_000
 
@@ -115,6 +117,7 @@ def create_denoising_dataloader(
     max_padded_len: int = 96_000,
 ) -> DataLoader:
     dataset = DenoisingDataset(file_paths, sample_rate=sample_rate)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,

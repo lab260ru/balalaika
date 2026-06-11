@@ -6,6 +6,7 @@ import torchaudio
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
+from src.utils.io_profile import clamp_loader_workers
 from src.utils.logging_setup import dataloader_worker_init as _worker_init
 
 
@@ -51,6 +52,7 @@ def create_transcription_dataloader(
     prefetch_factor: int,
 ) -> DataLoader:
     dataset = TranscriptionDataset(file_paths, sample_rate)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,
@@ -132,6 +134,7 @@ def create_group_transcription_dataloader(
     prefetch_factor: int,
 ) -> DataLoader:
     dataset = GroupTranscriptionDataset(file_paths, sample_rates)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,

@@ -110,6 +110,14 @@ runtime:
   # Number of file paths per on-disk work shard for multiprocessing stages.
   # Keep this small enough that a worker only materializes a bounded list.
   work_shard_size: 10000
+  # Disk type the dataset lives on: auto detects the rotational flag of the
+  # device backing podcasts_path (LVM/dm stacks are walked); hdd clamps
+  # DataLoader workers to 4 and probe pools to 2 so concurrent readers stop
+  # seek-thrashing one spindle; ssd keeps configured worker counts as-is.
+  # Env override: BALALAIKA_IO_PROFILE. Shard line order is a separate knob:
+  # BALALAIKA_SHARD_ORDER=path (default; directory-clustered reads on HDD)
+  # or legacy (pre-2026-06 input/duration order).
+  io_profile: auto
   # Root for TensorRT engine cache. Each session appends /trt_cache_<gpu_id>.
   trt_cache_path: ./cache/trt
   # Per-session TensorRT workspace size in bytes (4 GiB by default).
@@ -148,6 +156,11 @@ preprocess:
   # existing_chunks mode combines crest + LUFS in one native-rate read/write.
   # Set false to keep stages 1, 2, and 3 fully independent.
   fuse_audio_preprocessing: true
+  # existing_chunks + fuse: chunks at most this long reuse the loader's raw
+  # bytes for the native-rate pass, so each file leaves the disk once
+  # (bit-identical outputs). Longer files fall back to a second read.
+  # Default: 4 x duration. Lower it on very low-RAM nodes.
+  # existing_chunks_raw_bytes_max_s: 60
   # Maximum duration of each output segment in seconds.
   
   duration: 15
@@ -253,6 +266,12 @@ separation:
     batch_size: 8
     num_workers: 4
     prefetch_factor: 2
+    # Read only the random 4.04 s scoring window (+1 sample) from PCM
+    # wav/flac at 16 kHz instead of decoding the whole clip — proven
+    # bit-identical to full-decode-then-crop; ~4x fewer bytes streamed per
+    # 15 s clip. Recommended True for HDD datasets; other containers and
+    # sample rates fall back to the full decode automatically.
+    ranged_decode: False
     # TensorRT fp16: measured 4.25x faster than CUDA fp32 on RTX 4060 Ti
     # (224 -> 53 ms per batch of 8). Logits shift by ~0.005 in fp16 — far
     # below this stage's own run-to-run variation from its random crop. First
@@ -291,6 +310,13 @@ transcription:
   # Numba-accelerated ROVER aggregation (identical outputs, ~12x faster;
   # pinned by tests/test_fast_rover.py). False falls back to crowd-kit.
   use_fast_rover: True
+  # Intra-bucket work-shard order. "duration" reproduces the old flow
+  # bit-for-bit. "path" reads audio in directory order — on HDD datasets this
+  # removes ~1 random seek per file per model pass — but changes ASR batch
+  # composition: measured on 250 knife-edge bench clips (CPU, giga_ctc and
+  # e2e-ctc), ~15% of transcripts shift by ~1 character (~1.2% of characters);
+  # each order is itself fully deterministic. Recommended "path" on HDD.
+  shard_order: duration
   # CPU processes for ROVER shard aggregation.
   rover_workers: 4
   batch_size: 8

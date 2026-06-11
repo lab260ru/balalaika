@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import soundfile as sf
 import torch
 import torchaudio
 from loguru import logger as loguru_logger
@@ -12,6 +13,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from src.utils.io_profile import clamp_loader_workers
 from src.utils.logging_setup import dataloader_worker_init
 
 logger = logging.getLogger(__name__)
@@ -20,6 +22,13 @@ logger = logging.getLogger(__name__)
 DISTILLMOS_SAMPLE_RATE = 16_000
 ANTISPOOF_SAMPLE_RATE = 16_000
 ANTISPOOF_NUM_SAMPLES = 64_600
+
+# Containers/subtypes for which a soundfile ranged read has been proven to
+# reproduce torchcodec's full-decode float32 values bit-exactly (torch.equal).
+# WAV and FLAC are both lossless PCM containers; the subtypes below all decode
+# to identical float32 via libsndfile and torchcodec (verified on fixtures).
+_RANGED_DECODE_FORMATS = frozenset({"WAV", "WAVEX", "FLAC"})
+_RANGED_DECODE_SUBTYPES = frozenset({"PCM_16", "PCM_24", "PCM_32", "FLOAT", "DOUBLE"})
 
 
 class DistillMOSDataset(Dataset):
@@ -125,6 +134,7 @@ def create_distillmos_dataloader(
     # cache, which never hits across disjoint shards) is dead work.
     ordered = file_paths if assume_sorted else sort_by_length(file_paths, cache_dir=cache_dir)
     dataset = DistillMOSDataset(ordered)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,
@@ -148,13 +158,86 @@ class AntiSpoofingDataset(Dataset):
         file_paths: List[str],
         sample_rate: int = ANTISPOOF_SAMPLE_RATE,
         num_samples: int = ANTISPOOF_NUM_SAMPLES,
+        ranged_decode: bool = False,
     ):
         self.file_paths = file_paths
         self.sample_rate = int(sample_rate)
         self.num_samples = int(num_samples)
+        self.ranged_decode = bool(ranged_decode)
 
     def __len__(self) -> int:
         return len(self.file_paths)
+
+    def _try_ranged_load(self, path_str: str):
+        """Attempt a seek+read of only the random window (plus one predecessor
+        sample for preemphasis), avoiding a full decode for long clips.
+
+        Returns ``(waveform, original_length)`` where ``waveform`` is a 1-D
+        float32 mono tensor of exactly ``num_samples`` samples post-preemphasis,
+        identical to the full-decode-then-crop result, and ``original_length``
+        is the source frame count (equal to the full-decode path's value since
+        no resampling happens). Returns ``None`` if this clip is not eligible
+        for the ranged fast path (caller must fall back to full-decode).
+
+        IMPORTANT: this method consumes exactly one ``random.randint`` call,
+        the same as ``_pad_random`` does for clips longer than ``num_samples``,
+        so downstream RNG state stays identical to the full-decode path.
+        """
+        try:
+            info = sf.info(path_str)
+        except Exception:
+            return None
+
+        # Resampling has unbounded context, so a ranged read is not equivalent
+        # there. Only proven lossless containers/subtypes qualify.
+        if int(info.samplerate) != self.sample_rate:
+            return None
+        if str(info.format).upper() not in _RANGED_DECODE_FORMATS:
+            return None
+        if str(info.subtype).upper() not in _RANGED_DECODE_SUBTYPES:
+            return None
+
+        wave_len = int(info.frames)
+        # Short clips are repeat-padded by _pad_random and consume no RNG; the
+        # ranged path only handles the long-clip (crop) case to keep the RNG
+        # consumption pattern identical to the full-decode path.
+        if wave_len < self.num_samples:
+            return None
+
+        # Draw the random start exactly as _pad_random does.
+        start = random.randint(0, wave_len - self.num_samples)
+
+        if start > 0:
+            # Read one sample early so preemphasis y[n]=x[n]-a*x[n-1] has the
+            # correct predecessor at the window start; drop it afterwards.
+            read_start = start - 1
+            read_count = self.num_samples + 1
+            drop_leading = True
+        else:
+            # No predecessor exists at offset 0; preemphasis leaves y[0]=x[0]
+            # unchanged, matching the full-decode crop at start==0 exactly.
+            read_start = 0
+            read_count = self.num_samples
+            drop_leading = False
+
+        block, _ = sf.read(
+            path_str,
+            start=read_start,
+            frames=read_count,
+            dtype="float32",
+            always_2d=True,
+        )
+        # always_2d -> (frames, channels); transpose to (channels, frames) to
+        # match torchaudio/torchcodec channel-first layout used downstream.
+        waveform = torch.from_numpy(block).transpose(0, 1)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0)
+        else:
+            waveform = waveform.squeeze(0)
+        waveform = torchaudio.functional.preemphasis(waveform.unsqueeze(0)).squeeze(0)
+        if drop_leading:
+            waveform = waveform[1:]
+        return waveform.contiguous(), wave_len
 
     def _pad_random(self, waveform: torch.Tensor) -> torch.Tensor:
         if waveform.ndim > 1:
@@ -172,6 +255,18 @@ class AntiSpoofingDataset(Dataset):
         path_str = self.file_paths[idx]
         started_at = time.perf_counter()
         try:
+            if self.ranged_decode:
+                ranged = self._try_ranged_load(path_str)
+                if ranged is not None:
+                    waveform, original_length = ranged
+                    loguru_logger.debug(
+                        f"dataloader_audio_load dataset=antispoofing path={path_str} "
+                        f"seconds={time.perf_counter() - started_at:.6f} "
+                        f"sample_rate={self.sample_rate} frames={original_length} "
+                        f"ranged=1"
+                    )
+                    return path_str, waveform, original_length, ""
+
             waveform, source_sample_rate = torchaudio.load_with_torchcodec(path_str)
             waveform = waveform.to(dtype=torch.float32)
             if waveform.shape[0] > 1:
@@ -222,12 +317,15 @@ def create_antispoofing_dataloader(
     prefetch_factor: int,
     sample_rate: int = ANTISPOOF_SAMPLE_RATE,
     num_samples: int = ANTISPOOF_NUM_SAMPLES,
+    ranged_decode: bool = False,
 ) -> DataLoader:
     dataset = AntiSpoofingDataset(
         file_paths,
         sample_rate=sample_rate,
         num_samples=num_samples,
+        ranged_decode=ranged_decode,
     )
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,
