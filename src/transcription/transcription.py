@@ -17,6 +17,7 @@ from src.utils.audio_durations import (
 from src.utils.datasets.transcription import create_transcription_dataloader, recognize_batch
 from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
+from src.utils.node_profile import resolve_batch_size
 from src.utils.parallel import run_per_gpu_processes
 from src.utils.csv_manager import discover_audio_paths
 from src.utils.sidecars import text_sidecar_complete
@@ -125,7 +126,9 @@ def format_timestamps(result) -> str:
 def _process_files(cuda_id: int, model_name: str, files: List[str], model, config: dict,
                    output_suffix: str, do_timestamps: bool, target_sample_rate: int,
                    processed_counter=None, errors_counter=None, error_details=None):
-    batch_size = config.get('batch_size', 16)
+    batch_size = resolve_batch_size(
+        f"transcription.{model_name}", config.get('batch_size'), 16
+    )
     num_loader_workers = int(config.get('num_workers', 4))
     prefetch_factor = int(config.get('prefetch_factor', 2))
 
@@ -187,7 +190,9 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
     """Inference worker: loads onnx-asr model on a single GPU and claims file shards."""
     torch.cuda.set_device(cuda_id)
 
-    batch_size = config.get('batch_size', 16)
+    batch_size = resolve_batch_size(
+        f"transcription.{model_name}", config.get('batch_size'), 16
+    )
     use_trt = config.get('use_tensorrt', False)
     quantization = config.get('quantization')
 

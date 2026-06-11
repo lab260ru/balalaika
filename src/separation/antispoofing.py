@@ -42,6 +42,7 @@ from src.utils.datasets.separation import (
 )
 from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
+from src.utils.node_profile import resolve_batch_size
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 from src.utils.work_shards import (
@@ -135,7 +136,7 @@ def _process_files(
     skipped_counter,
     errors_counter,
 ) -> None:
-    batch_size = int(cfg.get("batch_size", 8))
+    batch_size = resolve_batch_size("antispoofing", cfg.get("batch_size"), 8)
     num_workers = int(cfg.get("num_workers", 2))
     prefetch_factor = int(cfg.get("prefetch_factor", 2))
     pending_files = []
@@ -235,7 +236,7 @@ def run_worker(
     model_path = Path(cfg.get("onnx_path", "./models/spectra_0.onnx"))
     logger.info(
         f"[cuda:{rank}] Spectra-0 claiming shards, "
-        f"batch={int(cfg.get('batch_size', 8))}, samples={MODEL_NUM_SAMPLES}"
+        f"batch={resolve_batch_size('antispoofing', cfg.get('batch_size'), 8)}, samples={MODEL_NUM_SAMPLES}"
     )
 
     try:

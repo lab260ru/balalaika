@@ -54,6 +54,7 @@ from src.utils.csv_manager import (
 )
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
+from src.utils.node_profile import resolve_batch_size
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
 from src.utils.work_shards import (
@@ -130,12 +131,12 @@ def _process_files(
     dataloader = create_loader(
         pending_files,
         cfg.get("base_model", "microsoft/wavlm-base-plus"),
-        cfg.get("bs", 32),
+        resolve_batch_size("music_detect", cfg.get("bs"), 32),
         cfg.get("num_workers", 4),
         audio_lengths,
     )
     loader_workers = int(cfg.get("num_workers", 4))
-    batch_size = int(cfg.get("bs", 32))
+    batch_size = resolve_batch_size("music_detect", cfg.get("bs"), 32)
     logger.debug(
         f"perf dataloader_config stage=music_detect rank={rank} "
         f"batch_size={batch_size} workers={loader_workers} "

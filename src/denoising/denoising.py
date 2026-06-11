@@ -40,6 +40,7 @@ from src.utils.datasets.denoising import (
 )
 from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
+from src.utils.node_profile import resolve_batch_size
 from src.utils.parallel import run_per_gpu_processes
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
@@ -186,7 +187,7 @@ def _process_files(
     skipped_counter,
     errors_counter,
 ) -> None:
-    batch_size = int(config.get("batch_size", 2))
+    batch_size = resolve_batch_size("denoising", config.get("batch_size"), 2)
     loader_workers = int(config.get("num_workers", 0))
     prefetch_factor = int(config.get("prefetch_factor", 2))
 
@@ -326,7 +327,7 @@ def run_worker(
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
 
-    batch_size = int(config.get("batch_size", 2))
+    batch_size = resolve_batch_size("denoising", config.get("batch_size"), 2)
     model_path = resolve_model_path(str(config.get("onnx_path", DEFAULT_ONNX_PATH)))
 
     session = create_session(

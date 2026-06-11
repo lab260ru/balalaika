@@ -43,6 +43,7 @@ from src.utils.csv_manager import (
     unprocessed_paths,
 )
 from src.utils.datasets.separation import create_distillmos_dataloader
+from src.utils.node_profile import resolve_batch_size
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
@@ -76,7 +77,9 @@ def _process_files(
     skipped_counter,
     errors_counter,
 ) -> None:
-    batch_size = int(config.get("distillmos", {}).get("batch_size", 16))
+    batch_size = resolve_batch_size(
+        "distillmos", config.get("distillmos", {}).get("batch_size"), 16
+    )
     num_loader_workers = int(config.get("distillmos", {}).get("num_workers", 2))
     prefetch_factor = int(config.get("distillmos", {}).get("prefetch_factor", 2))
 
@@ -177,7 +180,9 @@ def run_inference_worker(
         errors_counter.value += 1
         return
 
-    batch_size = int(config.get("distillmos", {}).get("batch_size", 16))
+    batch_size = resolve_batch_size(
+        "distillmos", config.get("distillmos", {}).get("batch_size"), 16
+    )
     num_loader_workers = int(config.get("distillmos", {}).get("num_workers", 2))
     logger.info(
         f"[cuda:{rank}] Claiming DistillMOS shards "
