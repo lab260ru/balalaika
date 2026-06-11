@@ -322,6 +322,16 @@ transcription:
   batch_size: 8
   num_workers: 16
   prefetch_factor: 4
+  # Keep DataLoader workers alive across work shards. Each GPU worker claims
+  # 10k-file shards in a loop; the old flow built a fresh DataLoader (spawning
+  # up to num_workers loader processes + refilling prefetch) per shard, idling
+  # the GPU a few seconds at every shard boundary. With this enabled one
+  # persistent loader feeds every shard a GPU worker claims — proven to yield
+  # the identical sequence of (shard, batch contents, order) as the per-shard
+  # loader (tests/test_transcription_persistent_loaders.py), so ASR outputs are
+  # byte-identical. Only active when num_workers > 0. Set False to restore the
+  # per-shard loader construction exactly.
+  persistent_loaders: True
   retry_empty_outputs: True
 
 punctuation:
