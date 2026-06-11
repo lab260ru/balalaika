@@ -15,7 +15,13 @@ be resumed from any point without editing shell scripts.
 Install system tools and create the development environment:
 
 ```bash
-sudo apt update && sudo apt install -y ffmpeg
+sudo apt update && sudo apt install -y \
+  ffmpeg \                 # video/audio toolkit
+  python3 \                # Python
+  python3-pip \            # Pip package manager
+  python3-venv \           # std-lib virtual-env support
+  python3-dev \            # headers for compiling native wheels
+  python-is-python3
 wget -qO- https://astral.sh/uv/install.sh | sh
 
 git clone https://github.com/mtuciru/balalaika
