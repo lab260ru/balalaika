@@ -176,6 +176,76 @@ measured 10 MB batch H2D 2.54 ms → 1.69 ms, and it makes the stages' existing
 ORT-fed loaders intentionally left unpinned (inputs convert to numpy; pinning
 does nothing there). Cost: a few MB of page-locked RAM per prefetched batch.
 
+### 4.9 Phonemizer / TryIParu G2P (stage 10) — batched OOV decode
+
+Stock `tryiparu.G2PModel` greedy-decodes every out-of-dictionary word
+one-at-a-time: ≤63 sequential decoder passes per word, a GPU sync per step,
+fresh CPU tensors per token, and a `torch.compile(mode="max-autotune")` call
+that costs ~2.8 s per worker yet compiles nothing (it wraps `forward`, while
+inference goes through the uncompiled `.encode`/`.decode` bound methods).
+`src/phonemizer/fast_g2p.py` keeps the weights, tokenizer and rules and fixes
+only the mechanics; the stage now also reuses rule splits per unique word and
+persists OOV decodes across runs/workers (`oov_cache_path`, weights-fingerprint
+keyed, fcntl lock-merge so concurrent workers can't clobber each other).
+
+`benchmarking/micro/bench_g2p.py`, 30 ASR-like fixture texts (24×250 words @2%
+OOV, 4×200 @15%, 2×20 — built from tryiparu's own 398k-word dictionary plus
+deterministic pseudo-words), GPU = RTX 4060 Ti running a training job:
+
+| Metric | Stock GPU | Stock CPU | Fast GPU | Fast CPU |
+|---|---|---|---|---|
+| OOV decode, ms/word | 123.8 | 82.0 | **5.7** | **8.4** |
+| 30 fixture texts | 18.2 s | 12.5 s | **4.7 s** | **3.9 s** |
+| mean / max per text | 0.61 / 1.74 s | 0.42 / 1.23 s | 0.16 / 0.26 s | 0.13 / 0.24 s |
+| worker init | 8.2 s | 5.9 s | 2.5 s | 2.3 s |
+
+On a 1200-word fresh-OOV batch the gap widens (per-text batches are small):
+stock 140 ms/word vs fast 3.8 ms/word = **37×**; CPU 86.6 → 8.2 ms/word =
+10.5×. Init is faster because the no-op compile is gone and the dictionary CSV
+parses once per node into `cache/g2p_dict.pkl` (0.94 s pandas → 0.25 s pickle
+per worker). A fully-cached text drops 9 ms → ~2 ms via the rule-split memo.
+
+**Proof of equivalence**: 0/1200 token mismatches vs the stock fp32 reference
+on CPU and on GPU at batch sizes 64/5/1 (run under production ambient flags);
+0/30 fixture texts differ across all impl×device combinations; identical
+`ValueError` (message and words-cached-before-raise semantics) on oversize
+words; the csv-module dictionary load compared equal to pandas
+`set_index().to_dict()` on all 397,782 keys. Pinned by 11 tests in
+`tests/test_phonemizer_fast_g2p.py`. Decode runs with TF32 saved/disabled/
+restored around it, because under the pipeline-wide TF32 default even the
+STOCK model flips argmax ties on knife-edge pseudo-words (3 of 1200 flip when
+toggling TF32 alone, batch size 1) — fp32 is the only stable reference, and at
+d_model=128 it is free (3.3 vs 3.4 ms/word measured).
+
+Two deliberate divergences, both pinned by tests: (1) a word encoding to
+exactly 62 BPE ids *crashes* stock (its zero-length pad segment is a float32
+empty tensor; `torch.cat` promotes the whole encoder input and
+`nn.Embedding` rejects it) — FastG2P decodes it normally, so such files
+produce phonemes instead of erroring; (2) TF32 tie-flips on synthetic
+pseudo-words under the old always-on TF32 regime no longer occur (fp32 is
+enforced during decode).
+
+A 28-agent adversarial review (4 lenses × verify-each-finding) then hardened
+the implementation: TF32 flip scoped to the decode call instead of leaking
+process-global state; GPU sync (`finished.all()`) polled every 4th step
+instead of every step (post-`<eos>` tokens are truncated, outputs identical);
+cache fingerprints switched from `(size, mtime)` to `(size, blake2b)` (mtime
+survives `cp -p`/rsync across different files); dict-cache build serialized
+under flock (was a thundering-herd CSV parse across workers); wrong-typed
+cache payloads ignored instead of bricking worker init; OOV pending list not
+accumulated when persistence is off; inline flush backs off geometrically;
+`device: cpu` no longer dies on CPU-only nodes (and runs ONE pool, not one
+per GPU); `_rover_phonemes.txt` written atomically (a killed worker used to
+leave a truncated sidecar that resume scans accept forever — pre-existing
+bug); `_rules_cache` RAM-bounded. Rejected as not-issues after verification:
+per-device OOV cache keys, decoder-input preallocation, sorting words by
+length before chunking (changes error-path cache semantics for <1 batch of
+typical work).
+
+Low-resource note: `phonemizer.device: cpu` runs the whole stage on CPU at
+~8 ms/word batched — on this node that beats the *busy* GPU and uses zero
+VRAM; keep `cuda` (default) when GPUs are idle.
+
 ## 5. End-to-end validation on real audio (proof nothing broke)
 
 250 real Russian wavs (OpenSTT), old commit `410de9b` in a worktree vs HEAD,
@@ -292,8 +362,8 @@ absent on this node or larger refactors)
    IOBinding to kill per-window GPU→CPU→GPU round-trips; vectorize `_binarize`
    and spkcache compression (file:line details in `.claude/analysis/preprocess-*.json`).
    Untestable here — the ONNX model files are not on this node.
-3. **Phonemizer**: persist the word→phoneme cache across runs and batch
-   `greedy_decode` over unique words.
+3. ~~**Phonemizer**: persist the word→phoneme cache across runs and batch
+   `greedy_decode` over unique words.~~ Done — see §4.9.
 4. **tone batch size**: raise beyond 64 (still climbing at the sweep cap) once
    measured on an idle GPU.
 5. Consider Parquet for pipeline *state* (keeping balalaika.csv as an export) —
@@ -306,6 +376,8 @@ source .dev_venv/bin/activate
 python -m benchmarking.micro.make_fixtures                  # once (~2 min)
 python -m benchmarking.micro.bench_csv_ops --label check    # §4.1 table
 python -m benchmarking.micro.bench_collate --label check    # §4.2
+python -m benchmarking.micro.bench_g2p --make-fixtures      # §4.9 (once)
+python -m benchmarking.micro.bench_g2p --impl fast --label check   # §4.9
 python -m benchmarking.warmup --config_path configs/config.yaml   # §2 (per node)
 python -m pytest tests/ -q                                  # 76+ behavior tests
 # stage-level before/after harness runs: benchmarking/reports/2026*/report.json

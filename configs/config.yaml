@@ -307,6 +307,17 @@ accent:
 phonemizer:
   podcasts_path: /mnt/hdd_6tb_1/yandex_data
   num_workers: 1
+  # "cpu" runs G2P on CPU instead of cuda:N. The model is tiny (d=128);
+  # batched CPU decode (~8 ms/word) is close to a busy GPU and uses no VRAM.
+  device: cuda
+  # Unique OOV words per padded greedy-decode batch.
+  g2p_batch_size: 64
+  # Cross-run/worker cache of OOV decodes, keyed by a model-weights
+  # fingerprint. Set empty ("") to disable persistence. Relative paths are
+  # anchored to the repo root. It is a pickle: point it only at directories
+  # writable solely by the user running the pipeline (never shared/scratch
+  # dirs on multi-user nodes).
+  oov_cache_path: cache/g2p_oov_cache.pkl
 
 denoising:
   # Root containing chunked audio and balalaika.csv.
