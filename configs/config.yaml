@@ -253,8 +253,13 @@ separation:
     batch_size: 8
     num_workers: 4
     prefetch_factor: 2
-    # TensorRT is supported when the exported ONNX has compatible dynamic batch profile.
-    use_tensorrt: False
+    # TensorRT fp16: measured 4.25x faster than CUDA fp32 on RTX 4060 Ti
+    # (224 -> 53 ms per batch of 8). Logits shift by ~0.005 in fp16 — far
+    # below this stage's own run-to-run variation from its random crop. First
+    # run builds an engine (~8 min, cached under runtime.trt_cache_path; one
+    # dynamic-batch profile covers batches 1..batch_size). Set False on nodes
+    # without TensorRT or to reproduce fp32 scores exactly.
+    use_tensorrt: True
 
   antispoofing_filter:
     # Delete when score_spoof - score_bonafide > threshold.

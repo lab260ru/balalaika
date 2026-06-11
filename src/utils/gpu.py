@@ -27,6 +27,18 @@ def apply_torch_perf_defaults(*, disable_math_sdp: bool = True) -> None:
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(False)
 
+def onnx_first_input_name(model_path: os.PathLike | str) -> str:
+    """First real graph input name from ONNX metadata (no InferenceSession)."""
+    import onnx
+
+    model = onnx.load(str(model_path), load_external_data=False)
+    initializers = {init.name for init in model.graph.initializer}
+    for graph_input in model.graph.input:
+        if graph_input.name not in initializers:
+            return graph_input.name
+    raise ValueError(f"No graph inputs found in {model_path}")
+
+
 def get_onnx_providers(
     cuda_id: int,
     *,

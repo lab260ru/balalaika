@@ -40,7 +40,7 @@ from src.utils.datasets.separation import (
     ANTISPOOF_SAMPLE_RATE,
     create_antispoofing_dataloader,
 )
-from src.utils.gpu import get_onnx_providers
+from src.utils.gpu import get_onnx_providers, onnx_first_input_name
 from src.utils.logging_setup import setup_logging
 from src.utils.node_profile import resolve_batch_size
 from src.utils.stage_status import write_stage_status
@@ -110,11 +110,33 @@ def create_session(
     model_path = ensure_model(model_path, cfg)
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    use_tensorrt = bool(cfg.get("use_tensorrt", False))
     providers = get_onnx_providers(
         rank,
-        use_tensorrt=bool(cfg.get("use_tensorrt", False)),
+        use_tensorrt=use_tensorrt,
         config_path=config_path,
     )
+    if use_tensorrt:
+        # Pin one dynamic-batch TRT profile (1..batch_size x fixed samples).
+        # Without it every distinct trailing-partial-batch size would trigger
+        # a fresh multi-minute engine build.
+        batch_size = resolve_batch_size("antispoofing", cfg.get("batch_size"), 8)
+        graph_input = onnx_first_input_name(model_path)
+        patched = []
+        for provider in providers:
+            name, opts = provider if isinstance(provider, tuple) else (provider, {})
+            opts = dict(opts)
+            if name == "TensorrtExecutionProvider":
+                opts.update(
+                    {
+                        "trt_profile_min_shapes": f"{graph_input}:1x{MODEL_NUM_SAMPLES}",
+                        "trt_profile_opt_shapes": f"{graph_input}:{batch_size}x{MODEL_NUM_SAMPLES}",
+                        "trt_profile_max_shapes": f"{graph_input}:{batch_size}x{MODEL_NUM_SAMPLES}",
+                        "trt_timing_cache_enable": True,
+                    }
+                )
+            patched.append((name, opts))
+        providers = patched
     logger.info(f"[cuda:{rank}] Spectra-0 ONNX providers: {providers}")
     session = ort.InferenceSession(str(model_path), options, providers=providers)
     input_name = session.get_inputs()[0].name
