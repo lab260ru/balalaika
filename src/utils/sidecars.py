@@ -31,6 +31,52 @@ def path_exists(path: Path, *, missing_on_too_long: bool, label: str = "Sidecar"
         raise
 
 
+class DirNameCache:
+    """Existence checks backed by one scandir per directory.
+
+    Equivalent to ``os.path.exists`` per path but O(#directories) syscalls
+    instead of O(#paths) — pending-work scans over millions of sidecars do
+    two existence probes per audio file, which this collapses to dictionary
+    lookups. Dangling symlinks are verified with a real ``exists`` so they
+    still read as missing. (Names longer than NAME_MAX can't appear in a
+    directory listing, so the ENAMETOOLONG special case disappears here:
+    such outputs simply count as missing and fail loudly at write time
+    instead of being silently skipped.)
+    """
+
+    def __init__(self) -> None:
+        self._names: dict[str, set[str]] = {}
+
+    def _dir_names(self, d: str) -> set[str]:
+        import os
+
+        cached = self._names.get(d)
+        if cached is not None:
+            return cached
+        present: set[str] = set()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            if os.path.exists(entry.path):
+                                present.add(entry.name)
+                        else:
+                            present.add(entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        self._names[d] = present
+        return present
+
+    def exists(self, path: Path | str) -> bool:
+        import os
+
+        d, name = os.path.split(str(path))
+        return name in self._dir_names(d)
+
+
 def text_sidecar_complete(path: Path, *, retry_empty: bool = False, label: str = "Sidecar") -> bool:
     """Return whether a text sidecar should be treated as already complete.
 
@@ -72,12 +118,13 @@ def pending(
     on disk are excluded too — useful for stages chained off a previous
     stage's sidecar (so a deleted upstream file doesn't reappear as work).
     """
+    cache = DirNameCache()
     out: List[Path] = []
     for raw in inputs:
         p = Path(raw)
-        if require_input_exists and not path_exists(p, missing_on_too_long=True):
+        if require_input_exists and not cache.exists(p):
             continue
-        if not path_exists(derive_output(p), missing_on_too_long=False):
+        if not cache.exists(derive_output(p)):
             out.append(p)
     return out
 
@@ -99,13 +146,14 @@ def pending_audio_to_sidecar(
         if config_path
         else get_audio_paths(str(podcasts_path))
     )
+    cache = DirNameCache()
     pendings: List[Path] = []
     for a in audio:
         a = Path(a)
         in_path = with_suffix_at_stem(a, in_suffix)
-        if not path_exists(in_path, missing_on_too_long=True):
+        if not cache.exists(in_path):
             continue
-        if path_exists(with_suffix_at_stem(a, out_suffix), missing_on_too_long=False):
+        if cache.exists(with_suffix_at_stem(a, out_suffix)):
             continue
         pendings.append(in_path)
     return pendings
