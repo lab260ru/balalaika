@@ -115,6 +115,104 @@ def run_per_gpu_pool(
     return error_count, error_details
 
 
+def _chunk_list(items: Sequence[Any], chunk_size: int) -> List[List[Any]]:
+    """Split ``items`` into consecutive chunks of at most ``chunk_size``."""
+    n = max(1, int(chunk_size))
+    return [list(items[i : i + n]) for i in range(0, len(items), n)]
+
+
+def run_per_gpu_pool_chunked(
+    items: Sequence[Any],
+    *,
+    work_fn: Callable[[List[Any]], Sequence[dict]],
+    initializer: Callable[..., None],
+    init_args_factory: Callable[[int], Tuple[Any, ...]],
+    chunk_size: int,
+    num_workers_per_gpu: int = 1,
+    gpu_ids: Optional[Sequence[int]] = None,
+    desc: str = "Progress",
+) -> tuple[int, list[dict]]:
+    """Like :func:`run_per_gpu_pool`, but submit work in **chunks** (slabs).
+
+    Instead of one :class:`~concurrent.futures.Future` per item (O(N) Futures
+    and one IPC pickle per item — real RAM/CPU at millions of files), this
+    round-robins ``items`` across GPUs, splits each GPU's shard into
+    ``chunk_size`` slabs, and submits ONE future per slab.  ``work_fn`` receives
+    the whole slab (a ``list``) so the worker can batch model calls across it.
+
+    ``work_fn`` must return a sequence of ``{"item", "reason"}`` dicts, one per
+    item in the slab that FAILED (empty when all succeeded).  Keeping fault
+    isolation inside the worker means a single bad file never fails its
+    slab-mates, matching the per-file ``try/except`` of the old stages.
+
+    Returns the same ``(error_count, error_details)`` 2-tuple as
+    :func:`run_per_gpu_pool`.
+    """
+    if gpu_ids is None:
+        gpu_ids = list(range(torch.cuda.device_count()))
+    gpu_ids = list(gpu_ids)
+    if not gpu_ids:
+        raise RuntimeError("No GPUs available; refusing to run a per-GPU pool.")
+    if not items:
+        return 0, []
+
+    shards = shard_round_robin(items, len(gpu_ids))
+    executors: List[ProcessPoolExecutor] = []
+    future_to_chunk: dict = {}
+    error_count = 0
+    error_details: list[dict] = []
+    total_items = len(items)
+
+    try:
+        for slot, gpu_id in enumerate(gpu_ids):
+            shard = shards[slot]
+            if not shard:
+                continue
+            chunks = _chunk_list(shard, chunk_size)
+            logger.info(
+                f"{desc}: launching {num_workers_per_gpu} workers on GPU {gpu_id} "
+                f"for {len(shard)} items in {len(chunks)} chunk(s)."
+            )
+            ex = ProcessPoolExecutor(
+                max_workers=num_workers_per_gpu,
+                initializer=initializer,
+                initargs=init_args_factory(gpu_id),
+            )
+            executors.append(ex)
+            for chunk in chunks:
+                future_to_chunk[ex.submit(work_fn, chunk)] = chunk
+
+        with tqdm(total=total_items, desc=desc) as bar:
+            for fut in as_completed(future_to_chunk):
+                chunk = future_to_chunk[fut]
+                try:
+                    failures = fut.result() or []
+                    for fail in failures:
+                        error_count += 1
+                        error_details.append(
+                            {
+                                "item": str(fail.get("item")),
+                                "reason": str(fail.get("reason")),
+                            }
+                        )
+                except Exception as exc:
+                    # The whole slab crashed (e.g. the worker process died):
+                    # attribute the failure to every item in the slab so the
+                    # count is honest rather than silently dropping work.
+                    logger.error(f"{desc}: chunk of {len(chunk)} failed: {exc}")
+                    for item in chunk:
+                        error_count += 1
+                        error_details.append({"item": str(item), "reason": str(exc)})
+                bar.update(len(chunk))
+    except KeyboardInterrupt:
+        logger.warning(f"{desc}: interrupted by user; shutting down workers...")
+    finally:
+        for ex in executors:
+            ex.shutdown(wait=True, cancel_futures=True)
+
+    return error_count, error_details
+
+
 def run_per_gpu_processes(
     run_worker: Callable,
     num_gpus: int,

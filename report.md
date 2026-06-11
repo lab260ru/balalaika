@@ -362,6 +362,75 @@ bit-exact — left as a knob-gated option, not taken.
 | WebDataset workers now receive **only their chunk's metadata** | full dict is GBs at 2 M rows, was pickled once per worker | stage 13; **this corrects §8 below** — the prior report claimed it was already done, but commit 5c124e5 only vectorized the load; now actually implemented |
 | Spawned workers honor the configured log level (`BALALAIKA_LOG_LEVEL` exported; DataLoader `worker_init_fn`) | emitted debug line 36.5 µs → 0.9 µs suppressed; stage/loader workers previously ran loguru's default DEBUG-to-stderr sink | every per-file `logger.debug` in dataset `__getitem__` at production scale (≈2 CPU-min per million files per call site, plus stderr noise) |
 
+### 4.14 Accents / ruAccent (stage 9) — lazy load, thread cap, batching, memo
+
+The slowest text stage. ruAccent loads four ONNX sessions plus a **koziev
+rupostagger (161 MB `ruword2tags.db` + a 2.4 MB CRF model) and rulemma
+(16.7 MB) rule engine that `process_all` never calls** (grep-verified; pinned
+by `tests/test_accents_fast.py`), and runs the stress-usage, ё-homograph and
+omograph models as **batch-1 ONNX calls per sentence**. Real ASR-chunk
+transcripts are ~1 sentence each (measured: median 15 chars, 1 sentence/file on
+250 real `_rover.txt`), so the only place ONNX batching pays off is *across
+files*. `src/accents/fast_accent.py` (`FastRUAccent`, mirroring §4.9's
+`fast_g2p.py`) keeps the four sessions, tokenizers and dictionaries and every
+per-sentence decision **byte-identical**, changing only the mechanics:
+
+- **lazy_rule_engine** (default on) — skips the unused koziev/rulemma load:
+  init **20.1 s → 11.3 s (1.78×)** and ~180 MB less RAM per worker.
+- **intra_op_threads** (default 4) — ruAccent's `load()` has no
+  `SessionOptions` hook, so each of the four sessions otherwise defaults to all
+  48 cores; with multiple workers that oversubscribes the 2-NUMA box. A
+  worker-scoped `InferenceSession.__init__` wrap caps it. **4 workers: stock
+  (uncapped, oversubscribed) 23.5 s → fast (capped) 14.7 s = 1.60×.**
+- **batch_sentences** (default on) — `process_batch(texts)` collects every
+  sentence of a file slab and runs ONE padded batch through the stress-usage and
+  ё-homograph models and ONE through the omograph model (raw logits are
+  attention-mask/batch-composition-invariant — measured 0.0 diff; the omograph's
+  even/odd-hypothesis selection, incl. its global softmax, is replayed exactly
+  per sentence on the shared logits). **CPU single worker: stock 5.21 s → fast
+  4.35 s = 1.20× (250 real-shaped fixtures, 0/250 char diffs).**
+- **memo_accent** (default on) — the **equivalence study's answer**: of
+  ruAccent's call paths, only `AccentModel.put_accent(word)` is provably
+  context-FREE (it lowercases the word, tokenizes that single string, runs the
+  accent ONNX, renders stress on the word — no sentence enters). The omograph
+  (`classify` over `<w>..</w>`-marked sentences) and ё-homograph
+  (`predict_yo_homographs(sentence)`) paths read the surrounding sentence and
+  are **never** memoized. The memo caches the '+' insertion *positions* keyed on
+  `word.lower()` (positions are case-invariant) and re-renders onto the original
+  case — verified byte-identical to stock across upper/lower/mixed case. Code
+  evidence is asserted in the test module.
+- **chunked submit** (item 5) — both accents and the phonemizer (stage 10) now
+  submit one `Future` per **slab** (`run_per_gpu_pool_chunked` in
+  `src/utils/parallel.py`) instead of one per file, collapsing O(N) Futures +
+  per-file IPC pickling at 2 M files. `run_per_gpu_pool` and its existing
+  callers (punctuation, transcription, denoising) are untouched; the new helper
+  has its own tests.
+
+**Proof of equivalence**: `FastRUAccent` is character-identical to stock
+`RUAccent.process_all` on the fixture corpus (homographs in disambiguating
+contexts — замок/мука/дорога/стоит/окна/белки; ё-restoration; OOV names/brands;
+ASR-like lowercase unpunctuated; punctuation-heavy; very short and very long) —
+**0 char diffs over the whole corpus, per feature and combined**; 0/250 diffs on
+the bench fixtures and 0/8 byte-diffs through the actual stage `process_chunk`
+(atomic write, idempotent resume). 50 tests in `tests/test_accents_fast.py`
+(per-feature equivalence, `process_batch` == per-file, thread-cap invariance,
+memo-gating code evidence, rule-engine-unused evidence, accent-memo correctness
+vs the real model). Knobs: `accent.use_fast_accent` (default True; False =
+stock per-file flow bit-for-bit), `batch_sentences` / `memo_accent` /
+`lazy_rule_engine` (each default True, independently verified),
+`accent.batch_size` (slab size, default 64), `accent.intra_op_threads`
+(default 4), `accent.device` (cuda/cpu), and `phonemizer.submit_chunk_size`
+(default 256). Bench: `python -m benchmarking.micro.bench_accents`.
+
+**Rejected after measurement**: naive within-file sentence batching (real files
+are 1 sentence → padding waste + Python post-processing made it 0.6–0.94× — a
+regression; the win is strictly cross-file, hence `process_batch`); batching the
+omograph into one cross-*file* softmax (its even-path softmax is global over the
+rows, so merging files would change selection — kept per-sentence-scoped);
+threads-instead-of-processes pool (ONNX releases the GIL but `num_workers=1`
+default means the spawn cost is paid once anyway, and a thread pool would share
+the §4.4-style per-file fallback less cleanly).
+
 ## 5. End-to-end validation on real audio (proof nothing broke)
 
 250 real Russian wavs (OpenSTT), old commit `410de9b` in a worktree vs HEAD,
@@ -493,11 +562,14 @@ absent on this node or larger refactors)
    measured on an idle GPU.
 5. Consider Parquet for pipeline *state* (keeping balalaika.csv as an export) —
    removes CSV parse cost entirely; bigger format decision, not taken unilaterally.
-6. **Accents stage (9)** is the slowest text stage per the audit: ruAccent runs
+6. ~~**Accents stage (9)** is the slowest text stage per the audit: ruAccent runs
    3-6 batch-1 ONNX calls per sentence with no batching, loads ~200 MB of
-   rule-engine assets per worker, and re-runs OOV words per sentence. Batching
-   inside ruAccent is upstream work; a word-level memo would change homograph
-   handling (context-dependent) — needs a careful equivalence study first.
+   rule-engine assets per worker, and re-runs OOV words per sentence.~~ Done —
+   see §4.14 (lazy rule-engine skip 1.78× load; thread cap 1.60× at 4 workers;
+   cross-file ONNX batching; context-free accent memo; chunked submit). The
+   word-level memo equivalence study found exactly one provably context-free
+   path (``put_accent``); homograph/ё paths are context-dependent and never
+   memoized.
 7. ~~**Antispoofing decode** (stage 6): the loader decodes + preemphasizes the
    full clip then keeps a random 4.04 s window — a seek-bounded read would cut
    ~3× of that decode CPU; exactness depends on container seek semantics
@@ -520,6 +592,9 @@ python -m benchmarking.micro.bench_g2p --make-fixtures      # §4.9 (once)
 python -m benchmarking.micro.bench_g2p --impl fast --label check   # §4.9
 python -m benchmarking.micro.bench_rover --label check --impl both # §4.11 (also proves 0 mismatches)
 python -m benchmarking.micro.bench_loudness --label check          # §4.12 (also proves 0 mismatches)
+python -m benchmarking.micro.bench_accents --make-fixtures         # §4.14 (once)
+python -m benchmarking.micro.bench_accents --impl both --label check          # §4.14 single-worker CPU + 0/250 diffs
+python -m benchmarking.micro.bench_accents --impl both --workers 4 --label cap # §4.14 thread-cap win (stock uncapped vs fast capped)
 TARGET=transcription.stage DATASET=cache/bench_sample/audio NUM_SAMPLES=250 \
   REPEATS=2 GPU_IDS=1 benchmarking/run_benchmark.sh                # §4.10 stage legs
 python -m benchmarking.warmup --config_path configs/config.yaml   # §2 (per node)

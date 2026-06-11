@@ -10,7 +10,7 @@ from loguru import logger
 from src.phonemizer.fast_g2p import FastG2P
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
-from src.utils.parallel import run_per_gpu_pool
+from src.utils.parallel import run_per_gpu_pool_chunked
 from src.utils.sidecars import pending_sidecar_chain
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config, read_file_content
@@ -29,7 +29,7 @@ def init_process(device_str: str, batch_size: int, oov_cache_path: str | None) -
     )
 
 
-def process_text(text_path: Path) -> None:
+def _process_one(text_path: Path) -> None:
     text_path = Path(text_path)
     output_path = text_path.with_name(f"{text_path.stem}_phonemes.txt")
     if output_path.exists():
@@ -50,6 +50,25 @@ def process_text(text_path: Path) -> None:
         raise
 
 
+def process_chunk(chunk) -> list:
+    """Run G2P over a slab of ``*_rover.txt`` paths.
+
+    The per-file G2P call (``FastG2P.__call__``) already batches OOV decode
+    across each text's unique words and shares its dict/OOV caches across the
+    whole worker, so the only change here vs the old one-file-per-Future loop is
+    that files arrive in slabs — O(N) Futures and per-file IPC pickling at 2M
+    files collapse to O(N/chunk_size).  Per-file fault isolation is preserved:
+    one bad file is reported, its slab-mates still complete."""
+    failures = []
+    for text_path in chunk:
+        try:
+            _process_one(text_path)
+        except Exception as exc:
+            logger.error(f"Error processing {Path(text_path).name}: {exc}")
+            failures.append({"item": str(text_path), "reason": str(exc)})
+    return failures
+
+
 def main(args):
     setup_logging("phonemizer", log_dir=args.log_dir)
     config = load_config(args.config_path, "phonemizer")
@@ -59,6 +78,8 @@ def main(args):
     device = config.get("device", "cuda")
     batch_size = config.get("g2p_batch_size", 64)
     oov_cache_path = config.get("oov_cache_path", "cache/g2p_oov_cache.pkl") or None
+    # Files per work-shard slab (submit-loop chunking; does not change G2P math).
+    chunk_size = int(config.get("submit_chunk_size", 256))
 
     pending_files = pending_sidecar_chain(
         src_path,
@@ -81,15 +102,16 @@ def main(args):
         # pool's default gpu_ids=range(device_count()) would refuse to run.
         pool_kwargs["gpu_ids"] = [0]
 
-    error_count, error_details = run_per_gpu_pool(
+    error_count, error_details = run_per_gpu_pool_chunked(
         pending_files,
-        work_fn=process_text,
+        work_fn=process_chunk,
         initializer=init_process,
         init_args_factory=lambda gpu_id: (
             "cpu" if device == "cpu" else f"cuda:{gpu_id}",
             batch_size,
             oov_cache_path,
         ),
+        chunk_size=chunk_size,
         num_workers_per_gpu=num_workers_per_gpu,
         desc="Phonemizer",
         **pool_kwargs,
