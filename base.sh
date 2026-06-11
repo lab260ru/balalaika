@@ -101,22 +101,54 @@ activate_venv "${BALALAIKA_VENV:-.dev_venv}"
 
 mkdir -p "${BALALAIKA_LOG_DIR:-./logs}"
 
-# ---- cudf.pandas accelerator ------------------------------------------------
-# Each stage's main process does the heavy CSV work (read_csv -> merge ->
-# atomic write) through pandas in csv_manager. cudf.pandas transparently
-# routes those calls to GPU when available and silently falls back to CPU
-# otherwise. We probe once at startup and toggle a launcher prefix per call.
+# ---- cudf.pandas accelerator (OPT-IN) ---------------------------------------
+# cudf.pandas transparently routes pandas calls to the GPU. It is now OPT-IN
+# (default OFF) for two concrete reasons:
 #
-# Disable explicitly with BALALAIKA_DISABLE_CUDF=1 (handy when debugging a
-# regression that smells like a cuDF/pandas API drift).
+#  1. csv_manager's hot path is the pyarrow CSV engine (report.md §4.1:
+#     3.4x read / 4.1x write). csv_manager deliberately DISABLES both pyarrow
+#     fast paths when it detects the cudf proxy, so enabling cudf.pandas
+#     silently forfeits those measured wins and routes the CSV-heavy path back
+#     through cuDF interception (fcntl-locked read/merge/write cycles full of
+#     ops cudf must D2H-fallback for).
+#  2. The blanket prefix injected cudf.pandas.install() into EVERY stage,
+#     including the GPU multiprocessing stages (ASR, denoising, DistillMOS,
+#     music_detect, antispoofing) whose parents do little parent-side pandas.
+#     Each such process then holds a cuDF CUDA context (hundreds of MB of VRAM)
+#     that contends with ORT/torch — an OOM risk on GPUs shared with a
+#     training job, not merely overhead.
+#
+# Opt back in on a node that genuinely benefits (CSV-bound stages, idle GPU)
+# with BALALAIKA_ENABLE_CUDF=1. BALALAIKA_DISABLE_CUDF=1 still forces it off
+# and wins if both are set.
 cudf_prefix=()
 if [[ "${BALALAIKA_DISABLE_CUDF:-0}" == "1" ]]; then
     echo "cudf.pandas: disabled via BALALAIKA_DISABLE_CUDF=1"
+elif [[ "${BALALAIKA_ENABLE_CUDF:-0}" != "1" ]]; then
+    echo "cudf.pandas: off by default (set BALALAIKA_ENABLE_CUDF=1 to opt in; keeps pyarrow CSV fast paths)"
 elif python3 -c "import cudf.pandas" >/dev/null 2>&1; then
     cudf_prefix=(python3 -m cudf.pandas)
-    echo "cudf.pandas: enabled (Pandas Accelerator Mode)"
+    echo "cudf.pandas: enabled via BALALAIKA_ENABLE_CUDF=1 (Pandas Accelerator Mode)"
 else
-    echo "cudf.pandas: not available, falling back to vanilla pandas"
+    echo "cudf.pandas: requested via BALALAIKA_ENABLE_CUDF=1 but not importable; falling back to vanilla pandas"
+fi
+
+# ---- thread-pool hygiene (OPT-IN) -------------------------------------------
+# This box has 48 logical cores shared with the user's training job. Left
+# uncapped, OpenMP/OpenBLAS/MKL each lazily spawn a full per-process thread
+# team (one per visible core) in every stage process AND every forked child
+# (loader workers, probe pools). With several workers that is hundreds of
+# spinning threads fighting the GPU EPs and the co-resident training job.
+#
+# runtime.threads_per_worker (BALALAIKA_THREADS_PER_WORKER) caps those teams
+# for all stage processes and the children they fork. Empty (the default)
+# exports nothing, so single-worker latency is unchanged (library defaults).
+if [[ -n "${BALALAIKA_THREADS_PER_WORKER:-}" ]]; then
+    export OMP_NUM_THREADS="$BALALAIKA_THREADS_PER_WORKER"
+    export OPENBLAS_NUM_THREADS="$BALALAIKA_THREADS_PER_WORKER"
+    export MKL_NUM_THREADS="$BALALAIKA_THREADS_PER_WORKER"
+    export NUMEXPR_NUM_THREADS="$BALALAIKA_THREADS_PER_WORKER"
+    echo "thread caps: OMP/OPENBLAS/MKL/NUMEXPR = $BALALAIKA_THREADS_PER_WORKER per worker"
 fi
 
 # ---- helpers ----------------------------------------------------------------

@@ -124,6 +124,19 @@ runtime:
   trt_workspace_bytes: 4294967296
   # Enable FP16 for TensorRT sessions when supported.
   trt_fp16: True
+  # Per-worker thread cap. Empty ("" — the default) leaves library defaults
+  # untouched so single-worker latency is unchanged. A positive int caps each
+  # stage process (and its forked children): ORT intra-op pools shrink to this
+  # value with inter-op=1 and no busy-spin on GPU-EP sessions, and base.sh
+  # exports OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS to match. Recommended on this
+  # 48-thread box shared with the training job, where multiple workers x
+  # multiple ORT sessions otherwise oversubscribe the CPU: try 4. Outputs of
+  # GPU-EP sessions are unaffected; CPU-executed ops change reduction order, so
+  # re-verify if a stage runs ops on CPU.
+  threads_per_worker: ""
+  # cudf.pandas is OFF by default (it disables the pyarrow CSV fast paths and
+  # adds a per-stage cuDF CUDA context that risks OOM on shared GPUs). Opt in
+  # on a cudf node with the env knob BALALAIKA_ENABLE_CUDF=1 (see base.sh).
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
@@ -177,6 +190,8 @@ preprocess:
   # Crest-factor DataLoader batch size per worker.
   crest_factor_batch_size: 1
   # Crest-factor DataLoader workers inside each process.
+  # Recommended: 4-8 on an HDD-backed dataset (0 serializes decode on the main
+  # thread, idling the CPU between files). Default kept at 0 for reproducibility.
   crest_factor_loader_workers: 0
   # Number of prefetched batches per crest-factor DataLoader worker.
   crest_factor_prefetch_factor: 2
@@ -194,6 +209,8 @@ preprocess:
   # Loudness-normalization DataLoader batch size per process.
   loudness_batch_size: 1
   # Loudness-normalization DataLoader workers inside each process.
+  # Recommended: 4-8 on an HDD-backed dataset (0 serializes decode -> LUFS ->
+  # re-encode on the main thread). Default kept at 0 for reproducibility.
   loudness_loader_workers: 0
   # Number of prefetched batches per loudness-normalization DataLoader worker.
   loudness_prefetch_factor: 2
@@ -369,6 +386,21 @@ denoising:
   processes: 0
   # TensorRT EP uses the shared runtime.trt_cache_path cache.
   use_tensorrt: True
+  # Optimization-profile "opt" length in seconds for the TRT engine. TensorRT
+  # tunes kernel tactics at this shape. 1.0 (default) reproduces the historical
+  # 1 s opt point byte-for-byte; real length-bucketed batches cluster at
+  # 5-15 s, so set ~= the dominant bucket (e.g. 15.0) to retune tactics for the
+  # lengths actually run. Clamped to the engine's [min, 20 s] bounds; rebuilds
+  # the engine once per node, then cached.
+  trt_opt_seconds: 1.0
+  # Background audio-save pool per GPU worker. 0 (default) saves synchronously
+  # inside the inference loop (byte- and behavior-identical to before). >0
+  # (e.g. 2-4) overlaps the HDD encode/write with the next GPU batch; the
+  # partial-CSV row is still written only after a successful save, and the
+  # shard is only marked done once all queued saves land. async_save_queue
+  # caps in-flight saves (RAM ~= queue x file size).
+  async_save_workers: 0
+  async_save_queue: 8
 
 export:
   podcasts_path: /mnt/hdd_6tb_1/yandex_data

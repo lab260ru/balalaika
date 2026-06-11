@@ -1,6 +1,7 @@
 """Shared in-memory crest filtering and loudness normalization."""
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Mapping, Optional
@@ -10,6 +11,51 @@ import pyloudnorm as pyln
 import torch
 
 _METER_CACHE: dict[tuple[int, float], pyln.Meter] = {}
+
+
+def save_audio_atomic(
+    audio_path: str,
+    tensor: "torch.Tensor",
+    sample_rate: int,
+) -> None:
+    """Atomically (over)write a normalized audio file in place.
+
+    The loudness/crest stages re-encode the *source* file in place. A plain
+    ``torchaudio.save_with_torchcodec`` over the original path leaves a
+    truncated file if the process is killed mid-encode — and since the
+    ``loudness_normalized`` marker is only written after a successful save, a
+    resume then re-decodes the now-corrupt audio and the original is gone with
+    no backup.
+
+    This writes to ``<path>.tmp<pid>`` in the SAME directory (so the final
+    ``os.replace`` is an atomic same-filesystem rename, no extra HDD seeks) and
+    swaps it onto the target only once the encode fully succeeded. The bytes
+    that land at the final path are byte-identical to the direct save (same
+    encoder, same args); only the failure window changes — mirrors the §11.8
+    ``download.py`` tmp+os.replace fix. A leftover ``.tmp<pid>`` from a crashed
+    process is cleaned up here on the next attempt.
+    """
+    import torchaudio
+
+    directory = os.path.dirname(audio_path) or "."
+    base = os.path.basename(audio_path)
+    # Keep the original extension on the temp file: save_with_torchcodec (and
+    # ffmpeg under it) pick the output container from the suffix, so the temp
+    # must end in the same ext (e.g. ".mp3"/".wav") to encode identically.
+    stem, ext = os.path.splitext(base)
+    tmp_path = os.path.join(directory, f"{stem}.tmp{os.getpid()}{ext}")
+    try:
+        torchaudio.save_with_torchcodec(tmp_path, tensor, sample_rate)
+        os.replace(tmp_path, audio_path)
+    except BaseException:
+        # Never leave a half-written temp behind (and never clobber the source
+        # on failure — the original is untouched until the atomic replace).
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _integrated_loudness_fast(meter: pyln.Meter, data: np.ndarray) -> float:

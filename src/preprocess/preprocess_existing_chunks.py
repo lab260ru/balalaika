@@ -33,6 +33,7 @@ from tqdm import tqdm
 from src.preprocess.audio_postprocessing import (
     fused_audio_preprocessing_enabled,
     postprocess_audio_tensor,
+    save_audio_atomic,
 )
 from src.preprocess.preprocess import (
     DEFAULT_CHUNK_DURATION_S,
@@ -269,7 +270,9 @@ def _postprocess_existing_chunk(
     if result.loudness_normalized:
         try:
             save_started_at = time.perf_counter()
-            torchaudio.save_with_torchcodec(path_audio, result.samples, int(native_sr))
+            # Atomic tmp+os.replace in the same dir: a crash mid-encode can no
+            # longer truncate the source file (bytes identical to direct save).
+            save_audio_atomic(path_audio, result.samples, int(native_sr))
             logger.debug(
                 f"perf audio_save stage=preprocess_existing_chunks path={path_audio} "
                 f"seconds={time.perf_counter() - save_started_at:.6f} "

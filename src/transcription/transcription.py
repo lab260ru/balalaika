@@ -20,7 +20,7 @@ from src.utils.datasets.transcription import (
     create_transcription_dataloader,
     recognize_batch,
 )
-from src.utils.gpu import get_onnx_providers
+from src.utils.gpu import get_onnx_providers, make_session_options
 from src.utils.logging_setup import setup_logging
 from src.utils.node_profile import resolve_batch_size
 from src.utils.parallel import run_per_gpu_processes
@@ -228,6 +228,9 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
         logger.info(f"ONNX providers for {model_name} on cuda:{cuda_id}: {providers}")
         load_args = [onnx_name] + ([local_path] if local_path else [])
         load_kwargs = {"providers": providers}
+        # No-op unless runtime.threads_per_worker is set (default keeps ORT's
+        # physical-core intra-op pool, so single-worker latency is unchanged).
+        load_kwargs["sess_options"] = make_session_options(config_path=config_path)
         if quantization:
             load_kwargs["quantization"] = quantization
 
@@ -287,11 +290,15 @@ class _GroupModelSpec:
     sample_rate: int
 
 
-def _load_group_model(model_name: str, config: dict, providers) -> _GroupModelSpec:
+def _load_group_model(
+    model_name: str, config: dict, providers, config_path: Optional[str] = None
+) -> _GroupModelSpec:
     onnx_name = MODEL_MAP.get(model_name, model_name)
     local_path = config.get('vosk_path') if 'vosk' in model_name else config.get('model_path')
     load_args = [onnx_name] + ([local_path] if local_path else [])
     load_kwargs = {"providers": providers}
+    # No-op unless runtime.threads_per_worker is set (see make_session_options).
+    load_kwargs["sess_options"] = make_session_options(config_path=config_path)
     if config.get('quantization'):
         load_kwargs["quantization"] = config.get('quantization')
 
@@ -422,7 +429,10 @@ def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
             cuda_id, use_tensorrt=config.get('use_tensorrt', False), config_path=config_path
         )
         logger.info(f"ONNX providers for group {group_models} on cuda:{cuda_id}: {providers}")
-        specs = [_load_group_model(name, config, providers) for name in group_models]
+        specs = [
+            _load_group_model(name, config, providers, config_path=config_path)
+            for name in group_models
+        ]
         for spec in specs:
             logger.info(
                 f"Worker {cuda_id}/{world_size}: {spec.name} loaded "

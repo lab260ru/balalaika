@@ -40,7 +40,11 @@ from src.utils.datasets.separation import (
     ANTISPOOF_SAMPLE_RATE,
     create_antispoofing_dataloader,
 )
-from src.utils.gpu import get_onnx_providers, onnx_first_input_name
+from src.utils.gpu import (
+    apply_ort_thread_caps,
+    get_onnx_providers,
+    onnx_first_input_name,
+)
 from src.utils.logging_setup import setup_logging
 from src.utils.node_profile import resolve_batch_size
 from src.utils.stage_status import write_stage_status
@@ -110,6 +114,9 @@ def create_session(
     model_path = ensure_model(model_path, cfg)
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    # No-op unless runtime.threads_per_worker is set (default keeps ORT's
+    # physical-core intra-op pool, so single-worker latency is unchanged).
+    apply_ort_thread_caps(options, config_path=config_path)
     use_tensorrt = bool(cfg.get("use_tensorrt", False))
     providers = get_onnx_providers(
         rank,
