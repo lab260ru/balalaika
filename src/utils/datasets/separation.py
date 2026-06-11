@@ -127,7 +127,10 @@ def create_distillmos_dataloader(
         "batch_size": batch_size,
         "shuffle": False,
         "num_workers": num_workers,
-        "pin_memory": False,
+        # pinned staging makes the stage's non_blocking H2D copy real
+        # (~35% faster copy, can overlap compute); without it non_blocking
+        # silently degrades to a synchronous pageable copy
+        "pin_memory": torch.cuda.is_available(),
         "collate_fn": distillmos_collate,
         "persistent_workers": num_workers > 0,
     }
