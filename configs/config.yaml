@@ -442,6 +442,34 @@ accent:
   # TensorRT EP for ruAccent ONNX path when supported.
   # Disabled — ruAccent model uses UINT8 casts unsupported by TensorRT.
   use_tensorrt: False
+  # "cuda" runs the four ruAccent ONNX sessions on cuda:N; "cpu" runs them on
+  # CPU (the report measures CPU as competitive on this 48-thread box and it
+  # uses zero VRAM — recommended when the GPUs are busy with training).
+  device: cuda
+  # FastRUAccent master switch. True (default) uses the in-repo fast path:
+  #   cross-file ONNX batching, a context-free per-word accent memo, and a lazy
+  #   skip of the unused koziev/rulemma rule engine (~180 MB + ~5 s/worker).
+  #   Proven character-identical to stock ruAccent on the fixture corpus
+  #   (tests/test_accents_fast.py). False restores stock RUAccent.process_all
+  #   per file bit-for-bit.
+  use_fast_accent: True
+  # Files per submit slab. The stage submits one Future per slab (not per file)
+  # and batches each slab's sentences through the ONNX models in one call each.
+  # Real ASR-chunk transcripts are ~1 sentence, so this batches ACROSS files —
+  # measured ~1.75x at 64 on CPU (250 real transcripts, 0/250 char diffs). Also
+  # caps O(N) Futures + per-file IPC pickling at multi-million-file scale.
+  batch_size: 64
+  # Intra-op thread cap for EACH of the four ruAccent ONNX sessions. ruAccent's
+  # load() exposes no SessionOptions hook, so without this every session would
+  # default to all 48 logical cores; with num_workers>1 that oversubscribes the
+  # 2-NUMA box (sessions x workers). 0 = stock (all cores). 4 is a safe default
+  # for multi-worker runs; raise toward 48/num_workers for a single worker.
+  intra_op_threads: 4
+  # Per-feature FastRUAccent knobs (all default True; each is independently
+  # verified character-identical). Turn one off to isolate a divergence.
+  batch_sentences: True   # cross-file/sentence ONNX batching
+  memo_accent: True       # context-free per-word put_accent memo
+  lazy_rule_engine: True  # skip the unused koziev/rulemma rule engine load
 
 phonemizer:
   podcasts_path: /mnt/hdd_6tb_1/yandex_data
@@ -449,6 +477,11 @@ phonemizer:
   # "cpu" runs G2P on CPU instead of cuda:N. The model is tiny (d=128);
   # batched CPU decode (~8 ms/word) is close to a busy GPU and uses no VRAM.
   device: cuda
+  # Files per submit slab. The stage submits one Future per slab instead of one
+  # per file, collapsing O(N) Future objects + per-file IPC pickling to
+  # O(N/chunk) at multi-million-file scale. Does NOT change G2P math (each file
+  # is still decoded independently; the worker's dict/OOV caches are shared).
+  submit_chunk_size: 256
   # Unique OOV words per padded greedy-decode batch.
   g2p_batch_size: 64
   # Cross-run/worker cache of OOV decodes, keyed by a model-weights

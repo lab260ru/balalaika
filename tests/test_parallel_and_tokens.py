@@ -20,7 +20,11 @@ from __future__ import annotations
 
 import pytest
 
-from src.utils.parallel import run_per_gpu_pool
+from src.utils.parallel import (
+    _chunk_list,
+    run_per_gpu_pool,
+    run_per_gpu_pool_chunked,
+)
 from src.utils.utils import process_token
 
 
@@ -38,6 +42,20 @@ def _work_fail_on_marked(item):
     if "FAIL" in str(item):
         raise ValueError(f"boom:{item}")
     return item
+
+
+def _chunk_work_fail_on_marked(chunk):
+    """Chunk work_fn: return one {item, reason} per item containing 'FAIL'."""
+    failures = []
+    for item in chunk:
+        if "FAIL" in str(item):
+            failures.append({"item": item, "reason": f"boom:{item}"})
+    return failures
+
+
+def _chunk_work_crash(chunk):
+    """Chunk work_fn that crashes the whole slab."""
+    raise RuntimeError("slab exploded")
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +136,95 @@ class TestRunPerGpuPoolErrorAttribution:
         # Each reason references its own item, proving the mapping is correct.
         for d in error_details:
             assert d["item"] in d["reason"]
+
+
+# ---------------------------------------------------------------------------
+# run_per_gpu_pool_chunked — slab submit (accents/phonemizer item 5)
+# ---------------------------------------------------------------------------
+
+class TestChunkList:
+    def test_chunk_sizes_and_coverage(self):
+        items = list(range(10))
+        chunks = _chunk_list(items, 3)
+        assert chunks == [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
+        # every item present exactly once, order preserved
+        assert [x for c in chunks for x in c] == items
+
+    def test_chunk_size_floor_is_one(self):
+        assert _chunk_list([1, 2, 3], 0) == [[1], [2], [3]]
+
+
+class TestRunPerGpuPoolChunked:
+    def test_empty_items_returns_two_tuple(self):
+        result = run_per_gpu_pool_chunked(
+            [],
+            work_fn=_chunk_work_fail_on_marked,
+            initializer=_noop_init,
+            init_args_factory=lambda gpu_id: (),
+            chunk_size=4,
+            gpu_ids=[0],
+            desc="empty",
+        )
+        assert result == (0, [])
+
+    def test_all_success(self):
+        error_count, error_details = run_per_gpu_pool_chunked(
+            ["a", "b", "c", "d", "e"],
+            work_fn=_chunk_work_fail_on_marked,
+            initializer=_noop_init,
+            init_args_factory=lambda gpu_id: (),
+            chunk_size=2,
+            num_workers_per_gpu=2,
+            gpu_ids=[0],
+            desc="ok",
+        )
+        assert error_count == 0
+        assert error_details == []
+
+    def test_per_item_failures_inside_a_slab(self):
+        """A single bad file is reported; its slab-mates are NOT counted."""
+        items = ["ok-1", "FAIL-2", "ok-3", "FAIL-4", "ok-5", "ok-6"]
+        error_count, error_details = run_per_gpu_pool_chunked(
+            items,
+            work_fn=_chunk_work_fail_on_marked,
+            initializer=_noop_init,
+            init_args_factory=lambda gpu_id: (),
+            chunk_size=3,
+            num_workers_per_gpu=1,
+            gpu_ids=[0],
+            desc="attrib",
+        )
+        assert error_count == 2
+        failed = {d["item"] for d in error_details}
+        assert failed == {"FAIL-2", "FAIL-4"}
+        for d in error_details:
+            assert d["item"] in d["reason"]
+
+    def test_slab_crash_attributes_all_its_items(self):
+        items = ["a", "b", "c", "d"]
+        error_count, error_details = run_per_gpu_pool_chunked(
+            items,
+            work_fn=_chunk_work_crash,
+            initializer=_noop_init,
+            init_args_factory=lambda gpu_id: (),
+            chunk_size=4,  # single slab => all 4 items attributed the crash
+            num_workers_per_gpu=1,
+            gpu_ids=[0],
+            desc="crash",
+        )
+        assert error_count == 4
+        assert {d["item"] for d in error_details} == {"a", "b", "c", "d"}
+
+    def test_no_gpu_ids_raises(self):
+        with pytest.raises(RuntimeError):
+            run_per_gpu_pool_chunked(
+                ["a"],
+                work_fn=_chunk_work_fail_on_marked,
+                initializer=_noop_init,
+                init_args_factory=lambda gpu_id: (),
+                chunk_size=4,
+                gpu_ids=[],
+            )
 
 
 # ---------------------------------------------------------------------------
