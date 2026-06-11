@@ -42,9 +42,26 @@ class DenoisingDataset(Dataset):
     def __init__(self, file_paths: List[str], sample_rate: int = DENOISING_SAMPLE_RATE):
         self.file_paths = file_paths
         self.sample_rate = int(sample_rate)
+        # Cache one transforms.Resample per source rate. torchaudio.functional
+        # .resample rebuilds the (sinc) polyphase kernel on EVERY call; the
+        # transform precomputes and reuses it. Same kernel parameters => the
+        # resampled tensor is bit-identical, just without the per-file rebuild.
+        # Each loader worker gets its own dataset copy, so this dict is
+        # process-local and needs no locking.
+        self._resamplers: dict[int, "torchaudio.transforms.Resample"] = {}
 
     def __len__(self) -> int:
         return len(self.file_paths)
+
+    def _resample(self, waveform: torch.Tensor, source_sample_rate: int) -> torch.Tensor:
+        resampler = self._resamplers.get(source_sample_rate)
+        if resampler is None:
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=source_sample_rate,
+                new_freq=self.sample_rate,
+            )
+            self._resamplers[source_sample_rate] = resampler
+        return resampler(waveform)
 
     def __getitem__(self, idx: int):
         path = self.file_paths[idx]
@@ -55,11 +72,7 @@ class DenoisingDataset(Dataset):
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
             if int(source_sample_rate) != self.sample_rate:
-                waveform = torchaudio.functional.resample(
-                    waveform,
-                    int(source_sample_rate),
-                    self.sample_rate,
-                )
+                waveform = self._resample(waveform, int(source_sample_rate))
             audio = normalize_to_int16(waveform.squeeze(0).numpy())
             if audio.size == 0:
                 raise RuntimeError("empty audio")
@@ -84,14 +97,34 @@ def denoising_collate(
     max_padded_len: int = 96_000,
 ) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[str]]:
     paths, waveforms, lengths, errors = zip(*batch)
+    paths = list(paths)
+    lengths = list(lengths)
+    errors = list(errors)
+
+    # A single file longer than the model's hard input cap used to raise here,
+    # which propagated through the DataLoader, killed the GPU worker, and
+    # abandoned its whole claimed shard. Instead mark each oversize item as a
+    # per-item error (counted + skipped exactly like a decode failure) and zero
+    # its length so it never enters padding/inference. Valid files are
+    # unaffected: padded_len is computed over the survivors only, so a giant
+    # neighbour no longer pads — or fails — the rest of the batch.
+    cap = int(max_padded_len) if max_padded_len else 0
+    if cap:
+        for idx in range(len(lengths)):
+            if errors[idx]:
+                continue
+            needed = next_multiple(int(lengths[idx]), int(pad_to_multiple))
+            if needed > cap:
+                errors[idx] = (
+                    f"audio length {int(lengths[idx])} exceeds model max "
+                    f"{cap} samples ({cap / DENOISING_SAMPLE_RATE:.1f}s); skipped"
+                )
+                lengths[idx] = 0
+
     lengths_tensor = torch.tensor(lengths, dtype=torch.int64)
-    padded_len = max(int(lengths_tensor.max()), int(pad_to_multiple))
+    valid_max = max((int(l) for l in lengths), default=0)
+    padded_len = max(valid_max, int(pad_to_multiple))
     padded_len = next_multiple(padded_len, int(pad_to_multiple))
-    if max_padded_len and padded_len > int(max_padded_len):
-        raise RuntimeError(
-            f"Batch padded length {padded_len} exceeds max_padded_len={max_padded_len}. "
-            "Increase the TensorRT max profile shape or use shorter files."
-        )
 
     padded = torch.zeros((len(batch), 1, padded_len), dtype=torch.int16)
     for idx, waveform in enumerate(waveforms):
@@ -103,7 +136,18 @@ def denoising_collate(
         if pad_len > 0 and pad_mode == "noise":
             padded[idx, 0, length:] = make_noise_padding(waveform, pad_len)
 
-    return list(paths), padded.contiguous(), lengths_tensor, list(errors)
+    return paths, padded.contiguous(), lengths_tensor, errors
+
+
+def denoising_worker_init(_: int) -> None:
+    # Each spawned loader worker otherwise inherits torch's default intra-op
+    # thread count (up to all physical cores). With several workers x several
+    # ORT sessions on a CPU shared with the training job, that oversubscribes
+    # the box. Per-file decode/resample is already parallelized across the
+    # workers, so per-op threading only adds scheduler thrash. Mirrors
+    # crest_factor_worker_init; conv1d parallelizes over output positions so
+    # the resampled tensor stays bit-identical at 1 thread.
+    torch.set_num_threads(1)
 
 
 def create_denoising_dataloader(
@@ -133,4 +177,5 @@ def create_denoising_dataloader(
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["worker_init_fn"] = denoising_worker_init
     return DataLoader(dataset, **loader_kwargs)
