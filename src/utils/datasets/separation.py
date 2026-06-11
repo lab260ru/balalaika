@@ -12,6 +12,8 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from src.utils.logging_setup import dataloader_worker_init
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,16 +64,11 @@ def distillmos_collate(batch: List[Tuple[str, torch.Tensor]]) -> Tuple[List[str]
 
 
 def estimate_audio_lengths(file_paths: List[str]) -> Dict[str, float]:
+    from src.utils.audit import safe_audio_duration
+
     lengths = {}
     for path_str in tqdm(file_paths, desc="Read audio before start"):
-        try:
-            info = torchaudio.info(path_str)
-            if info.sample_rate and info.num_frames:
-                lengths[path_str] = float(info.num_frames) / float(info.sample_rate)
-            else:
-                lengths[path_str] = 0.0
-        except Exception:
-            lengths[path_str] = 0.0
+        lengths[path_str] = safe_audio_duration(path_str)
     return lengths
 
 
@@ -121,8 +118,13 @@ def create_distillmos_dataloader(
     num_workers: int,
     prefetch_factor: int,
     cache_dir: str = "",
+    assume_sorted: bool = False,
 ) -> DataLoader:
-    dataset = DistillMOSDataset(sort_by_length(file_paths, cache_dir=cache_dir))
+    # Work shards from prepare_length_bucketed_work_shards are already
+    # duration-sorted; re-probing every file (and thrashing the shared JSON
+    # cache, which never hits across disjoint shards) is dead work.
+    ordered = file_paths if assume_sorted else sort_by_length(file_paths, cache_dir=cache_dir)
+    dataset = DistillMOSDataset(ordered)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,
@@ -136,6 +138,7 @@ def create_distillmos_dataloader(
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["worker_init_fn"] = dataloader_worker_init
     return DataLoader(dataset, **loader_kwargs)
 
 
@@ -235,4 +238,5 @@ def create_antispoofing_dataloader(
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["worker_init_fn"] = dataloader_worker_init
     return DataLoader(dataset, **loader_kwargs)

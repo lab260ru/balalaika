@@ -281,6 +281,16 @@ transcription:
   use_tensorrt: True
   use_vad: False
   use_rover: True
+  # Decode/resample each audio file ONCE for the first consensus_num models
+  # (they always process every pending file) instead of once per model —
+  # saves N-1 disk reads + decodes per file. Each model keeps its own batch
+  # size via sub-batching. Costs the summed VRAM of the grouped models on
+  # each GPU; set False on very tight VRAM or to reproduce the old
+  # one-model-at-a-time flow exactly.
+  share_decode: True
+  # Numba-accelerated ROVER aggregation (identical outputs, ~12x faster;
+  # pinned by tests/test_fast_rover.py). False falls back to crowd-kit.
+  use_fast_rover: True
   # CPU processes for ROVER shard aggregation.
   rover_workers: 4
   batch_size: 8

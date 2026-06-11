@@ -1,6 +1,7 @@
 # Balalaika Pipeline Performance Report
 
-Date: 2026-06-11 · Branch: `claude` · All numbers measured on this node.
+Date: 2026-06-11 (two passes; second pass = §4.10–4.13) · Branch: `claude` ·
+All numbers measured on this node.
 
 ## 1. Node and environment
 
@@ -246,6 +247,121 @@ Low-resource note: `phonemizer.device: cpu` runs the whole stage on CPU at
 ~8 ms/word batched — on this node that beats the *busy* GPU and uses zero
 VRAM; keep `cuda` (default) when GPUs are idle.
 
+### 4.10 Transcription stage restructure: shared decode (stage 7) — 1.39×, second pass 2026-06-11
+
+The stage ran its 5 ASR models strictly sequentially, and **each model
+re-read and re-decoded every audio file from disk** through its own
+DataLoader (`src/utils/datasets/transcription.py`), plus respawned GPU
+workers per model. The first `consensus_num` models always process every
+pending file (the consensus filter only engages after that many models
+exist), so they now run as one **shared-decode group**: each file is read,
+decoded and resampled once per GPU worker, and every grouped model consumes
+the same macro-batch through per-model sub-batching (each model keeps its
+own `batch_size: auto` value; per-chunk re-trimming keeps tensor shapes
+identical to the sequential flow). The remaining models keep the exact
+sequential flow because their pending sets depend on the previous model's
+outputs. Work shards now carry per-path "which models still need me"
+annotations, so resume semantics are preserved per model.
+
+Knob: `transcription.share_decode` (default True; False restores the old
+flow bit-for-bit). VRAM cost: the grouped models' sum on each GPU — on very
+tight VRAM set False.
+
+Measured, 250 real files × 5 models + ROVER, GPU 1 shared with training:
+
+| Leg | Wall | Note |
+|---|---|---|
+| Harness before (warm TRT) | 243.6 s | `transcription.stage`, repeat 2 |
+| Harness after (2 repeats) | 168.5 / 184.2 s | **1.38×** |
+| Same-conditions A/B, sequential | 254.2 s | `share_decode: false` |
+| Same-conditions A/B, shared | 183.5 s | **1.39×** |
+
+On this SSD-and-16-loader-workers node the saving is mostly CPU decode +
+worker respawn; on the production HDD the same change removes **2 of 3 full
+passes of random reads** for the grouped models (decode count measured in
+tests: `2·N+odd → N+odd` for 3 models with consensus 2), which is the
+dominant cost there. Avg RSS during the stage also dropped 13.0 → 11.8 GB.
+
+**Proof of unchanged outputs**: `tests/test_transcription_share_decode.py`
+pins byte-identical sidecars between both modes with deterministic fake
+models (orchestration-level equivalence: pending-set union, sub-batching,
+timestamps, consensus skipping, resume). On the real 250-file set with real
+models: 1749 = 1749 sidecars, **1742/1749 byte-identical, including every
+`_rover.txt` (0/250 differ — the stage's downstream product is unchanged)**.
+The 7 diffs (0.4 %) are single-token flips confined to one model
+(giga_ctc: 5 `.tst` + 2 `.txt` of 250). Controls: each mode is internally
+**deterministic** — sequential run twice → 0/1749 differ; shared run twice
+→ 0/1749 differ — so this is not run noise but a stable mode-dependent
+numeric divergence: three ORT/TRT sessions sharing one GPU process select
+different kernels/workspaces for giga_ctc, shifting float rounding on
+knife-edge frames. Same class of bounded divergence as the already-accepted
+Spectra-0 TRT fp16 (§7) and G2P TF32 pins (§4.9); `share_decode: false`
+restores the old flow bit-for-bit where strict reproducibility matters.
+Bonus robustness fix: ASR sidecars are now written atomically (tmp+rename)
+— a killed worker previously left a truncated `.txt` that resume scans
+accepted forever.
+
+### 4.11 ROVER aggregation: numba fast path — 12.2×
+
+crowd-kit's `ROVER._align` is an O(n·m) dynamic program in pure Python with
+per-cell tuple/list allocations, attrs objects, and a `deepcopy` in the
+traceback, run (models−1) times per file. `src/transcription/fast_rover.py`
+keeps the exact algorithm — same costs, same option-order tie-breaking,
+same zero-cost deletion against empty-token edge sets, same
+`(count, len(word), word)` voting — but runs the DP in a cached numba
+kernel over integer word ids; only the O(n+m) traceback/voting stays in
+Python.
+
+`benchmarking/micro/bench_rover.py`, 2000 ASR-like tasks (9424 hypothesis
+rows, 5 models, word-level corruptions):
+
+| Impl | tasks/s | per file |
+|---|---|---|
+| crowd-kit | 70 | 14.2 ms |
+| **FastROVER** | **857** | **1.2 ms** |
+
+At 500 k files this turns ~30 min of ROVER DP (4 workers) into ~2.5 min.
+**Output equality: 0/2000 aggregated strings differ**; pinned further by 13
+tests in `tests/test_fast_rover.py` (randomized corpora + every tie-break
+edge case). Knob: `transcription.use_fast_rover` (default True; crowd-kit
+fallback also engages automatically if numba is unavailable). Worker
+startup pays a one-time ~0.4 s numba cache load (`cache=True`; compile
+happens once per machine).
+
+### 4.12 BS.1770 loudness gating: bit-exact vectorization (stages 1+3)
+
+pyloudnorm's gating loop squares every sample ~4× (75 % overlapping blocks,
+fresh temp per block) and runs the gating passes as per-block Python list
+comprehensions. `_integrated_loudness_fast` in
+`src/preprocess/audio_postprocessing.py` squares each channel once and
+keeps every reduction's element order/length/dtype identical (numpy pairwise
+summation depends only on those), including the original's per-block
+`int()` truncation of block bounds — so the LUFS float, and therefore the
+normalized audio bytes, are **identical** (the §5 byte-identical bar
+still holds). Falls back to the stock meter on anything unexpected.
+
+Honest numbers: the measure step is dominated by the two scipy `lfilter`
+K-weighting passes, so the end-to-end win is modest — 1.22× on 100 real
+clips, 1.15× on 15–60 s chunks, plus removed allocation churn in the
+stage-1 fused path. 17 tests (`tests/test_fast_loudness.py`) pin LUFS
+equality and array equality on real + synthetic edge-case audio; 0/100
+mismatches in `benchmarking/micro/bench_loudness.py`. A further ~2×
+(fusing both biquads into one `sosfilt` pass) is possible but **not**
+bit-exact — left as a knob-gated option, not taken.
+
+### 4.13 Cross-stage quick wins (second pass)
+
+| Fix | Measured | Where it shows |
+|---|---|---|
+| Dead `import torch` removed from `src/utils/utils.py` | 2.5 s / 626 MB → 0.2 s / 24 MB per process | every CPU-only stage (download, both filters, collate, webdataset, report) **and each of their spawned workers** |
+| Duration probes: soundfile-first for wav/flac/ogg/opus (`safe_audio_duration`) | 4.6 ms → 0.07 ms per file (**66×**), 0/250 value mismatches | duration backfills in transcription/distillmos/music_detect; probe workers no longer import torch |
+| DistillMOS per-shard re-probe removed (`assume_sorted`) | probe pass gone (6 → 0 occurrences in stage logs), 48.6 → 44.2 s on 250 files; **scores bit-identical: max abs delta 0.0 across all 250 files** (real model, GPU 0) | stage 5 worker startup per shard (~24 s per 10 k-file shard on the HDD) + removes a racy shared JSON cache; knob `distillmos.sort_in_loader: true` restores old behavior |
+| music_detect durations hoisted out of workers (per-path values ride shard annotations, exact `str(float)` round-trip) | removes a full-CSV read (+ possible rewrite) **per claimed shard** inside GPU workers | stage 4 (pattern mirrors distillmos; not end-to-end runnable on this node — model weights absent; round-trip pinned by tests) |
+| `unprocessed_paths` narrow read (header sniff + `usecols=[filepath, column]`; missing column now skips the body read entirely) | 17-col 2 M-row fixture: 5.09 s → 4.10 s and ~0.5 GB less transient RAM; 10-col fixture 4.78 → 4.43 s; identical pending sets | every stage startup; wins grow with CSV width (production CSVs carry text columns) |
+| Collate main-CSV read switched to `fast_read_csv` (pyarrow) | ~3.4× on this read at 2 M rows (per §4.1 measurements) | stage 12 startup |
+| WebDataset workers now receive **only their chunk's metadata** | full dict is GBs at 2 M rows, was pickled once per worker | stage 13; **this corrects §8 below** — the prior report claimed it was already done, but commit 5c124e5 only vectorized the load; now actually implemented |
+| Spawned workers honor the configured log level (`BALALAIKA_LOG_LEVEL` exported; DataLoader `worker_init_fn`) | emitted debug line 36.5 µs → 0.9 µs suppressed; stage/loader workers previously ran loguru's default DEBUG-to-stderr sink | every per-file `logger.debug` in dataset `__getitem__` at production scale (≈2 CPU-min per million files per call site, plus stderr noise) |
+
 ## 5. End-to-end validation on real audio (proof nothing broke)
 
 250 real Russian wavs (OpenSTT), old commit `410de9b` in a worktree vs HEAD,
@@ -354,20 +470,42 @@ anyway, and the warmup sweep uses CUDA EP so it finishes in minutes, not hours.
 ## 9. Recommended next steps (analyzed, not applied — need either model files
 absent on this node or larger refactors)
 
-1. **Transcription stage restructure**: decode/resample each file once and share
-   across the 5 ASR models (currently 5 full decodes per file), and keep workers
-   alive across models instead of respawning per model. Largest remaining win in
-   the pipeline (decode is ~5× redundant), but a structural change to stage 7.
+1. ~~**Transcription stage restructure**: decode/resample each file once and
+   share across the ASR models.~~ Done — see §4.10 (1.39×). Remaining ideas
+   for stage 7: keep DataLoader workers alive across shards (GPU idles a few
+   seconds per 10 k-file shard), and the **RNNT decode loop** — giga_rnnt runs
+   200+ sequential batch-1 ONNX decoder calls per file inside onnx-asr (why it
+   sits at 7 it/s vs ~60 for CTC and sets the stage critical path); fixing it
+   means batched/stateful decode inside the onnx-asr Kaldi adapter (upstream
+   surgery, high effort, high payoff).
 2. **Sortformer/SmartTurn (stage 1)**: batch SmartVAD calls across segments; ORT
    IOBinding to kill per-window GPU→CPU→GPU round-trips; vectorize `_binarize`
    and spkcache compression (file:line details in `.claude/analysis/preprocess-*.json`).
-   Untestable here — the ONNX model files are not on this node.
+   Untestable here — the ONNX model files are not on this node. The 2026-06-11
+   second-pass audit additionally flagged: the ACTIVE existing_chunks+fuse path
+   decodes every chunk twice; diarization decode is fully serialized with GPU
+   inference (`diarization_loader_workers: 0`); raw mode accumulates all
+   chunk-row dicts in RAM. Full details: `.claude/analysis/audit2_findings.json`.
 3. ~~**Phonemizer**: persist the word→phoneme cache across runs and batch
    `greedy_decode` over unique words.~~ Done — see §4.9.
 4. **tone batch size**: raise beyond 64 (still climbing at the sweep cap) once
    measured on an idle GPU.
 5. Consider Parquet for pipeline *state* (keeping balalaika.csv as an export) —
    removes CSV parse cost entirely; bigger format decision, not taken unilaterally.
+6. **Accents stage (9)** is the slowest text stage per the audit: ruAccent runs
+   3-6 batch-1 ONNX calls per sentence with no batching, loads ~200 MB of
+   rule-engine assets per worker, and re-runs OOV words per sentence. Batching
+   inside ruAccent is upstream work; a word-level memo would change homograph
+   handling (context-dependent) — needs a careful equivalence study first.
+7. **Antispoofing decode** (stage 6): the loader decodes + preemphasizes the
+   full clip then keeps a random 4.04 s window — a seek-bounded read would cut
+   ~3× of that decode CPU; exactness depends on container seek semantics
+   (bit-exact for PCM wav/FLAC, needs verification per format).
+8. **Collate RAM**: stage 12 holds every sidecar text ~3× over (records list →
+   DataFrame → Arrow) while writing the parquet; chunked assembly would cap
+   peak RSS on low-RAM nodes.
+9. Remaining smaller audit findings (with verifier verdicts where the budget
+   allowed) are preserved in `.claude/analysis/audit2_findings.json`.
 
 ## 10. How to reproduce every number
 
@@ -378,7 +516,11 @@ python -m benchmarking.micro.bench_csv_ops --label check    # §4.1 table
 python -m benchmarking.micro.bench_collate --label check    # §4.2
 python -m benchmarking.micro.bench_g2p --make-fixtures      # §4.9 (once)
 python -m benchmarking.micro.bench_g2p --impl fast --label check   # §4.9
+python -m benchmarking.micro.bench_rover --label check --impl both # §4.11 (also proves 0 mismatches)
+python -m benchmarking.micro.bench_loudness --label check          # §4.12 (also proves 0 mismatches)
+TARGET=transcription.stage DATASET=cache/bench_sample/audio NUM_SAMPLES=250 \
+  REPEATS=2 GPU_IDS=1 benchmarking/run_benchmark.sh                # §4.10 stage legs
 python -m benchmarking.warmup --config_path configs/config.yaml   # §2 (per node)
-python -m pytest tests/ -q                                  # 76+ behavior tests
+python -m pytest tests/ -q                                  # 120+ behavior tests
 # stage-level before/after harness runs: benchmarking/reports/2026*/report.json
 ```

@@ -570,11 +570,36 @@ def unprocessed_paths(
     fresh-disk-but-stale-CSV state still gets processed.
     """
     logger.info(f"Loading main CSV to find unprocessed paths for column '{column}'.")
-    df = load_main_csv(podcasts_path)
+    df = None
+    main_path = csv_path(podcasts_path)
+    try:
+        with open(main_path, "r", encoding="utf-8", newline="") as f:
+            header = next(csv.reader(f))
+    except Exception:
+        header = None
 
     audio_resolved = normalize_path_values(
         audio_paths, desc=f"resolve_{column}_paths", drop_empty=True
     )
+
+    if header is not None and "filepath" in header:
+        if column not in header:
+            logger.info(
+                f"Column '{column}' is missing from the CSV header; "
+                f"all {len(audio_resolved)} paths are pending."
+            )
+            return audio_resolved
+        try:
+            # Only the 2 needed columns: a full-width read of a production
+            # CSV holds every text/score column in RAM just to drop it.
+            df = fast_read_csv(main_path, usecols=["filepath", column])
+            df["filepath"] = _normalize_path_series(df["filepath"])
+        except Exception as exc:
+            logger.warning(f"Narrow CSV read failed ({exc}); falling back to full read.")
+            df = None
+
+    if df is None:
+        df = load_main_csv(podcasts_path)
 
     if column not in df.columns or df.empty:
         logger.info(

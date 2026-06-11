@@ -1,8 +1,9 @@
 import argparse
 import multiprocessing as mp
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 import onnx_asr
 import torch
@@ -14,7 +15,11 @@ from src.utils.audio_durations import (
     duration_probe_workers,
     ensure_audio_durations,
 )
-from src.utils.datasets.transcription import create_transcription_dataloader, recognize_batch
+from src.utils.datasets.transcription import (
+    create_group_transcription_dataloader,
+    create_transcription_dataloader,
+    recognize_batch,
+)
 from src.utils.gpu import get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.node_profile import resolve_batch_size
@@ -28,6 +33,7 @@ from src.utils.work_shards import (
     load_work_shard_size,
     mark_work_shard_done,
     prepare_length_bucketed_work_shards,
+    read_annotated_work_shard,
     read_work_shard,
 )
 
@@ -57,6 +63,18 @@ def format_length_range(lengths: torch.Tensor, sample_rate: int) -> str:
     return f"min={seconds.min().item():.2f}s max={seconds.max().item():.2f}s"
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    """tmp+rename so a killed worker can't leave a truncated sidecar.
+
+    A partially written transcript passes the resume scan forever (only
+    zero-byte files are retried), so sidecars must appear atomically.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    tmp.replace(path)
+
+
 def save_results(paths: List[str], texts: List[Optional[str]], timestamps: Optional[List[Optional[str]]], model_suffix: str):
     for i, (path_str, text) in enumerate(zip(paths, texts)):
         path = Path(path_str)
@@ -67,8 +85,7 @@ def save_results(paths: List[str], texts: List[Optional[str]], timestamps: Optio
 
         txt_path = path.with_name(f"{path.stem}_{model_suffix}.txt")
         try:
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(text)
+            _write_text_atomic(txt_path, text)
         except Exception as e:
             logger.error(f"Write TXT failed {path.name}: {e}")
 
@@ -76,8 +93,7 @@ def save_results(paths: List[str], texts: List[Optional[str]], timestamps: Optio
         if ts:
             tst_path = path.with_name(f"{path.stem}_{model_suffix}.tst")
             try:
-                with open(tst_path, "w", encoding="utf-8") as f:
-                    f.write(ts)
+                _write_text_atomic(tst_path, ts)
             except Exception as e:
                 logger.error(f"Write TST failed {path.name}: {e}")
 
@@ -259,6 +275,184 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
         if error_details is not None:
             error_details.append({"worker": cuda_id, "model": model_name, "reason": str(e)})
 
+@dataclass
+class _GroupModelSpec:
+    """One loaded ASR model inside a shared-decode group worker."""
+
+    name: str
+    model: object
+    suffix: str
+    do_timestamps: bool
+    batch_size: int
+    sample_rate: int
+
+
+def _load_group_model(model_name: str, config: dict, providers) -> _GroupModelSpec:
+    onnx_name = MODEL_MAP.get(model_name, model_name)
+    local_path = config.get('vosk_path') if 'vosk' in model_name else config.get('model_path')
+    load_args = [onnx_name] + ([local_path] if local_path else [])
+    load_kwargs = {"providers": providers}
+    if config.get('quantization'):
+        load_kwargs["quantization"] = config.get('quantization')
+
+    model = onnx_asr.load_model(*load_args, **load_kwargs)
+
+    do_timestamps = config.get('with_timestamps', False) and model_name in SUPPORTED_TIMESTAMPS
+    if do_timestamps:
+        model = model.with_timestamps()
+    if config.get('use_vad', False):
+        vad = onnx_asr.load_vad("silero", **config.get('vad_params', {}))
+        model = model.with_vad(vad)
+
+    sample_rate = int(model.asr._get_sample_rate()) if hasattr(model, "asr") else TARGET_SAMPLE_RATE
+    return _GroupModelSpec(
+        name=model_name,
+        model=model,
+        suffix='vosk' if 'vosk' in model_name else model_name,
+        do_timestamps=do_timestamps,
+        batch_size=resolve_batch_size(
+            f"transcription.{model_name}", config.get('batch_size'), 16
+        ),
+        sample_rate=sample_rate,
+    )
+
+
+def _recognize_chunk(spec: _GroupModelSpec, paths: List[str], waveforms, lengths,
+                     sample_rate: int, errors_counter=None, error_details=None):
+    """Run one model over one sub-chunk with the same per-file fallback as
+    the sequential path."""
+    try:
+        return recognize_batch(spec.model, waveforms, lengths)
+    except Exception as e:
+        logger.error(
+            f"Batch failed for {spec.name}: files={len(paths)}, "
+            f"lengths=({format_length_range(lengths, sample_rate)}): {e}. "
+            "Falling back to single-file mode."
+        )
+        results = []
+        for path_str, waveform, length in zip(paths, waveforms, lengths):
+            try:
+                results.extend(recognize_batch(
+                    spec.model, waveform[:length].unsqueeze(0).contiguous(), length.unsqueeze(0)
+                ))
+            except Exception as e2:
+                seconds = float(length.item()) / float(sample_rate)
+                logger.error(f"File failed for {spec.name}: seconds={seconds:.2f}, file={path_str}: {e2}")
+                results.append(None)
+                if errors_counter is not None:
+                    errors_counter.value += 1
+                if error_details is not None:
+                    error_details.append({"file": path_str, "model": spec.name, "seconds": seconds, "reason": str(e2)})
+        return results
+
+
+def _process_group_files(cuda_id: int, specs: List[_GroupModelSpec],
+                         items: List[tuple], config: dict,
+                         processed_counter=None, errors_counter=None, error_details=None):
+    """Shared-decode pass: decode each file once, run every model that still
+    needs it in sub-chunks of that model's own batch size."""
+    all_names = [spec.name for spec in specs]
+    files: List[str] = []
+    needed: Dict[str, Set[str]] = {}
+    for path, note in items:
+        files.append(path)
+        needed[path] = set(note.split(',')) if note else set(all_names)
+
+    macro_batch = max(spec.batch_size for spec in specs)
+    num_loader_workers = int(config.get('num_workers', 4))
+    prefetch_factor = int(config.get('prefetch_factor', 2))
+
+    dataloader = create_group_transcription_dataloader(
+        files,
+        sample_rates=[spec.sample_rate for spec in specs],
+        batch_size=macro_batch,
+        num_workers=num_loader_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    for paths, padded_by_rate, load_errors in tqdm(dataloader, desc=f"ASR-group-{cuda_id}", position=cuda_id):
+        for path_str, reason in load_errors:
+            # Mirror the sequential flow's accounting: each model that still
+            # needed this file would have failed to load it once.
+            for name in needed.get(path_str, set(all_names)):
+                logger.error(f"Audio load failed {path_str}: {reason}")
+                if errors_counter is not None:
+                    errors_counter.value += 1
+                if error_details is not None:
+                    error_details.append({"file": path_str, "model": name, "reason": reason})
+
+        if not paths:
+            continue
+
+        for spec in specs:
+            indices = [i for i, p in enumerate(paths) if spec.name in needed[p]]
+            if not indices:
+                continue
+            padded, lengths = padded_by_rate[spec.sample_rate]
+            for start in range(0, len(indices), spec.batch_size):
+                chunk = indices[start:start + spec.batch_size]
+                chunk_paths = [paths[i] for i in chunk]
+                chunk_lengths = lengths[chunk]
+                max_len = int(chunk_lengths.max().item())
+                chunk_waveforms = padded[chunk][:, :max_len].contiguous()
+
+                results = _recognize_chunk(
+                    spec, chunk_paths, chunk_waveforms, chunk_lengths,
+                    spec.sample_rate, errors_counter, error_details,
+                )
+                if not isinstance(results, list):
+                    results = [results]
+                texts = [None if r is None else extract_text(r) for r in results]
+                ts = [None if r is None else format_timestamps(r) for r in results] if spec.do_timestamps else None
+                save_results(chunk_paths, texts, ts, spec.suffix)
+
+                if processed_counter is not None:
+                    processed_counter.value += len(chunk_paths)
+
+
+def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
+                     work_dir: str, config: dict, config_path: Optional[str] = None,
+                     processed_counter=None, errors_counter=None, error_details=None):
+    """Shared-decode inference worker: loads ALL group models on one GPU and
+    claims annotated file shards (path TAB comma-joined-pending-models)."""
+    torch.cuda.set_device(cuda_id)
+
+    try:
+        providers = get_onnx_providers(
+            cuda_id, use_tensorrt=config.get('use_tensorrt', False), config_path=config_path
+        )
+        logger.info(f"ONNX providers for group {group_models} on cuda:{cuda_id}: {providers}")
+        specs = [_load_group_model(name, config, providers) for name in group_models]
+        for spec in specs:
+            logger.info(
+                f"Worker {cuda_id}/{world_size}: {spec.name} loaded "
+                f"(batch={spec.batch_size}, rate={spec.sample_rate}, timestamps={spec.do_timestamps})"
+            )
+
+        claimed = 0
+        while True:
+            shard_path = claim_work_shard(work_dir, cuda_id)
+            if shard_path is None:
+                break
+            items = read_annotated_work_shard(shard_path)
+            claimed += 1
+            logger.info(f"Worker {cuda_id}: group-processing {len(items)} files from {shard_path.name}")
+            _process_group_files(
+                cuda_id, specs, items, config,
+                processed_counter, errors_counter, error_details,
+            )
+            mark_work_shard_done(shard_path)
+
+        logger.info(f"Worker {cuda_id} finished {claimed} shard(s) for group {group_models}.")
+
+    except Exception as e:
+        logger.exception(f"Worker {cuda_id} fatal error (group {group_models}): {e}")
+        if errors_counter is not None:
+            errors_counter.value += 1
+        if error_details is not None:
+            error_details.append({"worker": cuda_id, "model": ",".join(group_models), "reason": str(e)})
+
+
 def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int) -> bool:
     texts = []
     for mn in model_names:
@@ -336,7 +530,74 @@ def main(args):
     if retry_empty_outputs:
         logger.info("Retry-empty mode enabled: zero-byte transcript sidecars will be reprocessed")
 
+    share_decode = bool(config.get('share_decode', True))
+    # The first consensus_num models always transcribe every pending file (the
+    # consensus filter in get_valid_paths only engages once that many earlier
+    # models exist), so they can share one decode per file without changing
+    # which files any model processes. The remaining models keep the exact
+    # sequential flow because each one's pending set depends on the previous
+    # model's outputs (consensus skipping).
+    always_run = model_names[:consensus_num] if consensus_num > 0 else list(model_names)
+    grouped_models = always_run if (share_decode and len(always_run) > 1) else []
+
+    shard_size = load_work_shard_size(args.config_path)
+    duration_workers = duration_probe_workers(config)
+    bucket_seconds, max_bucket_duration = duration_bucket_settings(
+        args.config_path,
+        config,
+    )
+
+    if grouped_models:
+        logger.info(f"=== shared-decode group: {grouped_models} ===")
+        needed: Dict[str, List[str]] = {}
+        for model_name in grouped_models:
+            output_suffix = 'vosk' if 'vosk' in model_name else model_name
+            for p in get_valid_paths(src_path, output_suffix, [], consensus_num, retry_empty_outputs, args.config_path):
+                needed.setdefault(p, []).append(model_name)
+
+        if not needed:
+            logger.info(f"No files to process for group {grouped_models}")
+        else:
+            union_paths = list(needed.keys())
+            durations = ensure_audio_durations(
+                src_path,
+                union_paths,
+                num_workers=duration_workers,
+            )
+            annotations = {p: ",".join(models) for p, models in needed.items()}
+            group_tag = "_".join('vosk' if 'vosk' in m else m for m in grouped_models)
+            work_plan = prepare_length_bucketed_work_shards(
+                src_path,
+                f"transcription_group_{group_tag}",
+                union_paths,
+                durations,
+                shard_size=shard_size,
+                bucket_seconds=bucket_seconds,
+                max_duration=max_bucket_duration,
+                annotations=annotations,
+            )
+            del union_paths
+            del durations
+            del needed
+
+            logger.info(
+                f"{work_plan.total_items} files to process for group {grouped_models} "
+                f"in {work_plan.shard_count} shard(s)."
+            )
+
+            worker_errors, worker_error_details = run_per_gpu_processes(
+                run_group_worker,
+                num_gpus=num_gpus,
+                args=(grouped_models, str(work_plan.work_dir), config, args.config_path, processed, errors, error_details_list),
+            )
+            if worker_errors:
+                errors.value += worker_errors
+                for detail in worker_error_details:
+                    error_details_list.append({"model": ",".join(grouped_models), **detail})
+
     for idx, model_name in enumerate(model_names):
+        if model_name in grouped_models:
+            continue
         logger.info(f"=== [{idx + 1}/{len(model_names)}] {model_name} ===")
 
         output_suffix = 'vosk' if 'vosk' in model_name else model_name
@@ -347,16 +608,10 @@ def main(args):
             logger.info(f"No files to process for {model_name}")
             continue
 
-        shard_size = load_work_shard_size(args.config_path)
-        duration_workers = duration_probe_workers(config)
         durations = ensure_audio_durations(
             src_path,
             paths,
             num_workers=duration_workers,
-        )
-        bucket_seconds, max_bucket_duration = duration_bucket_settings(
-            args.config_path,
-            config,
         )
         work_plan = prepare_length_bucketed_work_shards(
             src_path,
@@ -396,6 +651,7 @@ def main(args):
                 shard_size=config.get('rover_shard_size'),
                 workers=config.get('rover_workers', 1),
                 retry_empty_outputs=retry_empty_outputs,
+                use_fast_rover=bool(config.get('use_fast_rover', True)),
             ).aggregate_and_save()
             logger.info("ROVER done.")
         except ImportError:

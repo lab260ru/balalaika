@@ -94,12 +94,16 @@ def _process_files(
     if not pending_files:
         return
 
+    # Shards arrive duration-sorted from prepare_length_bucketed_work_shards;
+    # sort_in_loader: true restores the old per-shard re-probe + JSON cache.
+    sort_in_loader = bool(config.get("distillmos", {}).get("sort_in_loader", False))
     dataloader = create_distillmos_dataloader(
         pending_files,
         batch_size=batch_size,
         num_workers=num_loader_workers,
         prefetch_factor=prefetch_factor,
         cache_dir=str(podcasts_path),
+        assume_sorted=not sort_in_loader,
     )
     prefetch_batches = num_loader_workers * prefetch_factor if num_loader_workers > 0 else 0
     logger.debug(

@@ -1,8 +1,6 @@
 from pathlib import Path
 from typing import List, Tuple
 
-import torch
-
 import re
 import yaml
 from loguru import logger

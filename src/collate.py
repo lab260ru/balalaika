@@ -6,7 +6,7 @@ from typing import Dict, Iterable, Optional
 import concurrent.futures
 from loguru import logger
 
-from src.utils.csv_manager import discover_audio_paths
+from src.utils.csv_manager import discover_audio_paths, fast_read_csv
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config, read_file_content
@@ -241,7 +241,7 @@ def main(args):
     df_path = Path(base_path) / "balalaika.csv"
     if df_path.exists():
         logger.info(f"Loading existing dataframe from {df_path}")
-        df = pd.read_csv(df_path)
+        df = fast_read_csv(df_path)
         df.drop_duplicates(subset='filepath', inplace=True)
         df = drop_csv_text_columns(df, extra_columns=sidecar_columns)
     else:

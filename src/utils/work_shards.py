@@ -67,12 +67,23 @@ def _write_one_shard(work_dir: Path, shard_index: int, paths: List[str]) -> None
     tmp.replace(final)
 
 
-def _write_labeled_shard(work_dir: Path, shard_index: int, label: str, paths: List[str]) -> None:
+def _write_labeled_shard(
+    work_dir: Path,
+    shard_index: int,
+    label: str,
+    paths: List[str],
+    annotations: Optional[Mapping[str, str]] = None,
+) -> None:
     final = work_dir / f"shard_{shard_index:06d}_{label}.pending"
     tmp = final.with_suffix(final.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8", newline="") as f:
         for path in paths:
             f.write(path)
+            if annotations is not None:
+                note = annotations.get(path, "")
+                if note:
+                    f.write("\t")
+                    f.write(note)
             f.write("\n")
     tmp.replace(final)
 
@@ -101,12 +112,16 @@ def prepare_work_shards(
     *,
     shard_size: int = DEFAULT_WORK_SHARD_SIZE,
     limit: Optional[int] = None,
+    annotations: Optional[Mapping[str, str]] = None,
 ) -> WorkShardPlan:
     """Write work shards for ``paths`` and return a small plan object.
 
     Existing work shards for the stage are discarded. The stage recomputes
     pending work from ``balalaika.csv`` before calling this, so stale shard
     files from an interrupted older run are safe to replace.
+
+    ``annotations`` optionally maps a path to a short string stored after a
+    tab on the same line (read back with :func:`read_annotated_work_shard`).
     """
     shard_size = max(1, int(shard_size or DEFAULT_WORK_SHARD_SIZE))
     work_dir = stage_work_dir(podcasts_path, stage_name)
@@ -121,6 +136,12 @@ def prepare_work_shards(
         else (len(paths) if hasattr(paths, "__len__") else None)
     )
 
+    def flush(paths_chunk: List[str], index: int) -> None:
+        if annotations is None:
+            _write_one_shard(work_dir, index, paths_chunk)
+        else:
+            _write_labeled_shard(work_dir, index, "plain", paths_chunk, annotations)
+
     for raw in tqdm(
         paths,
         total=expected_total,
@@ -134,12 +155,12 @@ def prepare_work_shards(
         current.append(path)
         total += 1
         if len(current) >= shard_size:
-            _write_one_shard(work_dir, shard_count, current)
+            flush(current, shard_count)
             shard_count += 1
             current = []
 
     if current:
-        _write_one_shard(work_dir, shard_count, current)
+        flush(current, shard_count)
         shard_count += 1
 
     logger.info(
@@ -159,6 +180,7 @@ def prepare_length_bucketed_work_shards(
     bucket_seconds: float = 1.0,
     max_duration: float = 15.0,
     limit: Optional[int] = None,
+    annotations: Optional[Mapping[str, str]] = None,
 ) -> WorkShardPlan:
     """Write work shards grouped by audio duration buckets.
 
@@ -167,6 +189,12 @@ def prepare_length_bucketed_work_shards(
     max go into a separate overflow bucket so they do not inflate normal
     short-clip batches. Existing stage shards are discarded, same as
     :func:`prepare_work_shards`.
+
+    ``annotations`` optionally maps a path to a short string stored after a
+    tab on the same shard line (used by grouped transcription to record
+    which models still need the file). Read such shards back with
+    :func:`read_annotated_work_shard`; the plain :func:`read_work_shard`
+    would return the raw tab-joined lines.
     """
     shard_size = max(1, int(shard_size or DEFAULT_WORK_SHARD_SIZE))
     bucket_seconds = max(0.001, float(bucket_seconds or 1.0))
@@ -210,6 +238,7 @@ def prepare_length_bucketed_work_shards(
                 shard_count,
                 label,
                 bucket_paths[start:start + shard_size],
+                annotations,
             )
             shard_count += 1
 
@@ -240,6 +269,22 @@ def claim_work_shard(work_dir: str | Path, worker_id: int) -> Optional[Path]:
 def read_work_shard(shard_path: str | Path) -> List[str]:
     with Path(shard_path).open("r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
+
+
+def read_annotated_work_shard(shard_path: str | Path) -> List[tuple[str, str]]:
+    """Read a shard written with ``annotations`` as (path, annotation) pairs.
+
+    Lines without a tab (plain shards) yield an empty annotation.
+    """
+    items: List[tuple[str, str]] = []
+    with Path(shard_path).open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            path, _, note = line.partition("\t")
+            items.append((path, note))
+    return items
 
 
 def mark_work_shard_done(shard_path: str | Path) -> None:

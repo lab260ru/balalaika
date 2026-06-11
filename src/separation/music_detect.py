@@ -26,7 +26,7 @@ import argparse
 import os
 import time
 from pathlib import Path
-from typing import List, Set
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 import torch
@@ -62,7 +62,7 @@ from src.utils.work_shards import (
     load_work_shard_size,
     mark_work_shard_done,
     prepare_work_shards,
-    read_work_shard,
+    read_annotated_work_shard,
 )
 
 apply_torch_perf_defaults(disable_math_sdp=False)
@@ -107,6 +107,7 @@ def _process_files(
     processed_counter,
     skipped_counter,
     errors_counter,
+    audio_lengths: Optional[Dict[str, float]] = None,
 ) -> int:
     cfg = config.get("music_detect", {})
     threshold = cfg.get("threshold", 0.5)
@@ -123,11 +124,14 @@ def _process_files(
     if not pending_files:
         return 0
 
-    audio_lengths = ensure_audio_durations(
-        podcasts_path,
-        pending_files,
-        num_workers=duration_probe_workers(cfg, config),
-    )
+    if audio_lengths is None:
+        # Fallback for shards without duration annotations; main() normally
+        # hoists this (one full-CSV pass) instead of paying it per shard.
+        audio_lengths = ensure_audio_durations(
+            podcasts_path,
+            pending_files,
+            num_workers=duration_probe_workers(cfg, config),
+        )
     dataloader = create_loader(
         pending_files,
         cfg.get("base_model", "microsoft/wavlm-base-plus"),
@@ -226,7 +230,14 @@ def run_worker(rank: int, world_size: int, work_dir: str, config: dict, processe
                 shard_path = claim_work_shard(work_dir, rank)
                 if shard_path is None:
                     break
-                shard_files = read_work_shard(shard_path)
+                items = read_annotated_work_shard(shard_path)
+                shard_files = [path for path, _ in items]
+                shard_lengths: Optional[Dict[str, float]] = None
+                if items and all(note for _, note in items):
+                    try:
+                        shard_lengths = {path: float(note) for path, note in items}
+                    except ValueError:
+                        shard_lengths = None
                 claimed += 1
                 logger.info(f"[{device}] Processing {len(shard_files)} files from {shard_path.name}...")
                 deleted_total += _process_files(
@@ -240,6 +251,7 @@ def run_worker(rank: int, world_size: int, work_dir: str, config: dict, processe
                     processed_counter,
                     skipped_counter,
                     errors_counter,
+                    audio_lengths=shard_lengths,
                 )
                 mark_work_shard_done(shard_path)
 
@@ -311,13 +323,25 @@ def main(args):
         return
 
     shard_size = load_work_shard_size(args.config_path)
+    # One duration pass for the whole stage; workers used to re-read (and
+    # sometimes rewrite) the full CSV once per claimed shard.
+    md_cfg = config.get("music_detect", {})
+    durations = ensure_audio_durations(
+        podcasts_path,
+        pending,
+        num_workers=duration_probe_workers(md_cfg, config),
+    )
+    annotations = {p: str(float(durations.get(p, 0.0) or 0.0)) for p in pending}
     work_plan = prepare_work_shards(
         podcasts_path,
         PARTIAL_PREFIX,
         pending,
         shard_size=shard_size,
+        annotations=annotations,
     )
     del pending
+    del durations
+    del annotations
 
     logger.info(
         f"{work_plan.total_items} files still need a music_prob; "

@@ -205,11 +205,17 @@ def main(config, config_path: str | None = None):
 
     logger.info(f"Starting {len(chunks)} workers to build WebDataset from {len(all_audio_paths)} audio files...")
 
+    def chunk_metadata(chunk: List[str]) -> Dict[str, dict]:
+        # Ship each worker only its own chunk's records — the full dict is
+        # GBs at production row counts and gets pickled once per worker.
+        stems = {os.path.splitext(os.path.basename(p))[0] for p in chunk}
+        return {s: metadata_dict[s] for s in stems if s in metadata_dict}
+
     total_processed = 0
     total_errors = 0
     with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
         futures = [
-            executor.submit(worker_fn, worker_id, chunk, wds_output_dir, metadata_dict, max_shard_size, max_shard_count)
+            executor.submit(worker_fn, worker_id, chunk, wds_output_dir, chunk_metadata(chunk), max_shard_size, max_shard_count)
             for worker_id, chunk in enumerate(chunks)
         ]
 
