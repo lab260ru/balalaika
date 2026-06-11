@@ -60,7 +60,9 @@ def run_per_gpu_pool(
         desc: Tqdm description.
 
     Returns:
-        Number of items that completed successfully.
+        A ``(error_count, error_details)`` tuple: the number of items whose
+        ``work_fn`` raised, and a list of ``{"item", "reason"}`` dicts (one per
+        failure).
     """
     if gpu_ids is None:
         gpu_ids = list(range(torch.cuda.device_count()))
@@ -68,12 +70,11 @@ def run_per_gpu_pool(
     if not gpu_ids:
         raise RuntimeError("No GPUs available; refusing to run a per-GPU pool.")
     if not items:
-        return 0, [], []
+        return 0, []
 
     shards = shard_round_robin(items, len(gpu_ids))
     executors: List[ProcessPoolExecutor] = []
-    futures: List = []
-    completed = 0
+    future_to_item: dict = {}
     error_count = 0
     error_details: list[dict] = []
 
@@ -93,15 +94,15 @@ def run_per_gpu_pool(
             )
             executors.append(ex)
             for item in chunk:
-                futures.append(ex.submit(work_fn, item))
+                future_to_item[ex.submit(work_fn, item)] = item
 
-        with tqdm(total=len(futures), desc=desc) as bar:
-            for fut in as_completed(futures):
+        with tqdm(total=len(future_to_item), desc=desc) as bar:
+            for fut in as_completed(future_to_item):
                 try:
                     fut.result()
-                    completed += 1
                 except Exception as exc:
-                    logger.error(f"{desc}: task failed: {exc}")
+                    item = future_to_item[fut]
+                    logger.error(f"{desc}: task failed for {item}: {exc}")
                     error_count += 1
                     error_details.append({"item": str(item), "reason": str(exc)})
                 bar.update(1)

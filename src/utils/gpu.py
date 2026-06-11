@@ -1,6 +1,6 @@
 """GPU / ONNX-Runtime helpers shared across pipeline stages.
 
-Three small helpers:
+Two small helpers:
 
 * :func:`apply_torch_perf_defaults` — the same TF32 / Flash / Mem-efficient SDP
   toggles every stage opted into. Replaces the ~5-line ``torch.backends.cuda``
@@ -8,8 +8,6 @@ Three small helpers:
 * :func:`get_onnx_providers` — single source of truth for the onnxruntime
   provider tuple list. With ``use_tensorrt=True`` it returns a TensorRT-first
   list using the engine cache root from the runtime config block.
-* :func:`gpu_count` — small wrapper around ``torch.cuda.device_count`` that
-  doesn't crash on CPU-only hosts.
 """
 from __future__ import annotations
 

@@ -120,6 +120,8 @@ def process_token(token, label):
         return token.upper() + "..."
     if label == "UPPER_TOTAL_QUESTIONVOSKL":
         return token.upper() + "?!"
+    logger.debug(f"process_token: unrecognized label {label!r}; returning token unchanged.")
+    return token
 
 def normalize_text(text: str) -> str:
     text = text.lower().strip()

@@ -75,7 +75,7 @@ cache_path: ./cache
 csv:
   # Fold worker partial CSVs into balalaika.csv after every N rows of
   # cumulative progress across workers. 0 disables periodic flushing
-  # (only the post-stage merge runs). 10 000 rows ≈ a few seconds of pandas
+  # (only the post-stage merge runs). 100 000 rows ≈ a few seconds of pandas
   # work on a multi-million-row CSV; raise it for very large datasets.
   flush_every_rows: 100000
   # Fallback timer: at least flush every N seconds even if the row threshold
@@ -91,8 +91,13 @@ csv:
 runtime:
   # Python virtualenv that base.sh / *_yaml.sh activate.
   venv_path: .dev_venv
-  # CPU range passed to `taskset -c` for CPU-bound stages. Empty to disable.
-  cpu_affinity: "0-80"
+  # CPU range passed to `taskset -c` for CPU-bound stages. Empty ("") disables
+  # pinning entirely, which is the safe default: an explicit range that exceeds
+  # the host's core count (e.g. "0-80" on a 48-core box) is silently clamped by
+  # taskset and a stale range can mis-pin or crash on smaller machines. Set a
+  # NUMA-local range manually (e.g. "0-23") for memory-bound stages where you
+  # want all workers on one socket; leave empty to let the OS scheduler decide.
+  cpu_affinity: ""
   # Default directory for per-stage rotating log files. CLIs accept --log_dir.
   log_dir: ./logs
   # Minimum log level for console and per-stage files. Use DEBUG to include
