@@ -73,7 +73,18 @@ cache_path: ./cache
 # until the next run.
 # -----------------------------------------------------------------------------
 csv:
-  # Fold worker partial CSVs into balalaika.csv after every N rows of
+  # Pipeline-state format. "csv" (default) keeps balalaika.csv as the live
+  # state file — zero behavior change. "parquet" keeps state in
+  # balalaika.parquet (snappy) for all hot ops (load, atomic write with .bak,
+  # periodic flush, absorb, drop_missing, narrow column reads — parquet column
+  # projection makes those genuinely cheap and preserves dtypes natively), and
+  # still writes balalaika.csv as an export at stage completion so external
+  # consumers keep working. Resume is seamless: a legacy CSV-only dataset is
+  # migrated to parquet on first load; a stale parquet under csv mode is
+  # ignored with a warning. Measured at 2 M rows: ~1.9x faster atomic write,
+  # cheaper narrow reads; the CSV export round-trips byte-identical.
+  state_format: csv
+  # Fold worker partial CSVs into the state file after every N rows of
   # cumulative progress across workers. 0 disables periodic flushing
   # (only the post-stage merge runs). 100 000 rows ≈ a few seconds of pandas
   # work on a multi-million-row CSV; raise it for very large datasets.

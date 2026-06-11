@@ -42,6 +42,7 @@ from loguru import logger
 from tqdm import tqdm
 
 CSV_NAME = "balalaika.csv"
+PARQUET_NAME = "balalaika.parquet"
 AUDIO_EXTENSIONS: Tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".opus")
 
 # Default knobs for the periodic merger. Overridable via the top-level `csv:`
@@ -75,8 +76,42 @@ BASE_COLUMNS: Tuple[str, ...] = (
 
 
 def csv_path(podcasts_path: os.PathLike | str) -> Path:
-    """Return the canonical path to ``balalaika.csv`` for a dataset root."""
+    """Return the canonical path to the CSV export for a dataset root.
+
+    This is always ``<root>/balalaika.csv`` regardless of the state format: in
+    parquet mode the CSV is kept as an export for external consumers, in csv
+    mode it *is* the state file.
+    """
     return Path(podcasts_path) / CSV_NAME
+
+
+def parquet_path(podcasts_path: os.PathLike | str) -> Path:
+    """Return the path to ``balalaika.parquet`` for a dataset root."""
+    return Path(podcasts_path) / PARQUET_NAME
+
+
+def state_format() -> str:
+    """Resolve the pipeline state format: ``"csv"`` (default) or ``"parquet"``.
+
+    Read from the ``BALALAIKA_STATE_FORMAT`` environment variable (exported by
+    ``base.sh`` from the ``csv.state_format`` config key, so it also reaches
+    spawned workers). Anything other than ``parquet`` — including unset — means
+    csv mode, preserving the zero-behavior-change default.
+    """
+    value = os.environ.get("BALALAIKA_STATE_FORMAT", "").strip().lower()
+    return "parquet" if value == "parquet" else "csv"
+
+
+def state_path(podcasts_path: os.PathLike | str) -> Path:
+    """Return the active pipeline-state file for a dataset root.
+
+    ``balalaika.parquet`` in parquet mode, else ``balalaika.csv``. All state
+    ops (load / atomic write / flush / absorb / drop_missing / narrow reads)
+    operate on this file; :func:`csv_path` remains the CSV export target.
+    """
+    if state_format() == "parquet":
+        return parquet_path(podcasts_path)
+    return csv_path(podcasts_path)
 
 
 def resolve_path(p: os.PathLike | str) -> str:
@@ -139,6 +174,36 @@ def _normalize_path_series(values: pd.Series) -> pd.Series:
     if needs_resolve.any():
         s.loc[needs_resolve] = [resolve_path(p) for p in s.loc[needs_resolve]]
     return s
+
+
+def _filepath_is_canonical(col: pd.Series) -> bool:
+    """Cheap check: is every value already an absolute, stripped path string?
+
+    Steady-state pipeline CSVs store absolute, already-stripped paths, so the
+    expensive ``astype(str)`` materialisation + per-row resolve done by
+    :func:`_normalize_path_series` is almost always a no-op that produces a
+    value-identical Series — but at the cost of a fresh object column the size
+    of the whole frame. This guard answers "would normalization change
+    anything?" so we can skip the duplicate (and the enclosing ``df.copy()``)
+    entirely when it wouldn't.
+
+    A value is left unchanged by normalization iff it is already a ``str`` that
+    is absolute and free of surrounding whitespace. Any non-string (NaN, None,
+    numbers), relative path, empty string, or whitespace-padded value forces
+    the full normalization path.
+    """
+    if col.dtype != object:
+        # Numeric / bool columns stringify to a different representation.
+        return False
+    sep = os.sep
+    for v in col.to_numpy():
+        if type(v) is not str:
+            return False  # NaN/None/numbers -> astype(str) changes them
+        if not v.startswith(sep):
+            return False  # relative path (incl. "") -> would be resolved
+        if v != v.strip():
+            return False  # surrounding whitespace would be stripped
+    return True
 
 
 def _paths_exist_mask(paths: Sequence[str], *, desc: str) -> List[bool]:
@@ -222,12 +287,74 @@ def fast_read_csv(path, **kwargs) -> pd.DataFrame:
         return pd.read_csv(path, low_memory=False, **kwargs)
 
 
+def _read_parquet(path, columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """Read a parquet state file (optionally projecting ``columns``).
+
+    Column projection is genuinely cheap in parquet (only the requested column
+    chunks leave the disk), which is what makes the narrow reads in
+    :func:`unprocessed_paths` / the duration cache so much lighter in parquet
+    mode than the equivalent CSV ``usecols`` read.
+    """
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path, columns=list(columns) if columns is not None else None)
+    return table.to_pandas()
+
+
+def _is_parquet_path(path: Path) -> bool:
+    """True for the parquet state file and its ``.bak`` / ``.tmp`` siblings.
+
+    The backup/temp helpers append a suffix (``balalaika.parquet.bak``,
+    ``balalaika.parquet.tmp.<pid>``), so a plain ``.suffix`` check is not
+    enough — match on the ``.parquet`` component anywhere in the name.
+    """
+    name = path.name.lower()
+    return name.endswith(".parquet") or ".parquet." in name
+
+
+def _read_state_body(path: Path) -> pd.DataFrame:
+    """Read a state file, dispatching on its suffix (parquet vs CSV)."""
+    if _is_parquet_path(path):
+        return _read_parquet(path)
+    return fast_read_csv(path)
+
+
+def _state_header(path: Path) -> Optional[List[str]]:
+    """Return the column names of a state file without reading the body.
+
+    CSV: read the first line. Parquet: read the schema (metadata only). Returns
+    ``None`` if the file is missing/unreadable.
+    """
+    if not path.exists():
+        return None
+    try:
+        if _is_parquet_path(path):
+            import pyarrow.parquet as pq
+
+            return list(pq.read_schema(path).names)
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            return list(next(csv.reader(f)))
+    except Exception:
+        return None
+
+
+def _read_state_narrow(path: Path, columns: Sequence[str]) -> pd.DataFrame:
+    """Read only ``columns`` from a state file (parquet projection / CSV usecols)."""
+    if _is_parquet_path(path):
+        return _read_parquet(path, columns=list(columns))
+    return fast_read_csv(path, usecols=list(columns))
+
+
 def _read_csv_safe(path: Path) -> Optional[pd.DataFrame]:
-    """Best-effort read; tolerates a stale ``.tmp`` left by an earlier crash."""
+    """Best-effort read; tolerates a stale ``.tmp`` left by an earlier crash.
+
+    Works for both CSV and parquet state files (dispatch on suffix). Named for
+    its historical CSV role; the body reader handles either format.
+    """
     if path.exists():
         try:
-            logger.info(f"Reading CSV {path.name}...")
-            df = fast_read_csv(path)
+            logger.info(f"Reading state {path.name}...")
+            df = _read_state_body(path)
             logger.info(f"Read {len(df)} rows from {path.name}.")
             return df
         except pd.errors.EmptyDataError:
@@ -247,8 +374,8 @@ def _read_csv_safe(path: Path) -> Optional[pd.DataFrame]:
         if not tmp.exists():
             continue
         try:
-            logger.info(f"Reading CSV fallback {tmp.name}...")
-            df = fast_read_csv(tmp)
+            logger.info(f"Reading state fallback {tmp.name}...")
+            df = _read_state_body(tmp)
             logger.info(f"Recovered {len(df)} rows from leftover {tmp.name}.")
             return df
         except Exception as exc:
@@ -323,7 +450,35 @@ def _write_csv_with_progress(df: pd.DataFrame, path: Path, *, desc: str) -> None
             )
 
 
+def _write_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Write ``df`` to a parquet state file (snappy compression).
+
+    Parquet preserves dtypes natively, so the parquet state file round-trips
+    int/float/bool/str/NaN columns exactly — no string round-trip / dtype
+    re-inference like CSV. snappy keeps writes fast and files compact.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, str(path), compression="snappy")
+
+
+def _write_state_body(df: pd.DataFrame, path: Path) -> None:
+    """Serialize ``df`` to ``path`` dispatching on suffix (parquet vs CSV)."""
+    if _is_parquet_path(path):
+        _write_parquet(df, path)
+    else:
+        _write_csv_with_progress(df, path, desc=f"write_{path.name}")
+
+
 def _atomic_write_csv_unlocked(df: pd.DataFrame, path: Path) -> None:
+    """Atomically write ``df`` to ``path`` (tmp + hardlink .bak + fsync + rename).
+
+    Format-agnostic: ``balalaika.csv`` writes CSV, ``balalaika.parquet`` writes
+    snappy parquet. The atomicity machinery (tmp file, hardlink backup, fsync,
+    rename) is identical for both.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(
         f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
@@ -334,15 +489,15 @@ def _atomic_write_csv_unlocked(df: pd.DataFrame, path: Path) -> None:
         # Hardlink instead of byte-copy: after os.replace() swaps `path` to the
         # new inode, `bak` still references the previous generation — identical
         # backup semantics at O(1) cost instead of re-reading/writing the whole
-        # multi-GB CSV on every flush. Falls back to a copy on filesystems
-        # without hardlink support.
+        # multi-GB state file on every flush. Falls back to a copy on
+        # filesystems without hardlink support.
         try:
             bak.unlink(missing_ok=True)
             os.link(path, bak)
         except OSError:
             _copy_file_with_progress(path, bak, desc=f"backup_{path.name}")
 
-    _write_csv_with_progress(df, tmp, desc=f"write_{path.name}")
+    _write_state_body(df, tmp)
     try:
         with open(tmp, "rb") as f:
             os.fsync(f.fileno())
@@ -367,11 +522,26 @@ def atomic_write_csv(df: pd.DataFrame, path: os.PathLike | str) -> None:
 # Main-CSV operations
 # ---------------------------------------------------------------------------
 
-def _normalize_filepath_column(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_filepath_column(df: pd.DataFrame, *, owned: bool = False) -> pd.DataFrame:
+    """Return ``df`` with its ``filepath`` column normalized.
+
+    When ``owned`` is False (the default, for frames an external caller may
+    still alias) a copy is made before mutating — but only if normalization
+    would actually change a value (:func:`_filepath_is_canonical`). Steady-state
+    pipeline CSVs hold absolute, stripped paths, so the common case skips both
+    the full-frame ``df.copy()`` and the per-row resolve pass entirely.
+
+    When ``owned`` is True the caller guarantees no other reference to ``df``
+    exists (it was just read inside the same lock), so the column is assigned
+    in place — no defensive copy, ~one full frame less peak RAM per CSV touch.
+    """
     if df is None or df.empty:
         return df
     if "filepath" in df.columns:
-        df = df.copy()
+        if _filepath_is_canonical(df["filepath"]):
+            return df  # nothing to do; no copy needed
+        if not owned:
+            df = df.copy()
         df["filepath"] = _normalize_path_series(df["filepath"])
     return df
 
@@ -384,14 +554,73 @@ def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[base + extras]
 
 
+# ---------------------------------------------------------------------------
+# State-format interop (parquet mode)
+# ---------------------------------------------------------------------------
+
+def _migrate_state_if_needed(podcasts_path: os.PathLike | str) -> None:
+    """Reconcile on-disk state with the configured format (call inside the lock).
+
+    * parquet mode, only ``balalaika.csv`` exists (legacy / first run after the
+      switch): read the CSV and write ``balalaika.parquet`` so all subsequent
+      state ops use parquet. The CSV is left in place (it doubles as the
+      export). Resume is preserved — no data is lost.
+    * csv mode, a stale ``balalaika.parquet`` is present: warn and ignore it
+      (csv mode reads/writes the CSV only). The parquet is left untouched so a
+      later switch back to parquet mode can still pick it up.
+    """
+    fmt = state_format()
+    parquet = parquet_path(podcasts_path)
+    csv = csv_path(podcasts_path)
+    if fmt == "parquet":
+        if not parquet.exists() and csv.exists():
+            df = _read_csv_safe(csv)
+            if df is not None and not df.empty:
+                logger.warning(
+                    f"State format is parquet but only {csv.name} exists — "
+                    f"migrating {len(df)} rows to {parquet.name} (one time)."
+                )
+                _atomic_write_csv_unlocked(df, parquet)
+            elif df is not None:
+                # Empty CSV: still create an empty parquet so format is consistent.
+                _atomic_write_csv_unlocked(df, parquet)
+    else:  # csv mode
+        if parquet.exists():
+            logger.warning(
+                f"State format is csv but a stale {parquet.name} is present; "
+                "ignoring it. Delete it or set csv.state_format: parquet to use it."
+            )
+
+
+def _export_csv_from_state(podcasts_path: os.PathLike | str, df: pd.DataFrame) -> None:
+    """In parquet mode, (re)write ``balalaika.csv`` as an export for consumers.
+
+    No-op in csv mode (the CSV already *is* the state). Atomic, same .bak
+    semantics. Called at stage completion (final absorb) so external tools that
+    read ``balalaika.csv`` keep working while the hot state path stays parquet.
+    """
+    if state_format() != "parquet":
+        return
+    export = csv_path(podcasts_path)
+    with _csv_write_lock(export):
+        _atomic_write_csv_unlocked(df, export)
+
+
 def load_main_csv(podcasts_path: os.PathLike | str) -> pd.DataFrame:
-    """Return the current ``balalaika.csv`` (or an empty DataFrame)."""
-    df = _read_csv_safe(csv_path(podcasts_path))
+    """Return the current pipeline state (or an empty DataFrame).
+
+    Reads ``balalaika.parquet`` in parquet mode, else ``balalaika.csv``,
+    migrating a legacy CSV-only dataset into parquet on first access.
+    """
+    with _csv_write_lock(state_path(podcasts_path)):
+        _migrate_state_if_needed(podcasts_path)
+        df = _read_csv_safe(state_path(podcasts_path))
     if df is None:
         return pd.DataFrame(columns=["filepath"])
     if "filepath" not in df.columns:
         df["filepath"] = ""
-    return _normalize_filepath_column(df)
+    # Freshly read frame, no external alias yet -> normalize in place.
+    return _normalize_filepath_column(df, owned=True)
 
 
 def ensure_main_csv(
@@ -409,8 +638,9 @@ def ensure_main_csv(
     Returns the loaded DataFrame (potentially empty if ``audio_paths`` was not
     supplied and the CSV did not yet exist).
     """
-    target = csv_path(podcasts_path)
+    target = state_path(podcasts_path)
     with _csv_write_lock(target):
+        _migrate_state_if_needed(podcasts_path)
         bak = Path(str(target) + ".bak")
         df = _read_csv_safe(target)
 
@@ -422,7 +652,7 @@ def ensure_main_csv(
                     f"{bak.name}"
                 )
                 _atomic_write_csv_unlocked(bak_df, target)
-                df = _normalize_filepath_column(bak_df)
+                df = _normalize_filepath_column(bak_df, owned=True)
             elif audio_paths is None:
                 logger.error(
                     f"{target.name} and {bak.name} are both corrupt — "
@@ -449,7 +679,7 @@ def ensure_main_csv(
             _atomic_write_csv_unlocked(df, target)
             return df
 
-        return _normalize_filepath_column(df)
+        return _normalize_filepath_column(df, owned=True)
 
 
 def upsert_columns(
@@ -483,12 +713,14 @@ def upsert_columns(
 
     Returns the resulting DataFrame after the atomic write.
     """
-    target = csv_path(podcasts_path)
+    target = state_path(podcasts_path)
     with _csv_write_lock(target):
+        _migrate_state_if_needed(podcasts_path)
         df = _read_csv_safe(target)
         if df is None or "filepath" not in df.columns:
             df = pd.DataFrame(columns=["filepath"])
-        df = _normalize_filepath_column(df)
+        # `df` was just read inside the lock; no external alias -> in place.
+        df = _normalize_filepath_column(df, owned=True)
 
         if bootstrap_audio_paths is not None:
             boot = pd.DataFrame(
@@ -509,7 +741,11 @@ def upsert_columns(
         if results_df is not None and not results_df.empty:
             if "filepath" not in results_df.columns:
                 raise ValueError("results_df must contain a 'filepath' column")
-            results = _normalize_filepath_column(results_df.copy())
+            # Normalize without an unconditional full-frame copy: the guard
+            # copies only when a value actually changes, and the column slice
+            # below produces a fresh frame we own regardless, so the caller's
+            # results_df is never mutated.
+            results = _normalize_filepath_column(results_df)
             present = [c for c in value_columns if c in results.columns]
             results = results[["filepath", *present]].drop_duplicates(
                 subset="filepath", keep="last"
@@ -569,14 +805,13 @@ def unprocessed_paths(
     Files that aren't represented in the CSV at all are also returned so a
     fresh-disk-but-stale-CSV state still gets processed.
     """
-    logger.info(f"Loading main CSV to find unprocessed paths for column '{column}'.")
+    logger.info(f"Loading main state to find unprocessed paths for column '{column}'.")
     df = None
-    main_path = csv_path(podcasts_path)
-    try:
-        with open(main_path, "r", encoding="utf-8", newline="") as f:
-            header = next(csv.reader(f))
-    except Exception:
-        header = None
+    main_path = state_path(podcasts_path)
+    # Parquet column projection is genuinely cheap (only the 2 needed column
+    # chunks leave the disk); the CSV path sniffs the header first so a missing
+    # column skips the body read entirely.
+    header = _state_header(main_path)
 
     audio_resolved = normalize_path_values(
         audio_paths, desc=f"resolve_{column}_paths", drop_empty=True
@@ -585,17 +820,17 @@ def unprocessed_paths(
     if header is not None and "filepath" in header:
         if column not in header:
             logger.info(
-                f"Column '{column}' is missing from the CSV header; "
+                f"Column '{column}' is missing from the state header; "
                 f"all {len(audio_resolved)} paths are pending."
             )
             return audio_resolved
         try:
             # Only the 2 needed columns: a full-width read of a production
-            # CSV holds every text/score column in RAM just to drop it.
-            df = fast_read_csv(main_path, usecols=["filepath", column])
+            # state file holds every text/score column in RAM just to drop it.
+            df = _read_state_narrow(main_path, ["filepath", column])
             df["filepath"] = _normalize_path_series(df["filepath"])
         except Exception as exc:
-            logger.warning(f"Narrow CSV read failed ({exc}); falling back to full read.")
+            logger.warning(f"Narrow state read failed ({exc}); falling back to full read.")
             df = None
 
     if df is None:
@@ -667,7 +902,8 @@ def read_partial_csvs(
 
     merged = pd.concat(frames, ignore_index=True)
     if "filepath" in merged.columns:
-        merged = _normalize_filepath_column(merged)
+        # Freshly concatenated frame -> normalize in place.
+        merged = _normalize_filepath_column(merged, owned=True)
         merged = merged.drop_duplicates(subset="filepath", keep="last")
     return merged
 
@@ -694,19 +930,22 @@ def absorb_partial_csvs(
     bootstrap_audio_paths: Optional[Iterable[os.PathLike | str]] = None,
     preserve_existing: bool = True,
 ) -> Tuple[pd.DataFrame, int]:
-    """Merge any leftover partials into the main CSV and delete them.
+    """Merge any leftover partials into the main state and delete them.
 
     Returns ``(partials_df, rows_absorbed)``. ``partials_df`` is the raw
-    concatenated partials (handy for stage audit accounting); the main CSV is
+    concatenated partials (handy for stage audit accounting); the main state is
     updated only when there is something to merge or ``bootstrap_audio_paths``
     is given.
+
+    In parquet mode this is the stage-completion point that also (re)writes the
+    ``balalaika.csv`` export for external consumers (no-op in csv mode).
     """
     partials = read_partial_csvs(podcasts_path, prefix)
 
     if partials.empty and bootstrap_audio_paths is None:
         return partials, 0
 
-    upsert_columns(
+    merged_df = upsert_columns(
         podcasts_path,
         partials,
         value_columns=value_columns,
@@ -715,6 +954,9 @@ def absorb_partial_csvs(
         preserve_existing=preserve_existing,
     )
     delete_partial_csvs(podcasts_path, prefix)
+    # Refresh the CSV export from the just-written parquet state (no-op in csv
+    # mode). Uses the merged frame upsert returned, so no extra read.
+    _export_csv_from_state(podcasts_path, merged_df)
     return partials, int(len(partials))
 
 
@@ -927,6 +1169,25 @@ def _count_partial_rows(podcasts_path: os.PathLike | str, prefix: str) -> int:
     return total
 
 
+def _partials_signature(podcasts_path: os.PathLike | str, prefix: str) -> Tuple[Tuple[str, int], ...]:
+    """Cheap (name, size) fingerprint of all ``<prefix>_part_*.csv`` files.
+
+    Partials are append-only (``PartialCsvWriter`` only ever appends), so the
+    set of partial paths plus each one's byte size uniquely identifies "the
+    workers have produced no further rows since the last observation". One
+    ``stat`` per partial — no read, no parse. Used by the periodic merger to
+    skip a full read+upsert+rewrite cycle that would reproduce a byte-identical
+    ``balalaika.csv``.
+    """
+    sig: List[Tuple[str, int]] = []
+    for p in list_partial_csvs(podcasts_path, prefix):
+        try:
+            sig.append((p.name, p.stat().st_size))
+        except OSError:
+            continue
+    return tuple(sig)
+
+
 class PeriodicCsvMerger:
     """Background-thread merger that keeps ``balalaika.csv`` fresh during a stage.
 
@@ -982,6 +1243,10 @@ class PeriodicCsvMerger:
         self._thread: Optional[threading.Thread] = None
         self._last_flush_ts = 0.0
         self._last_flushed_rows = 0
+        # (name, size) fingerprint of the partials at the last actual flush, so
+        # a triggered flush that would re-merge byte-identical partials (no new
+        # rows since last time) skips the full read+upsert+rewrite cycle.
+        self._last_flushed_sig: Tuple[Tuple[str, int], ...] = ()
         self._enabled = self.flush_every_rows > 0 or self.flush_every_seconds > 0
 
     def _flush_once(self) -> int:
@@ -1036,6 +1301,17 @@ class PeriodicCsvMerger:
 
             if not should_flush:
                 continue
+            # Skip the whole read+upsert+rewrite when the partials are byte-for-
+            # byte unchanged since the last flush: re-merging them would only
+            # reproduce the current balalaika.csv. Append-only partials make a
+            # (name, size) signature a sound "nothing new" test. (When a
+            # bootstrap path list is configured the first flush must still run
+            # to inject those rows, so only skip once a flush has happened.)
+            sig = _partials_signature(self.podcasts_path, self.prefix)
+            if self._last_flushed_sig and sig == self._last_flushed_sig:
+                self._last_flush_ts = now
+                self._last_flushed_rows = current_rows
+                continue
             try:
                 merged = self._flush_once()
             except Exception as exc:
@@ -1043,6 +1319,7 @@ class PeriodicCsvMerger:
                 continue
             self._last_flush_ts = now
             self._last_flushed_rows = current_rows
+            self._last_flushed_sig = sig
             if merged:
                 logger.info(
                     f"balalaika.csv refreshed: {merged} rows from "
@@ -1192,12 +1469,17 @@ def _dedupe_paths(paths: Iterable[os.PathLike | str]) -> List[str]:
 
 
 def _audio_paths_from_csv(podcasts_path: os.PathLike | str) -> List[str]:
-    target = csv_path(podcasts_path)
+    # Prefer the active state file (parquet projection is cheap); fall back to
+    # the CSV export when the state file doesn't exist yet (e.g. first stage
+    # start before any migration, or csv mode).
+    target = state_path(podcasts_path)
     if not target.exists():
-        logger.info(f"{target.name} not found; cannot load audio paths from CSV.")
+        target = csv_path(podcasts_path)
+    if not target.exists():
+        logger.info(f"{target.name} not found; cannot load audio paths from state.")
         return []
     try:
-        df = fast_read_csv(target, usecols=["filepath"])
+        df = _read_state_narrow(target, ["filepath"])
     except (ValueError, pd.errors.EmptyDataError):
         logger.warning(f"{target.name} has no usable filepath column.")
         return []

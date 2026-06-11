@@ -16,6 +16,7 @@ Output keys (printed only when present / non-empty):
 * ``BALALAIKA_TRT_WORKSPACE``  — TensorRT workspace bytes (per session)
 * ``BALALAIKA_TRT_FP16``       — ``1`` / ``0`` toggle for fp16
 * ``BALALAIKA_IO_PROFILE``     — ``auto``/``hdd``/``ssd`` reader-concurrency profile
+* ``BALALAIKA_STATE_FORMAT``   — ``csv``/``parquet`` pipeline-state format (from ``csv.state_format``)
 
 The Python modules also read the same ``runtime`` block via :func:`runtime_cfg`
 so the values stay aligned between shell and Python.
@@ -39,6 +40,11 @@ DEFAULTS: Dict[str, Any] = {
     "trt_workspace_bytes": 4 * 1024 ** 3,
     "trt_fp16": True,
     "io_profile": "auto",
+    # Sourced from the top-level `csv:` block, not `runtime:` (see
+    # _load_runtime). "csv" keeps balalaika.csv as the live state; "parquet"
+    # uses balalaika.parquet + a CSV export. Exported so every spawned stage
+    # worker sees the same format.
+    "state_format": "csv",
 }
 
 ENV_KEYS = {
@@ -50,6 +56,7 @@ ENV_KEYS = {
     "trt_workspace_bytes": "BALALAIKA_TRT_WORKSPACE",
     "trt_fp16": "BALALAIKA_TRT_FP16",
     "io_profile": "BALALAIKA_IO_PROFILE",
+    "state_format": "BALALAIKA_STATE_FORMAT",
 }
 
 
@@ -59,8 +66,16 @@ def _load_runtime(config_path: str) -> Dict[str, Any]:
         return {}
     with p.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    block = data.get("runtime", {}) if isinstance(data, dict) else {}
-    return block if isinstance(block, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    block = data.get("runtime", {})
+    cfg: Dict[str, Any] = dict(block) if isinstance(block, dict) else {}
+    # state_format lives in the `csv:` block but is exported alongside the
+    # runtime env so base.sh propagates it to every stage/worker.
+    csv_block = data.get("csv", {})
+    if isinstance(csv_block, dict) and csv_block.get("state_format") is not None:
+        cfg.setdefault("state_format", csv_block.get("state_format"))
+    return cfg
 
 
 def runtime_cfg(config_path: str | None = None) -> Dict[str, Any]:
