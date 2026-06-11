@@ -25,7 +25,16 @@ def base_mutator(config: Dict[str, Any], _: argparse.Namespace, work_dataset_pat
 
 def set_dataset_everywhere(config: Dict[str, Any], work_dataset_path: Path) -> None:
     dataset_path = str(work_dataset_path)
-    for key in ("download", "preprocess", "separation", "transcription", "punctuation", "accent", "phonemizer"):
+    for key in (
+        "download",
+        "preprocess",
+        "separation",
+        "transcription",
+        "punctuation",
+        "accent",
+        "phonemizer",
+        "denoising",
+    ):
         section = ensure_dict(config, key)
         section["podcasts_path"] = dataset_path
 
@@ -58,52 +67,48 @@ def patch_separation_music_detect(config: Dict[str, Any], args: argparse.Namespa
         music_detect["bs"] = args.batch_size_override
 
 
-def patch_separation_nisqa(config: Dict[str, Any], args: argparse.Namespace, work_dataset_path: Path) -> None:
-    section = patch_separation_common(config, args, work_dataset_path)
-    nisqa = ensure_dict(section, "nisqa")
-    if args.batch_size_override is not None:
-        nisqa["bs"] = args.batch_size_override
-    if args.cpu_workers_per_gpu is not None:
-        nisqa["num_workers"] = args.cpu_workers_per_gpu
-    section["bs"] = nisqa.get("bs", 32)
-    section["num_workers_nisqa"] = nisqa.get("num_workers", 4)
-    section["nisqa_config_path"] = nisqa.get("nisqa_config_path", "./configs/nisqa_b.yaml")
-
-
 def patch_separation_distillmos(config: Dict[str, Any], args: argparse.Namespace, work_dataset_path: Path) -> None:
-    patch_separation_common(config, args, work_dataset_path)
-
-
-def patch_separation_diarization(config: Dict[str, Any], args: argparse.Namespace, work_dataset_path: Path) -> None:
+    # src/separation/distillmos_process.py: load_config(..., "separation") then
+    # config["distillmos"].{batch_size,num_workers,prefetch_factor}.
     section = patch_separation_common(config, args, work_dataset_path)
-    diarization = ensure_dict(section, "diarization")
-    if args.disable_diarization:
-        diarization["enabled"] = False
+    distillmos = ensure_dict(section, "distillmos")
+    if args.batch_size_override is not None:
+        distillmos["batch_size"] = args.batch_size_override
     if args.cpu_workers_per_gpu is not None:
-        diarization["num_workers"] = args.cpu_workers_per_gpu
+        distillmos["num_workers"] = args.cpu_workers_per_gpu
 
 
-def patch_separation_silence(config: Dict[str, Any], args: argparse.Namespace, work_dataset_path: Path) -> None:
+def patch_separation_antispoofing(config: Dict[str, Any], args: argparse.Namespace, work_dataset_path: Path) -> None:
+    # src/separation/antispoofing.py: load_config(..., "separation") then
+    # cfg = config["antispoofing"]; reads batch_size, num_workers,
+    # prefetch_factor, use_tensorrt, onnx_path.
     section = patch_separation_common(config, args, work_dataset_path)
-    silence_detect = ensure_dict(section, "silence_detect")
+    antispoofing = ensure_dict(section, "antispoofing")
+    if args.batch_size_override is not None:
+        antispoofing["batch_size"] = args.batch_size_override
     if args.cpu_workers_per_gpu is not None:
-        silence_detect["num_workers"] = args.cpu_workers_per_gpu
+        antispoofing["num_workers"] = args.cpu_workers_per_gpu
 
 
 def patch_separation_stage(config: Dict[str, Any], args: argparse.Namespace, work_dataset_path: Path) -> None:
+    # Current separation stage order: music_detect -> distillmos -> antispoofing.
     patch_separation_common(config, args, work_dataset_path)
     patch_separation_music_detect(config, args, work_dataset_path)
-    patch_separation_nisqa(config, args, work_dataset_path)
-    patch_separation_diarization(config, args, work_dataset_path)
-    patch_separation_silence(config, args, work_dataset_path)
+    patch_separation_distillmos(config, args, work_dataset_path)
+    patch_separation_antispoofing(config, args, work_dataset_path)
 
 
-def transcription_batch_section(model_name: str) -> str:
-    if "giga" in model_name:
-        return "giga"
-    if "vosk" in model_name:
-        return "vosk"
-    return model_name
+def patch_denoising(config: Dict[str, Any], args: argparse.Namespace, work_dataset_path: Path) -> None:
+    # src/denoising/denoising.py: load_config(..., "denoising") then reads FLAT
+    # keys batch_size, num_workers, prefetch_factor, processes, use_tensorrt,
+    # onnx_path under the denoising section.
+    base_mutator(config, args, work_dataset_path)
+    section = ensure_dict(config, "denoising")
+    section["podcasts_path"] = str(work_dataset_path)
+    if args.batch_size_override is not None:
+        section["batch_size"] = args.batch_size_override
+    if args.cpu_workers_per_gpu is not None:
+        section["num_workers"] = args.cpu_workers_per_gpu
 
 
 def patch_transcription_common(config: Dict[str, Any], args: argparse.Namespace, work_dataset_path: Path) -> Dict[str, Any]:
@@ -114,11 +119,13 @@ def patch_transcription_common(config: Dict[str, Any], args: argparse.Namespace,
 
 
 def patch_transcription_stage(config: Dict[str, Any], args: argparse.Namespace, work_dataset_path: Path) -> None:
+    # src/transcription/transcription.py reads a FLAT transcription.batch_size
+    # (and num_workers / prefetch_factor) — there are no per-model subsections.
     section = patch_transcription_common(config, args, work_dataset_path)
     if args.batch_size_override is not None:
-        for model_name in section.get("model_names", []):
-            model_section = ensure_dict(section, transcription_batch_section(str(model_name)))
-            model_section["batch_size"] = args.batch_size_override
+        section["batch_size"] = args.batch_size_override
+    if args.cpu_workers_per_gpu is not None:
+        section["num_workers"] = args.cpu_workers_per_gpu
 
 
 def patch_transcription_model(model_name: str) -> ConfigMutator:
@@ -128,8 +135,9 @@ def patch_transcription_model(model_name: str) -> ConfigMutator:
         section["consensus_num"] = 0
         section["use_rover"] = False
         if args.batch_size_override is not None:
-            model_section = ensure_dict(section, transcription_batch_section(model_name))
-            model_section["batch_size"] = args.batch_size_override
+            section["batch_size"] = args.batch_size_override
+        if args.cpu_workers_per_gpu is not None:
+            section["num_workers"] = args.cpu_workers_per_gpu
 
     return mutator
 
@@ -180,6 +188,7 @@ def patch_pipeline(config: Dict[str, Any], args: argparse.Namespace, work_datase
     patch_punctuation(config, args, work_dataset_path)
     patch_accent(config, args, work_dataset_path)
     patch_phonemizer(config, args, work_dataset_path)
+    patch_denoising(config, args, work_dataset_path)
     patch_collate(config, args, work_dataset_path)
 
 
@@ -218,13 +227,11 @@ TARGETS: Dict[str, TargetSpec] = {
     ),
     "separation.stage": TargetSpec(
         name="separation.stage",
-        description="Full separation sequence: music_detect, NISQA, DistillMOS, diarization, silence_detect.",
+        description="Full separation sequence: music_detect, DistillMOS, anti-spoofing.",
         modules=(
             "src.separation.music_detect",
-            "src.separation.nisqa_process",
             "src.separation.distillmos_process",
-            "src.separation.diarization",
-            "src.separation.silence_detect",
+            "src.separation.antispoofing",
         ),
         mutator=patch_separation_stage,
         uses_gpu=True,
@@ -236,13 +243,6 @@ TARGETS: Dict[str, TargetSpec] = {
         mutator=patch_separation_music_detect,
         uses_gpu=True,
     ),
-    "separation.nisqa": TargetSpec(
-        name="separation.nisqa",
-        description="NISQA MOS model only.",
-        modules=("src.separation.nisqa_process",),
-        mutator=patch_separation_nisqa,
-        uses_gpu=True,
-    ),
     "separation.distillmos": TargetSpec(
         name="separation.distillmos",
         description="DistillMOS model only.",
@@ -250,18 +250,11 @@ TARGETS: Dict[str, TargetSpec] = {
         mutator=patch_separation_distillmos,
         uses_gpu=True,
     ),
-    "separation.diarization": TargetSpec(
-        name="separation.diarization",
-        description="Pyannote diarization only.",
-        modules=("src.separation.diarization",),
-        mutator=patch_separation_diarization,
-        uses_gpu=True,
-    ),
-    "separation.silence_detect": TargetSpec(
-        name="separation.silence_detect",
-        description="Silero silence metrics only.",
-        modules=("src.separation.silence_detect",),
-        mutator=patch_separation_silence,
+    "separation.antispoofing": TargetSpec(
+        name="separation.antispoofing",
+        description="Spectra-0 anti-spoofing scoring only.",
+        modules=("src.separation.antispoofing",),
+        mutator=patch_separation_antispoofing,
         uses_gpu=True,
     ),
     "transcription.stage": TargetSpec(
@@ -298,6 +291,13 @@ TARGETS: Dict[str, TargetSpec] = {
         mutator=patch_phonemizer,
         uses_gpu=True,
     ),
+    "denoising.stage": TargetSpec(
+        name="denoising.stage",
+        description="ONNX/TensorRT MossFormer2_SE_48K in-place denoising stage.",
+        modules=("src.denoising.denoising",),
+        mutator=patch_denoising,
+        uses_gpu=True,
+    ),
     "collate.stage": TargetSpec(
         name="collate.stage",
         description="Final collate into parquet.",
@@ -308,13 +308,16 @@ TARGETS: Dict[str, TargetSpec] = {
     ),
     "pipeline.base": TargetSpec(
         name="pipeline.base",
-        description="Full base pipeline from preprocess to collate.",
+        description="Full base pipeline: preprocess -> crest -> loudness -> "
+        "music_detect -> distillmos -> antispoofing -> transcription -> "
+        "punctuation -> accents -> phonemizer -> collate.",
         modules=(
             "src.preprocess.preprocess",
             "src.preprocess.crest_factor_remover",
             "src.preprocess.preprocess_audio",
             "src.separation.music_detect",
             "src.separation.distillmos_process",
+            "src.separation.antispoofing",
             "src.transcription.transcription",
             "src.punctuation.punctuation",
             "src.accents.accents",
