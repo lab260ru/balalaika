@@ -117,6 +117,15 @@ def asr_consistency_percent(row: pd.Series, asr_columns: list[str]) -> float:
 
 
 def add_asr_consistency_column(df: pd.DataFrame, model_names: Iterable[str]) -> pd.DataFrame:
+    """Vectorised equivalent of applying :func:`asr_consistency_percent` per row.
+
+    Transcripts are normalised column-wise, factorised to integer codes, and
+    agreement is computed from pairwise code comparisons — same semantics as
+    the row-wise reference implementation (kept above for tests), orders of
+    magnitude faster on multi-million-row frames.
+    """
+    import numpy as np
+
     asr_columns = []
     seen = set()
     for model_name in model_names:
@@ -133,27 +142,77 @@ def add_asr_consistency_column(df: pd.DataFrame, model_names: Iterable[str]) -> 
         logger.info("ASR consistency skipped: fewer than two ASR text columns found.")
         return out
 
-    out[ASR_CONSISTENCY_COLUMN] = out.apply(
-        asr_consistency_percent,
-        axis=1,
-        asr_columns=asr_columns,
-    )
+    normalized = [
+        out[col].fillna("").astype(str).str.lower().str.split().str.join(" ")
+        for col in asr_columns
+    ]
+    # One shared factorisation so equal transcripts share an integer code.
+    stacked = pd.concat(normalized, ignore_index=True)
+    codes_flat, uniques = pd.factorize(stacked)
+    empty_code = -1
+    for idx, value in enumerate(uniques):
+        if value == "":
+            empty_code = idx
+            break
+
+    n = len(out)
+    k_cols = len(asr_columns)
+    codes = codes_flat.reshape(k_cols, n)
+    nonempty = codes != empty_code
+
+    matches = np.zeros((k_cols, n), dtype=np.int16)
+    for i in range(k_cols):
+        for j in range(i + 1, k_cols):
+            eq = (codes[i] == codes[j]) & nonempty[i] & nonempty[j]
+            matches[i] += eq
+            matches[j] += eq
+
+    k = nonempty.sum(axis=0)
+    best = np.where(nonempty, matches, -1).max(axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        consistency = np.where(
+            k >= 2, best / np.maximum(k - 1, 1) * 100.0, np.nan
+        )
+    out[ASR_CONSISTENCY_COLUMN] = consistency.astype(float)
     logger.info(
         f"Added {ASR_CONSISTENCY_COLUMN} from ASR columns: {asr_columns}"
     )
     return out
 
 
-def process_audio_file(audio_path_str: str, base_path: Path, file_types: Dict[str, str]) -> Dict[str, Optional[str]]:
+def process_audio_file(
+    audio_path_str: str,
+    base_path: Path,
+    file_types: Dict[str, str],
+    _dir_names: Optional[Dict[str, set]] = None,
+) -> Dict[str, Optional[str]]:
+    import os
 
-    audio_path = Path(audio_path_str)
-    dir_path = audio_path.parent
-    base_name = audio_path.stem
+    dirname, filename = os.path.split(audio_path_str)
+    base_name = os.path.splitext(filename)[0]
+    # os.path.join mirrors the original Path join: an absolute dirname wins
+    # over base_path, a relative one is anchored under it.
+    target_dir = os.path.join(str(base_path), dirname)
 
-    results = {'filepath': audio_path_str}
+    names = None
+    if _dir_names is not None:
+        names = _dir_names.get(target_dir)
+        if names is None:
+            try:
+                names = {entry.name for entry in os.scandir(target_dir)}
+            except OSError:
+                names = set()
+            _dir_names[target_dir] = names
+
+    results: Dict[str, Optional[str]] = {'filepath': audio_path_str}
     for key, suffix in file_types.items():
-        file_path = base_path / dir_path / f"{base_name}{suffix}"
-        results[key] = read_file_content(file_path)
+        name = f"{base_name}{suffix}"
+        if names is not None and name not in names:
+            # directory listing says the sidecar doesn't exist -> same result
+            # as read_file_content's FileNotFoundError path, without the open
+            results[key] = ''
+        else:
+            results[key] = read_file_content(os.path.join(target_dir, name))
 
     return results
 
@@ -195,20 +254,34 @@ def main(args):
 
     logger.info(f"Starting processing with {num_workers} workers")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        future_to_path = {executor.submit(process_audio_file, path, base_path, file_types): path for path in audio_paths}
-        
-        for future in tqdm(concurrent.futures.as_completed(future_to_path), total=len(audio_paths), desc="Processing files"):
+    # Submit slabs of paths rather than one future per file: per-future
+    # dispatch overhead is ~20-30us, which adds minutes at tens of millions
+    # of files while the actual sidecar reads stay identical.
+    slab_size = 2000
+    dir_names_cache: Dict[str, set] = {}
+
+    def process_slab(paths):
+        slab_results, slab_errors = [], []
+        for path in paths:
             try:
-                data = future.result()
-                if data:
-                    results.append(data)
-                    processed += 1
-            except Exception as exc:
-                path = future_to_path[future]
-                logger.error(f'{path} generated an exception: {exc}')
-                errors += 1
-                error_details.append({"file": str(path), "reason": str(exc)})
+                slab_results.append(
+                    process_audio_file(path, base_path, file_types, dir_names_cache)
+                )
+            except Exception as exc:  # keep per-file error attribution
+                slab_errors.append((path, exc))
+        return slab_results, slab_errors
+
+    slabs = [audio_paths[i:i + slab_size] for i in range(0, len(audio_paths), slab_size)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        with tqdm(total=len(audio_paths), desc="Processing files") as bar:
+            for slab_results, slab_errors in executor.map(process_slab, slabs):
+                results.extend(slab_results)
+                processed += len(slab_results)
+                for path, exc in slab_errors:
+                    logger.error(f'{path} generated an exception: {exc}')
+                    errors += 1
+                    error_details.append({"file": str(path), "reason": str(exc)})
+                bar.update(len(slab_results) + len(slab_errors))
 
     if not results:
         logger.info("No data was processed. Exiting.")
