@@ -1,6 +1,7 @@
 # Balalaika Pipeline Performance Report
 
-Date: 2026-06-11 (three passes; second pass = §4.10–4.13, HDD pass = §11) ·
+Date: 2026-06-11 (four passes; second pass = §4.10–4.13, HDD pass = §11,
+§9-backlog pass = §4.14–4.15 + §12) ·
 Branch: `claude` · All numbers measured on this node.
 
 ## 1. Node and environment
@@ -607,8 +608,8 @@ anyway, and the warmup sweep uses CUDA EP so it finishes in minutes, not hours.
   drop_missing) replace per-file random stats with sequential directory reads —
   this is the dominant win on spinning disks.
 
-## 9. Recommended next steps (analyzed, not applied — need either model files
-absent on this node or larger refactors)
+## 9. Recommended next steps — **all items below are now done** (fourth pass,
+2026-06-11; details in §4.14–4.15 and §12). Original analysis kept for context.
 
 1. ~~**Transcription stage restructure**: decode/resample each file once and
    share across the ASR models.~~ Done — see §4.10 (1.39×). ~~The **RNNT
@@ -617,23 +618,30 @@ absent on this node or larger refactors)
    the stage critical path).~~ Done — see §4.14 (`src/transcription/fast_rnnt.py`,
    batched stateful decode for both the GigaAM RNN-T and Kaldi/Vosk adapters;
    giga_rnnt 9.5→23.2 it/s on GPU at batch 8, 0/250 text+timestamp+token
-   divergence). Remaining idea for stage 7: keep DataLoader workers alive
-   across shards (GPU idles a few seconds per 10 k-file shard).
-2. **Sortformer/SmartTurn (stage 1)**: batch SmartVAD calls across segments; ORT
+   divergence). ~~Remaining idea for stage 7: keep DataLoader workers alive
+   across shards (GPU idles a few seconds per 10 k-file shard).~~ Done —
+   §12.1 (persistent loaders, shard-boundary cost 7.5–8.5×, batch sequence
+   pinned identical).
+2. ~~**Sortformer/SmartTurn (stage 1)**: batch SmartVAD calls across segments; ORT
    IOBinding to kill per-window GPU→CPU→GPU round-trips; vectorize `_binarize`
-   and spkcache compression (file:line details in `.claude/analysis/preprocess-*.json`).
-   Untestable here — the ONNX model files are not on this node. The 2026-06-11
-   second-pass audit additionally flagged: ~~the ACTIVE existing_chunks+fuse path
-   decodes every chunk twice~~ (done — §11.5); diarization decode is fully
-   serialized with GPU inference (`diarization_loader_workers: 0`); raw mode
-   accumulates all chunk-row dicts in RAM. Full details:
-   `.claude/analysis/audit2_findings.json`.
+   and spkcache compression; diarization decode fully serialized with GPU
+   inference (`diarization_loader_workers: 0`); raw mode accumulates all
+   chunk-row dicts in RAM.~~ Done — §12.2 (whole pack; model files still absent
+   on this node, so every model-touching change is knob-gated default-off and
+   pinned by logic tests vs verbatim old code; `_binarize` 5.1×,
+   `get_chunk_metrics` 56×, raw-mode RAM O(chunks)→O(1)).
+   ~~the ACTIVE existing_chunks+fuse path decodes every chunk twice~~ (done — §11.5).
 3. ~~**Phonemizer**: persist the word→phoneme cache across runs and batch
    `greedy_decode` over unique words.~~ Done — see §4.9.
-4. **tone batch size**: raise beyond 64 (still climbing at the sweep cap) once
-   measured on an idle GPU.
-5. Consider Parquet for pipeline *state* (keeping balalaika.csv as an export) —
-   removes CSV parse cost entirely; bigger format decision, not taken unilaterally.
+4. ~~**tone batch size**: raise beyond 64 (still climbing at the sweep cap) once
+   measured on an idle GPU.~~ Done — §12.6 (ladder cap now 512; tone plateaus
+   at **bs=128** ≈ 10.1 it/s on the still-contended GPU 1 — re-probe when idle
+   for a clean ceiling).
+5. ~~Consider Parquet for pipeline *state* (keeping balalaika.csv as an export) —
+   removes CSV parse cost entirely; bigger format decision, not taken
+   unilaterally.~~ Done as an **opt-in knob, default unchanged** — §12.4
+   (`csv.state_format: parquet`; balalaika.csv still exported at stage end,
+   export proven byte-identical).
 6. ~~**Accents stage (9)** is the slowest text stage per the audit: ruAccent runs
    3-6 batch-1 ONNX calls per sentence with no batching, loads ~200 MB of
    rule-engine assets per worker, and re-runs OOV words per sentence.~~ Done —
@@ -647,11 +655,14 @@ absent on this node or larger refactors)
    ~3× of that decode CPU; exactness depends on container seek semantics
    (bit-exact for PCM wav/FLAC, needs verification per format).~~ Done —
    §11.6 (`ranged_decode`, bit-exact for PCM wav/FLAC, 4.2× fewer bytes).
-8. **Collate RAM**: stage 12 holds every sidecar text ~3× over (records list →
+8. ~~**Collate RAM**: stage 12 holds every sidecar text ~3× over (records list →
    DataFrame → Arrow) while writing the parquet; chunked assembly would cap
-   peak RSS on low-RAM nodes.
-9. Remaining smaller audit findings (with verifier verdicts where the budget
-   allowed) are preserved in `.claude/analysis/audit2_findings.json`.
+   peak RSS on low-RAM nodes.~~ Done — §12.3 (streamed ParquetWriter slabs,
+   peak RSS O(slab); read-back-identical output).
+9. ~~Remaining smaller audit findings (with verifier verdicts where the budget
+   allowed) are preserved in `.claude/analysis/audit2_findings.json`.~~ Swept —
+   §12.5 (cudf gating, thread hygiene, atomic loudness writes, punctuation
+   trio, denoising pack, export/report/recovery fixes).
 
 ## 10. How to reproduce every number
 
@@ -673,7 +684,7 @@ python -m benchmarking.micro.bench_accents --impl both --workers 4 --label cap #
 TARGET=transcription.stage DATASET=cache/bench_sample/audio NUM_SAMPLES=250 \
   REPEATS=2 GPU_IDS=1 benchmarking/run_benchmark.sh                # §4.10 stage legs
 python -m benchmarking.warmup --config_path configs/config.yaml   # §2 (per node)
-python -m pytest tests/ -q                                  # 120+ behavior tests
+python -m pytest tests/ -q                # full suite: 1387 passed (fourth pass)
 # stage-level before/after harness runs: benchmarking/reports/2026*/report.json
 ```
 
@@ -896,3 +907,147 @@ default — it will detect hdd), consider `transcription.shard_order: path`
 and `separation.antispoofing.ranged_decode: true`, and keep
 `BALALAIKA_SHARD_ORDER` unset (path order is the default for everything
 that's proven equivalent).
+
+## 12. Fourth pass (2026-06-11): the §9 backlog, cleared
+
+Every §9 item that was still open is now implemented. Eight parallel
+worktree tracks, each integrated only after its equivalence tests passed on
+the merged tree. §4.14 (RNN-T) and §4.15 (accents) above are part of this
+pass; the rest:
+
+### 12.1 Stage 7: persistent DataLoaders across work shards
+
+Each GPU worker previously built a fresh DataLoader per 10 k-file shard
+(spawning up to 16 loader processes and refilling prefetch while the GPU
+idled). One persistent loader per worker now survives across all shards: a
+Manager-backed shard state + generation counter feeds the same worker pool
+(one bulk IPC per shard). Measured (10 shards × 8 wavs, instant model, CPU —
+isolates pure boundary cost): workers=4 **24.1 → 3.2 s (7.5×)**, workers=16
+**29.0 → 3.4 s (8.5×)** ≈ 2–2.6 s of GPU idle saved per shard boundary.
+Knob `transcription.persistent_loaders` (default True — the batch sequence
+is pinned byte-identical to per-shard loaders by tests, both `share_decode`
+modes; rejected alternatives that broke ordering: in-place dataset mutation
+under `persistent_workers` provably serves stale files, IterableDataset
+interleaves worker outputs). `tests/test_transcription_persistent_loaders.py`.
+
+### 12.2 Stage 1: the Sortformer/SmartTurn pack (§9.2)
+
+Models still absent on this node ⇒ every model-touching change is knob-gated
+default-off; CPU rewrites are pinned exact vs verbatim old code:
+
+| Item | Result | Knob (default = old behavior) |
+|---|---|---|
+| SmartVAD per-segment calls | batched feature-extraction + one ONNX call per slab; batched FE differs ≤1 float32 ULP ⇒ gated | `preprocess.smart_vad_batch_size: 1` |
+| Streaming state GPU→CPU→GPU per ~10 s chunk | ORT IOBinding backend, identical-by-construction (proven on synthetic ONNX, CPU+CUDA EP) | `preprocess.sortformer_io_binding: False` |
+| `_binarize` per-frame Python loop | np.diff edge detection, **5.1×** (144 → 28 ms / 900 s window), bit-exact | — (always on) |
+| spkcache boost/topk/gather | numpy, **2.5×**, bit-exact incl. tie order | — |
+| silence-profile running mean | numba kernel, bit-exact (numpy closed form drifts 1e-7 and was rejected — the mean feeds back into the model) | — |
+| `get_chunk_metrics` O(chunks×segments) | SegmentIndex (searchsorted + prefix-max), **56×** on a 2 h episode, exact | — |
+| raw mode accumulates every chunk dict in worker AND parent | workers return aggregates only; rows already stream via partial CSVs — O(chunks)→O(1) RAM, no multi-GB pickle | — |
+| diarization loader workers=0 (decode serialized with GPU) | prefetch floored (was a crash at >0 workers), torch threads pinned; defaults unchanged, recommended 2/2 documented | `preprocess.diarization_loader_workers` |
+| hardcoded TRT-first + fp16 | `preprocess.use_tensorrt` now actually read | default True (= old behavior) |
+
+~1000 parametrized equivalence tests (`test_sortformer_postproc.py`,
+`test_smart_vad_batch.py`, `test_sortformer_io_binding.py`,
+`test_get_chunk_metrics.py`, `test_preprocess_raw_streaming.py`).
+
+### 12.3 Collate / export / report RAM + small findings (§9.8)
+
+- **Collate**: records-list → DataFrame → merge → one giant `to_parquet`
+  (3× residency of all sidecar text, the stage that would OOM first at 2 M
+  rows) → streamed slab assembly through one `pyarrow.parquet.ParquetWriter`,
+  per-slab metadata merge + per-row consistency. Peak RSS old/new: 20 k rows
+  1.33×, **60 k rows 1.82×** and growing with size ⇒ bounded at production
+  scale. Also faster (60 k: 89.3 → 69.7 s). Output pinned read-back-identical
+  (values/dtypes/row order; parquet bytes may differ in row-group layout).
+  Knobs: `download.collate_slab_rows: 200000`,
+  `download.collate_parquet_compression` (default snappy = old codec; zstd
+  ≈2× smaller opt-in).
+- **to_webdataset**: per-cell sanitize in the worker hot loop → vectorized at
+  load: 1 M rows **15.4 → 3.8 s (4.1×)**, JSON bytes identical.
+- **report.py** missing-values scan: parquet via row-group `null_count`
+  statistics + string-column projection (**2.8×**); CSV fallback chunked
+  vectorized pandas (1.3×), counts pinned identical (pyarrow CSV reader
+  rejected: errors on ragged rows the old reader tolerated).
+- **recovery_from_meta**: existence check now short-circuits BEFORE the
+  full-episode pydub decode; also fixed a Cyrillic `с` in `taskset -с` that
+  broke `recovery_from_meta_yamls.sh`.
+
+### 12.4 Parquet pipeline state (§9.5) — opt-in, default csv
+
+`csv.state_format: csv|parquet` (default **csv** — zero change). In parquet
+mode every state op (load/atomic write/flush/absorb/drop_missing/narrow
+reads) runs on `balalaika.parquet` (same tmp+rename + hardlink-`.bak`
+atomicity), and `balalaika.csv` is still written as an export at stage
+completion; resume migrates csv→parquet on first load. Pinned: a scripted
+ensure→upsert→flush→absorb→drop_missing→export sequence produces a
+**byte-identical balalaika.csv** in both modes (mixed dtypes/NaN/unicode/
+quoting). Measured at 2 M rows: atomic write 4.12 → **2.21 s**, flush cycle
+15.6 → 12.9 s, narrow reads cheaper via true column projection. Same-pass
+state-layer wins regardless of format: upsert peak RSS **2547 → 1769 MB**
+(copy-elision, byte-identical output); `audio_durations` cache 9.7 → 5.9 s
+on the realistic subset case (identical dict); periodic flush skips
+entirely when partials are byte-unchanged (stat signature; final CSV
+identical). Env: `BALALAIKA_STATE_FORMAT` (exported by base.sh).
+
+### 12.5 Small-findings sweep (§9.9)
+
+- **cudf.pandas now opt-in** (`BALALAIKA_ENABLE_CUDF=1`; default off — it
+  silently disabled the §4.1 pyarrow fast paths and added a per-stage CUDA
+  context on shared GPUs).
+- **Thread hygiene**: `runtime.threads_per_worker` (default "" = unchanged).
+  When set: ORT intra-op caps + inter-op=1 + no GPU-EP busy-spin, and
+  OMP/OPENBLAS/MKL/NUMEXPR exports. Measured: 1 worker capped is 1.40×
+  *slower* (why the default stays off); **4 parallel workers 2.9× faster**
+  (0.71 vs 2.08 s) — set it on many-worker CPU-contended nodes.
+- `runtime_cfg`/`get_onnx_providers` no longer re-parse YAML + re-mkdir the
+  TRT cache per session (lru_cache per process, identical provider lists).
+- **Loudness writes are atomic** (tmp + `os.replace`, same dir): a crash
+  mid-encode can no longer destroy the source file. Written bytes pinned
+  identical (md5).
+- **Punctuation**: stage-end `produced` accounting via DirNameCache (no
+  per-file stat storm); slabs sorted by token length before padding
+  (re-verified on the real RUPunct: per-file vs unsorted vs sorted —
+  **0 character diffs on 60 texts**); >512-token texts pre-screened to the
+  per-file fallback (the model's true positional limit; they previously
+  failed an entire slab first — now they also *produce output* via native
+  chunking instead of erroring).
+- **Denoising** (model absent ⇒ logic tests + conservative defaults):
+  optional bounded background writer (`denoising.async_save_workers`,
+  default 0 = synchronous; CSV row only after successful save), resample
+  kernel cached per source rate, loader workers pinned to 1 torch thread,
+  TRT profile seconds exposed (`denoising.trt_opt_seconds`, default 1.0 =
+  unchanged), and a single >20 s file no longer kills the whole GPU worker
+  mid-shard (per-item error + shard continues).
+
+### 12.6 tone batch size past the sweep cap (§9.4)
+
+Warmup ladder cap raised 64 → 512 (`--max-batch`, plus `--models tone`-style
+per-model probing). Re-probed on GPU 1 (still contended — training holds
+both GPUs): 0.26 it/s @1 → 7.8 @64 → **10.1 @128**, flat at 256 (10.04),
+VRAM guard blocks 512. Suggested `tone` batch: **128** (written to
+`cache/node_profile.json`, flagged contended). Absolute numbers will rise on
+an idle GPU; the plateau *shape* is the durable result.
+
+### 12.7 Integration validation
+
+Tracks were developed in isolated worktrees off `claude` HEAD `26bc150` and
+merged one at a time, re-running each track's equivalence tests on the
+merged tree (the stage-7 file was touched by three tracks — loaders, RNN-T,
+session options — and its full pin set passes post-merge). Full suite on the
+final tree: see §10.
+
+### 12.8 Reproduce (this pass)
+
+```bash
+source .dev_venv/bin/activate
+python -m benchmarking.micro.bench_persistent_loaders          # §12.1
+python -m benchmarking.micro.bench_sortformer_postproc         # §12.2 kernels
+python -m benchmarking.micro.bench_collate --label check       # §12.3 (asserts read-back equality)
+python -m benchmarking.micro.bench_export --label check        # §12.3 wds/report
+python -m benchmarking.micro.bench_csv_ops --state-format parquet --label check  # §12.4
+python -m benchmarking.micro.bench_ort_threads                 # §12.5 thread caps
+python -m benchmarking.micro.verify_punct_batch                # §12.5 RUPunct 0-diff proof (real model)
+CUDA_VISIBLE_DEVICES=1 python -m benchmarking.warmup --models tone --max-batch 512 \
+  --config_path configs/config.yaml                            # §12.6
+```
