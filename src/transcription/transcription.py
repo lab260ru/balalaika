@@ -16,6 +16,8 @@ from src.utils.audio_durations import (
     ensure_audio_durations,
 )
 from src.utils.datasets.transcription import (
+    PersistentGroupTranscriptionLoader,
+    PersistentTranscriptionLoader,
     create_group_transcription_dataloader,
     create_transcription_dataloader,
     recognize_batch,
@@ -139,24 +141,15 @@ def format_timestamps(result) -> str:
     return '\n'.join(f"{start:.3f}\t{end:.3f}\t{word}" for start, end, word in words)
 
 
-def _process_files(cuda_id: int, model_name: str, files: List[str], model, config: dict,
-                   output_suffix: str, do_timestamps: bool, target_sample_rate: int,
-                   processed_counter=None, errors_counter=None, error_details=None):
-    batch_size = resolve_batch_size(
-        f"transcription.{model_name}", config.get('batch_size'), 16
-    )
-    num_loader_workers = int(config.get('num_workers', 4))
-    prefetch_factor = int(config.get('prefetch_factor', 2))
+def _process_batches(batch_iter, cuda_id: int, model_name: str, model, output_suffix: str,
+                     do_timestamps: bool, target_sample_rate: int,
+                     processed_counter=None, errors_counter=None, error_details=None):
+    """Consume ``(paths, waveforms, lengths, load_errors)`` batches.
 
-    dataloader = create_transcription_dataloader(
-        files,
-        sample_rate=target_sample_rate,
-        batch_size=batch_size,
-        num_workers=num_loader_workers,
-        prefetch_factor=prefetch_factor,
-    )
-
-    for paths, waveforms, lengths, load_errors in tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id):
+    Shared by the per-shard loader and the persistent loader: the batch
+    sequence is identical either way, so recognition/save semantics are too.
+    """
+    for paths, waveforms, lengths, load_errors in batch_iter:
         for path_str, reason in load_errors:
             logger.error(f"Audio load failed {path_str}: {reason}")
             if errors_counter is not None:
@@ -198,6 +191,30 @@ def _process_files(cuda_id: int, model_name: str, files: List[str], model, confi
 
         if processed_counter is not None:
             processed_counter.value += len(paths)
+
+
+def _process_files(cuda_id: int, model_name: str, files: List[str], model, config: dict,
+                   output_suffix: str, do_timestamps: bool, target_sample_rate: int,
+                   processed_counter=None, errors_counter=None, error_details=None):
+    batch_size = resolve_batch_size(
+        f"transcription.{model_name}", config.get('batch_size'), 16
+    )
+    num_loader_workers = int(config.get('num_workers', 4))
+    prefetch_factor = int(config.get('prefetch_factor', 2))
+
+    dataloader = create_transcription_dataloader(
+        files,
+        sample_rate=target_sample_rate,
+        batch_size=batch_size,
+        num_workers=num_loader_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    _process_batches(
+        tqdm(dataloader, desc=f"ASR-{cuda_id}", position=cuda_id),
+        cuda_id, model_name, model, output_suffix, do_timestamps, target_sample_rate,
+        processed_counter, errors_counter, error_details,
+    )
 
 
 def run_worker(cuda_id: int, world_size: int, model_name: str,
@@ -243,28 +260,55 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
 
         target_sample_rate = int(model.asr._get_sample_rate()) if hasattr(model, "asr") else TARGET_SAMPLE_RATE
 
+        num_loader_workers = int(config.get('num_workers', 4))
+        prefetch_factor = int(config.get('prefetch_factor', 2))
+        # Persistent loader keeps DataLoader workers alive across shards instead
+        # of respawning them per claimed shard. Only meaningful with worker
+        # processes; with num_workers==0 the per-shard loader has no spawn cost.
+        use_persistent = bool(config.get('persistent_loaders', True)) and num_loader_workers > 0
+
         claimed = 0
-        while True:
-            shard_path = claim_work_shard(work_dir, cuda_id)
-            if shard_path is None:
-                break
-            files = read_work_shard(shard_path)
-            claimed += 1
-            logger.info(f"Worker {cuda_id}: processing {len(files)} files from {shard_path.name}")
-            _process_files(
-                cuda_id,
-                model_name,
-                files,
-                model,
-                config,
-                output_suffix,
-                do_timestamps,
-                target_sample_rate,
-                processed_counter,
-                errors_counter,
-                error_details,
-            )
-            mark_work_shard_done(shard_path)
+        loader = None
+        try:
+            if use_persistent:
+                loader = PersistentTranscriptionLoader(
+                    sample_rate=target_sample_rate,
+                    batch_size=batch_size,
+                    num_workers=num_loader_workers,
+                    prefetch_factor=prefetch_factor,
+                ).__enter__()
+
+            while True:
+                shard_path = claim_work_shard(work_dir, cuda_id)
+                if shard_path is None:
+                    break
+                files = read_work_shard(shard_path)
+                claimed += 1
+                logger.info(f"Worker {cuda_id}: processing {len(files)} files from {shard_path.name}")
+                if loader is not None:
+                    _process_batches(
+                        tqdm(loader.iter_shard(files), desc=f"ASR-{cuda_id}", position=cuda_id),
+                        cuda_id, model_name, model, output_suffix, do_timestamps,
+                        target_sample_rate, processed_counter, errors_counter, error_details,
+                    )
+                else:
+                    _process_files(
+                        cuda_id,
+                        model_name,
+                        files,
+                        model,
+                        config,
+                        output_suffix,
+                        do_timestamps,
+                        target_sample_rate,
+                        processed_counter,
+                        errors_counter,
+                        error_details,
+                    )
+                mark_work_shard_done(shard_path)
+        finally:
+            if loader is not None:
+                loader.__exit__(None, None, None)
 
         logger.info(f"Worker {cuda_id} finished {claimed} shard(s) for {model_name}.")
 
@@ -346,31 +390,26 @@ def _recognize_chunk(spec: _GroupModelSpec, paths: List[str], waveforms, lengths
         return results
 
 
-def _process_group_files(cuda_id: int, specs: List[_GroupModelSpec],
-                         items: List[tuple], config: dict,
-                         processed_counter=None, errors_counter=None, error_details=None):
-    """Shared-decode pass: decode each file once, run every model that still
-    needs it in sub-chunks of that model's own batch size."""
+def _group_shard_inputs(specs: List[_GroupModelSpec], items: List[tuple]):
+    """Split annotated shard items into (files, needed-map) for a group shard."""
     all_names = [spec.name for spec in specs]
     files: List[str] = []
     needed: Dict[str, Set[str]] = {}
     for path, note in items:
         files.append(path)
         needed[path] = set(note.split(',')) if note else set(all_names)
+    return files, needed
 
-    macro_batch = max(spec.batch_size for spec in specs)
-    num_loader_workers = int(config.get('num_workers', 4))
-    prefetch_factor = int(config.get('prefetch_factor', 2))
 
-    dataloader = create_group_transcription_dataloader(
-        files,
-        sample_rates=[spec.sample_rate for spec in specs],
-        batch_size=macro_batch,
-        num_workers=num_loader_workers,
-        prefetch_factor=prefetch_factor,
-    )
+def _process_group_batches(batch_iter, specs: List[_GroupModelSpec],
+                           needed: Dict[str, Set[str]], all_names: List[str],
+                           processed_counter=None, errors_counter=None, error_details=None):
+    """Consume grouped ``(paths, padded_by_rate, load_errors)`` batches.
 
-    for paths, padded_by_rate, load_errors in tqdm(dataloader, desc=f"ASR-group-{cuda_id}", position=cuda_id):
+    Shared by the per-shard and persistent group loaders: the macro-batch
+    sequence is identical, so sub-batching and save semantics are too.
+    """
+    for paths, padded_by_rate, load_errors in batch_iter:
         for path_str, reason in load_errors:
             # Mirror the sequential flow's accounting: each model that still
             # needed this file would have failed to load it once.
@@ -410,6 +449,32 @@ def _process_group_files(cuda_id: int, specs: List[_GroupModelSpec],
                     processed_counter.value += len(chunk_paths)
 
 
+def _process_group_files(cuda_id: int, specs: List[_GroupModelSpec],
+                         items: List[tuple], config: dict,
+                         processed_counter=None, errors_counter=None, error_details=None):
+    """Per-shard group loader path (non-persistent fallback)."""
+    all_names = [spec.name for spec in specs]
+    files, needed = _group_shard_inputs(specs, items)
+
+    macro_batch = max(spec.batch_size for spec in specs)
+    num_loader_workers = int(config.get('num_workers', 4))
+    prefetch_factor = int(config.get('prefetch_factor', 2))
+
+    dataloader = create_group_transcription_dataloader(
+        files,
+        sample_rates=[spec.sample_rate for spec in specs],
+        batch_size=macro_batch,
+        num_workers=num_loader_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    _process_group_batches(
+        tqdm(dataloader, desc=f"ASR-group-{cuda_id}", position=cuda_id),
+        specs, needed, all_names,
+        processed_counter, errors_counter, error_details,
+    )
+
+
 def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
                      work_dir: str, config: dict, config_path: Optional[str] = None,
                      processed_counter=None, errors_counter=None, error_details=None):
@@ -429,19 +494,46 @@ def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
                 f"(batch={spec.batch_size}, rate={spec.sample_rate}, timestamps={spec.do_timestamps})"
             )
 
+        all_names = [spec.name for spec in specs]
+        macro_batch = max(spec.batch_size for spec in specs)
+        num_loader_workers = int(config.get('num_workers', 4))
+        prefetch_factor = int(config.get('prefetch_factor', 2))
+        use_persistent = bool(config.get('persistent_loaders', True)) and num_loader_workers > 0
+
         claimed = 0
-        while True:
-            shard_path = claim_work_shard(work_dir, cuda_id)
-            if shard_path is None:
-                break
-            items = read_annotated_work_shard(shard_path)
-            claimed += 1
-            logger.info(f"Worker {cuda_id}: group-processing {len(items)} files from {shard_path.name}")
-            _process_group_files(
-                cuda_id, specs, items, config,
-                processed_counter, errors_counter, error_details,
-            )
-            mark_work_shard_done(shard_path)
+        loader = None
+        try:
+            if use_persistent:
+                loader = PersistentGroupTranscriptionLoader(
+                    sample_rates=[spec.sample_rate for spec in specs],
+                    batch_size=macro_batch,
+                    num_workers=num_loader_workers,
+                    prefetch_factor=prefetch_factor,
+                ).__enter__()
+
+            while True:
+                shard_path = claim_work_shard(work_dir, cuda_id)
+                if shard_path is None:
+                    break
+                items = read_annotated_work_shard(shard_path)
+                claimed += 1
+                logger.info(f"Worker {cuda_id}: group-processing {len(items)} files from {shard_path.name}")
+                if loader is not None:
+                    files, needed = _group_shard_inputs(specs, items)
+                    _process_group_batches(
+                        tqdm(loader.iter_shard(files), desc=f"ASR-group-{cuda_id}", position=cuda_id),
+                        specs, needed, all_names,
+                        processed_counter, errors_counter, error_details,
+                    )
+                else:
+                    _process_group_files(
+                        cuda_id, specs, items, config,
+                        processed_counter, errors_counter, error_details,
+                    )
+                mark_work_shard_done(shard_path)
+        finally:
+            if loader is not None:
+                loader.__exit__(None, None, None)
 
         logger.info(f"Worker {cuda_id} finished {claimed} shard(s) for group {group_models}.")
 
