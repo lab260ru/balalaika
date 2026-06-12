@@ -1,5 +1,7 @@
 import argparse
 import multiprocessing as mp
+import os
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +60,24 @@ MODEL_MAP = {
 SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
 TARGET_SAMPLE_RATE = 16_000
 
+# Per-worker count of fast_rnnt patch skips (fast path -> stock decode). Each
+# worker process gets its own module global; surfaced in the end-of-run summary
+# log line so a mixed fast/stock run is greppable beyond the single warning.
+_FAST_PATH_FALLBACKS = 0
+
+
+def reset_fast_path_fallbacks() -> None:
+    global _FAST_PATH_FALLBACKS
+    _FAST_PATH_FALLBACKS = 0
+
+
+def fast_path_fallback_count() -> int:
+    return _FAST_PATH_FALLBACKS
+
+
+def log_fast_path_fallbacks(cuda_id: int) -> None:
+    logger.info(f"Worker {cuda_id}: fast-path fallbacks: {_FAST_PATH_FALLBACKS}")
+
 
 def maybe_patch_fast_rnnt(model, config: dict):
     """Install batched stateful RNN-T greedy decode on a loaded onnx-asr model.
@@ -79,6 +99,8 @@ def maybe_patch_fast_rnnt(model, config: dict):
     try:
         return _patch_fast_rnnt(model)
     except Exception as exc:  # never let the fast path break a worker
+        global _FAST_PATH_FALLBACKS
+        _FAST_PATH_FALLBACKS += 1
         logger.warning(f"fast_rnnt patch skipped ({exc}); using stock decode")
         return model
 
@@ -94,12 +116,22 @@ def _write_text_atomic(path: Path, text: str) -> None:
     """tmp+rename so a killed worker can't leave a truncated sidecar.
 
     A partially written transcript passes the resume scan forever (only
-    zero-byte files are retried), so sidecars must appear atomically.
+    zero-byte files are retried), so sidecars must appear atomically. The
+    staging file is a UNIQUE ``tempfile.mkstemp`` name in the destination
+    directory (cleaned up on error): a fixed ``<name>.tmp`` path lets an
+    orphaned worker from a crashed re-run race the same staging file and
+    publish interleaved bytes. Mirrors the peer writers in
+    ``phonemizer._process_one`` and ``accents._write_accent``.
     """
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    tmp.replace(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def save_results(paths: List[str], texts: List[Optional[str]], timestamps: Optional[List[Optional[str]]], model_suffix: str):
@@ -247,6 +279,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
                processed_counter=None, errors_counter=None, error_details=None):
     """Inference worker: loads onnx-asr model on a single GPU and claims file shards."""
     torch.cuda.set_device(cuda_id)
+    reset_fast_path_fallbacks()
 
     batch_size = resolve_batch_size(
         f"transcription.{model_name}", config.get('batch_size'), 16
@@ -341,6 +374,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
                 loader.__exit__(None, None, None)
 
         logger.info(f"Worker {cuda_id} finished {claimed} shard(s) for {model_name}.")
+        log_fast_path_fallbacks(cuda_id)
 
     except Exception as e:
         logger.exception(f"Worker {cuda_id} fatal error ({model_name}): {e}")
@@ -517,6 +551,7 @@ def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
     """Shared-decode inference worker: loads ALL group models on one GPU and
     claims annotated file shards (path TAB comma-joined-pending-models)."""
     torch.cuda.set_device(cuda_id)
+    reset_fast_path_fallbacks()
 
     try:
         providers = get_onnx_providers(
@@ -575,6 +610,7 @@ def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
                 loader.__exit__(None, None, None)
 
         logger.info(f"Worker {cuda_id} finished {claimed} shard(s) for group {group_models}.")
+        log_fast_path_fallbacks(cuda_id)
 
     except Exception as e:
         logger.exception(f"Worker {cuda_id} fatal error (group {group_models}): {e}")
