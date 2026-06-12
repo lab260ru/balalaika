@@ -27,6 +27,11 @@ apply_torch_perf_defaults()
 MODEL_MAX_TOKENS = 512
 MODEL_STRIDE = 128
 
+# HF pipelines pad each DataLoader batch to its in-batch max, so the length sort
+# only cuts padding waste if the slab is fed in several smaller micro-batches:
+# length-sorted neighbors share micro-batches padded to their LOCAL max.
+PUNCT_PIPELINE_BATCH = 8
+
 model = None
 tokenizer = None
 
@@ -88,10 +93,11 @@ def make_punct_batch(rover_paths) -> None:
 
     Two padding/robustness refinements:
 
-    * Texts are sorted by token length before the batched call so a single long
-      transcript doesn't pad the whole slab to its length (BERT attention is
-      O(L^2)). Each output goes to its own file, so write-back order is
-      irrelevant and per-text outputs are unchanged.
+    * Texts are sorted by token length and fed in PUNCT_PIPELINE_BATCH-sized
+      micro-batches so a single long transcript doesn't pad the whole slab to
+      its length (HF pads each DataLoader batch to its in-batch max, and BERT
+      attention is O(L^2)). Each output goes to its own file, so write-back
+      order is irrelevant and per-text outputs are unchanged.
     * Texts tokenizing past the model's 512-token limit are pre-screened onto
       the per-file path (the fast tokenizer chunks + aggregates them there)
       rather than being fed into the batched call where they would fail the
@@ -136,7 +142,8 @@ def make_punct_batch(rover_paths) -> None:
         pending.sort(key=lambda item: item[2])
         try:
             all_preds = model(
-                [text for _, text, _ in pending], batch_size=len(pending)
+                [text for _, text, _ in pending],
+                batch_size=min(PUNCT_PIPELINE_BATCH, len(pending)),
             )
             for (punct_path, _, _), preds in zip(pending, all_preds):
                 punct_path.write_text(

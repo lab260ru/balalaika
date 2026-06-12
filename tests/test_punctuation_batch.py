@@ -45,6 +45,7 @@ class _RecordingModel:
 
     def __init__(self):
         self.batch_calls: list[list[str]] = []
+        self.batch_sizes: list[int] = []
         self.single_calls: list[str] = []
 
     def _preds_for(self, text):
@@ -54,6 +55,7 @@ class _RecordingModel:
     def __call__(self, arg, batch_size=None):
         if isinstance(arg, list):
             self.batch_calls.append(list(arg))
+            self.batch_sizes.append(batch_size)
             return [self._preds_for(t) for t in arg]
         self.single_calls.append(arg)
         return self._preds_for(arg)
@@ -96,6 +98,26 @@ def test_batch_is_sorted_by_token_length(tmp_path, fake_model):
     for p in paths:
         out = p.with_name(p.name.replace("_rover.txt", "_punct.txt"))
         assert out.exists()
+
+
+def test_batch_size_capped_to_micro_batch(tmp_path, fake_model):
+    # An 18-text slab must be fed with batch_size == PUNCT_PIPELINE_BATCH (8),
+    # so length-sorted neighbors share micro-batches padded to their LOCAL max
+    # instead of one slab padded to the longest text.
+    paths = [_write_rover(tmp_path, f"f{i}", 5 + i) for i in range(18)]
+    punct.make_punct_batch(paths)
+
+    assert len(fake_model.batch_calls) == 1
+    assert fake_model.batch_sizes == [punct.PUNCT_PIPELINE_BATCH]
+    assert punct.PUNCT_PIPELINE_BATCH == 8
+
+
+def test_batch_size_is_len_pending_when_below_micro_batch(tmp_path, fake_model):
+    # Fewer texts than the micro-batch => no point asking for more.
+    paths = [_write_rover(tmp_path, f"g{i}", 5 + i) for i in range(3)]
+    punct.make_punct_batch(paths)
+
+    assert fake_model.batch_sizes == [3]
 
 
 def test_oversize_routed_to_per_file_not_batched(tmp_path, fake_model):
