@@ -45,6 +45,8 @@ import numpy.typing as npt
 import onnxruntime as rt
 from loguru import logger
 
+from src.utils.gpu import make_session_options
+
 # log_softmax lives in the installed package; import defensively so a future
 # onnx-asr layout change degrades to "no fast path" rather than crashing.
 try:  # pragma: no cover - import guard
@@ -92,8 +94,12 @@ def _rebuild_dynamic_batch(
     _relabel(model.graph.input, input_batch_axis)
     _relabel(model.graph.output, output_batch_axis)
 
-    sess_options = rt.SessionOptions()
-    sess_options.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
+    # Route through make_session_options so these dynamic-batch decoder/joiner
+    # sessions inherit runtime.threads_per_worker's intra-op cap (+ no-spin)
+    # like every other ORT session the ASR worker builds; OMP_NUM_THREADS alone
+    # does not reliably bound ORT's own intra-op pool. It sets ORT_ENABLE_ALL
+    # graph optimization, matching the prior hand-rolled options.
+    sess_options = make_session_options()
 
     providers = session.get_providers()
     provider_options = list(session.get_provider_options().values())

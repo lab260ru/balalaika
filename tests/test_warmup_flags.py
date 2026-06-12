@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmarking.warmup import batch_size_ladder
+from benchmarking.warmup import batch_size_ladder, denoising_probe_frames
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,30 @@ def test_ladder_cap_512():
     ladder = batch_size_ladder(512)
     assert 512 in ladder
     assert 1024 not in ladder
+
+
+# ---------------------------------------------------------------------------
+# denoising probe frame count (VRAM guard must see the runtime worst case)
+# ---------------------------------------------------------------------------
+
+def test_denoising_probe_frames_match_runtime_padded_len():
+    """The denoising warmup must probe at the runtime worst case so the VRAM
+    guard sees the activation memory the stage actually uses. The runtime
+    stage pads every batch up to MODEL_MAX_PADDED_LEN
+    (src/denoising/denoising.py); probing at the shorter --probe-seconds clip
+    under-measures VRAM and lets batch_size:auto OOM on the first long shard."""
+    from src.denoising.denoising import MODEL_MAX_PADDED_LEN
+
+    args = argparse.Namespace(probe_seconds=10.0)
+    assert denoising_probe_frames(args) == MODEL_MAX_PADDED_LEN
+
+
+def test_denoising_probe_frames_ignores_short_probe_seconds():
+    """Even a tiny --probe-seconds must still probe the full padded length."""
+    from src.denoising.denoising import MODEL_MAX_PADDED_LEN
+
+    args = argparse.Namespace(probe_seconds=1.0)
+    assert denoising_probe_frames(args) == MODEL_MAX_PADDED_LEN
 
 
 # ---------------------------------------------------------------------------
