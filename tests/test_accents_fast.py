@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
+import types
 
+import numpy as np
 import pytest
 
 ruaccent = pytest.importorskip("ruaccent")
@@ -359,3 +362,158 @@ class TestAccentMemoCorrectness:
         )
         assert fast._put_accent_memoized(w) == first
         assert fast._put_accent_memoized(w.upper()).lower() == first.lower()
+
+
+# --------------------------------------------------------------------------- #
+# 8. Duplicate-sentence omograph batching (no model needed).                  #
+# --------------------------------------------------------------------------- #
+class _HypTagTokenizer:
+    """Captures the per-row hypotheses of the single shared batch so the fake
+    session can stamp each row's logits with WHICH homograph it came from."""
+
+    def __init__(self):
+        self.hyps = None
+
+    def __call__(self, texts, hyps, **kwargs):  # noqa: ANN001
+        self.hyps = list(hyps)
+        return {"input_ids": np.zeros((len(texts), 1), dtype=np.int64)}
+
+
+class _HypTagSession:
+    """Returns logits whose column 1 is the captured hypothesis string's base
+    word codepoint sum — a per-CONTENT tag, so a slice handed the wrong rows
+    carries a different homograph's tag and is caught regardless of row index."""
+
+    def __init__(self, tokenizer):
+        self._tok = tokenizer
+
+    def run(self, _outputs, inputs):  # noqa: ANN001
+        n = inputs["input_ids"].shape[0]
+        rows = np.zeros((n, 2), dtype=np.float32)
+        for i, hyp in enumerate(self._tok.hyps):
+            rows[i, 1] = sum(ord(c) for c in hyp.replace("+", ""))
+        return [rows]
+
+
+def _omo_skeleton():
+    """A FastRUAccent shell with only the attributes ``_prime_omograph_logits``
+    and ``_collect_omograph_inputs`` touch, plus a content-tagging fake omograph
+    model — no ONNX, no model assets."""
+    fast = object.__new__(FastRUAccent)
+    fast._sent_model_preds = {}
+    fast.omographs = {"орган": ["+орган", "орг+ан"], "замок": ["з+амок", "зам+ок"]}
+    fast.yo_words = {}
+    fast.yo_homographs = {}
+    tok = _HypTagTokenizer()
+    om = types.SimpleNamespace(tokenizer=tok, session=_HypTagSession(tok))
+    fast.omograph_model = om
+    fast.delete_spaces_before_punc = lambda s: s
+    return fast
+
+
+def _base_tag(word: str) -> float:
+    return float(sum(ord(c) for c in word))
+
+
+class TestDuplicateSentenceOmographAlignment:
+    """A homograph-bearing sentence that occurs twice must NOT shift a later,
+    distinct homograph sentence onto the duplicate's logit rows.
+
+    ``_prime_omograph_logits`` extends the shared ONNX batch once per OCCURRENCE
+    but replays the slice offsets once per UNIQUE sentence; a duplicate therefore
+    used to desync the walk and hand every later sentence the wrong rows.
+    """
+
+    def test_duplicate_does_not_shift_later_sentence(self):
+        # [A, A, B]: A (орган) appears twice as the *same* string, B (замок) once.
+        # Each row's tag is its homograph's base; B's slice MUST carry замок's tag,
+        # not the duplicate орган rows it inherited under the desynced walk.
+        fast = _omo_skeleton()
+        fast._prime_omograph_logits(
+            [" Купил орган.", " Купил орган.", " Открыл замок."]
+        )
+        mapping = fast._omo_logits_by_sentence
+
+        a_tags = mapping[" Купил орган."][0][:, 1].tolist()
+        b_tags = mapping[" Открыл замок."][0][:, 1].tolist()
+        assert a_tags == [_base_tag("орган")] * 2, a_tags
+        assert b_tags == [_base_tag("замок")] * 2, b_tags
+
+    def test_no_duplicate_is_unaffected(self):
+        # Control: with no duplicate the slices were always content-correct.
+        fast = _omo_skeleton()
+        fast._prime_omograph_logits([" Купил орган.", " Открыл замок."])
+        mapping = fast._omo_logits_by_sentence
+        assert mapping[" Купил орган."][0][:, 1].tolist() == [_base_tag("орган")] * 2
+        assert mapping[" Открыл замок."][0][:, 1].tolist() == [_base_tag("замок")] * 2
+
+
+@needs_model
+class TestDuplicateSentenceEndToEnd:
+    """End-to-end: a text whose split yields a repeated homograph sentence then a
+    distinct one must stay character-identical to stock ``process_all``."""
+
+    DUP_TEXTS = [
+        "Раз. Купил замок вчера. Купил замок вчера. Включил орган громко.",
+        "Эй! Купил орган вчера! Купил орган вчера! Открыл замок ночью!",
+        "Раз. Тут стоит орган. Тут стоит орган. Там висит замок.",
+    ]
+
+    @pytest.mark.parametrize("text", DUP_TEXTS)
+    def test_duplicate_homograph_sentence_matches_stock(self, stock, text):
+        fast = _load_fast()
+        assert fast.process_all(text) == stock.process_all(text), repr(text)
+
+
+# --------------------------------------------------------------------------- #
+# 9. _sent_model_preds is freed per batch (no unbounded growth, no model).    #
+# --------------------------------------------------------------------------- #
+class _IdentityAccentModel:
+    def put_accent(self, word):  # noqa: ANN001
+        return word
+
+
+def _bookkeeping_skeleton():
+    """A tiny-mode FastRUAccent shell that runs the WHOLE batched flow with no
+    real ONNX: tiny_mode skips the stress model, '`е`'-free text skips the yo
+    model, and an empty ``omographs`` skips the omograph model."""
+    fast = object.__new__(FastRUAccent)
+    fast._batch_sentences = True
+    fast._memo_accent = False
+    fast.tiny_mode = True
+    fast.normalize = re.compile(r"[^a-zA-Zа-яА-ЯёЁ0-9\s.,!?]")
+    fast._accent_memo = {}
+    fast._sent_cache_dict = {}
+    fast._sent_model_preds = {}
+    fast._omo_logits_by_sentence = {}
+    fast.omographs = {}
+    fast.yo_words = {}
+    fast.yo_homographs = {}
+    fast.accents = {}
+    fast._SENT_CACHE_MAX = FastRUAccent._SENT_CACHE_MAX
+    fast.omograph_model = object()  # never invoked: no homographs -> no ONNX call
+    fast.accent_model = _IdentityAccentModel()
+    for name in ("delete_spaces_before_punc", "has_punctuation", "count_vowels"):
+        setattr(fast, name, types.MethodType(getattr(FastRUAccent, name), fast))
+    return fast
+
+
+class TestSentModelPredsFreed:
+    """``_sent_model_preds`` (two ONNX output objects per raw sentence) must be
+    cleared once a batch is consumed; the persistent module-global accent worker
+    would otherwise grow it unbounded over a stage run."""
+
+    # 'е'/'ё'-free so the yo model is never touched in the skeleton flow.
+    TXT = "Мама мыла раму. Папа купил стол. Ура урок."
+
+    def test_process_all_internal_frees_preds(self):
+        fast = _bookkeeping_skeleton()
+        fast._sent_model_preds["STALE"] = {"stress": None, "yo": None}
+        fast.process_all_internal(self.TXT)
+        assert fast._sent_model_preds == {}, fast._sent_model_preds
+
+    def test_process_batch_frees_preds(self):
+        fast = _bookkeeping_skeleton()
+        fast._sent_model_preds["STALE"] = {"stress": None, "yo": None}
+        fast.process_batch(["Мама мыла раму.", "Папа купил стол."])
+        assert fast._sent_model_preds == {}, fast._sent_model_preds

@@ -264,6 +264,7 @@ class FastRUAccent(RUAccent):
         for sents in per_text_sentences:
             outputs.append("".join(self._process_sentence_fast(s) for s in sents))
         self._omo_logits_by_sentence = {}
+        self._sent_model_preds = {}
         return outputs
 
     # ------------------------------------------------------------------ #
@@ -283,7 +284,9 @@ class FastRUAccent(RUAccent):
         # each — exactly the calls stock makes per sentence, bit-identical under
         # the attention mask.  Sentences already in the per-file cache skip both
         # the prime and the loop, mirroring stock's @lru_cache(4096).
-        to_predict = [s for s in sentences if s not in self._sent_cache_dict]
+        to_predict = list(
+            dict.fromkeys(s for s in sentences if s not in self._sent_cache_dict)
+        )
         if to_predict:
             self._prime_sentence_models(to_predict)
             # Then pre-compute the omograph classifier logits for every
@@ -293,6 +296,7 @@ class FastRUAccent(RUAccent):
         outputs = [self._process_sentence_fast(s) for s in sentences]
         # Free per-file scratch so a long worker run does not accumulate it.
         self._omo_logits_by_sentence = {}
+        self._sent_model_preds = {}
         return "".join(outputs)
 
     def _prime_sentence_models(self, sentences: List[str]) -> None:
@@ -356,6 +360,11 @@ class FastRUAccent(RUAccent):
         all_hyps: List[str] = []
 
         for sentence in sentences:
+            # ``per_sentence`` dedupes (one slice per unique sentence) but the
+            # batch and the replay walk are per-occurrence; skip duplicates so the
+            # rows we push stay exactly aligned with the offsets we replay below.
+            if sentence in per_sentence:
+                continue
             words = self._yo_words_for_sentence(sentence)
             if words is None:
                 continue
