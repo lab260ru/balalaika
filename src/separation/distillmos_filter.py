@@ -484,15 +484,17 @@ def main(args):
         )
 
     # Audit baseline is the post-prune dataframe (missing-on-disk rows have just
-    # been dropped). files_in / hours_in come straight from this frame's scored
-    # rows and its authoritative total_duration column — no need to touch the
-    # kept files on the HDD. This reproduces the print_preview numbers exactly.
+    # been dropped). files_in and the kept-side hours (base_save_hours) come
+    # straight from this frame's scored rows and its authoritative
+    # total_duration column — no need to touch the kept files on the HDD. The
+    # deleted side's hours are taken from the partials' probed durations below
+    # (base_delete_hours can undercount a candidate whose baseline duration was
+    # missing), so hours_in is finalised there.
     baseline = load_main_csv(podcasts_path)
     base_delete_count, base_delete_hours, base_save_count, base_save_hours = preview_counts(
         baseline, threshold
     )
     files_in = base_delete_count + base_save_count
-    hours_in = base_delete_hours + base_save_hours
 
     processed, deleted, errors = run_deletion_workers(
         podcasts_path, threshold, num_workers, args.config_path
@@ -531,6 +533,19 @@ def main(args):
                 combined.loc[deleted_mask, "duration_s"], errors="coerce"
             ).fillna(0.0)
             hours_deleted = float(deleted_durations.sum() / 3600.0)
+
+    # Keep the audit's hours internally consistent from a single duration
+    # source for the deleted side. ``hours_in`` from preview_counts counts the
+    # deletion candidates' *baseline* total_duration (``base_delete_hours``),
+    # but ``hours_deleted`` is the partials' probed ``duration_s`` — which a
+    # run_worker probe fills in exactly when the baseline duration was missing
+    # (so base_delete_hours undercounts it). Substitute the probed deleted
+    # hours for the baseline deleted hours so hours_in == base_save_hours +
+    # hours_deleted; then hours_out == base_save_hours by construction (the
+    # kept files' hours, never negative, never touched by a probe). This
+    # restores the original audit_from_filter_partials guarantee
+    # (hours_in - hours_deleted == hours_out) without baseline path matching.
+    hours_in = base_save_hours + hours_deleted
 
     record_stage_summary(
         podcasts_path=podcasts_path,

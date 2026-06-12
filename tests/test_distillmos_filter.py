@@ -382,6 +382,46 @@ def test_symlinked_root_audit_counts_deleted_files_and_hours(tmp_path):
     assert audit["hours_in"] - audit["hours_out"] == 2.0
 
 
+def test_deleted_candidate_missing_csv_duration_audit_stays_consistent(tmp_path):
+    """A DELETED candidate with a missing (NaN) ``total_duration`` in the
+    baseline CSV but a real probed ``duration_s`` must not drive ``hours_out``
+    negative.
+
+    ``hours_in`` is derived from the baseline's ``total_duration`` while
+    ``hours_deleted`` is derived from the partials' probed ``duration_s``; when
+    the deleted candidate's baseline duration is missing it contributes 0 to
+    ``hours_in`` yet its probed 2.0 h is subtracted as ``hours_deleted`` ->
+    ``hours_out`` would be -1.0 h with the mismatched-source audit. The audit
+    must be internally consistent from a single duration source:
+    ``hours_out >= 0`` and ``hours_in - hours_out == hours_deleted``.
+    """
+    rows = [
+        # mos, csv_total_duration, exists, real_duration_s
+        (2.0, np.nan, True, 7200.0),  # 0 candidate -> deleted; CSV dur missing, probed 2.0 h
+        (4.0, 3600.0, True, 3600.0),  # 1 kept; 1.0 h
+    ]
+    paths = make_dataset(tmp_path, rows, real_wavs=True)
+
+    _run_main(tmp_path, threshold=3.0, num_workers=1)
+
+    assert not os.path.exists(paths[0])
+    assert os.path.exists(paths[1])
+
+    fs = pd.read_csv(tmp_path / "filter_summary.csv").iloc[-1]
+    audit = _read_summary(tmp_path)
+    assert audit["files_deleted"] == 1
+    assert audit["files_in"] == 2
+    assert audit["files_out"] == 1
+    # Probed duration of the deleted candidate is 2.0 h.
+    hours_removed = audit["hours_in"] - audit["hours_out"]
+    assert hours_removed == 2.0
+    assert float(fs.hours_removed) == 2.0
+    # The crux: hours must stay internally consistent and never negative.
+    assert audit["hours_out"] >= 0.0
+    # The single kept file is 1.0 h; the audit must reflect that on the way out.
+    assert audit["hours_out"] == 1.0
+
+
 def test_non_symlinked_root_audit_unchanged(tmp_path):
     """Same scenario without a symlink: the audit numbers are identical to the
     symlinked case (1 deleted, 2.0 h removed). Guards against the fix changing
