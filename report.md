@@ -1059,3 +1059,317 @@ python -m benchmarking.micro.verify_punct_batch                # §12.5 RUPunct 
 CUDA_VISIBLE_DEVICES=1 python -m benchmarking.warmup --models tone --max-batch 512 \
   --config_path configs/config.yaml                            # §12.6
 ```
+
+## 13. Adversarial code review of the whole optimization branch (fifth pass, 2026-06-12)
+
+Scope: the full `main...HEAD` diff (~13.4k changed source lines across 87
+non-test files). Method: 12 independent finder angles (line-by-line over four
+file partitions, removed-behavior audit, cross-file caller tracing, Python/
+numpy/pandas/torch/shell pitfalls, wrapper/cache-key correctness, reuse,
+simplification, efficiency, altitude), ~30 deduplicated candidates, then one
+dedicated verifier per candidate (23 verdicts) plus a final gap sweep.
+Every verifier had to either CONFIRM with a quoted line + concrete trigger
+(running a CPU repro where feasible), or REFUTE with the disproving line.
+Both GPUs were occupied by the training job throughout, so all repros ran
+CPU-only (`CUDA_VISIBLE_DEVICES=""`); nothing here touched the GPUs.
+
+Headline: the two big rewrites are clean — batched RNN-T decode and FastROVER
+were re-verified during this review (3,300 randomized decode trials, 15,000
+ROVER trials, zero mismatches). The bugs found are at the seams: caching
+layers, state-export plumbing, dtype defaults, and resume logic.
+
+### 13.1 Confirmed bugs (each verified by a dedicated agent; ranked)
+
+1. **Accent stress corruption when a file repeats a sentence**
+   `src/accents/fast_accent.py:368` (`_prime_omograph_logits`).
+   `per_sentence` is a dict (dedupes), but `all_texts.extend(pre)` runs per
+   occurrence, so the logits-offset replay walks past duplicate rows and every
+   later sentence's slice lands on the wrong logits. Reachable via the
+   per-file fallback `process_all_internal` (its `to_predict` at line 286
+   filters cached sentences but does **not** dedupe; `process_batch` dedupes
+   via `seen` and is safe). End-to-end CPU repro on
+   `«Ну. Орган. Орган. Замок.»`: `Замок` received `Орган`'s logits and
+   rendered **`з+амок` instead of `зам+ок`** — silent wrong stress.
+   Fix: `to_predict = list(dict.fromkeys(...))` before priming.
+
+2. **Denoising input no longer byte-identical: float64 resample kernel**
+   `src/utils/datasets/denoising.py:59`. The cached
+   `torchaudio.transforms.Resample` defaults to `dtype=None`, which builds
+   its sinc kernel in **float64** then casts; the original
+   `functional.resample(waveform, ...)` built it in **float32**. Measured
+   (torch 2.8.0): 44.1→48 kHz float max|diff| 8.5e-6 → **3.27 % of int16
+   samples flip ±1**; 22.05 kHz → 2.99 %. The diff's own comment claims
+   "bit-identical" — it is not, for any non-48 kHz source. Fix (verified, 0
+   differing samples at all tested rates): pass `dtype=torch.float32` to
+   `transforms.Resample`.
+
+3. **Collate can crash + silently truncate `balalaika.parquet`**
+   `src/collate.py:365-376`. Slab streaming locks the Arrow schema from
+   slab 0; a metadata column that is all-NaN in the first 200k rows is
+   inferred as type `null`, and the first later slab with strings raises
+   `ArrowNotImplementedError: Unsupported cast from string to null`
+   (CPU-repro'd on the exact code path). The `finally` closes the writer, so
+   what remains is a *valid* parquet containing only slab 0 — later slabs
+   silently dropped, stage aborted. Fix: promote `null`-typed fields in the
+   locked schema to `pa.string()` before creating the writer.
+
+4. **Collate scandir cache: one transient OSError silently empties a
+   directory's sidecars** `src/collate.py:197-205`. `dir_names_cache` is one
+   plain dict shared lock-free by all worker threads for the whole run;
+   `except OSError: names = set()` then *caches* the empty set. If a
+   transient scandir failure (EMFILE under co-tenant fd pressure, concurrent
+   rename) races a successful listing and lands last, every subsequent file
+   in that directory reads all sidecars as `''` — transcripts/phonemes/
+   accents silently missing from the output with no logged error. The
+   pre-rewrite code had no cache, so a transient error cost one file, loudly.
+   Fix: never cache the error case (fall through uncached), and/or reuse the
+   `with os.scandir` + per-process `DirNameCache` already in sidecars.py.
+
+5. **Parquet state mode: exports read a stale `balalaika.csv`**
+   `src/utils/csv_manager.py:685` + `src/to_webdataset.py:245` +
+   `src/collate.py:317`. `upsert_columns` writes only `balalaika.parquet`;
+   the CSV export refresh (`_export_csv_from_state`) is wired *only* into
+   `absorb_partial_csvs`. Direct upserters — `ensure_audio_durations` from
+   stage 7 among others — therefore never refresh the CSV. Both stage 12
+   (collate) and stage 13 (to_webdataset) read the **hardcoded CSV** (only
+   report.py was taught to prefer parquet). Concrete resume sequence: stage 7
+   upserts durations into parquet → stage 11 early-returns "already denoised"
+   before its final absorb → collate + webdataset build from a pre-duration
+   CSV generation. Mitigation: `state_format: csv` is still the default;
+   parquet mode is opt-in. Fix: make collate/to_webdataset load via
+   `state_path()` like report.py, or refresh the export after every upsert.
+
+6. **Over-long sidecar names: one-time skip became an every-run
+   reprocess-and-fail loop** `src/utils/sidecars.py` (DirNameCache). The old
+   `text_sidecar_complete`/`path_exists` caught `ENAMETOOLONG` and returned
+   "complete" (skip forever). A scandir listing can never contain an
+   over-NAME_MAX name, so DirNameCache reports it missing; stages 7–10
+   re-run the model for that file every invocation and the atomic write then
+   fails with `ENAMETOOLONG` (repro'd: errno 36; the `.tmp` staging name is
+   even longer). The docstring documents the change as intentional
+   ("fail loudly at write time"), but the result is a permanent per-run
+   model-re-run + error-log loop, not a one-time failure. Fix: short-circuit
+   names exceeding `os.pathconf(dir, 'PC_NAME_MAX')` as done pre-rewrite.
+
+7. **DistillMOS deletion audit reports 0 when the dataset root is
+   symlinked** `src/separation/distillmos_filter.py:533`. Worker partials
+   store `resolve_path()`-resolved paths; the baseline from `load_main_csv`
+   keeps absolute paths verbatim (`normalize_path_string` does not resolve).
+   On a symlink/bind-mount/`..` root the `.isin()` mask is all-False →
+   `filter_summary.csv` says `deleted: 0 / hours_deleted: 0.0` while files
+   were really deleted (repro'd: 0 vs the correct 1). The original audit
+   summed the partials' own `deleted` column and was immune. Fix: restore
+   that, or resolve both sides before matching.
+
+8. **`.ogg` durations shifted ~30 ms by the probe-order change**
+   `src/utils/audit.py:94`. `_SOUNDFILE_EXACT_SUFFIXES` includes `.ogg`, so
+   soundfile is probed first; libsndfile excludes Vorbis padding frames that
+   torchaudio/ffmpeg (the old first probe) includes. Measured: 1.500 s vs
+   1.528 s on a synthesized file (−28 ms; a second file −31 ms). The value is
+   upserted into `total_duration` (4 dp) — permanent state drift vs the old
+   pipeline for every `.ogg`. `.wav/.flac/.opus` agree exactly. Fix: drop
+   `.ogg` from the soundfile-first set.
+
+9. **Unbounded per-worker memo in the accent stage**
+   `src/accents/fast_accent.py:108`. `_sent_model_preds` (two ONNX output
+   arrays per unique sentence) is never cleared; accent workers are
+   module-global, living for the whole stage. Sibling caches are bounded
+   (`_sent_cache_dict` cap 4096) or cleared per batch
+   (`_omo_logits_by_sentence`) — this one grows with every unique sentence
+   on a 31 GB node. Fix: `self._sent_model_preds.clear()` at the end of
+   `process_batch`, next to the existing `_omo_logits_by_sentence` clear.
+
+10. **fast_rnnt ONNX sessions bypass the intra-op thread cap**
+    `src/transcription/fast_rnnt.py:95`. `_rebuild_dynamic_batch` hand-rolls
+    `rt.SessionOptions()` instead of `make_session_options` (gpu.py), so the
+    decoder/joiner sessions inside the spawned ASR workers run with no
+    `runtime.threads_per_worker` cap — the oversubscription the cap was
+    added (§12.5) to prevent. `OMP_NUM_THREADS` does not reliably bound
+    ORT's own pool. (fast_accent caps correctly at load time; warmup.py has
+    the same pattern but is benchmark-only.) Fix: one-line switch to
+    `make_session_options`.
+
+11. **`runtime.io_profile` in config.yaml is dead** `src/utils/io_profile.py:124`.
+    The module docstring lists the YAML key as resolution step #1, and the
+    HDD-clamp log line tells users to set it — but `load_io_profile` (the
+    only reader) has **zero callers**; every stage calls
+    `clamp_loader_workers`/`resolve_io_profile` without it. Only
+    `BALALAIKA_IO_PROFILE` and sysfs auto-detection work. On a disk that
+    sysfs misreports (RAID/dm member, network mount → `None`→ssd), an
+    explicit `io_profile: hdd` is silently ignored and loader workers go
+    unclamped — the exact spindle-thrash §11 fought. Fix: thread the config
+    value through (it also duplicates `runtime_cfg`, which already defines
+    the key + env precedence — wire it there).
+
+12. **Fast-path fallbacks are silent, so one run can mix decoders**
+    clearest at `src/accents/accents.py:105-111`: if `process_batch` raises
+    on a slab, it falls back per-slab to the stock per-file path with one
+    WARNING and no counter — sidecars from the two paths are
+    indistinguishable. fast_rnnt falls back per-process at init (all-or-
+    nothing, less concerning); FastROVER per shard. Since fast/stock are
+    proven equivalent this is an observability gap, not wrong output — but
+    it would mask exactly the case where the fast path is wrong on the
+    inputs that crash it. Fix: count fallbacks into `write_stage_status`.
+
+13. **Punctuation batching defeats its own length-sort**
+    `src/punctuation/punctuation.py:136-139`. Texts are sorted by token
+    length, then passed with `batch_size=len(pending)` — one DataLoader
+    batch padded to the slab max, so the sort is a no-op (HF `pad_collate_fn`
+    pads to the batch max). With slab=16 the waste is bounded but real on
+    long-vs-short mixes. Fix: fixed small `batch_size` (e.g. 8) so sorted
+    neighbors share micro-batches.
+
+### 13.2 Plausible (mechanism verified, trigger narrow or environment-dependent)
+
+- **Warmup→runtime VRAM mismatch for denoising `batch_size: auto`**
+  (`benchmarking/warmup.py:322`): the probe uses
+  `min(probe_seconds, 10)·48 kHz = 480 k` frames, but the runtime stage pads
+  batches up to `MODEL_MAX_PADDED_LEN = 960 k` (20 s) — 2× the measured
+  activation memory. An `auto` batch size tuned at 10 s can OOM on the first
+  shard containing a ≥10 s clip, especially with training co-resident.
+  Probe at `MODEL_MAX_PADDED_LEN` instead.
+- **Fixed `.tmp` staging name** in `_write_text_atomic`
+  (`src/transcription/transcription.py:99`): same-run collisions are ruled
+  out by shard claiming (atomic rename) + sequential model runs; the residual
+  window is an orphaned worker from a crashed previous run still flushing
+  while a re-run writes the same sidecar. Peers (accents/phonemizer) already
+  use `mkstemp` + cleanup-on-error; mirror that.
+- **`_sanitize_records` int/bool branches ignore `null_mask`**
+  (`src/to_webdataset.py:114-124`): crashes on pandas nullable Int64/boolean
+  containing `pd.NA` (repro'd), but unreachable today — the loader always
+  reads CSV, where missing ints become float64 and route through the
+  null-aware float branch. Latent trap if metadata ever loads from parquet
+  (see 13.1 #5). Gate the casts on `null_mask` like the float branch.
+- **0-byte `balalaika.csv` now degrades the report** (`src/report.py:149`):
+  `pd.read_csv` raises EmptyDataError where the old `csv.DictReader`
+  returned an empty table; caught and downgraded to "no csv found". Cosmetic.
+- **Broad `except Exception` around `_integrated_loudness_fast`**
+  (`src/preprocess/audio_postprocessing.py:196`): the >5-channel fallback it
+  guards is real (verified to raise) and 1–2 ch parity is test-pinned; the
+  residual risk is silent self-disabling. Narrow the except and log once.
+
+### 13.3 Intentional output changes vs `main` (good direction — document, don't fix)
+
+- **Long transcripts now get punctuated**: stock fed >512-token texts into a
+  512-position BERT (tokenizer shipped the 1e30 sentinel `model_max_length`)
+  → CUDA device-side assert, file skipped. The new 512+stride chunk path
+  produces output for exactly those files (verified against transformers
+  4.51.3 internals). Short texts are byte-identical.
+- **Boundary-length OOV words now get phonemes**: a word tokenizing to
+  exactly 62 BPE ids crashed stock tryiparu (empty pad tensor promotes the
+  cat to float32; embedding rejects it — repro'd), losing the whole file's
+  sidecar; FastG2P types the tensor and decodes. Pinned in
+  `tests/test_phonemizer_fast_g2p.py`.
+
+### 13.4 Cleanup backlog (verified where marked ✓)
+
+- ~~`distillmos.use_tensorrt` dead key~~ **WITHDRAWN — section misread.**
+  The `use_tensorrt: True` at config.yaml:355 belongs to **antispoofing**
+  (live key: antispoofing.py reads it; Spectra-0's measured 4.25× TRT fp16
+  path). `separation.distillmos` never had a `use_tensorrt` key, and
+  DistillMOS itself is plain PyTorch fp32 — so the original §13.1-candidate
+  "fp16 scores feed the deletion filter" stays refuted, just for a different
+  reason than first written. A cleanup commit briefly flipped the
+  antispoofing key to False on this misreading; the adversarial fix
+  verification (§13.7) caught it and it was reverted verbatim (8dd017d).
+- ✓ `_onnx_first_input_name` in denoising.py is byte-for-byte
+  `gpu.py:onnx_first_input_name`; denoising.py already imports from gpu.
+- ✓ RNN-T micro-wins (per-step context rebuild, per-emit full-vocab softmax)
+  are real but minor — the per-step ONNX joiner launch dominates; take them
+  only as tidy-ups.
+- Four hand-rolled atomic-write idioms (transcription/accents/phonemizer/
+  fast_g2p) with divergent tmp-name/cleanup/fsync semantics → one shared
+  helper (csv_manager's is the most complete).
+- Dead gated paths carried in two places: sortformer IOBinding (~90 lines,
+  `sortformer_io_binding` is False everywhere) and the denoising
+  `_BoundedAudioSaver` fork (`async_save_workers` always 0); also the
+  `smart_vad_batch_size>1` branch (always 1 in config).
+- `run_per_gpu_pool_chunked` is a near-copy of `run_per_gpu_pool`; the
+  CPU-shim (`gpu_ids=[0]`) is duplicated in accents+phonemizer and absent in
+  punctuation (which therefore can't run CPU-only).
+- Accent hot path recomputes `split_by_words` up to 3× and `_process_yo_fast`
+  2× per sentence; punctuation tokenizes every text twice (screen + model).
+  `_sanitize_records` uses `Series.iloc[i]` per element (use `.tolist()`).
+- Collate's config keys live in the `download:` section; `io_profile.py`
+  re-parses the YAML instead of using cached `runtime_cfg` (same fix as
+  13.1 #11).
+
+### 13.5 Refuted during verification (don't re-chase these)
+
+- distillmos TRT fp16 "score shift before deletion" — refuted: DistillMOS has
+  no `use_tensorrt` key and runs plain PyTorch CUDA-fp32 (the config line the
+  finding pointed at is antispoofing's — see the withdrawn 13.4 entry).
+- FastG2P dict-loader type coercion — both loaders produce byte-identical
+  dicts on the shipped 397,782-row CSV (0 key/value diffs).
+- TF32 fast-vs-stock G2P divergence — fast_g2p saves/restores TF32 in
+  try/finally and *is* the production path; no concurrent stock baseline.
+- Accent memo `.lower()` length edge — exhaustive Unicode sweep: only U+0130
+  changes length, and stock renders via the same lowercase indices; outputs
+  byte-identical at every reachable stress position.
+- `flush_every_rows` 10k→100k recovery-window — partial CSVs flush per row
+  and are absorbed at next startup; the diff only fixed a stale comment.
+- `cpu_affinity: ""` — deliberate fix of the over-range "0-80" (§6 bug #6).
+
+### 13.6 Parity evidence executed during this review (CPU-only)
+
+| Check | Result |
+|---|---|
+| Batched RNN-T greedy vs stock loop (GigaAM + Kaldi backends) | 3,300 randomized trials, 0 mismatches |
+| FastROVER vs crowd-kit ROVER | 15,000 randomized trials, 0 mismatches |
+| G2P dictionary fast loader vs pandas loader | byte-identical (397,782 keys) |
+| Accent memo `.lower()` rendering vs stock | exhaustive sweep, 0 divergences |
+| `transforms.Resample` vs `functional.resample` | **parity broken** (13.1 #2); fix verified 0-diff |
+| Accent duplicate-sentence repro | **wrong stress confirmed** (13.1 #1) |
+| Collate slab-0 null schema | **crash + truncation confirmed** (13.1 #3) |
+
+Suggested fix order: #1/#2/#3 are one-to-three-line fixes with outsized
+correctness impact; then #4–#8 (resume/state seams); #9–#13 and 13.2 as
+convenient.
+
+### 13.7 Fixes applied (same day, 2026-06-12) — all 15 findings closed
+
+Process: 11 fix agents in isolated worktrees (one per finding group), each
+required to write the regression test first and show it failing on the buggy
+code before fixing; branches merged serially; then an **adversarial
+verification pass** (one verifier per fix attacking coverage/drift/new-bugs/
+test-quality, plus a cross-fix interaction sweep) which found three real
+problems in the first fix wave — all three fixed and re-verified the same
+way. Full suite after everything: **1430 passed, 0 failed** (was 1387 before
+the review; the delta is ~45 new pinned regression tests plus one corrected
+env-dependent test gate).
+
+| § | Finding | Fix (commit) |
+|---|---|---|
+| 13.1 #1 | accent duplicate-sentence logits | dedupe `to_predict` + defensive skip in `_prime_omograph_logits`; e2e test pins `зам+ок` (e04c855) |
+| 13.1 #2 | resample float64 kernel | `dtype=torch.float32` on `transforms.Resample`; parity test vs `functional.resample`; the old test was asserting the bug and now references functional (36d276f) |
+| 13.1 #3 | collate null-schema crash | null-typed slab-0 fields promoted to `pa.string()` before locking the writer schema; residual mismatch now raises naming the column (08305b1) |
+| 13.1 #4 | scandir cache poisoning | OSError listings are never cached; per-file direct-read fallback; thread-shared cache only ever stores good listings (08305b1) |
+| 13.1 #5 | parquet-mode stale CSV | new `read_state_dataframe` (parquet→CSV precedence, dtype normalization back to CSV-equivalents); collate + to_webdataset routed through it; `_sanitize_records` int/bool branches now honor `null_mask` (734fc53) |
+| 13.1 #6 | ENAMETOOLONG loop | `DirNameCache` short-circuits names over the per-dir `PC_NAME_MAX` as complete + warns once; pending() excludes them again (89206c8) |
+| 13.1 #7 | deletion audit 0 on symlinks | files/hours deleted from the partials' own rows (fc357c1); follow-up: `hours_in = base_save_hours + hours_deleted` so hours can never go negative (740458c, found by the verification pass) |
+| 13.1 #8 | .ogg duration shift | `.ogg` removed from the soundfile-first set; probe-order test (06f4c4e) |
+| 13.1 #9 | unbounded accent memo | `_sent_model_preds` cleared at the same reset points as `_omo_logits_by_sentence` (e04c855) |
+| 13.1 #10 | fast_rnnt uncapped sessions | sessions built via `make_session_options` (ddd0207); follow-up: `config_path` threaded through the whole chain + `BALALAIKA_CONFIG_PATH` fallback — the first fix was a silent no-op (`runtime_cfg(None)` never reads YAML), caught by the cross-fix sweep; tests now assert `intra_op_num_threads` actually lands (a8f7bb5) |
+| 13.1 #11 | dead io_profile YAML knob | `resolve_io_profile` consults `runtime_cfg` (env > YAML > sysfs); dead `load_io_profile` removed (1078f25) |
+| 13.1 #12 | silent fallback mixing | greppable `fast-path fallbacks: N` counters in accents/rover/transcription worker summaries (71d1956) |
+| 13.1 #13 | punct batch defeats sort | `batch_size=min(8, len(pending))` micro-batches (3849483) |
+| 13.2 warmup | denoising probe ½ runtime pad | probe at `MODEL_MAX_PADDED_LEN` (960k frames) so `batch_size:auto` sees worst-case memory (ddd0207) |
+| 13.2 tmp name | fixed `.tmp` staging | `mkstemp` + cleanup-on-error, matching the phonemizer/accents writers (71d1956) |
+
+Verification-pass catches (would have shipped otherwise):
+1. the config "cleanup" had flipped **antispoofing's** live TRT switch on a
+   misread section (reverted, 8dd017d — see withdrawn 13.4 entry);
+2. distillmos audit could report **negative hours_out** when a deleted file
+   had no CSV duration (740458c);
+3. the fast_rnnt thread-cap fix **never actually applied the cap** without a
+   config path (a8f7bb5).
+
+Also fixed in passing: `tests/test_sortformer_io_binding.py` gated its CUDA
+variant on the ORT build instead of a usable device, so the suite failed
+under `CUDA_VISIBLE_DEVICES=""` while training occupies the GPUs (a898799,
+pre-existing).
+
+Not done (deliberately, beyond the findings): the 13.4 structural cleanups —
+dead IOBinding/async-saver/smart_vad-batch paths, the pool near-copy, the
+four atomic-write idioms' unification, collate keys in the `download:`
+section, accent/punct micro-recomputes. All remain available as follow-ups.
