@@ -513,26 +513,24 @@ def main(args):
         ignore_index=True,
     ) if (leftover_partials is not None or new_partials_df is not None) else pd.DataFrame()
 
-    # files_deleted / hours_deleted reflect the files actually removed (from the
-    # candidate partials), exactly as the old all-rows audit did. In the normal
-    # case every candidate is removed and this equals the preview delete counts.
-    deleted_paths = set()
+    # files_deleted / hours_deleted reflect the files actually removed, taken
+    # straight from the candidate partials' own rows (their ``deleted`` flag and
+    # ``duration_s``) — exactly as the old all-rows audit did. Matching the
+    # partials' resolve_path()-resolved filepaths against the verbatim baseline
+    # paths would miss every row on a symlinked/bind-mounted/'..' root (the two
+    # path forms differ), reporting 0 deleted; the partials are authoritative.
+    files_deleted = 0
+    hours_deleted = 0.0
     if not combined.empty and "deleted" in combined.columns:
         deleted_mask = combined["deleted"].astype(str).str.lower().isin(
             {"true", "1", "yes"}
-        )
-        deleted_paths = set(
-            combined.loc[deleted_mask, "filepath"].astype(str).tolist()
-        )
-
-    base_durations = (
-        pd.to_numeric(baseline["total_duration"], errors="coerce").fillna(0.0)
-        if "total_duration" in baseline.columns
-        else pd.Series(0.0, index=baseline.index)
-    )
-    base_deleted_mask = baseline["filepath"].astype(str).isin(deleted_paths)
-    files_deleted = int(base_deleted_mask.sum())
-    hours_deleted = float(base_durations[base_deleted_mask].sum() / 3600.0)
+        ) | (combined["deleted"] == True)  # noqa: E712
+        files_deleted = int(deleted_mask.sum())
+        if "duration_s" in combined.columns:
+            deleted_durations = pd.to_numeric(
+                combined.loc[deleted_mask, "duration_s"], errors="coerce"
+            ).fillna(0.0)
+            hours_deleted = float(deleted_durations.sum() / 3600.0)
 
     record_stage_summary(
         podcasts_path=podcasts_path,
