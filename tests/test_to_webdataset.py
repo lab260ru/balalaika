@@ -31,7 +31,9 @@ def test_worker_fn_roundtrip(tmp_path):
             "DistillMOS": [4.25, 3.5],
         }
     ).to_csv(csv, index=False)
-    metadata = load_metadata(csv)
+    # load_metadata now takes the dataset root (state-aware) rather than the CSV
+    # path; in csv mode it reads <root>/balalaika.csv exactly as before.
+    metadata = load_metadata(tmp_path)
     assert set(metadata) == {"chunk_001", "chunk_0010"}
 
     out = tmp_path / "wds"

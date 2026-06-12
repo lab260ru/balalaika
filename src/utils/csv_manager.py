@@ -623,6 +623,69 @@ def load_main_csv(podcasts_path: os.PathLike | str) -> pd.DataFrame:
     return _normalize_filepath_column(df, owned=True)
 
 
+def _normalize_state_dtypes_to_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce a parquet-loaded frame to the dtypes a CSV read would yield.
+
+    Parquet preserves pandas' nullable extension dtypes (``Int64`` / ``boolean``
+    / ``string``) and Arrow-backed types, but every CSV consumer in the pipeline
+    was written against the numpy-backed dtypes ``fast_read_csv`` produces:
+
+    * nullable integer -> ``int64`` when no nulls, else ``float64`` (CSV loses
+      integerness once a column has a hole, exactly like ``pd.read_csv``);
+    * nullable boolean -> ``object`` with ``True`` / ``False`` / ``None``;
+    * nullable / Arrow string -> ``object`` with ``None`` for missing.
+
+    Operates in place on a frame the caller owns; returns it for chaining.
+    """
+    import pandas.api.types as ptypes
+
+    if df is None or df.empty:
+        return df
+    for col in df.columns:
+        s = df[col]
+        dtype = s.dtype
+        if not ptypes.is_extension_array_dtype(dtype):
+            continue
+        if ptypes.is_integer_dtype(dtype):
+            df[col] = s.astype("int64") if not s.isna().any() else s.astype("float64")
+        elif ptypes.is_bool_dtype(dtype):
+            df[col] = s.astype(object).where(s.notna(), None)
+        elif ptypes.is_string_dtype(dtype):
+            df[col] = s.astype(object).where(s.notna(), None)
+    return df
+
+
+def read_state_dataframe(podcasts_path: os.PathLike | str) -> pd.DataFrame:
+    """Read the active pipeline state for a late-stage consumer (read-only).
+
+    Mirrors :func:`report.py`'s precedence: in parquet mode prefer
+    ``balalaika.parquet`` when it exists, else fall back to the ``balalaika.csv``
+    export; csv mode always reads the CSV. This is the canonical reader for
+    stages that run *after* the direct upserters (``ensure_audio_durations`` &
+    co.) which write only the parquet state without refreshing the CSV export —
+    so the hardcoded CSV would be stale.
+
+    Unlike :func:`load_main_csv` this never migrates or writes; the parquet frame
+    is normalized to CSV-equivalent dtypes (see
+    :func:`_normalize_state_dtypes_to_csv`) so consumers see the dtypes they
+    always got from ``fast_read_csv``. Returns an empty (``filepath``-only) frame
+    when no state file exists.
+    """
+    parquet = parquet_path(podcasts_path)
+    if state_format() == "parquet" and parquet.exists():
+        df = _read_csv_safe(parquet)
+        if df is not None:
+            df = _normalize_state_dtypes_to_csv(df)
+    else:
+        df = _read_csv_safe(csv_path(podcasts_path))
+    if df is None:
+        return pd.DataFrame(columns=["filepath"])
+    if "filepath" not in df.columns:
+        df["filepath"] = ""
+    # Freshly read frame, no external alias yet -> normalize in place.
+    return _normalize_filepath_column(df, owned=True)
+
+
 def ensure_main_csv(
     podcasts_path: os.PathLike | str,
     audio_paths: Optional[Iterable[os.PathLike | str]] = None,

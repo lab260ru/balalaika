@@ -41,17 +41,23 @@ TEXT_COLUMNS = {
 }
 
 
-def load_metadata(csv_path: Path) -> Dict[str, dict]:
-    """Загружает balalaika.csv и делает словарь с ключом по базовому имени файла."""
+def load_metadata(podcasts_path: Path) -> Dict[str, dict]:
+    """Загружает состояние пайплайна и делает словарь с ключом по базовому имени файла.
+
+    Reads the active pipeline state (``balalaika.parquet`` in parquet mode, else
+    ``balalaika.csv``) so the metadata reflects direct upserters — e.g. stage-7's
+    duration cache — that write only the parquet state without refreshing the CSV
+    export.
+    """
     import os
 
-    if not csv_path.exists():
-        logger.warning(f"Metadata file {csv_path} not found!")
+    from src.utils.csv_manager import read_state_dataframe
+
+    df = read_state_dataframe(podcasts_path)
+    if df.empty:
+        logger.warning(f"No pipeline state found under {podcasts_path}!")
         return {}
 
-    from src.utils.csv_manager import fast_read_csv
-
-    df = fast_read_csv(csv_path)
     drop_cols = [
         col
         for col in df.columns
@@ -112,16 +118,24 @@ def _sanitize_records(df: pd.DataFrame) -> List[dict]:
             strs = s.astype(object).astype(str)
             vals = [None if null_mask[i] else strs.iloc[i] for i in range(n)]
         elif ptypes.is_integer_dtype(s):
-            # Native ints; integer columns cannot hold NaN.
+            # Native int64 holds no NaN, but pandas' nullable Int64 (e.g. from a
+            # parquet read) can carry pd.NA -> honour the mask like the float
+            # branch. to_numpy() upcasts nullable-with-null to float64, so guard
+            # int() on the present cells only.
             arr = s.to_numpy()
-            vals = [int(x) for x in arr.tolist()]
+            pylist = arr.tolist()
+            vals = [None if null_mask[i] else int(pylist[i]) for i in range(n)]
         elif ptypes.is_float_dtype(s):
             arr = s.to_numpy()
             pylist = arr.tolist()  # numpy float64 -> python float
             vals = [None if null_mask[i] else pylist[i] for i in range(n)]
         elif ptypes.is_bool_dtype(s):
+            # Native bool holds no NA, but nullable 'boolean' (parquet) can; its
+            # to_numpy() is an object array with pd.NA -> bool(pd.NA) raises, so
+            # honour the mask and only coerce present cells.
             arr = s.to_numpy()
-            vals = [bool(x) for x in arr.tolist()]
+            pylist = arr.tolist()
+            vals = [None if null_mask[i] else bool(pylist[i]) for i in range(n)]
         else:
             # Object/mixed column: fall back to the exact per-cell transform.
             raw = s.tolist()
@@ -242,8 +256,7 @@ def main(config, config_path: str | None = None):
     max_shard_count = config.get('max_shard_count', 10000)
         
     podcasts_path = Path(podcasts_path_str)
-    csv_path = podcasts_path / 'balalaika.csv'
-    
+
     wds_output_dir = podcasts_path.parent / f"{podcasts_path.name}_webdataset" / "train"
     wds_output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"WebDataset shards will be saved to: {wds_output_dir}")
@@ -256,7 +269,7 @@ def main(config, config_path: str | None = None):
         logger.warning("No audio data to process.")
         return
 
-    metadata_dict = load_metadata(csv_path)
+    metadata_dict = load_metadata(podcasts_path)
 
     chunk_size = len(all_audio_paths) // num_workers + 1
     chunks = [all_audio_paths[i:i + chunk_size] for i in range(0, len(all_audio_paths), chunk_size)]
