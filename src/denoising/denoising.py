@@ -8,8 +8,10 @@ and trimmed back to the original decoded length before saving.
 
 import argparse
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import onnxruntime as ort
@@ -40,6 +42,7 @@ from src.utils.datasets.denoising import (
 )
 from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
+from src.utils.node_profile import resolve_batch_size
 from src.utils.parallel import run_per_gpu_processes
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config
@@ -114,11 +117,34 @@ def ensure_model(model_path: Path, cfg: Dict) -> None:
 
 
 
+def _opt_profile_samples(cfg: Dict) -> int:
+    """Sample count for the TRT optimization profile's ``opt`` shape.
+
+    TensorRT tunes kernel tactics at the ``opt`` shape. The historical default
+    is 1 s (48000 samples) while real length-bucketed batches cluster at
+    5-15 s, so the engine ran tactics tuned for inputs an order of magnitude
+    shorter. ``denoising.trt_opt_seconds`` moves the opt point; the default
+    (1.0) reproduces the previous shape byte-for-byte. Clamped to the
+    [min, max] profile bounds.
+    """
+    try:
+        opt_seconds = float(cfg.get("trt_opt_seconds", 1.0))
+    except (TypeError, ValueError):
+        opt_seconds = 1.0
+    samples = int(round(opt_seconds * MODEL_SAMPLE_RATE))
+    min_samples = int(MODEL_TRT_MIN_SHAPE.rsplit("x", 1)[-1])
+    return max(min_samples, min(samples, MODEL_MAX_PADDED_LEN))
+
+
 def add_denoising_trt_profile_options(
     providers,
     input_name: str,
     batch_size: int,
+    cfg: Dict | None = None,
 ):
+    cfg = cfg or {}
+    opt_samples = _opt_profile_samples(cfg)
+    detailed_log = bool(cfg.get("trt_detailed_build_log", True))
     patched = []
     for provider in providers:
         if isinstance(provider, tuple):
@@ -131,14 +157,31 @@ def add_denoising_trt_profile_options(
             options.update(
                 {
                     "trt_profile_min_shapes": f"{input_name}:{MODEL_TRT_MIN_SHAPE}",
-                    "trt_profile_opt_shapes": f"{input_name}:{batch_size}x1x{MODEL_SAMPLE_RATE}",
+                    "trt_profile_opt_shapes": f"{input_name}:{batch_size}x1x{opt_samples}",
                     "trt_profile_max_shapes": f"{input_name}:{batch_size}x1x{MODEL_MAX_PADDED_LEN}",
                     "trt_timing_cache_enable": True,
-                    "trt_detailed_build_log": True,
+                    "trt_detailed_build_log": detailed_log,
                 }
             )
+            # Persist the timing cache next to the engine cache so a rebuild
+            # (e.g. after moving the opt shape) reuses tactic timings.
+            engine_cache = options.get("trt_engine_cache_path")
+            if engine_cache:
+                options["trt_timing_cache_path"] = engine_cache
         patched.append((provider_name, options))
     return patched
+
+
+def _onnx_first_input_name(model_path: Path) -> str:
+    """First graph input name, without instantiating an InferenceSession."""
+    import onnx
+
+    model = onnx.load(str(model_path), load_external_data=False)
+    initializers = {init.name for init in model.graph.initializer}
+    for graph_input in model.graph.input:
+        if graph_input.name not in initializers:
+            return graph_input.name
+    raise ValueError(f"No graph inputs found in {model_path}")
 
 
 def create_session(
@@ -157,20 +200,83 @@ def create_session(
     sess_options.intra_op_num_threads = ORT_THREADS
     sess_options.add_session_config_entry("session.set_denormal_as_zero", "1")
 
-    probe = ort.InferenceSession(
-        str(model_path),
-        sess_options=sess_options,
-        providers=["CPUExecutionProvider"],
-    )
-    input_name = probe.get_inputs()[0].name
-    del probe
+    # Read the input name from graph metadata instead of building a throwaway
+    # CPU InferenceSession (which loaded and optimized the full model once per
+    # worker just to learn one string).
+    input_name = _onnx_first_input_name(model_path)
 
     use_tensorrt = bool(cfg.get("use_tensorrt", True))
     providers = get_onnx_providers(rank, use_tensorrt=use_tensorrt, config_path=config_path)
-    providers = add_denoising_trt_profile_options(providers, input_name, batch_size)
+    providers = add_denoising_trt_profile_options(providers, input_name, batch_size, cfg)
 
     logger.info(f"[cuda:{rank}] Denoising ONNX providers: {providers}")
     return ort.InferenceSession(str(model_path), sess_options, providers=providers)
+
+
+def _save_audio(path_str: str, enhanced_tensor: torch.Tensor) -> None:
+    """Encode + write one denoised file (the GIL-releasing ffmpeg part)."""
+    torchaudio.save_with_torchcodec(str(path_str), enhanced_tensor, MODEL_SAMPLE_RATE)
+
+
+class _BoundedAudioSaver:
+    """Optional bounded background writer for the per-item denoised saves.
+
+    The encode+write (ffmpeg, releases the GIL) runs on a small thread pool so
+    it overlaps the next GPU batch instead of stalling it. The pool threads do
+    ONLY the save; all bookkeeping — the partial-CSV row, ``already_done`` and
+    the processed counter — is applied on the MAIN thread when a future is
+    reaped, so those structures stay single-threaded (no locking) and a row is
+    still written only AFTER its file's save succeeded (crash semantics
+    unchanged). In-flight futures are capped at ``max_pending`` so RAM stays
+    bounded; :meth:`drain` blocks until every queued save has landed, and
+    callers must drain before marking a shard done.
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        writer: PartialCsvWriter,
+        already_done: Set[str],
+        processed_counter,
+        errors_counter,
+        workers: int,
+        max_pending: int,
+    ) -> None:
+        self._rank = rank
+        self._writer = writer
+        self._already_done = already_done
+        self._processed_counter = processed_counter
+        self._errors_counter = errors_counter
+        self._max_pending = max(1, int(max_pending))
+        self._pool = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+        self._pending: Deque[Tuple[Future, str, str]] = deque()
+
+    def _commit(self, future: Future, path_str: str, resolved: str) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            logger.error(f"Failed to save denoised audio {path_str}: {exc}")
+            self._errors_counter.value += 1
+            return
+        self._writer.write({"filepath": resolved, PROCESSED_COLUMN: True})
+        self._already_done.add(resolved)
+        self._processed_counter.value += 1
+
+    def submit(self, path_str: str, resolved: str, enhanced_tensor: torch.Tensor) -> None:
+        while len(self._pending) >= self._max_pending:
+            fut, p, r = self._pending.popleft()
+            self._commit(fut, p, r)
+        future = self._pool.submit(_save_audio, path_str, enhanced_tensor)
+        self._pending.append((future, path_str, resolved))
+
+    def drain(self) -> None:
+        while self._pending:
+            fut, p, r = self._pending.popleft()
+            self._commit(fut, p, r)
+
+    def close(self) -> None:
+        self.drain()
+        self._pool.shutdown(wait=True)
 
 
 def _process_files(
@@ -186,9 +292,14 @@ def _process_files(
     skipped_counter,
     errors_counter,
 ) -> None:
-    batch_size = int(config.get("batch_size", 2))
+    batch_size = resolve_batch_size("denoising", config.get("batch_size"), 2)
     loader_workers = int(config.get("num_workers", 0))
     prefetch_factor = int(config.get("prefetch_factor", 2))
+    # 0 (default) = save synchronously inside the loop, byte- and
+    # behavior-identical to before. >0 overlaps the HDD encode/write of one
+    # batch with the next GPU batch via a bounded background pool.
+    async_save_workers = int(config.get("async_save_workers", 0))
+    async_save_queue = int(config.get("async_save_queue", 8))
 
     pending_files = []
     for path in files:
@@ -200,6 +311,18 @@ def _process_files(
 
     if not pending_files:
         return
+
+    saver: Optional[_BoundedAudioSaver] = None
+    if async_save_workers > 0:
+        saver = _BoundedAudioSaver(
+            rank,
+            writer,
+            already_done,
+            processed_counter,
+            errors_counter,
+            workers=async_save_workers,
+            max_pending=async_save_queue,
+        )
 
     dataloader = create_denoising_dataloader(
         pending_files,
@@ -282,6 +405,12 @@ def _process_files(
                 enhanced_tensor = torch.from_numpy(
                     enhanced.astype(np.float32, copy=False) / 32768.0
                 ).unsqueeze(0)
+                if saver is not None:
+                    # Bookkeeping (CSV row, already_done, counter) is applied on
+                    # this thread when the future is reaped — only after a
+                    # successful save — so crash semantics are unchanged.
+                    saver.submit(str(path_str), resolved, enhanced_tensor)
+                    continue
                 save_started_at = time.perf_counter()
                 torchaudio.save_with_torchcodec(
                     str(path_str),
@@ -311,6 +440,11 @@ def _process_files(
                 errors_counter.value += 1
         batch_wait_started_at = time.perf_counter()
 
+    if saver is not None:
+        # Block until every queued save (and its CSV row) has landed before the
+        # caller marks this shard done.
+        saver.close()
+
 
 def run_worker(
     rank: int,
@@ -326,7 +460,7 @@ def run_worker(
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
 
-    batch_size = int(config.get("batch_size", 2))
+    batch_size = resolve_batch_size("denoising", config.get("batch_size"), 2)
     model_path = resolve_model_path(str(config.get("onnx_path", DEFAULT_ONNX_PATH)))
 
     session = create_session(
@@ -447,6 +581,10 @@ def main():
         shard_size=shard_size,
         bucket_seconds=bucket_seconds,
         max_duration=max_bucket_duration,
+        # Denoising writes audio whose bytes can depend on batch composition
+        # (padded MossFormer2 batches); keep the duration order until the
+        # path-order divergence is measured on a node with the model.
+        order="legacy",
     )
     del pending
     del durations

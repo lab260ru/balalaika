@@ -29,6 +29,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torchaudio
 from dotenv import load_dotenv
@@ -92,7 +93,14 @@ def init_models(gpu_id: int, config: Dict[str, Any], config_path: Optional[str] 
     device = f"cuda:{gpu_id}"
     if torch.cuda.is_available():
         torch.cuda.set_device(gpu_id)
-    providers = get_onnx_providers(gpu_id, use_tensorrt=True, config_path=config_path)
+    # Provider/precision for the dynamic-shape streaming Sortformer session is a
+    # config knob. Default True preserves today's behavior exactly (TensorRT
+    # first with the runtime trt_fp16 precision); set preprocess.use_tensorrt
+    # false to run on CUDA EP fp32 — see config.yaml for the tradeoff. The
+    # numerics of TRT-fp16 vs CUDA-fp32 cannot be validated on this node (the
+    # ONNX model is absent), so the default is unchanged.
+    use_tensorrt = bool(config.get('use_tensorrt', True))
+    providers = get_onnx_providers(gpu_id, use_tensorrt=use_tensorrt, config_path=config_path)
 
     try:
         from src.preprocess.sortformer_onnx import DiarizationConfig, Sortformer
@@ -106,6 +114,7 @@ def init_models(gpu_id: int, config: Dict[str, Any], config_path: Optional[str] 
         config=model_config,
         providers=providers,
         device=device,
+        use_io_binding=bool(config.get('sortformer_io_binding', False)),
     )
 
     vad_args = config.get('vad_args', {})
@@ -232,6 +241,7 @@ def apply_eos_classification(
     max_duration: float = 15.0,
     min_duration: float = DEFAULT_MIN_SEGMENT_DURATION_S,
     max_merge_gap: float = DEFAULT_MAX_MERGE_GAP_S,
+    smart_vad_batch_size: int = 1,
 ) -> List[Tuple[float, float, int]]:
     global smart_vad
     if not segments:
@@ -244,19 +254,46 @@ def apply_eos_classification(
     else:
         vad_audio = audio
     audio_np = vad_audio.squeeze(0).numpy() if vad_audio.dim() > 1 else vad_audio.numpy()
-    classified = []
+
+    # Slice every non-empty segment first (the empty-skip rule is identical to
+    # the per-segment loop). Then classify either one at a time (batch size 1 —
+    # the default, bit-identical to the old flow) or in slabs of
+    # smart_vad_batch_size through one feature-extraction + ONNX call each.
+    pending: List[Tuple[float, float, int, np.ndarray]] = []
     for s, e, spk in segments:
         segment_audio = audio_np[int(s * vad_sr):min(int(e * vad_sr), len(audio_np))]
         if len(segment_audio) == 0:
             continue
-        inference_started_at = time.perf_counter()
-        pred = smart_vad.predict_endpoint(segment_audio, sample_rate=vad_sr)['prediction'] if smart_vad else 1
-        logger.debug(
-            f"perf model=smart_vad event=inference "
-            f"seconds={time.perf_counter() - inference_started_at:.6f} "
-            f"sample_rate={vad_sr} frames={len(segment_audio)}"
-        )
-        classified.append((s, e, spk, pred))
+        pending.append((s, e, spk, segment_audio))
+
+    classified = []
+    batch_size = max(1, int(smart_vad_batch_size))
+    if smart_vad is None:
+        classified = [(s, e, spk, 1) for s, e, spk, _ in pending]
+    elif batch_size <= 1:
+        for s, e, spk, segment_audio in pending:
+            inference_started_at = time.perf_counter()
+            pred = smart_vad.predict_endpoint(segment_audio, sample_rate=vad_sr)['prediction']
+            logger.debug(
+                f"perf model=smart_vad event=inference "
+                f"seconds={time.perf_counter() - inference_started_at:.6f} "
+                f"sample_rate={vad_sr} frames={len(segment_audio)}"
+            )
+            classified.append((s, e, spk, pred))
+    else:
+        for i in range(0, len(pending), batch_size):
+            slab = pending[i:i + batch_size]
+            inference_started_at = time.perf_counter()
+            results = smart_vad.predict_endpoint_batch(
+                [seg_audio for _, _, _, seg_audio in slab], sample_rate=vad_sr
+            )
+            logger.debug(
+                f"perf model=smart_vad event=inference_batch "
+                f"seconds={time.perf_counter() - inference_started_at:.6f} "
+                f"sample_rate={vad_sr} items={len(slab)}"
+            )
+            for (s, e, spk, _), res in zip(slab, results):
+                classified.append((s, e, spk, res['prediction']))
 
     merged: List[Tuple[float, float, int]] = []
 
@@ -289,10 +326,48 @@ def apply_eos_classification(
     return merged
 
 
+class SegmentIndex:
+    """Searchsorted index over an episode's diarization segments.
+
+    ``raw_segments`` is sorted by start (``diarize_audio`` guarantees this), so
+    a per-chunk overlap query only needs the segments whose ``start < c_end``
+    and whose ``end > c_start``. ``starts`` bounds the upper end via
+    ``searchsorted``; a prefix-max of ``ends`` bounds the lower end, turning the
+    old O(chunks × segments) full scan into O(chunks × log + overlaps). The
+    arithmetic over the selected candidates is unchanged, so outputs (including
+    the ``round(x, 2)`` values written to balalaika.csv) are identical.
+    """
+
+    __slots__ = ("starts", "ends", "speakers", "prefix_max_end")
+
+    def __init__(self, raw_segments: List[Tuple[float, float, int]]):
+        n = len(raw_segments)
+        if n == 0:
+            self.starts = np.empty(0, dtype=np.float64)
+            self.ends = np.empty(0, dtype=np.float64)
+            self.speakers = np.empty(0, dtype=np.int64)
+            self.prefix_max_end = np.empty(0, dtype=np.float64)
+            return
+        self.starts = np.fromiter((s[0] for s in raw_segments), dtype=np.float64, count=n)
+        self.ends = np.fromiter((s[1] for s in raw_segments), dtype=np.float64, count=n)
+        self.speakers = np.fromiter((s[2] for s in raw_segments), dtype=np.int64, count=n)
+        self.prefix_max_end = np.maximum.accumulate(self.ends)
+
+    def candidate_range(self, c_start: float, c_end: float) -> range:
+        # Segments with start < c_end (upper bound) intersected with the
+        # earliest index whose running-max end exceeds c_start (lower bound).
+        hi = int(np.searchsorted(self.starts, c_end, side="left"))
+        if hi == 0:
+            return range(0, 0)
+        lo = int(np.searchsorted(self.prefix_max_end[:hi], c_start, side="right"))
+        return range(lo, hi)
+
+
 def get_chunk_metrics(
     c_start: float,
     c_end: float,
     raw_segments: List[Tuple[float, float, int]],
+    seg_index: Optional["SegmentIndex"] = None,
 ) -> Tuple[float, float, int]:
     chunk_dur = c_end - c_start
     if chunk_dur <= 0:
@@ -301,12 +376,23 @@ def get_chunk_metrics(
     intervals = []
     speakers_in_chunk = set()
 
-    for rs, re_, spk in raw_segments:
-        overlap_s = max(c_start, rs)
-        overlap_e = min(c_end, re_)
-        if overlap_s < overlap_e:
-            intervals.append([overlap_s, overlap_e])
-            speakers_in_chunk.add(spk)
+    if seg_index is not None:
+        starts = seg_index.starts
+        ends = seg_index.ends
+        speakers = seg_index.speakers
+        for i in seg_index.candidate_range(c_start, c_end):
+            overlap_s = max(c_start, float(starts[i]))
+            overlap_e = min(c_end, float(ends[i]))
+            if overlap_s < overlap_e:
+                intervals.append([overlap_s, overlap_e])
+                speakers_in_chunk.add(int(speakers[i]))
+    else:
+        for rs, re_, spk in raw_segments:
+            overlap_s = max(c_start, rs)
+            overlap_e = min(c_end, re_)
+            if overlap_s < overlap_e:
+                intervals.append([overlap_s, overlap_e])
+                speakers_in_chunk.add(spk)
 
     intervals.sort(key=lambda x: x[0])
     if not intervals:
@@ -460,6 +546,10 @@ def cut_audio(
     )
     source_duration = float(dur_attr) if dur_attr else 0.0
 
+    # Build the searchsorted index over this episode's segments ONCE so each
+    # chunk's metrics query is bounded instead of scanning every segment.
+    seg_index = SegmentIndex(raw_segments)
+
     for start, end, spk in final_segments:
         dur = end - start
         if dur <= min_save_duration:
@@ -469,7 +559,9 @@ def cut_audio(
         if clamped_end <= start:
             continue
 
-        sil_pct, max_sil, unique_spk = get_chunk_metrics(start, end, raw_segments)
+        sil_pct, max_sil, unique_spk = get_chunk_metrics(
+            start, end, raw_segments, seg_index=seg_index
+        )
 
         try:
             samples = decoder.get_samples_played_in_range(
@@ -541,12 +633,24 @@ def cut_audio(
     return results
 
 
-def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Dict[str, Any]) -> Dict[str, Any]:
+def process_audio_file(
+    path_audio: str,
+    audio: torch.Tensor,
+    sr: int,
+    config: Dict[str, Any],
+    raw_bytes: Optional[bytes] = None,
+) -> Dict[str, Any]:
     """Process a single source recording.
 
     Returns a dict with ``segments`` (list of metadata dicts for each chunk
     written) and ``source_duration_s`` so the parent process can build the
     audit summary without re-probing files.
+
+    ``raw_bytes`` carries the file's already-read encoded bytes from the loader
+    (only for short single-chunk sources). When present the fused single-chunk
+    branch decodes the native-rate waveform from those bytes instead of doing a
+    second cold-cache disk read — torchcodec decodes a ``bytes`` source
+    bit-identically to a path source.
     """
     limit_dur = config.get('duration', 15)
     chunk_duration = config.get('chunk_duration', DEFAULT_CHUNK_DURATION_S)
@@ -595,7 +699,11 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
                 }
 
             if fuse_audio:
-                decoder = AudioDecoder(str(p_audio))
+                # Reuse the loader's bytes for the native decode when available
+                # so this short source is not read from the HDD a second time.
+                decoder = AudioDecoder(
+                    raw_bytes if raw_bytes is not None else str(p_audio)
+                )
                 native_sr = int(decoder.metadata.sample_rate)
                 native_audio = decoder.get_all_samples().data.to(dtype=torch.float32)
                 del decoder
@@ -644,6 +752,7 @@ def process_audio_file(path_audio: str, audio: torch.Tensor, sr: int, config: Di
         final_segments = apply_eos_classification(
             audio, sr, clean_segments, max_duration=limit_dur,
             min_duration=min_segment_dur, max_merge_gap=max_merge_gap,
+            smart_vad_batch_size=int(config.get("smart_vad_batch_size", 1)),
         )
 
         if not final_segments:
@@ -737,18 +846,34 @@ def _run_diarization_shard(
     ``balalaika.csv`` every N rows, and a final ``absorb_partial_csvs`` runs
     at the end. No retries, no respawns — keep this hot path simple.
     """
-    results: List[Dict[str, Any]] = []
+    # Rows are streamed to the partial CSV as they are produced, so the shard
+    # holds only running aggregates (row count + duration sum) instead of every
+    # chunk dict — O(1) RAM in the worker, no multi-GB list pickled to the
+    # parent. The parent only ever needed len() and a total_duration sum.
+    n_rows = 0
+    duration_sum_s = 0.0
     crest_audit = _new_crest_audit()
     partial_fields = (
         FUSED_PARTIAL_FIELDS
         if fused_audio_preprocessing_enabled(config)
         else PARTIAL_FIELDS
     )
+    # The native-rate re-decode only happens for short sources that fall into the
+    # single-chunk branch (``total_audio_duration <= duration``). Reuse the bytes
+    # the loader already read for exactly those — large multi-hour sources go down
+    # the lazy ``cut_audio`` window path and must NOT have their (100s of MB) bytes
+    # shipped through the batch, so the loader caps byte reuse at ``duration``.
+    raw_bytes_max_duration_s = (
+        float(config.get("duration", 15))
+        if fused_audio_preprocessing_enabled(config)
+        else None
+    )
     dataloader = create_diarization_dataloader(
         gpu_files,
         batch_size=int(config.get("diarization_batch_size", 1)),
         num_workers=int(config.get("diarization_loader_workers", num_loader_workers)),
         prefetch_factor=int(config.get("diarization_prefetch_factor", 2)),
+        raw_bytes_max_duration_s=raw_bytes_max_duration_s,
     )
     batch_size = int(config.get("diarization_batch_size", 1))
     loader_workers = int(config.get("diarization_loader_workers", num_loader_workers))
@@ -772,12 +897,14 @@ def _run_diarization_shard(
                 f"batch={batch_idx} seconds={batch_received_at - batch_wait_started_at:.6f} "
                 f"items={len(batch)}"
             )
-            for path_audio, audio, sr, error in batch:
+            for path_audio, audio, sr, error, raw_bytes in batch:
                 if error:
                     logger.error(f"Broken file {path_audio}: {error}")
                     continue
                 try:
-                    res = process_audio_file(str(path_audio), audio, sr, config)
+                    res = process_audio_file(
+                        str(path_audio), audio, sr, config, raw_bytes=raw_bytes
+                    )
                     _merge_crest_audit(
                         crest_audit, res.get("crest_audit", _new_crest_audit())
                     )
@@ -790,12 +917,17 @@ def _run_diarization_shard(
                                 f"seconds={time.perf_counter() - write_started_at:.6f} "
                                 f"path={seg.get('filepath', '')}"
                             )
-                            results.append(seg)
+                            n_rows += 1
+                            duration_sum_s += float(seg.get("total_duration", 0.0) or 0.0)
                 except Exception as e:
                     logger.error(f"Task error on GPU {gpu_id}: {e}")
             batch_wait_started_at = time.perf_counter()
 
-    return {"segments": results, "crest_audit": crest_audit}
+    return {
+        "rows": n_rows,
+        "duration_sum_s": duration_sum_s,
+        "crest_audit": crest_audit,
+    }
 
 
 def process_gpu_batch(gpu_id: int, gpu_files: List[Path], config: Dict[str, Any], config_path: str, num_workers_per_gpu: int, podcasts_path: str) -> Dict[str, Any]:
@@ -887,7 +1019,10 @@ def main(args):
             "before scheduling new work."
         )
 
-    all_results: List[Dict[str, Any]] = []
+    # Aggregates only (row count + duration sum) — the per-chunk dicts are
+    # already streamed to the partial CSVs, so the parent never accumulates them.
+    total_rows = 0
+    total_duration_s = 0.0
     crest_audit = _new_crest_audit()
     files_per_gpu: List[List[Path]] = (
         [[] for _ in range(num_gpus)] if num_gpus > 0 else [paths_to_process]
@@ -932,7 +1067,8 @@ def main(args):
                 for future in as_completed(gpu_futures):
                     try:
                         batch_result = future.result()
-                        all_results.extend(batch_result["segments"])
+                        total_rows += int(batch_result.get("rows", 0))
+                        total_duration_s += float(batch_result.get("duration_sum_s", 0.0))
                         _merge_crest_audit(
                             crest_audit, batch_result["crest_audit"]
                         )
@@ -958,13 +1094,13 @@ def main(args):
             f"Metadata atomically written to {podcasts_path / 'balalaika.csv'}."
         )
 
-    hours_out = sum(float(r.get('total_duration', 0.0)) for r in all_results) / 3600.0
+    hours_out = total_duration_s / 3600.0
 
     record_stage_summary(
         podcasts_path=podcasts_path,
         stage="preprocess",
         files_in=len(paths_to_process),
-        files_out=len(all_results),
+        files_out=total_rows,
         hours_in=hours_in,
         hours_out=hours_out,
         params={

@@ -1,0 +1,1167 @@
+{
+ "areas": [
+  {
+   "area": "collate-export-report",
+   "findings": [
+    {
+     "title": "Collate holds every sidecar text in RAM 3x (list-of-dicts -> DataFrame -> merge -> arrow) before one giant to_parquet; stream slabs to a ParquetWriter instead",
+     "locations": [
+      "src/collate.py:252",
+      "src/collate.py:274-284",
+      "src/collate.py:290-296",
+      "src/collate.py:145-151"
+     ],
+     "category": "ram",
+     "description": "Stage 12 accumulates one Python dict per audio file containing ALL sidecar contents (~17 columns: accent/rover/punct/phonemes + per-model transcripts + .tst timestamp blobs) into `results`, then builds `extracted_df = pd.DataFrame(results)` (line 290), pd.merge with the metadata frame (292), runs consistency, and finally `to_parquet` which converts the whole frame to Arrow — yet another full copy of every string. At 2M rows: dict overhead alone is ~1.5-2.2 GB (one ~1.1 KB dict per row), sidecar text content (transcripts ~0.2-1 KB x ~8 models + multi-KB .tst JSON) is ~5-10 GB as Python strings, and `results` is never freed, so peak = dicts + strings + object-frame pointers + a second full copy of all string data in Arrow buffers inside to_parquet. That plausibly exceeds the ~21 GB free on this node and OOMs at production scale. The consistency step adds its own transient: lines 145-151 materialize k normalized copies of every transcript plus a concat of all of them before factorize (~2x all-transcript bytes). All of this is row-independent: consistency depends only on the row's own transcripts, sidecar reads are per-file, and `executor.map` already yields slabs in input order.",
+     "proposed_fix": "Stream the export: pre-index metadata once (df.set_index('filepath') or a dict), then for each 100-200k-row slab of audio_paths collect sidecar columns into per-column lists (no per-row dicts), join metadata by lookup, compute asr_consistency on the slab (factorize per slab gives identical results since agreement is within-row), build a pyarrow Table and append via pyarrow.parquet.ParquetWriter with a fixed schema. Row order is preserved (slabs are ordered), so values and order are identical; only row-group layout/file bytes differ. While there, expose `parquet_compression` (zstd shrinks text-heavy output ~2x = fewer HDD write bytes) and replace the `.str.split().str.join(' ')` normalization (allocates a word-list per row) with `.str.replace(r'\\s+',' ',regex=True).str.strip()` — same ' '.join(s.split()) semantics. Peak RAM drops from O(dataset text) to O(slab + metadata frame). No numba/C++ needed — this is allocation discipline, not compute.",
+     "expected_gain": "Peak RAM at 2M rows drops from an estimated 12-20 GB (OOM territory on this 31 GB node) to ~2-3 GB; wall-clock roughly neutral to slightly faster (giant merge replaced by ordered slab joins; ParquetWriter writes overlap collection). Scales with dataset size — at 10M rows the current code cannot run on this node at all.",
+     "benchmarkable": true,
+     "risk": "medium — parquet VALUES and row order provably identical (pin with a round-trip equality test like tests/test_collate_consistency.py), but file bytes/row-group layout differ from the single-shot to_parquet; schema must be fixed up-front (all sidecar cols are str, consistency float). Keep the old path behind a knob if byte-stability of the .parquet matters."
+    },
+    {
+     "title": "to_webdataset still pickles the FULL metadata_dict to every worker — report.md §8 claims this was fixed, but it is not in the code",
+     "locations": [
+      "src/to_webdataset.py:210-214",
+      "src/to_webdataset.py:69-73",
+      "src/to_webdataset.py:203-204"
+     ],
+     "category": "ram",
+     "description": "report.md §8 states 'webdataset workers now receive only their shard's metadata instead of the full dict', but `executor.submit(worker_fn, worker_id, chunk, wds_output_dir, metadata_dict, ...)` at to_webdataset.py:212 ships the ENTIRE metadata_dict to every ProcessPoolExecutor worker. The commit 5c124e5 that report.md cites only vectorized load_metadata and the sibling scandir — the subsetting was never applied. At 2M rows the records dict is ~2-4 GB (one ~1 KB dict per stem plus values); with export.num_workers raised above the config default of 1, the parent pickles those GB once per worker (tens of seconds each, serialized in the parent) and each child unpickles a full private copy: 8 workers x ~3 GB = guaranteed OOM on this 31 GB node. This is exactly the trap flagged in .claude/analysis/denoising-export.json ('to_webdataset metadata_dict pickling') — still open.",
+     "proposed_fix": "Subset per chunk before submit: `stems = {os.path.splitext(os.path.basename(p))[0] for p in chunk}; chunk_meta = {s: metadata_dict[s] for s in stems if s in metadata_dict}` and pass chunk_meta. ~6 lines, outputs identical (each worker only ever looks up its own chunk's stems). Do NOT rely on fork COW — the per-cell sanitization loop touches refcounts and un-shares the pages anyway. Also fix report.md §8 to match reality. Optionally split into more chunks than workers (chunk_id in the shard pattern instead of worker_id) to fix byte-skew stragglers, since chunks are count-balanced, not byte-balanced.",
+     "expected_gain": "Removes the N-workers RAM multiplier (8 workers: ~24 GB -> ~3 GB total for metadata) and N full-dict pickle/unpickle cycles at pool startup (minutes at 2M rows). Makes num_workers > 1 actually usable on this node.",
+     "benchmarkable": true,
+     "risk": "low — byte-identical shards (same keys looked up); trivial change. The report.md correction is documentation-only."
+    },
+    {
+     "title": "Collate loads balalaika.csv with plain pd.read_csv instead of the pyarrow fast_read_csv used everywhere else",
+     "locations": [
+      "src/collate.py:244"
+     ],
+     "category": "io",
+     "description": "Every other CSV consumer (to_webdataset.py:54, csv_manager users) goes through `fast_read_csv` (multithreaded pyarrow parser, ~4x faster, BALALAIKA_CSV_ENGINE=c escape hatch). Collate's main-CSV load at line 244 is still `pd.read_csv(df_path)` — the single biggest CSV read in the stage. Per report.md §4.1's own measurements the pyarrow path reads a 2M-row/10-col file in ~3.1 s vs ~10.5 s; production CSVs are wider (more columns survive until collate) so the absolute gap is larger. This was simply missed in the bf283fd collate pass.",
+     "proposed_fix": "from src.utils.csv_manager import fast_read_csv; df = fast_read_csv(df_path). No path normalization needed here (collate merges on the raw filepath strings it read itself, so self-consistent).",
+     "expected_gain": "~3-4x on the stage's CSV load: ~7 s saved at 2M rows, ~35 s at 10M, more on wide frames. Small but free.",
+     "benchmarkable": true,
+     "risk": "low — same already-accepted pipeline-wide tradeoff (pyarrow 1-ULP float parse, RFC-4180 quoting on read is moot); the env knob restores the old parser."
+    },
+    {
+     "title": "to_webdataset sanitizes metadata per-cell in the worker hot loop (pd.isna + isinstance + hasattr per value per file)",
+     "locations": [
+      "src/to_webdataset.py:105-115",
+      "src/to_webdataset.py:91",
+      "src/to_webdataset.py:44-73"
+     ],
+     "category": "cpu-hotloop",
+     "description": "For every audio file, worker_fn loops over its ~20 metadata cells doing scalar `pd.isna(v)` (~1 us each — it is a dispatching pandas call), an isinstance float/nan re-check that pd.isna already covered, an isinstance Timestamp/Timedelta check, and `hasattr(v,'item')` to unbox numpy scalars. At 2M files that is ~40M pd.isna calls plus 80M+ auxiliary checks ≈ 1-2 minutes of pure Python in the default single-worker configuration — all of it recomputing the SAME answers because the types are fixed per column. Additionally line 91 stats every file (`audio_path.exists()`) immediately before `read_bytes()` — a redundant random-seek stat per file on the production HDD.",
+     "proposed_fix": "Sanitize once, vectorized, in load_metadata: convert datetime columns with .astype(str), numeric columns to native Python with df.astype(object).where(df.notna(), None) (NaN -> None, numpy scalars -> object), then to_dict('records') yields JSON-ready dicts and the worker body becomes `json_data = dict(meta)`. Drop the exists() pre-check and let the existing read_bytes try/except handle missing files (the exception path already `continue`s identically — note: today a missing file silently skips without counting an error, preserve that). Pin equivalence by comparing serialized json bytes for a fixture with NaN, int64, float, Timestamp, and string cells.",
+     "expected_gain": "~1-2 minutes of worker CPU per 2M files removed, plus 2M random stat() calls on the HDD (seek-bound, likely another several minutes cold). Helps most at the config default num_workers=1 where this loop is the only CPU consumer besides tar writing.",
+     "benchmarkable": true,
+     "risk": "medium — JSON bytes must stay identical (None vs NaN, int unboxing, Timestamp str format); needs the equivalence test above. The exists() removal is low risk (same control flow via the existing except branch)."
+    },
+    {
+     "title": "report.py missing-values scan: pure-Python csv.DictReader cell loop for CSV; parquet path decodes all columns when only string columns need scanning",
+     "locations": [
+      "src/report.py:107-119",
+      "src/report.py:92-103"
+     ],
+     "category": "cpu-hotloop",
+     "description": "_read_csv_missing_summary iterates every row with csv.DictReader and runs `str(value).strip() == \"\"` per cell: at 2M rows x 30 columns that is 60M Python-level operations ≈ 2-4 minutes, single-threaded. It only runs when balalaika.parquet is absent (parquet is preferred at report.py:123-129), so it is the fallback path — but that is exactly the path taken when someone runs the report mid-pipeline before collate. The parquet path streams batches (good) but `iter_batches` with no column selection decodes EVERY column, while null counts for non-string columns are already available for free in row-group statistics (pq metadata `null_count`); only string columns genuinely need a data scan for the empty-string count.",
+     "proposed_fix": "CSV path: chunked `fast_read_csv`/pd.read_csv(chunksize=..., dtype=str, na_filter=...) with vectorized `s.isna() | s.str.strip().eq('')` per chunk — preserves the whitespace-only-counts-as-missing semantics exactly. Parquet path: pull null_count per column from `pq.ParquetFile.metadata` row-group statistics and pass `columns=[string cols]` to iter_batches so numeric/bool columns are never decoded.",
+     "expected_gain": "CSV fallback: minutes -> a few seconds at 2M rows. Parquet path: ~30-50% less data decoded (numeric columns skipped) — modest since report runs once per pipeline, ~10-30 s at production scale.",
+     "benchmarkable": true,
+     "risk": "low — counts are provably identical (pin with a fixture containing whitespace-only cells, missing trailing cells, and nulls); report is a leaf stage with no downstream consumers of timing."
+    },
+    {
+     "title": "recovery_from_meta decodes the entire episode into RAM before checking whether all output segments already exist (cold path)",
+     "locations": [
+      "src/recovery_from_meta.py:28",
+      "src/recovery_from_meta.py:40-47",
+      "src/recovery_from_meta.py:31",
+      "src/recovery_from_meta_yamls.sh:22"
+     ],
+     "category": "io",
+     "description": "process_audio_file calls `AudioSegment.from_mp3(audio_path)` (line 28) — pydub decodes the WHOLE episode to raw PCM in RAM via an ffmpeg subprocess: a 1-hour 44.1 kHz stereo podcast is ~600 MB, and ThreadPoolExecutor runs num_workers of these concurrently (8 workers ≈ 5 GB, 32 ≈ OOM on 31 GB). The per-segment `os.path.exists(dest_path)` skip (line 43) happens AFTER the full decode, so on re-runs every already-completed episode is fully re-decoded for nothing (`saved` stays False, the source is kept, and the next run decodes it again — forever). Each kept segment then spawns another ffmpeg subprocess via segment.export (line 46). Bonus bug: recovery_from_meta_yamls.sh:22 invokes `taskset -с 0-24` with a CYRILLIC 'с' (U+0441), so taskset errors out and the launcher is broken as committed.",
+     "proposed_fix": "(1) Zero-risk: compute all dest_path names from episode_meta FIRST and return before any decode when every segment exists — identical outputs, kills the eternal re-decode on resume. (2) Optional: replace pydub with one `ffmpeg -ss start -t dur -i src out.mp3` per segment (input seeking, no full-episode RAM decode; ~0 MB resident vs ~600 MB) — but re-encode parameters must match pydub's defaults or output bytes change, so gate behind a knob. (3) Fix the Cyrillic 'c' in the launcher. This stage is not wired into base.sh (cold/manual path) — deprioritize beyond fix (1) and (3).",
+     "expected_gain": "(1) Resume runs skip completed episodes entirely: re-runs go from re-decoding the full corpus (hours, HDD-bound) to a metadata-only pass (seconds-minutes). (2) Peak RAM per worker ~600 MB -> ~tens of MB, enabling more workers on this node.",
+     "benchmarkable": true,
+     "risk": "low for (1) and (3) — control-flow only, outputs identical; medium for (2) — produced mp3 bytes would differ unless encoder params are matched exactly."
+    }
+   ],
+   "area_summary": "Read all four files end-to-end plus the helpers they call (read_file_content in src/utils/utils.py, fast_read_csv/discover_audio_paths in src/utils/csv_manager.py, webdataset's TarWriter/ShardWriter source in the venv) and cross-checked against report.md §4.2/4.3 and .claude/analysis/denoising-export.json. The big prior wins (collate sidecar slab-scandir 17.6x, vectorized ASR consistency 1.9x, webdataset vectorized metadata load + sibling scandir) are genuinely in the code — but one claimed fix is NOT: report.md §8 says webdataset workers receive only their shard's metadata, while to_webdataset.py:212 still pickles the full dict to every worker (finding 2). The dominant remaining themes are peak-RAM blowups at production row counts (collate's triple-copy of all sidecar text, webdataset's N-way metadata duplication) rather than compute; no numba/C++/CUDA candidates exist here — the hot loops are allocation/syscall problems, not math. Audited per the leads and found NOT material: tar writing (ShardWriter writes plain uncompressed USTAR tars through default-buffered file objects, no fsync, sequential — fine for HDD); parquet write currently uses default snappy (a zstd knob folded into finding 1); shard worker balance is count-based not byte-based but moot at the config default num_workers=1 (noted in finding 2's fix). Trivia merged here: collate's dir_names_cache dict is shared across threads without a lock (benign last-writer-wins race, at worst a duplicate scandir); add_asr_consistency_column mutates the caller's frame via out = df (known, low); report.py's full-history table re-parses params JSON per row (negligible); recovery_from_meta launcher has a Cyrillic 'с' in `taskset -с` that breaks it outright (rolled into finding 6). recovery_from_meta is not wired into base.sh stages 12-14 and is treated as a cold path per instructions."
+  },
+  {
+   "area": "shared-utils",
+   "findings": [
+    {
+     "title": "base.sh auto-enables cudf.pandas, which silently disables the new pyarrow CSV fast paths and adds GPU-OOM risk on busy GPUs",
+     "locations": [
+      "base.sh:104-149",
+      "src/utils/csv_manager.py:196-222 (fast_read_csv routes to pd.read_csv low_memory=False when cudf proxy detected)",
+      "src/utils/csv_manager.py:297 (pyarrow writer also disabled under cudf)",
+      "src/utils/csv_manager.py:313-323 (chunked iloc.to_csv to an open file handle — guaranteed cudf->pandas fallback)"
+     ],
+     "category": "gpu",
+     "description": "base.sh probes `import cudf.pandas` and, if present, wraps EVERY stage in cudf.pandas.install() (opt-out only via BALALAIKA_DISABLE_CUDF=1). csv_manager deliberately detects the proxy and falls back off both pyarrow paths — so on any cudf-equipped node the measured 3.4x read / 4.1x write wins (report §4.1) are forfeited and replaced by cudf interception. Worse, the csv_manager workload is hostile to cudf.pandas: fcntl-locked read/merge/write cycles, set(...tolist()) (full D2H copy), .loc assignment from Python lists (_normalize_path_series:140), csv.DictWriter partials, chunked df.iloc[...].to_csv(f) to an open handle — each unsupported op triggers a whole-frame GPU->CPU fallback copy, and a multi-GB read_csv on a GPU already holding 11-14 GB of a training job risks OOM-ing the training process. On THIS node cudf is not installed (verified: import fails in .dev_venv) so nothing is measurable here — but on a RAPIDS-image production node this is a silent regression that can be slower than the pre-optimization baseline. The block's own comment claims it accelerates 'read_csv -> merge -> atomic write', which is exactly the path csv_manager now turns off under the proxy.",
+     "proposed_fix": "Flip the default to opt-in: only add the cudf prefix when BALALAIKA_ENABLE_CUDF=1 is set (keep the probe + message). Alternatively auto-disable when pyarrow is importable (it always is in this repo's lockfile) since the pyarrow engine already covers the CSV-heavy path without touching VRAM. Pure orchestration change, no Python code paths altered; outputs unchanged by construction (csv_manager already treats cudf as the byte-conservative slow path).",
+     "expected_gain": "On cudf-equipped nodes: restores the already-measured 3.4x/4.1x CSV read/write wins for every stage and removes a multi-GB VRAM allocation contending with training jobs. On nodes without cudf: zero change.",
+     "benchmarkable": false,
+     "risk": "low — config/launcher default change only; outputs identical (cudf path was never byte-different, just slower/riskier). Keep the env knob so a node that genuinely benefits can opt back in."
+    },
+    {
+     "title": "unprocessed_paths reads the full-width CSV (all ~17 columns) when it needs exactly 2",
+     "locations": [
+      "src/utils/csv_manager.py:562-598 (unprocessed_paths -> load_main_csv)",
+      "src/utils/csv_manager.py:387-394 (load_main_csv full read + _normalize_filepath_column)",
+      "src/utils/csv_manager.py:370-376 (df.copy() of the full frame)"
+     ],
+     "category": "ram",
+     "description": "Every stage calls unprocessed_paths once at startup; it does load_main_csv (full read of balalaika.csv: all columns, 3.06 s at 2 M rows per report §4.1), then a full-frame df.copy() inside _normalize_filepath_column, only to use two columns: 'filepath' and the stage's value column. At 2 M rows x 17 mostly-string columns the transient frame is multiple GB; at 10 M rows on the 31 GB node this is the single largest stage-startup allocation. The done-set construction itself is already vectorized (applied in the prior pass) — the remaining waste is purely read width. Cost: ~11 stages x one full-width read per run, each ~3-8x wider than needed.",
+     "proposed_fix": "Read with usecols=['filepath', column] through fast_read_csv. Since pyarrow (and the C fallback) raise on a missing usecols column, sniff the header first (read the first line with csv.reader — one syscall) and fall back to the current 'column missing => everything pending' branch without parsing the body at all (an extra win: today a missing column still pays the full read). Normalize only the 2-column frame (no full copy). Pending list is provably identical.",
+     "expected_gain": "~2-4 s and ~70-90 % less transient RAM per stage at 2 M rows (linear in rows and width; ~x5 at 10 M). When the column doesn't exist yet (first run of a stage) the entire CSV parse is skipped.",
+     "benchmarkable": true,
+     "risk": "low — same pending set; covered by the existing bench_csv_ops fixture and an equality assertion old-vs-new."
+    },
+    {
+     "title": "_csv_duration_cache: slow C-engine read (callable usecols bypasses fast_read_csv) + 2M-iteration Python loop with per-row normalize and tqdm",
+     "locations": [
+      "src/utils/audio_durations.py:57-62 (pd.read_csv with callable usecols — never uses the pyarrow engine)",
+      "src/utils/audio_durations.py:71-88 (per-row tqdm loop: normalize_path_string + set lookup + _positive_duration per row)",
+      "src/utils/audio_durations.py:37-49 (_normalise_requested_paths — second per-item Python pass over all requested paths)"
+     ],
+     "category": "cpu-hotloop",
+     "description": "ensure_audio_durations runs at startup of music_detect, distillmos_process and antispoofing (3 stages/run). It reads balalaika.csv with pd.read_csv(usecols=<lambda>) — the lambda is unsupported by pyarrow, so this is the old single-threaded C engine, NOT the optimized fast_read_csv used everywhere else — then iterates all rows in Python under tqdm, calling normalize_path_string and a float() try/except per row. At 2 M rows that is roughly 4-6 s of C-engine parse plus 4-8 s of GIL-bound loop, i.e. ~10 s per stage x 3 stages, growing linearly (production datasets are larger). The whole thing computes: {normalized filepath -> positive total_duration} restricted to requested_norms.",
+     "proposed_fix": "(1) Read via fast_read_csv(target, usecols=['filepath','total_duration']) after a header sniff (same pattern as the unprocessed_paths fix). (2) Vectorize: s = _normalize_path_series(df['filepath']); d = pd.to_numeric(df['total_duration'], errors='coerce'); mask = d.gt(0) & s.isin(requested_norms); dict(zip(s[mask], d[mask])). Equivalence is a direct dict-equality test. _normalise_requested_paths can stay (it preserves (original, normalized) pairs).",
+     "expected_gain": "~8-11 s -> ~1 s per duration-using stage at 2 M rows (x3 stages per pipeline run); removes a full-column Python object churn pass. Scales linearly with rows.",
+     "benchmarkable": true,
+     "risk": "low — pure refactor of a pure function; pyarrow float parse can differ by 1 ULP from the C engine (already the documented, accepted tradeoff for every other read; durations are round(x,4) values where it is invisible). Keep BALALAIKA_CSV_ENGINE=c honoring via fast_read_csv."
+    },
+    {
+     "title": "Periodic flush cycle is O(full CSV + all partials) per flush and re-runs drop_missing scandirs; mostly redundant for durability since partials are the actual recovery mechanism",
+     "locations": [
+      "src/utils/csv_manager.py:962-1016 (PeriodicCsvMerger._flush_once/_loop)",
+      "src/utils/csv_manager.py:616-647 (read_partial_csvs re-reads every partial in full each flush)",
+      "src/utils/csv_manager.py:877-902 (_count_partial_rows re-reads all partial bytes every 30 s poll)",
+      "src/utils/csv_manager.py:544-556 (drop_missing_files existence scan runs inside every periodic upsert for filter stages)",
+      "configs/config.yaml:75-79 (flush_every_rows: 100000)"
+     ],
+     "category": "io",
+     "description": "Each periodic flush = full re-read of ALL partials (they only grow) + full main-CSV read + full-frame normalize/merge + full rewrite (+hardlink bak) — measured 14.73 s at 2 M rows (report §4.1). A stage that produces 2 M rows at flush_every_rows=100k performs ~20 flushes ≈ 5 minutes of pure state churn, O(N²/flush_rows) overall; for filter stages every flush additionally re-scandirs every dataset directory on the production HDD (drop_missing passes through at line 974). Crucially, the merger never deletes partials and every stage absorbs leftover partials at the next start (e.g. music_detect.py:279), so the periodic flush adds durability ONLY in the narrow case where a partial later becomes unreadable — otherwise it is pure freshness cosmetics for mid-stage observers. The poll loop also re-reads every partial byte-by-byte each 30 s to count newlines, even though partials are append-only. This is the remaining piece of report §9.5 (parquet/append-log state); the items here are cheaper increments that don't require the format decision.",
+     "proposed_fix": "Three independent, format-preserving steps: (a) make the per-flush partial reads and row counts incremental — cache (path -> byte offset, rows) and read/count only appended bytes up to the last complete newline (partials are append-only by construction of PartialCsvWriter); (b) skip drop_missing_files on periodic flushes (keep it for the final absorb only — mid-stage prunes are redone at the end anyway), removing the per-flush HDD directory sweep; (c) raise the default flush_every_rows (e.g. 1 M) or make the periodic flush time-only (flush_every_seconds), documenting that balalaika.csv may lag the partials mid-stage; the resume path is unaffected. (a) and (b) leave final outputs byte-identical; (c) changes only mid-stage CSV freshness.",
+     "expected_gain": "At 2 M rows: up to ~15 s saved per flush x ~20 flushes ≈ 4-5 min per row-producing stage; eliminates repeated full-partial reads (grows with stage progress) and the per-flush directory sweep on /mnt/hdd_6tb_1. Grows quadratically with dataset size under the current scheme.",
+     "benchmarkable": true,
+     "risk": "low for (a)/(b) — end-of-stage CSV is provably identical (final absorb recomputes everything); medium-low for (c) — documented behavior knob (already exists in the csv: config block), no data-loss path since partials persist until absorbed."
+    },
+    {
+     "title": "upsert_columns peak RAM ≈ 3-4 full frames: unconditional df.copy() in _normalize_filepath_column plus outer merge",
+     "locations": [
+      "src/utils/csv_manager.py:370-376 (_normalize_filepath_column: always df.copy())",
+      "src/utils/csv_manager.py:135-141 (_normalize_path_series always builds astype(str).str.strip() copy)",
+      "src/utils/csv_manager.py:487-542 (upsert: read -> normalize-copy -> outer merge -> per-column combine_first)"
+     ],
+     "category": "ram",
+     "description": "Every upsert (stage-start absorb, every periodic flush, durations write-back, final absorb) holds: the freshly read frame (plus pyarrow's transient Table), a full deep copy from _normalize_filepath_column (the copy duplicates ALL columns even though only 'filepath' may change — and in steady state nothing changes because stored paths are already absolute and stripped), then the outer-merge result (another full frame with __incoming columns). On the 31 GB node this is the highest RAM watermark of every stage's bookkeeping; at 10 M rows x 17 columns it becomes an OOM candidate, especially while the training job also holds host RAM.",
+     "proposed_fix": "(1) In _normalize_filepath_column compute the normalized series first and only copy/assign when it differs: s = _normalize_path_series(df['filepath']); if s.equals(df['filepath']): return df — steady-state CSVs (absolute, pre-stripped paths) skip the whole duplicate. (2) For frames that are function-local (just read inside the same lock: load_main_csv, upsert at line 488-491, read_partial_csvs) assign the column in place instead of copying — they have no aliasing callers. (3) Optionally drop the boolean incoming_marker column trick in favor of an indicator merge ('_merge' from how='outer', indicator=True) to avoid one extra object column on the merged frame.",
+     "expected_gain": "Removes one full-frame deep copy per CSV touch (4-6 touches/stage): roughly 1-2 GB lower peak per merge at 2 M rows, several GB at 10 M; also saves the ~0.5-1 s the copy costs. Output frame identical.",
+     "benchmarkable": true,
+     "risk": "medium — aliasing must be audited (callers of load_main_csv/ensure_main_csv that mutate the returned frame would now mutate shared state; a quick grep shows stages treat it read-only, but this needs the existing behavior tests + bench_csv_ops equality run). The s.equals() short-circuit alone is low-risk and captures most of the win."
+    },
+    {
+     "title": "phonemizer/accents submit one ProcessPoolExecutor future per file — O(N) Future objects and IPC pickles in the parent at production scale",
+     "locations": [
+      "src/utils/parallel.py:96-97 (one ex.submit per item, future_to_item dict holds all)",
+      "src/phonemizer/phonemizer.py:82-96 (items = individual pending files)",
+      "src/accents/accents.py:70-78 (items = individual pending files)",
+      "src/punctuation/punctuation.py:119-133 (already fixed: submits batch_size slabs)"
+     ],
+     "category": "parallelism",
+     "description": "run_per_gpu_pool submits every item up-front and keeps a future->item dict for the whole run. Each concurrent.futures.Future carries a threading.Condition + lock + callback list (~0.5-1 KB effective with dict overhead). For phonemizer/accents the items are individual file Paths: at a production backlog of 500 k-1 M pending sidecars the parent allocates ~0.5-1 GB just for futures/bookkeeping before any work happens, plus one pickle round-trip and executor scheduling (~tens of µs) per file. Punctuation already moved to slab submission for the 5x batching win — phonemizer and accents still submit per file even though FastG2P (report §4.9) batches internally per text and ruAccent processes one text per call.",
+     "proposed_fix": "Adopt the punctuation slab pattern: chunk pending_files into lists of e.g. 64-256 and make work_fn process a slab (a thin wrapper looping the existing per-file function, with the same per-file try/except so one bad file doesn't fail neighbors). Alternatively/additionally add a bounded submission window in run_per_gpu_pool (submit ~4x num_workers futures, refill on completion) so parent memory is O(workers) instead of O(items) for all callers without touching stage code.",
+     "expected_gain": "Parent RAM −0.5-1 GB at 500 k+ pending files; removes N pickle/scheduling round trips (~25-50 s at 1 M items, minor vs model time but free); makes the 31 GB node safe for large backlogs. Per-file outputs unchanged (sidecar writes are inside the worker).",
+     "benchmarkable": true,
+     "risk": "low-medium — error accounting becomes per-slab; mitigate exactly as punctuation did (count actually-produced sidecars for stage status). Per-file fallback inside the slab keeps failure isolation."
+    },
+    {
+     "title": "Duration probe workers spawn fresh interpreters that import the full torch/torchaudio stack just to read audio headers",
+     "locations": [
+      "src/utils/audit.py:89-114 (safe_audio_duration: torchaudio first, soundfile fallback)",
+      "src/utils/audio_durations.py:95-118 (_probe_missing_durations: ProcessPoolExecutor, default 4 workers)",
+      "src/separation/music_detect.py:254 + distillmos_process.py:231 + antispoofing.py:316 (mp.set_start_method('spawn') — probe children re-import everything)"
+     ],
+     "category": "startup",
+     "description": "The three duration-using stages set the global start method to 'spawn', so each of the (default 4) probe workers boots a fresh interpreter and safe_audio_duration's `import torchaudio` pulls in torch + CUDA libs: ~4-6 s startup and ~500-800 MB RSS per worker — ~2-3 GB transient RAM on the 31 GB node, concurrent with the parent that already has torch loaded. All of this to read a sample-rate/num-frames header. The cost hits any run where new files lack total_duration (first run after stage 1, or after re-chunking); steady-state reruns skip the pool entirely.",
+     "proposed_fix": "Probe with soundfile first for extensions libsndfile decodes exactly (.wav/.flac/.ogg/.opus — which is what the pipeline's chunked files are), keeping torchaudio as the fallback and as primary for .mp3 (ffmpeg-based info can differ from libsndfile on VBR mp3). soundfile imports in ~0.1 s at ~30 MB. Gate the reorder behind a small config/env knob if byte-equal reporting on mp3 sources must be guaranteed. Alternatively pass an initializer that pre-imports soundfile only, and never let torchaudio load in probe children.",
+     "expected_gain": "−2-3 GB transient RAM and ~−20 s pool startup per probing run (x3 stages when durations are cold); per-probe latency also drops (no torch dispatch).",
+     "benchmarkable": true,
+     "risk": "medium if blanket-reordered (mp3 duration values could differ slightly between backends, changing length buckets); low if extension-gated as proposed — for wav/flac/ogg/opus both backends report frames/samplerate from the same header, value-identical (assertable on the 250-wav bench sample)."
+    }
+   ],
+   "area_summary": "Read all 10 area files end-to-end plus base.sh and the consuming stages (punctuation/phonemizer/accents/music_detect/crest/antispoofing/distillmos) to verify what the prior pass already applied: pyarrow read/write, hardlink .bak, vectorized dedupe/done-set, scandir exist-masks, DirNameCache, single os.walk audio discovery, and the parallel.py arity/error-attribution bugs are all in place and were not re-reported. The biggest open item is the cudf.pandas auto-enable in base.sh, which on cudf-equipped nodes silently disables every pyarrow fast path and risks GPU OOM against training jobs (not measurable on this node — cudf is absent from .dev_venv). The remaining wins are: 2-column usecols reads for unprocessed_paths and the duration cache (the latter still uses the slow C engine via a callable usecols plus a 2M-iteration Python loop), incremental/leaner periodic flushes (the cycle is still O(full CSV + all partials) per flush and re-runs drop_missing scandirs, while partials — not the flush — are the actual crash-recovery mechanism), a full-frame deep copy removable from every merge, slab submission for phonemizer/accents (punctuation already does it), and soundfile-first duration probes to keep torch out of spawn'd probe workers. Checked and fine: work_shards (claim glob is one listing per claim at realistic shard counts ~10^3; bucketed prepare holds all paths in RAM ~100 MB/1M paths — acceptable), gpu.py, node_profile.py (profile cached), stage_status.py, audit.record_stage_summary (single-row append), PartialCsvWriter's flush-per-row (rows arrive at model speed, syscall cost is noise), and normalize_path_values' plain loop on the audio list (~1-2 s at 1M, already tqdm-free; vectorizable only by changing call signatures — not worth the churn)."
+  },
+  {
+   "area": "separation-gpu-stages",
+   "area_summary": "Read all 6 stage files end-to-end plus their helpers (src/utils/datasets/separation.py, src/utils/audio_durations.py, src/utils/work_shards.py, csv_manager PartialCsvWriter, audit.safe_audio_duration) and microbenchmarked the per-call primitives (Path.resolve 37.9us, torchaudio.info 2.43ms, soundfile.info 88us; bench audio is 16kHz mono PCM_16; numba 0.65 present; distillmos importable; musicdetection package+weights ABSENT so stage 4 is analysis-only end-to-end). The prior pass already fixed the GPU-side basics (pinned staging + real non_blocking for distillmos/music_detect loaders, TRT fp16 for Spectra-0 4.25x, single-CSV-read distillmos_filter parent), so the remaining waste is almost all CPU/metadata work that idles the GPUs: a redundant 2.4ms-per-file torchaudio.info pass per DistillMOS shard, per-shard full-CSV reloads in music_detect, syscall-heavy Path.resolve in every per-file loop, full-clip decodes for a 4s antispoofing crop, and dead-data duration probes in the filters. Minor items not promoted to findings: claim_work_shard does sorted(glob) per claim = O(shards^2) scans (work_shards.py:227, small at current shard counts); antispoofing_filter parses the main CSV twice via scored_rows (antispoofing_filter.py:294,313 — second load skippable when absorbed==0); PartialCsvWriter flushes every row (csv_manager.py:770) and distillmos/music_detect emit 2+ eagerly-formatted loguru debug f-strings + perf_counter pairs per FILE even at INFO level (distillmos_process.py:116-145, music_detect.py:182-195) — together tens of seconds per million rows, trivially batchable with a flush-every-K knob and a level guard.",
+   "findings": [
+    {
+     "title": "DistillMOS workers re-probe audio lengths per shard (sort_by_length) on shards that are already duration-sorted; shared JSON cache is clobbered across workers so it never hits",
+     "locations": [
+      "src/utils/datasets/separation.py:64-75",
+      "src/utils/datasets/separation.py:78-115",
+      "src/utils/datasets/separation.py:125",
+      "src/separation/distillmos_process.py:97-103",
+      "src/utils/work_shards.py:200-213"
+     ],
+     "category": "io",
+     "description": "Every claimed shard builds a dataloader via create_distillmos_dataloader, which calls sort_by_length -> estimate_audio_lengths: a SINGLE-THREADED torchaudio.info loop inside the GPU worker process, measured at 2.43 ms/file warm-cache (ffmpeg StreamReader spin-up per call). But the shards were already written duration-sorted by prepare_length_bucketed_work_shards (work_shards.py:204-206) using durations main() computed at distillmos_process.py:286 — the probe re-derives information the stage already has. The JSON cache (podcasts_path/distillmos_sorted_files.json) is shared across workers/shards: each worker's shard set is disjoint from the cached list, so it takes the 'cache stale, rebuilding' branch (separation.py:103), re-probes, and overwrites the file — with 2 GPU workers it is also a write race. Cost: ~24 s of GPU-idle serial CPU per 10k shard; at 2M files / 200 shards that is roughly 80 minutes per run, worse on the HDD where each info() is a random read.",
+     "proposed_fix": "Feed shard files to DistillMOSDataset in their on-disk order (add an assume_sorted=True flag to create_distillmos_dataloader or simply bypass sort_by_length from this stage) and delete the racy JSON cache path. No numba/C++ needed — it is pure dead work.",
+     "expected_gain": "Removes ~2.4 ms/file of serial CPU inside GPU workers: ~20-30 s per 10k shard, ~80 min per 2M-file stage run; GPU stops idling between shards.",
+     "benchmarkable": true,
+     "risk": "low — shard order is preserved verbatim, so batch composition only changes where sort_by_length ordered duration-ties differently than the shard sort; verify MOS scores on the 250-wav bench sample (expected identical / sub-noise)."
+    },
+    {
+     "title": "music_detect re-reads (and may rewrite) the entire balalaika.csv once per shard via ensure_audio_durations inside the worker loop",
+     "locations": [
+      "src/separation/music_detect.py:126-130",
+      "src/utils/audio_durations.py:52-88",
+      "src/utils/audio_durations.py:151-166",
+      "src/separation/music_detect.py:163-165",
+      "src/separation/music_detect.py:313-319"
+     ],
+     "category": "io",
+     "description": "_process_files calls ensure_audio_durations for EVERY claimed shard. Each call runs _csv_duration_cache: a full pd.read_csv of balalaika.csv (plain pandas with a usecols lambda, not the pyarrow fast path) plus a per-row tqdm Python loop calling normalize_path_string over every CSV row, and then upsert_columns -> a full atomic CSV rewrite whenever any duration was probed. At 2M rows that is ~8-12 s per call x N shards (200 shards at shard_size 10k ~= 30+ min) plus rewrite churn that races with the PeriodicCsvMerger. distillmos and antispoofing already hoist this to main() (distillmos_process.py:286, antispoofing.py:352) — music_detect was missed. Two compounding issues: (a) music_detect uses plain prepare_work_shards (line 314) instead of length-bucketed shards, so LengthBasedBatchSampler batches inside random 10k shards still mix 1s..15s clips and WavLM pads to batch max; (b) the lookup audio_lengths.get(str(path), 0.0) at line 163 misses whenever predict_proba returns a path form differing from the dict keys, silently triggering a 2.4 ms safe_audio_duration probe per file.",
+     "proposed_fix": "Hoist ensure_audio_durations to main() over all pending paths (mirroring distillmos_process.py:286), switch to prepare_length_bucketed_work_shards, and pass each shard its own duration slice; normalize the lookup key the same way the dict keys were built.",
+     "expected_gain": "Removes (N_shards-1) full CSV reads + rewrites: ~30 min at 2M rows / 200 shards, scaling linearly with both; plus 10-30% fewer padded WavLM frames from bucketed shards.",
+     "benchmarkable": true,
+     "risk": "low — duration values and scored outputs unchanged; the CSV/duration helper path is benchmarkable on this node without the model (music_detection.safetensors absent, so end-to-end stage timing is not)."
+    },
+    {
+     "title": "_csv_duration_cache: per-row Python normalize + tqdm over the whole CSV with the slow pandas parser (runs at start of distillmos, antispoofing, and per-shard in music_detect)",
+     "locations": [
+      "src/utils/audio_durations.py:57-83"
+     ],
+     "category": "cpu-hotloop",
+     "description": "The duration cache load does pd.read_csv(target, usecols=lambda col: ..., low_memory=False) — a Python-callable usecols forces per-column callback and the C engine, not the pyarrow path that gave 3.4x in the CSV layer — followed by a pure-Python for loop with tqdm over all rows calling normalize_path_string per row and a membership check against requested_norms. At 2M rows this is ~4-8 s of parse plus ~4-6 s of Python loop, paid at every distillmos/antispoofing stage start (and per shard in music_detect until finding #2 is fixed).",
+     "proposed_fix": "Read with engine='pyarrow' and explicit usecols=['filepath','total_duration']; vectorize the normalization (paths are absolute -> pure string ops; reuse csv_manager.normalize_path_values or a vectorized .str pipeline), filter via .isin(requested_norms), then dict(zip(...)). No numba needed — pandas vectorization suffices.",
+     "expected_gain": "~3-5x on this step: ~10 s -> ~2-3 s per stage start at 2M rows; multiplies with finding #2 for music_detect.",
+     "benchmarkable": true,
+     "risk": "low — same dict contents; pyarrow 1-ULP float caveat is irrelevant for round(x,4) durations; existing csv fixtures can pin equality."
+    },
+    {
+     "title": "Antispoofing dataset decodes and preemphasizes the full clip, then keeps only a 4.04 s random window — ~3x wasted decode I/O per long clip, now the likely bottleneck after the TRT 4.25x win",
+     "locations": [
+      "src/utils/datasets/separation.py:168-198",
+      "src/utils/datasets/separation.py:156-166",
+      "src/separation/antispoofing.py:174-181"
+     ],
+     "category": "io",
+     "description": "AntiSpoofingDataset.__getitem__ does a full torchcodec decode of the clip (pipeline chunks are up to 15 s = ~480 KB of 16 kHz PCM_16; resample no-ops since audio is already 16 kHz), converts to float32, runs preemphasis over the FULL waveform, then _pad_random crops 64600 samples (4.04 s). For any clip longer than 4.04 s, 60-73% of the decoded bytes and the preemphasis work are discarded. With TRT fp16 the GPU side is down to ~6.6 ms/item (52.7 ms / batch of 8), so 4 loader workers doing ~3-6 ms full decodes plus float conversion are at or past parity — on the production HDD, where each file read is ~3.7x more bytes than needed, the loader becomes the hard bottleneck. The existing dataloader_wait / dataloader_audio_load debug perf lines can quantify this directly.",
+     "proposed_fix": "Probe frames from the wav header (soundfile, 88 us), draw the random start, then seek+read exactly 64601 samples (one extra leading sample so preemphasis y[n]=x[n]-a*x[n-1] reproduces the full-decode value at the window's first sample bit-exactly for PCM wav); keep the current full-decode path for files shorter than num_samples (the repeat branch) and for non-wav containers. Gate with a config knob (e.g. antispoofing.ranged_decode).",
+     "expected_gain": "~2-3.5x less loader I/O and CPU per >4 s item; on HDD reads ~130 KB instead of up to 480 KB per file. Stage wall gain depends on how loader-bound it is post-TRT — measurable here on the 250-wav bench.",
+     "benchmarkable": true,
+     "risk": "medium — decode backend changes (torchcodec -> soundfile) for the cropped read; bit-exact for PCM wav and the stage is already non-deterministic by design (random crop, documented in report section 6), but should be knob-gated and validated on bench wavs."
+    },
+    {
+     "title": "DistillMOS inference is plain fp32 torch; its fixed 122880-sample internal windows make it the same shape-static TRT-fp16 candidate that gave Spectra-0 4.25x",
+     "locations": [
+      "src/separation/distillmos_process.py:173-177",
+      "src/separation/distillmos_process.py:112-129",
+      "src/separation/antispoofing.py:104-145"
+     ],
+     "category": "gpu",
+     "description": "run_inference_worker loads distillmos.ConvTransformerSQAModel and runs it in fp32 (only TF32 matmul from apply_torch_perf_defaults). The model internally pads/segments every input into fixed 122880-sample windows concatenated along the batch axis, so the real compute shape is (total_windows, 122880) — static width, exactly the property that made Spectra-0 a clean TensorRT candidate (224 -> 52.7 ms/batch, 4.25x). Two escalation levels: (a) cheap: torch.autocast('cuda', dtype=torch.float16) around sqa_model(batch), config-gated; (b) full: one-time ONNX export with a dynamic window-batch dim, run via ORT TRT fp16 reusing the pinned-profile session pattern already written for antispoofing (create_session, antispoofing.py:119-139) so trailing partial batches don't trigger rebuilds. fp16 also halves activation VRAM — valuable while both GPUs carry the training job.",
+     "proposed_fix": "Add a config-gated fp16/TRT path: start with autocast (no new artifacts), then ONNX+TRT-fp16 with engine cache under runtime.trt_cache_path; default off until score divergence is measured and documented like the Spectra-0 entry.",
+     "expected_gain": "Est. 1.5-3x inference throughput on an idle GPU plus ~2x activation-VRAM cut; on this contended node only relative numbers (warmup saw saturation at 57.8-60.5 it/s with the training job co-resident).",
+     "benchmarkable": true,
+     "risk": "medium and outputs change: MOS shifts of order 0.001-0.01 expected (Spectra-0 fp16 logit delta was 0.0085); files near the distillmos_filter threshold can flip, so this must stay behind a config knob with a measured divergence bound vs fp32 on the 250-wav bench."
+    },
+    {
+     "title": "distillmos_filter deletion phase iterates and writes a partial row for EVERY scored file instead of just deletion candidates",
+     "locations": [
+      "src/separation/distillmos_filter.py:292-299",
+      "src/separation/distillmos_filter.py:223-256",
+      "src/separation/distillmos_filter.py:437-450",
+      "src/separation/antispoofing_filter.py:321",
+      "src/separation/antispoofing_filter.py:345-353"
+     ],
+     "category": "io",
+     "description": "run_deletion_workers builds items for ALL scored paths (mos not NaN), not just mos<threshold. Each worker then pays per row: resolve_path (37.9 us measured Path.resolve), a writer.write with per-row flush, and a processed_counter bump — for the typically 95%+ of files that are merely kept (deleted=False). The resulting N-row partial is then re-parsed and outer-merged into the main CSV (lines 437-443) although it adds no values (preserve_existing=True, scores already present). The sibling antispoofing_filter already does this right: it shards only deletion_candidates (antispoofing_filter.py:321) and derives the audit from the baseline frame. At 2M scored rows the kept-file churn is ~2M x ~55 us ~= 2 min of worker time, a 2M-row partial write+parse+merge (~15-30 s), and worker already_done sets holding millions of strings.",
+     "proposed_fix": "Shard only candidates (mos < threshold); compute audit files_in/hours_in from the already-loaded df (the exact numbers print_preview computes at line 383) instead of audit_from_filter_partials row counts; keep partial rows only for actually-attempted deletions.",
+     "expected_gain": "Deletion phase drops from O(all scored) to O(candidates): ~10-100x fewer partial rows, minutes saved at 2M rows plus a large RAM cut in workers and the absorb step.",
+     "benchmarkable": true,
+     "risk": "medium — filter_summary.csv files_in/hours_in must be reproduced from the dataframe (pin with an equality test mirroring tests/test_distillmos_filter.py); resume semantics for kept files change (today they are needlessly re-written each run)."
+    },
+    {
+     "title": "Duration probes call torchaudio.info first (2.43 ms) where soundfile (88 us, 27x cheaper) is exact for the pipeline's wav files; antispoofing_filter probes every deletion candidate only to write a never-read column",
+     "locations": [
+      "src/utils/audit.py:89-114",
+      "src/separation/antispoofing_filter.py:200",
+      "src/separation/antispoofing_filter.py:211-217",
+      "src/separation/antispoofing_filter.py:364-369",
+      "src/separation/antispoofing_filter.py:386-395",
+      "src/utils/audio_durations.py:91-118",
+      "src/separation/music_detect.py:165",
+      "src/separation/distillmos_filter.py:243-247"
+     ],
+     "category": "io",
+     "description": "safe_audio_duration tries torchaudio.info first — measured 2.43 ms/call warm-cache (it spins up an ffmpeg StreamReader per call) — with soundfile as fallback, although soundfile.info is 88 us and returns identical frames/samplerate from the same header for the PCM wav files every pipeline stage produces. This multiplies across the ensure_audio_durations probe pool (audio_durations.py:95-118, chunked over a ProcessPool) and all per-file fallbacks. Worst case: antispoofing_filter.run_worker calls safe_audio_duration on EVERY deletion candidate before unlinking it (line 200) and writes duration_s to the partial — but the final audit recomputes all hours from baseline['total_duration'] (lines 386-395) and absorb runs with value_columns=[] (lines 364-369), so the probed value is consumed by nothing. 100k deletions = ~4 min of probe CPU plus 100k random header reads on the HDD, entirely for dead data.",
+     "proposed_fix": "(a) Reorder safe_audio_duration: soundfile first, torchaudio fallback for exotic containers. (b) In antispoofing_filter, delete the probe and carry total_duration from the candidates frame into the shard (or drop the duration_s field — it is provably unread).",
+     "expected_gain": "27x cheaper duration probes pipeline-wide for wav; antispoofing_filter deletion phase ~2-5x faster wall on probe-bound runs and far fewer HDD seeks.",
+     "benchmarkable": true,
+     "risk": "low — identical values for wav/flac/ogg (verified probe parity is testable on the 250 bench wavs); torchaudio fallback retained; removing the dead column is output-neutral by construction."
+    },
+    {
+     "title": "resolve_path (Path.resolve, 37.9 us + per-component syscalls) runs twice per file in every separation inner loop, on paths that were already normalized — and is inconsistent with how already_done sets are keyed",
+     "locations": [
+      "src/separation/music_detect.py:117",
+      "src/separation/music_detect.py:157",
+      "src/separation/distillmos_process.py:88",
+      "src/separation/distillmos_process.py:131",
+      "src/separation/antispoofing.py:166",
+      "src/separation/antispoofing.py:228",
+      "src/separation/distillmos_filter.py:224",
+      "src/separation/antispoofing_filter.py:197",
+      "src/utils/csv_manager.py:82-99",
+      "src/utils/csv_manager.py:786-790"
+     ],
+     "category": "cpu-hotloop",
+     "description": "Each stage resolves every file path twice (pending-filter pass + post-inference write pass) via resolve_path = str(Path(p).resolve()), measured at 37.9 us/call (readlink/lstat per path component). The shard files were already written from unprocessed_paths output, which is normalized by the string-ops normalize_path_values — csv_manager.py:87-99 explicitly documents that Path.resolve is 'prohibitively expensive when repeated over tens of millions of rows' and that absolute paths are trusted verbatim. So this is ~76 us of redundant syscall work per file: ~2.5 min per 2M files per stage, across 5 stage files. There is also a latent correctness hazard: PartialCsvWriter.already_done builds its set with normalize_path_values (csv_manager.py:786-790, verbatim absolute strings) while the loops probe membership with resolve_path — on a symlinked dataset root the strings differ, so every done-check would silently miss and files would be re-scored on resume.",
+     "proposed_fix": "Replace resolve_path with normalize_path_string in the per-file loops (or normalize once when reading the shard). Pure string op for absolute paths, no vectorization framework needed.",
+     "expected_gain": "~2-3 min saved per stage at 2M files (more on HDD where lstat seeks) and removal of the symlink resume-mismatch hazard.",
+     "benchmarkable": true,
+     "risk": "low — byte-identical output strings for absolute real paths (the only kind the shards contain); on symlink/.. inputs the new behavior matches the convention the done-sets and CSV layer already use."
+    }
+   ]
+  },
+  {
+   "area": "preprocess-chunking",
+   "area_summary": "Checked all six files end-to-end (preprocess.py 1022 lines, preprocess_existing_chunks.py 626, sortformer_onnx.py 442, smart_turn/inference.py 85, offline_svad.py 162, utils/datasets/preprocess.py 204) plus helpers in csv_manager.py, gpu.py, audio_postprocessing.py and configs/config.yaml. The CSV/state layer this stage uses was already optimized by the prior pass; the model-adjacent hot paths flagged in report.md §9.2 are all still unapplied and verified present, and I add four new findings: a hardcoded TRT-fp16 provider for the dynamic-shape streaming Sortformer (perf + silent output divergence), a per-chunk double/triple audio decode in the ACTIVE existing_chunks+fuse config, an O(all-chunk-rows) RAM accumulation/pickle in raw mode, and decode fully serialized with GPU inference (loader workers=0). Trivia merged here rather than as findings: src/libs/smart_turn/inference.py is imported nowhere yet builds an ORT session + WhisperFeatureExtractor at import time (delete or guard, preprocess.py uses offline_svad.SmartVAD instead); pending_metadata_paths re-runs .map(normalize_path_string) over the done rows even though load_main_csv already vectorized-normalizes the filepath column (csv_manager.py:370-376), ~2-4 s redundant at 2M rows, and _metadata_complete_mask does astype(str).str.strip() per object column (~1 s/column at 2M rows) once per run (preprocess_existing_chunks.py:95-101,120); raw mode splits files round-robin by count not duration with no work-stealing (preprocess.py:896-898 — existing_chunks mode already uses claimable work shards, raw mode could reuse them); torch.cuda.empty_cache() runs after every source file (preprocess.py:702-704 — throttle to every N files, but keep occasional calls since the GPU is shared with training); offline_svad.py:142's explicit torch.cuda.synchronize is redundant because output[0,0].item() already blocks. Sortformer and SmartTurn ONNX files are absent on this node, so model-touching findings are marked benchmarkable=false; the pure-CPU numpy post-processing and the decode-redundancy findings are benchmarkable with synthetic tensors / the 250-wav bench sample.",
+   "findings": [
+    {
+     "title": "existing_chunks fuse mode decodes every chunk file twice (and raw fuse mode decodes short files twice on top of the loader decode)",
+     "locations": [
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess_existing_chunks.py:234",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess_existing_chunks.py:317-322",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess_existing_chunks.py:343-347",
+      "/home/kirill/mnt/ssd_work/balalaika/src/utils/datasets/preprocess.py:158-174",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:597-604"
+     ],
+     "category": "io",
+     "description": "This is the ACTIVE production path (config: input_mode=existing_chunks, fuse_audio_preprocessing=true, data on /mnt/hdd_6tb_1). Per chunk file: (1) DiarizationDataset.__getitem__ opens AudioDecoder(path, sample_rate=16000) and fully decodes for diarization; (2) _postprocess_existing_chunk immediately re-opens the SAME file via torchaudio.load_with_torchcodec at native rate for crest+LUFS; (3) kept files are rewritten. With loader workers=0 the second read usually hits the page cache (reads are ~1 s apart), so the real waste is the second full ffmpeg decode (~10-30 ms CPU per 15 s chunk), which at 500k+ production chunks is hours of single-thread CPU that is *serialized with GPU inference* in the current config — and it becomes real double disk I/O once loader prefetch is enabled or memory pressure evicts the cache. Note _postprocess_existing_chunk does not depend on the diarization result at all, only on the audio. Raw mode has the same pattern for files <= limit_dur: the loader already decoded the file at 16k, then preprocess.py:598-600 re-opens and get_all_samples() the whole native file.",
+     "proposed_fix": "Read the file bytes once in the dataset worker and construct both AudioDecoder instances from the in-memory bytes (torchcodec accepts bytes sources): return (path, bytes_or_native_tensor, audio_16k, sr). Decoding twice from identical bytes keeps outputs byte-identical (same decoder, same input) while removing the second file open/read and moving both decodes into loader workers where they overlap GPU diarization (see the loader-workers finding). Optionally add a config knob to derive the 16k tensor by resampling the native decode (single decode) — that diverges slightly (torchaudio resample vs ffmpeg swresample) so it must be gated and is not the default. Chunks are <=15 s (~0.5-6 MB native), so carrying both tensors through the batch is fine on 31 GB.",
+     "expected_gain": "Removes ~50% of decode CPU in the active stage path; combined with loader-worker overlap, est. 1.3-2x stage throughput in existing_chunks+fuse mode at production scale; removes one file-open+read per chunk on the HDD (matters when cache is cold).",
+     "benchmarkable": true,
+     "risk": "low for the bytes-once variant (decodes are bit-identical; verifiable on the 250-wav bench sample without any model); medium for the single-decode-resample knob (diarization input changes slightly — gate it)."
+    },
+    {
+     "title": "Diarization source decode fully serialized with GPU inference (loader workers=0, prefetch_factor=0, missing worker_init_fn)",
+     "locations": [
+      "/home/kirill/mnt/ssd_work/balalaika/configs/config.yaml:156-161",
+      "/home/kirill/mnt/ssd_work/balalaika/src/utils/datasets/preprocess.py:187-204",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:747-755",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess_existing_chunks.py:317-322"
+     ],
+     "category": "parallelism",
+     "description": "diarization_loader_workers defaults to 0 in config, so every torchcodec decode+resample (both modes) runs synchronously in the GPU process between Sortformer calls — the GPU idles for the full decode time of every file, and in existing_chunks mode also for the native re-decode and the LUFS rewrite. The DataLoader already supports workers/prefetch (datasets/preprocess.py:200-203). Two blockers for just flipping the knob: (a) diarization_prefetch_factor is 0 and torch requires prefetch_factor >= 1 when num_workers > 0, so setting workers>0 with the current config crashes; (b) create_diarization_dataloader sets no worker_init_fn, unlike the crest loader (datasets/preprocess.py:51 pins torch.set_num_threads(1)), so each decode worker can claim all 48 threads.",
+     "proposed_fix": "Default diarization_loader_workers to 2 and diarization_prefetch_factor to 2 (or make prefetch_factor floor at 1 when workers>0), and add a worker_init_fn pinning torch.set_num_threads(1) to create_diarization_dataloader. RAM caution for raw mode long-form audio: a 2 h source decoded to 16 k mono fp32 is ~460 MB, so workers*prefetch must stay small (2x2 worst case ~1.8 GB buffered) — document this; existing_chunks chunks are ~1 MB each so it is free there.",
+     "expected_gain": "Decode time hidden behind GPU inference: est. 20-40% wall-clock on decode-bound raw files, more in existing_chunks mode where per-file CPU work (2 decodes + crest + pyloudnorm) is comparable to the GPU diarize time of a 15 s chunk.",
+     "benchmarkable": false,
+     "risk": "low — ordering preserved (shuffle=False), decode results identical; only buffering RAM changes. End-to-end gain not measurable on this node (Sortformer ONNX absent); loader-only throughput is."
+    },
+    {
+     "title": "Hardcoded TensorRT-first provider with global fp16 for the dynamic-shape streaming Sortformer session",
+     "locations": [
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:95",
+      "/home/kirill/mnt/ssd_work/balalaika/src/utils/gpu.py:55-74",
+      "/home/kirill/mnt/ssd_work/balalaika/configs/config.yaml:113-118",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/sortformer_onnx.py:68-83"
+     ],
+     "category": "gpu",
+     "description": "init_models builds Sortformer providers with get_onnx_providers(gpu_id, use_tensorrt=True, ...) — hardcoded, unlike every other stage which gates TRT behind a config key — and runtime trt_fp16 defaults to True. The streaming session's inputs have genuinely dynamic shapes across calls (spkcache lengths cycle through ~{0,124,188,248,312}, fifo {0,124}; sortformer_onnx.py:197-208), and no TRT profile min/max shapes are pinned (the spectra-0 work in report.md pinned profiles; this session does not). Consequences: several multi-minute engine builds on first run (one per shape signature), possible heavy graph partitioning of the streaming model into many small TRT subgraphs (often slower than CUDA EP), a 4 GiB TRT workspace competing with the user's training job on the shared 16 GB GPU, and — most importantly — fp16 silently changes every diarization prediction, hence all segment boundaries and chunk metadata, with no documented fidelity check (unlike spectra-0's measured 0.0085 logit delta). Telling detail: sortformer_onnx.py's own default provider list has the TRT block commented out (lines 70-78), suggesting it was tried and disabled, but init_models overrides it with TRT-first anyway.",
+     "proposed_fix": "Add a preprocess.use_tensorrt config knob (mirroring separation/antispoofing) defaulting to False so Sortformer runs on CUDAExecutionProvider until TRT is actually measured on a node with the model; if TRT is kept, pin trt_profile_min/max/opt_shapes for the small closed set of shape signatures and decide fp16 explicitly per-model rather than inheriting the global trt_fp16 flag.",
+     "expected_gain": "Avoids multi-minute first-run engine builds and potential steady-state regression from subgraph partitioning; frees the 4 GiB TRT workspace on the shared GPU; removes an undocumented output divergence (fp16) from stage 1, which feeds every downstream stage.",
+     "benchmarkable": false,
+     "risk": "low to apply (CUDA EP is the conservative choice and matches the module's own default); flag: current TRT-fp16 behavior means today's outputs already differ from fp32 — switching to CUDA EP changes outputs vs the current default, so document the flip."
+    },
+    {
+     "title": "SmartVAD runs one feature-extraction + ONNX call per segment in raw mode (batchable to one call per file slab)",
+     "locations": [
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:247-259",
+      "/home/kirill/mnt/ssd_work/balalaika/src/libs/smart_turn/offline_svad.py:72-150"
+     ],
+     "category": "gpu",
+     "description": "apply_eos_classification (raw mode only; not called in existing_chunks) loops every timeline segment and calls smart_vad.predict_endpoint one at a time. Each call: np.pad to exactly 8 s, a WhisperFeatureExtractor invocation computing a full 800-frame mel on GPU (H2D of 128000 floats + kernels), one batch-1 ONNX run via IOBinding, a redundant full torch.cuda.synchronize (line 142 — output[0,0].item() already blocks), and ~2-5 ms of Python/FE overhead. A 2 h source with ~4 s turns produces ~1800 segments, i.e. ~1800 sequential round trips ≈ 20-30 s of VAD per file, all GPU-underutilized. The model's output is already shaped (B, 1) (offline_svad.py:127-130), so the graph supports batching; all inputs are padded to the identical fixed (80, 800) shape, so stacking is trivial; and the downstream merge loop (preprocess.py:261-289) consumes predictions in order with no cross-segment dependency, so batched results are semantically identical.",
+     "proposed_fix": "Add a predict_endpoint_batch(list_of_segments) to SmartVAD: pad/truncate all segments (the existing _truncate_audio), pass the list to one feature_extractor call (transformers FE accepts batches), one io-bound session.run on (N, 80, 800), threshold the (N,1) output; call it from apply_eos_classification in slabs of a config-capped smart_vad_batch_size (16-32; (32,80,800) fp32 is ~8 MB, safe on the shared GPU). Drop the explicit synchronize.",
+     "expected_gain": "Est. 3-5x on the VAD step of long multi-turn files (kernel-launch/FE/Python overhead amortized); VAD is one of the three serial per-file costs in raw mode, so several seconds saved per long source file.",
+     "benchmarkable": false,
+     "risk": "medium — batched cuBLAS/cuDNN kernels can differ from batch-1 by float-epsilon, and probabilities sit against a 0.4 threshold, so knife-edge segments could flip; gate behind a knob (default on) and document, mirroring the RUPunct batching proof done in §4.4. Model file absent on this node, so equivalence must be proven where smart-turn-v3.2-gpu.onnx exists."
+    },
+    {
+     "title": "Sortformer streaming loop bounces all state GPU->CPU->GPU every ~10 s chunk (numpy session.run + full-window mel D2H)",
+     "locations": [
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/sortformer_onnx.py:133",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/sortformer_onnx.py:197-251",
+      "/home/kirill/mnt/ssd_work/balalaika/src/libs/smart_turn/offline_svad.py:124-143"
+     ],
+     "category": "gpu",
+     "description": "extract_mel_features computes the spectrogram on GPU then copies the whole window to host as numpy (line 133: ~46 MB D2H per 900 s window). _streaming_update then feeds every chunk as numpy dicts to session.run — ORT re-uploads chunk features (~512 KB), spkcache (~385 KB) and fifo (~254 KB) H2D and copies preds + new_embs (~260 KB) D2H on every one of the ~91 calls per 900 s window, plus a fresh output allocation per call. All FIFO/spkcache state lives in CPU numpy (with per-chunk np.concatenate reallocations at lines 223-243) purely so Python can slice it, then goes straight back to the GPU.",
+     "proposed_fix": "Use ORT IOBinding with torch CUDA tensors via OrtValue.from_dlpack — the repo already has the exact working pattern in offline_svad.py:124-143 including the CPU fallback. Keep the mel features tensor resident on GPU (slices of a contiguous (1,T,128) tensor along dim 1 are contiguous, so per-chunk views bind directly), keep spkcache/fifo as torch CUDA tensors updated with torch.cat/narrow, and only pull chunk_preds (a few KB) to host per chunk for _binarize. The spkcache compression math (_compress_spkcache) can stay on CPU initially by syncing only when compression triggers (~once per chunk in steady state but operating on ~640 KB), or be ported to torch later.",
+     "expected_gain": "Eliminates ~1.4 MB of per-chunk H2D/D2H plus the 46 MB-per-window mel copy; prior analysis estimated 10-25% of Sortformer inference wall time, biggest on short chunks (existing_chunks mode) where per-call overhead dominates the 124-frame compute.",
+     "benchmarkable": false,
+     "risk": "medium — IOBinding itself is numerically a no-op (same tensors, no recompute), but the refactor touches the streaming-state bookkeeping; needs the absent ONNX model to validate bit-equality of preds. Keep the numpy path as fallback for CPU-EP nodes, as offline_svad does."
+    },
+    {
+     "title": "Pure-Python per-frame loops in Sortformer CPU post-processing (_binarize, silence profile, spkcache top-k/gather) + string format/parse round trip",
+     "locations": [
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/sortformer_onnx.py:359-417",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/sortformer_onnx.py:253-260",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/sortformer_onnx.py:310-357",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:127-144"
+     ],
+     "category": "cpu-hotloop",
+     "description": "_binarize iterates Python-level over every (frame, speaker) scalar — 45k iterations (~5-15 ms) per 900 s window, 752 per 15 s chunk — then formats segments into 'start end speaker_N' strings that preprocess.py:127-144 immediately splits and re-floats. _update_silence_profile recomputes a running mean one 512-dim frame at a time (~124 Python iterations per popped chunk, every ~10 s of audio). _get_topk_indices builds Python lists from a full argsort and _gather_spkcache assigns 188 rows one by one on every compression trigger (~once per 10 s on long files); _boost_topk_scores full-argsorts where argpartition suffices. Aggregate: low milliseconds per 10 s of audio of GIL-bound work inside the single per-GPU process — small per file but multiplied by hundreds of thousands of files, and it runs interleaved with (not overlapped by) GPU calls.",
+     "proposed_fix": "Plain numpy, no numba needed (though numba 0.65.1 is installed if wanted): _binarize via boolean threshold + np.flatnonzero(np.diff) edge detection per speaker column, returning (start, end, spk) tuples directly and deleting the string round trip (parse_diarization_output keeps its tuple branch, preprocess.py:140-141, so callers need no change); _update_silence_profile as the closed-form weighted mean (mean*n + sil_embs.sum(0))/(n+k); _get_topk_indices/_gather_spkcache via np.argpartition + vectorized fancy-index gather with a mean_sil_emb fill mask.",
+     "expected_gain": "Est. 1-5% of stage CPU time (more on long-form raw audio); removes O(frames x speakers) Python work from the hot per-file path. Small but cheap and self-contained.",
+     "benchmarkable": true,
+     "risk": "low for _binarize/top-k/gather (integer/threshold logic, bit-identical outputs, provable on synthetic preds arrays on this node — no model needed); the silence-profile closed form changes float summation order (~1e-7 relative) — either keep a sequential-equivalent np.add.reduce ordering or document the epsilon."
+    },
+    {
+     "title": "Raw mode accumulates every chunk-row dict in worker RAM and pickles the full list back, only to compute a count and an hours sum",
+     "locations": [
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:740",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:784-793",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:798-816",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:932-935",
+      "/home/kirill/mnt/ssd_work/balalaika/src/preprocess/preprocess.py:961-967"
+     ],
+     "category": "ram",
+     "description": "_run_diarization_shard appends every chunk metadata dict to a results list (line 793) even though each row was already streamed to the partial CSV one line earlier; the full list is returned through the ProcessPoolExecutor future (pickled across the process boundary, line 816) and the parent accumulates all shards into all_results (line 935). The ONLY uses are len(all_results) for files_out and a sum of total_duration for hours_out (lines 961-967). At production scale (millions of chunks) a ~10-field dict costs ~600-1000 B, so this is multiple GB held in the child, a comparable pickle buffer spike at shard end, and another copy in the parent — on a 31 GB node shared with training, this is the stage's largest avoidable RAM consumer. existing_chunks mode already avoids this with mp.Value counters.",
+     "proposed_fix": "Return only aggregates from the shard: {'rows': n, 'duration_s': total, 'crest_audit': ...} — or compute files_out/hours_out from the DataFrame that absorb_partial_csvs already returns (preprocess.py:949 currently discards it; preprocess_existing_chunks.py:568-576 already uses exactly this pattern). Drop results.append and all_results entirely.",
+     "expected_gain": "O(total_chunks) RAM -> O(1): several GB saved at production scale in both child and parent, plus eliminates a multi-hundred-MB pickle at shard completion; no throughput change at small scale.",
+     "benchmarkable": false,
+     "risk": "low — audit summary numbers computed from the same rows; only caveat is rows absorbed at startup from a prior interrupted run must not be double-counted (the startup absorb at lines 878-888 already separates them)."
+    }
+   ]
+  },
+  {
+   "area": "preprocess-crest-loudness",
+   "findings": [
+    {
+     "title": "Stage startup does 3 full CSV reads + 1 unconditional full CSV rewrite + 3 path-normalization passes (both stages)",
+     "locations": [
+      "src/preprocess/crest_factor_remover.py:303",
+      "src/preprocess/crest_factor_remover.py:308-315",
+      "src/preprocess/crest_factor_remover.py:323",
+      "src/preprocess/preprocess_audio.py:289",
+      "src/preprocess/preprocess_audio.py:293-299",
+      "src/preprocess/preprocess_audio.py:307",
+      "src/utils/csv_manager.py:681-682",
+      "src/utils/csv_manager.py:489-509",
+      "src/utils/csv_manager.py:573-577"
+     ],
+     "category": "io",
+     "description": "Both stages run the same scaffold: ensure_main_csv() reads balalaika.csv (read 1); absorb_partial_csvs() is called with bootstrap_audio_paths=audio_paths, and because bootstrap is not None the early-return at csv_manager.py:681-682 never fires — upsert_columns ALWAYS runs even with zero leftover partials, re-reading the full CSV (read 2), re-normalizing every audio path a 2nd time (csv_manager.py:494-499), concat+drop_duplicates over N_csv+N_audio rows, and doing a full atomic write (+.bak hardlink) of the entire CSV even when nothing changed; then unprocessed_paths() re-reads the full CSV a 3rd time (csv_manager.py:573) and re-normalizes the audio paths a 3rd time (csv_manager.py:575-577, they were already resolved by discover_audio_paths). At 2M rows with the already-optimized pyarrow layer (report §4.1: load 3.06s, write 3.63s) that is roughly 2 redundant reads (~6s) + 1 redundant write (~3.6s) + 2 redundant normalize passes (~2-4s) ≈ 10-14s of pure waste per stage start, ×2 stages in this area (the pattern repeats in other stages too). Scales linearly with rows; the unconditional rewrite also churns the HDD and the .bak hardlink every run even when the stage is a steady-state no-op under fuse_audio_preprocessing: true.",
+     "proposed_fix": "Reuse one loaded DataFrame across the three steps at the call sites: have ensure_main_csv return its df (it already does), make absorb_partial_csvs accept/return it, and only call upsert_columns when (partials non-empty) OR (set(audio_resolved) - set(df.filepath) is non-empty); add an unprocessed_paths(df=...) overload that takes the in-memory frame and pre-resolved paths. Safe here because PeriodicCsvMerger has not started yet and stages run sequentially. No numba/C++ needed — this is pure call-graph plumbing.",
+     "expected_gain": "~10-14s per stage start at 2M rows (×2 stages), linear in dataset size (~×5 at 10M rows); removes one full-CSV write per stage start — the biggest remaining HDD-write waste in these stages' steady-state no-op runs.",
+     "benchmarkable": true,
+     "risk": "low-medium. balalaika.csv values are identical; skipping the no-change rewrite trivially preserves bytes (today the file is rewritten with identical content). Must keep the new-file registration semantics (new files on disk still get rows) — pin with a test that adds a file between runs."
+    },
+    {
+     "title": "Crest stage decodes the entire dataset on a single thread (config 1 worker / batch 1 / 0 loader workers)",
+     "locations": [
+      "configs/config.yaml:163",
+      "configs/config.yaml:165",
+      "configs/config.yaml:167",
+      "src/preprocess/crest_factor_remover.py:277-280",
+      "src/utils/datasets/preprocess.py:20-48",
+      "src/utils/datasets/preprocess.py:71-89"
+     ],
+     "category": "parallelism",
+     "description": "config.yaml pins num_workers_crest_factor: 1, crest_factor_batch_size: 1, crest_factor_loader_workers: 0 (set 2026-05-26/31, untouched by the perf pass; the code defaults at crest_factor_remover.py:278-279 are 256/2). With loader_workers=0 the DataLoader decodes in-process with zero overlap, so one thread does a full torchcodec decode of every pending file. CrestFactorDataset.__getitem__ already reduces each file to 4 scalars (peak, sum_squares, length, sr) inside the loader worker, so the stage is embarrassingly parallel with near-zero RAM per in-flight item; crest_factor_worker_init already pins torch to 1 thread per loader worker. At production scale (hundreds of thousands of chunks, up to 900s each per config chunk_duration: 900) a single-threaded decode pass is tens of hours; the per-batch compute (calculate_crest_factors_from_stats) is microseconds. Note: under the default fuse_audio_preprocessing: true this stage is normally a catch-up no-op, so the win applies to non-fused configs and backfill runs.",
+     "proposed_fix": "Config-only change: raise crest_factor_loader_workers to 8-16 and crest_factor_batch_size to 64-256 (and/or wire batch_size: auto). Keep num_workers_crest_factor=1 so partial-CSV row order is exactly preserved (torch DataLoader with shuffle=False returns items in dataset order regardless of worker count). No code change required.",
+     "expected_gain": "Near-linear with loader workers until HDD/CPU saturates: roughly 6-12x on the stage's decode-bound wall clock; tens of hours → hours on a full production backfill. Invisible at 250-file bench steady state but directly measurable there with the existing perf dataloader_wait DEBUG lines.",
+     "benchmarkable": true,
+     "risk": "low, outputs provably unchanged: per-file peak/sum_squares are computed per item in the dataset, batch ops are elementwise, rounding to 4 decimals identical at any batch size; with num_workers=1 the partial CSV is byte-identical."
+    },
+    {
+     "title": "Loudness stage runs decode → LUFS measure → re-encode strictly serially in one process (config 1/1/0)",
+     "locations": [
+      "configs/config.yaml:180",
+      "configs/config.yaml:182",
+      "configs/config.yaml:184",
+      "src/preprocess/preprocess_audio.py:152-185",
+      "src/preprocess/preprocess_audio.py:66-76",
+      "src/utils/datasets/preprocess.py:92-115"
+     ],
+     "category": "parallelism",
+     "description": "loudness_num_workers: 1, loudness_batch_size: 1, loudness_loader_workers: 0 means each file is fully decoded (torchcodec, C), then LUFS-measured (pyloudnorm, GIL-bound Python+numpy), then re-encoded and written back (torchcodec, blocking) — three phases that never overlap, on one core, while 47 others idle. Per-file split is roughly decode ~30-40%, measure ~5-15%, encode ~45-60%, so simple prefetch already hides a third of the time. Caveat for RAM (the 31GB node): LoudnessNormalizeDataset returns the FULL native-rate waveform through collate; a 900s 48kHz stereo float32 item is ~345MB, and with loader workers each in-flight item transits torch shared memory — batch_size × prefetch_factor × workers items can be resident, with no per-item size guard.",
+     "proposed_fix": "Config: loudness_loader_workers: 2-4 with loudness_batch_size kept at 1-4 and prefetch_factor 1-2 (bounds in-flight RAM to ~0.7-2.8GB worst case); optionally loudness_num_workers: 2-4 to parallelize the GIL-bound measure+encode across processes (HDD-permitting). Code option for a further win without RAM growth: move the synchronous _write_audio call onto a 1-thread writer executor inside the worker so file N's encode overlaps file N+1's measure (torchcodec encode releases the GIL); add a config knob defaulting to off.",
+     "expected_gain": "1.4-1.8x from decode prefetch alone; 2-4x combined with 2-4 worker processes until the HDD's mixed read/write seeks saturate. Like crest, full value shows on non-fused configs / backfill runs (fused stage 1 normally leaves this stage a no-op).",
+     "benchmarkable": true,
+     "risk": "low for loader workers with num_workers=1: identical floats reach process_audio_file (shm round trip preserves bits), same encode, same row order — md5-identical outputs, verifiable against the report §5 bar on the 250-wav bench. num_workers>1 keeps audio bytes identical but can reorder rows across partials (values identical after keyed upsert) — flag/gate that separately. Writer-thread variant is medium risk (error-path ordering) and should stay behind a knob."
+    },
+    {
+     "title": "pyloudnorm BS.1770 gating is a per-block Python loop with 4x redundant squaring — vendor a bit-exact vectorized meter (hot in BOTH the fused stage-1 path and this stage)",
+     "locations": [
+      "src/preprocess/audio_postprocessing.py:62-73",
+      ".dev_venv/lib/python3.12/site-packages/pyloudnorm/meter.py:79-84",
+      ".dev_venv/lib/python3.12/site-packages/pyloudnorm/meter.py:89",
+      ".dev_venv/lib/python3.12/site-packages/pyloudnorm/meter.py:93-107",
+      "src/preprocess/preprocess.py:402",
+      "src/preprocess/preprocess_existing_chunks.py:242"
+     ],
+     "category": "cpu-hotloop",
+     "description": "normalize_audio_loudness calls pyloudnorm Meter.integrated_loudness, which (a) loops in Python over channels × numBlocks computing np.sum(np.square(data[l:u])) per 400ms block — with 75% overlap every sample is squared ~4x and a 19200-element temp is allocated per block (a 900s 48kHz chunk = ~9000 blocks, ~173M redundant element ops); (b) builds the blockwise-loudness list with a per-block Python list comprehension calling np.sum on a tiny list + scalar np.log10 (meter.py:89); (c) does the two gating passes with nested list comprehensions (meter.py:93-107). For a 60s mono 48k chunk the gating Python part is ~15ms of a ~50ms measure (the rest is the 2 scipy.lfilter K-weighting passes, already C). This runs per chunk in the FUSED stage-1 path (postprocess_audio_tensor at preprocess.py:402 / preprocess_existing_chunks.py:242) — i.e. on every chunk at production scale even with the default config — plus per file in this standalone stage.",
+     "proposed_fix": "Vendor a meter in audio_postprocessing.py with two tiers. Tier A (default, provably bit-exact): precompute sq = np.square(filtered) once per channel and keep the per-block np.sum over slices of it (identical pairwise summation over identical floats → identical bits), and vectorize (b)/(c) with the same ufuncs elementwise (np.log10 on an array is per-element identical to scalar calls; np.mean over fancy-indexed blocks matches np.mean over the equivalent list). Tier B (knob-gated, e.g. loudness_fast_meter): fully vectorize block sums via the 4-non-overlapping-subblock decomposition (step = block/4) or reduceat — last-ULP LUFS may differ, so verify md5 on the 250-wav bench before enabling. numba is installed (0.65.1) but is the wrong tool here: its sequential accumulation cannot reproduce numpy's pairwise float32 sums bit-for-bit, breaking the byte-identical-output bar.",
+     "expected_gain": "Tier A: measure 1.3-1.6x; Tier B: up to ~2.5x (lfilter then dominates). Stage-level ~5-15% on standalone loudness; a larger relative share of the fused stage-1 postprocess CPU (no decode in that path). At millions of chunks this is tens of CPU-hours, and it also removes ~9000 temp allocations per long chunk.",
+     "benchmarkable": true,
+     "risk": "medium overall, but Tier A is designed bit-exact (same gain → same written samples; verify md5-identical on the 250-file bench, same bar as report §5). Tier B must stay behind a config knob with documented divergence. Vendoring also fixes the latent non-thread-safe _METER_CACHE (Meter mutates self.blockwise_loudness)."
+    },
+    {
+     "title": "Normalized audio is rewritten in place non-atomically — a crash mid-encode permanently destroys the source file",
+     "locations": [
+      "src/preprocess/preprocess_audio.py:66-76",
+      "src/preprocess/preprocess_existing_chunks.py:265",
+      "src/preprocess/audio_postprocessing.py:100-127"
+     ],
+     "category": "other",
+     "description": "_write_audio (and the fused save at preprocess_existing_chunks.py:265) calls torchaudio.save_with_torchcodec directly on the original path. SIGKILL/OOM/power-loss mid-encode leaves a truncated file; because the loudness_normalized marker is only written after a successful save, resume re-decodes the now-corrupt file, counts an error, and the original audio is gone — there is no backup. This is the same class of bug the perf pass already fixed for _rover_phonemes.txt sidecars (report §4.9). Not a speed win, but it gates how aggressively the parallelism findings above can be deployed (more in-flight files = more exposure).",
+     "proposed_fix": "Write to <path>.tmp<pid> in the same directory and os.replace() onto the target (same-directory rename, no extra HDD seeks; identical bytes land at the final path). Optionally fsync before rename behind a knob for the production HDD.",
+     "expected_gain": "No throughput change (rename is free); eliminates a permanent-data-loss window per written file, which matters at hundreds of thousands of writes per run.",
+     "benchmarkable": true,
+     "risk": "low — final bytes identical (verify md5 on the 250-wav bench); only failure-path behavior changes (leftover .tmp files need a startup sweep or unique names)."
+    }
+   ],
+   "area_summary": "Read all three files end-to-end plus their helpers (src/utils/datasets/preprocess.py, csv_manager.py call paths, work_shards usage) and the installed pyloudnorm source; cross-checked against report.md §4-6 and the two prior analysis JSONs. Already done and NOT re-reported: pyarrow CSV layer, .bak hardlink, bounded crest audit fallback (now sample-capped at crest_factor_remover.py:437-448), loudness skipped-counter fix, the documented peak-is-ignored and lossy-re-encode known issues, and the md5-identical 250-file validation. The area's model math is trivial (crest is 4 scalars/file); the remaining waste is (1) startup CSV redundancy — an unconditional full-CSV rewrite plus two redundant full reads per stage start caused by bootstrap_audio_paths defeating absorb's early return, (2) zero parallelism in the shipped config (1 process / 0 loader workers / batch 1 for both stages — the code defaults are saner than config.yaml), (3) the pyloudnorm per-block Python gating loop, which is the one real numba/vectorization candidate and is hot even under the default fused path via postprocess_audio_tensor, and (4) a non-atomic in-place audio rewrite that risks data loss. Trivia not worth separate findings: calculate_crest_factors at crest_factor_remover.py:71-77 is dead code (only the _from_stats variant is called); the prior analysis's 'duplicate decode' in calculate_crest_factor is overstated (the second .to(float32,cpu) is a no-op returning self once converted, only the multichannel mean allocates); unprocessed_paths re-normalizes already-resolved paths (folded into finding 1); mp.Value counter increments are non-atomic (reporting only); per-row PartialCsvWriter flush is negligible vs decode/encode; no resampling happens in these stages (lead's concern — confirmed absent). All five findings are benchmarkable on this node: CPU-only work, 250 real wavs present, and the stages already emit perf DEBUG lines (dataloader_wait, process_file, audio_save) that attribute decode/measure/encode time per file."
+  },
+  {
+   "area": "text-stages",
+   "findings": [
+    {
+     "title": "Accents stage is completely unbatched: 3-6 batch-1 ONNX calls per sentence, one file per future (the RUPunct situation before §4.4, times four models)",
+     "locations": [
+      "src/accents/accents.py:34-46 (process_file: one accentizer.process_all per file)",
+      "src/accents/accents.py:70-77 (run_per_gpu_pool over individual files, no slabs)",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/ruaccent.py:235-261 (per-sentence loop, lru_cache(4096))",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/stress_usage_model.py:100-111 (predict_stress_usage: batch-1 session.run per sentence)",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/yo_homograph_model.py:100-110 (predict_yo_homographs: batch-1 session.run per sentence whenever the sentence contains 'е', i.e. almost always)",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/omograph_model.py:74-90 (odd-hypothesis path: one session.run PER HYPOTHESIS at batch 1)"
+     ],
+     "category": "gpu",
+     "description": "RUAccent.process_all splits each file into sentences and, per sentence, runs: 1 stress-usage BERT (120 MB ONNX) at batch 1, 1 yo-homograph BERT (14.5 MB) at batch 1 if the sentence contains the letter 'е' (virtually every Russian sentence), an omograph NLI model (368 MB) — batched within the sentence only on the even-hypothesis path, otherwise one session.run per hypothesis — and one accent-model run per unknown stressed word. The stage submits one future per FILE, so there is zero cross-file or cross-sentence batching: every call is a latency-bound batch-1 GPU round trip with Python tokenize/softmax/aggregate between calls. This is exactly the shape RUPunct had before the §4.4 fix (measured there: 48.8 -> 252 texts/s at batch 64, 5.2x). With ~2 sentences/file that is ~4-6 ONNX calls per file; at a plausible ~10-20 files/s/GPU, 1 M production files cost ~14-28 GPU-hours per run.",
+     "proposed_fix": "Mirror the punctuation fix plus the fast_g2p pattern: (1) feed the stage slabs of files (reuse the punctuation slab code); (2) a thin 'fast_ruaccent' wrapper (keep weights/tokenizers/dicts from the installed package) that collects all sentences in a slab, dedupes them, and runs stress-usage and yo-homograph as padded batches (both are plain token-classification BERTs — same mechanics as the already-batched RUPunct); (3) batch omograph NLI pairs across sentences; (4) batch accent-model words. No numba/C++ needed — this is pure GPU batching. Numerics caveat: the wrapper must reproduce ruaccent's exact quirks to stay char-identical, notably OmographModel.classify's softmax over the WHOLE batch (omograph_model.py:91-100, e_x/e_x.sum() with no axis) and AccentModel's 0.55 score threshold; prove equivalence with the same char-identical harness used for §4.4 (60+ varied texts, batched vs per-file) and gate with a config knob defaulting to the proven path.",
+     "expected_gain": "3-8x stage throughput (RUPunct analog measured 5.2x at batch 64); ~10-25 GPU-hours saved per 1 M-file production run; also cuts per-call H2D/D2H round trips",
+     "benchmarkable": true,
+     "risk": "medium — padded-batch matmuls can flip argmax/threshold decisions on knife-edge scores (same class of risk as §4.4 and §4.9, both of which proved out char-identical / documented); requires equivalence proof + knob"
+    },
+    {
+     "title": "RUAccent loads a rule engine + koziev POS-tagger/lemmatizer (~200 MB of assets) per worker that NO inference path ever uses",
+     "locations": [
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/ruaccent.py:120-125 (RuleEngine constructed and loaded when tiny_mode=False)",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/ruaccent.py:83-88 (downloads koziev/rulemma + rupostagger + 168.8 MB ruword2tags.db per fresh node)",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/rule_accent_engine.py:19-27 (loads accents.json, forms.json, Lemmatizer (rulemma.dat 16.7 MB), RuPosTagger (2.4 MB CRF + 9.7 MB ruword2tags.dat + sqlite db))",
+      "src/accents/accents.py:26-31 (load(..., tiny_mode=False) triggers it in every worker)"
+     ],
+     "category": "ram",
+     "description": "grep over the whole installed package shows self.rule_accent is assigned in load() and never referenced again — _process_accent uses only the accents dict and accent_model. Yet every accents worker (one per GPU here, N on bigger nodes) downloads (first run: ~198 MB — ruword2tags.db 168.8 MB + rulemma.dat 16.7 MB + ruword2tags.dat 9.7 MB + CRF model 2.4 MB, written INTO site-packages) and then parses/loads the lemmatizer dictionaries and tagger at init. That is pure dead weight: seconds of init and an estimated 100-500 MB resident RAM per worker on a 31 GB node, plus a wasted ~200 MB per-node download.",
+     "proposed_fix": "Stub the load before calling accentizer.load() in init_process — e.g. monkeypatch ruaccent.rule_accent_engine.RuleEngine.load to a no-op (and skip the koziev download branch), or carry a 2-line fork patch. Provably output-identical: the attribute is never read (verifiable by grep + the existing stage tests). Keep it behind a config knob if paranoid, but there is no code path that can diverge.",
+     "expected_gain": "Per worker: seconds off init + est. 100-500 MB RAM (measure exact RSS delta on first load); one-time ~200 MB download avoided per fresh node; biggest relative win when num_workers > 1 on the 31 GB box",
+     "benchmarkable": true,
+     "risk": "low — dead code elimination; outputs byte-identical"
+    },
+    {
+     "title": "Accents workers create 4 ONNX sessions with default thread pools: ~4 x physical-core intra-op threads, spin-wait enabled, on a box shared with the training job",
+     "locations": [
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/accent_model.py:16 (InferenceSession(path, providers=providers) — no SessionOptions)",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/omograph_model.py:13",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/stress_usage_model.py:11",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/yo_homograph_model.py:11",
+      "src/accents/accents.py:21-31 (load API passes providers only; no way to pass sess_options)"
+     ],
+     "category": "parallelism",
+     "description": "Each of the 4 InferenceSessions defaults intra_op_num_threads to all physical cores (~24 here) with allow_spinning on — ~96 spin-capable threads per worker, ~192 across the two per-GPU workers, on the 48-thread box that also runs the user's training dataloaders. With CUDA EP most matmul lands on GPU, but pre/post CPU nodes and the spin-wait between the stage's MANY small batch-1 runs (see finding 1) burn cores and cause scheduler thrash. Session creation also redundantly graph-optimizes the 368 MB omograph model per worker.",
+     "proposed_fix": "In init_process, before accentizer.load(), wrap onnxruntime.InferenceSession (functools.partial-style monkeypatch or tiny fork patch) to inject SessionOptions with intra_op_num_threads=2-4, inter_op=1, and add_session_config_entry('session.intra_op.allow_spinning','0'). Optionally expose as accent.ort_intra_op_threads in config. Outputs from CUDA-EP runs are unaffected by CPU pool sizing; for the rare CPU-fallback nodes results are deterministic per ORT op partitioning at fixed thread count (pin the chosen count).",
+     "expected_gain": "Removes ~100+ idle/spinning threads per worker; 1.5-3x for the stage when num_workers>1 or when co-running with training (current measured contention pattern); near-zero cost otherwise",
+     "benchmarkable": true,
+     "risk": "low — CUDA EP outputs unchanged; document thread count for CPU-EP nodes"
+    },
+    {
+     "title": "No word-level memo for AccentModel.put_accent — same out-of-dictionary word re-runs ONNX in every new sentence (plus get_outputs() rebuilt per call)",
+     "locations": [
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/ruaccent.py:204-220 (_process_accent calls put_accent for every dict-miss multi-vowel word, per sentence)",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/accent_model.py:33-50 (put_accent: slow CharTokenizer + batch-1 session.run + session.get_outputs() name map rebuilt on EVERY call)",
+      ".dev_venv/lib/python3.12/site-packages/ruaccent/ruaccent.py:246 (only cache is sentence-level lru_cache(4096) — whole-sentence repeats only)"
+     ],
+     "category": "algorithmic",
+     "description": "put_accent(word) is a pure function of word.lower() (deterministic ONNX run), but results are never cached at word granularity — only identical whole sentences hit the lru_cache. ASR transcripts repeat OOV words (names, slang, ASR misspellings) heavily under Zipf; every occurrence in a distinct sentence pays a CharTokenizer pass (pure-Python per-char slow tokenizer), a batch-1 session.run, and a rebuilt output-name dict. At production scale (millions of files x ~1-3 OOV words each) this is millions of avoidable ONNX calls. Same applies in milder form to the yo/omograph dictionary lookups (already dict-based, fine).",
+     "proposed_fix": "Add a word -> stressed-word dict memo in the stage worker (wrap accentizer.accent_model.put_accent with an unbounded-or-LRU cache keyed on word.lower()), cache the get_outputs() name map at load, and optionally persist the memo across runs/workers exactly like the phonemizer oov_cache (§4.9 pattern: fingerprint-keyed pickle + flock merge). Outputs identical by construction (same session, same input bytes). Combine with finding 1's batched wrapper: dedupe unique miss-words per slab and run them as one padded batch.",
+     "expected_gain": "2-10x fewer accent-model calls depending on word repeat rate; with persistence, re-runs skip nearly all of them; also removes per-call Python tokenizer cost",
+     "benchmarkable": true,
+     "risk": "low — memoization of a pure function; persistent-cache variant inherits the proven §4.9 locking design"
+    },
+    {
+     "title": "Punctuation 'produced' accounting re-stats every pending file one-by-one at stage end",
+     "locations": [
+      "src/punctuation/punctuation.py:135-141 (produced = sum(1 for ... if Path(...).exists()))"
+     ],
+     "category": "io",
+     "description": "After the pool finishes, main() walks ALL pending files and calls Path.exists() per file to count produced sidecars — O(N) serial stat() calls. On the production HDD with hundreds of thousands to millions of pending sidecars, and dentry caches partially evicted after hours of stage runtime, this is the exact per-file stat storm that §4.7 removed from the pending scans (DirNameCache exists precisely for this). Cost: minutes of random HDD I/O for a log-only counter.",
+     "proposed_fix": "Reuse src/utils/sidecars.DirNameCache: one scandir per directory, then count name membership — identical result set (the equivalence was already verified for the pending-scan use of DirNameCache on a 50 k fixture). 5-line change.",
+     "expected_gain": "O(#files) stats -> O(#dirs) scandirs at stage end; minutes saved on cold-cache HDD at production scale; zero behavior change",
+     "benchmarkable": true,
+     "risk": "low — same counting semantics; symlink handling already covered by DirNameCache"
+    },
+    {
+     "title": "Punctuation slabs pad every text to the slab's longest text — sort slab by text length before the batched pipeline call",
+     "locations": [
+      "src/punctuation/punctuation.py:121-124 (slabs built in CSV discovery order)",
+      "src/punctuation/punctuation.py:83 (model([texts], batch_size=len(pending)) — one padded forward per slab)"
+     ],
+     "category": "gpu",
+     "description": "Slabs are cut from pending_files in discovery order, so each 64-text batch pads to its longest member; BERT attention is O(L^2), so one long transcript in a slab of short utterances multiplies the whole batch's FLOPs. The worker already reads all slab texts into memory (lines 66-77) before calling the pipeline, so length information is free at that point. With ASR-segment length distributions (heavy short tail, occasional long segments) the padding waste is real but bounded.",
+     "proposed_fix": "Inside make_punct_batch, sort the in-memory (path, text) list by len(text) before the pipeline call and pass a sub-batch size (e.g. keep pipeline batch_size at the profile value but hand workers larger slabs, say 8x batch_size, so sorting actually groups similar lengths) — write-back order is irrelevant since each output goes to its own file. Per-text outputs are independent of batch composition in exact math; the §4.4 char-identical proof should be re-run once with sorted batches to pin fp-level equivalence (same harness, 60 texts).",
+     "expected_gain": "1.2-1.8x on the punctuation forward pass for skewed length distributions; nothing on uniform lengths",
+     "benchmarkable": true,
+     "risk": "low-medium — same fp-batch-composition risk class already accepted and proof-tooled in §4.4; rerun the proof"
+    },
+    {
+     "title": "RUPunct has no effective max_length: a >512-token text makes the whole slab fail, re-runs all its files one-by-one, and can poison the worker's CUDA context",
+     "locations": [
+      "src/punctuation/punctuation.py:24-35 (tokenizer/pipeline created without model_max_length/stride)",
+      "src/punctuation/punctuation.py:82-97 (slab-level except: whole slab retried per file = 2x model work for the good files)",
+      ".dev_venv/lib/python3.12/site-packages/transformers/pipelines/token_classification.py:254 (truncation = True only honors model_max_length — which is the 1e30 sentinel for RUPunct, verified on this node)"
+     ],
+     "category": "other",
+     "description": "Verified: RUPunct/RUPunct_big's tokenizer has model_max_length = the VERY_LARGE_INTEGER sentinel while the model's max_position_embeddings is 512. The pipeline's truncation flag is therefore a no-op, so any transcript tokenizing past 512 feeds out-of-range position ids into nn.Embedding — on CUDA that is a device-side assert, which (a) fails the whole 64-file slab, (b) triggers the per-file fallback that re-runs the 63 good files (2x work), and (c) a device assert typically poisons the worker's CUDA context so every subsequent slab in that worker errors until the pool dies. Rover texts are per-VAD-segment and usually short, so this is rare — but one long segment in a production run can silently turn a worker into an error generator for the rest of the stage.",
+     "proposed_fix": "Set tokenizer.model_max_length = 512 at init and pass stride (e.g. 128) to the pipeline ctor — the TokenClassificationPipeline natively chunks + aggregates with a fast tokenizer and aggregation_strategy='first' (token_classification.py:195-215). Texts under 512 tokens produce byte-identical output (chunking only engages past the limit); over-limit texts change from 'hard-fail + worker poisoning' to 'fully punctuated', a strict improvement worth documenting rather than gating.",
+     "expected_gain": "Removes the 2x slab re-run and worker-poisoning failure mode; throughput-neutral on the common path; long files go from lost to processed",
+     "benchmarkable": true,
+     "risk": "low — short-text outputs provably unchanged; long-text outputs change from error to result (document in report)"
+    }
+   ],
+   "area_summary": "Punctuation (stage 8) is in good shape after the §4.4 batching: slab-batched pipeline calls, profile-driven batch size, DirNameCache pending scans, per-file fallback. Residuals found there are the stage-end per-file stat recount, in-slab padding waste, and a verified no-op truncation config that turns one >512-token text into a slab failure with CUDA-context-poisoning potential. Accents (stage 9) is the material target: the installed ruaccent runs every sentence through 3-6 batch-1 ONNX calls file-at-a-time (the exact pre-§4.4 RUPunct shape, so the 5.2x batching result is a grounded estimate), loads a never-referenced rule engine (~200 MB of koziev assets, downloads into site-packages) in every worker, creates 4 sessions with default ~24-thread spinning pools on a box shared with training, and has no word-level memo for the pure-function accent model. All accents findings are benchmarkable on this node after a one-time ~530 MB HF asset download (ruaccent imports fine from .dev_venv; assets not yet downloaded locally). Minor items not promoted to findings: accents process_file swallows all exceptions so write_stage_status always reports processed=len(pending) (observability bug); punctuation/accents Path.write_text is non-atomic while phonemizer got the tmp+rename fix in §4.9 (truncated sidecars survive resume); punctuation's code default num_workers=4 vs config's 1 would cost 4x1.4 GB VRAM per GPU with little gain now that batching saturates one worker; optional fp16 RUPunct (1.4 GB fp32 BertForTokenClassification) could give ~1.5-2x + half VRAM but would not be char-identical, so only behind a knob."
+  },
+  {
+   "area": "phonemizer-denoising",
+   "findings": [
+    {
+     "title": "Phonemizer submits one ProcessPool future per file — dispatch overhead + multi-GB parent RAM at production scale",
+     "locations": [
+      "src/phonemizer/phonemizer.py:82-94",
+      "src/utils/parallel.py:96-107",
+      "src/punctuation/punctuation.py:121-134 (slab precedent)"
+     ],
+     "category": "parallelism",
+     "description": "run_per_gpu_pool eagerly calls ex.submit() once per pending file and builds future_to_item for ALL items before the as_completed loop starts (parallel.py:96-97). Measured on this node: ~0.26 ms per no-op task round-trip (0.06 ms submit + 0.2 ms drain) through a single executor manager thread. Warm-path phonemizer work is only ~3-6 ms/file after the §4.9 optimizations (report: ~2 ms g2p for a fully-cached text + read + atomic write), so IPC/bookkeeping is ~5-13% of per-file wall and the manager thread caps aggregate throughput near ~4-5k files/s regardless of worker count. Worse for RAM: at 2 M pending sidecars the parent materializes 2 M Future + _WorkItem + pickled-Path entries (~0.5-1 KB each) ≈ 1-2 GB plus the as_completed waiter set, on a 31 GB node — and the submit loop alone takes ~2 min before tqdm shows progress. Punctuation (stage 8) already solved exactly this with slab submission; phonemizer was left per-file.",
+     "proposed_fix": "Mirror punctuation: slice pending_files into slabs of ~128-512 paths (plain strings, not Path objects), submit one future per slab, and have process_text's wrapper loop the slab catching per-file exceptions and returning a per-file error list so accounting stays per-file (punctuation switched to counting produced sidecars — same pattern works here). No numba/C++ needed; this is pure orchestration. Optionally stream slabs with a bounded in-flight window instead of submitting all upfront to flatten the RAM curve completely.",
+     "expected_gain": "~1.1-1.3x warm-path stage throughput (removes ~0.26 ms/file IPC and manager-thread serialization), minus ~1-2 GB parent RSS and ~2 min of silent submit time at 2 M pending files; gains scale linearly with file count.",
+     "benchmarkable": true,
+     "risk": "low — file outputs byte-identical; only error-reporting granularity changes (per-slab futures with per-file errors collected inside the worker), same divergence punctuation already accepted."
+    },
+    {
+     "title": "Denoising saves files synchronously inside the GPU inference loop (HDD write + re-encode blocks next batch)",
+     "locations": [
+      "src/denoising/denoising.py:280-322",
+      "src/denoising/denoising.py:295-305"
+     ],
+     "category": "io",
+     "description": "_process_files runs session.run, then in the same thread loops the batch items doing torchaudio.save_with_torchcodec to the production HDD (in-place over the source file) plus a partial-CSV row per item, before pulling the next batch. The dataloader overlaps decode, but nothing overlaps encode+write: ffmpeg open/encode/close + HDD write is ~20-200 ms per file (more for opus/flac re-encode of 10-20 s @48 kHz), i.e. plausibly 10-30% of loop wall against a heavy MossFormer2 batch (~0.5-2 s for batch_size=2). The GPU sits idle for the whole save loop. The prior analysis listed this; report.md applied only the throwaway-session fix (§4.6), so this is still open in current code.",
+     "proposed_fix": "Hand (path, enhanced int16/float array, length) to a bounded ThreadPoolExecutor (2-4 threads; ffmpeg encode releases the GIL) and perform writer.write + already_done.add + counter updates in the completion callback, with a small queue cap (e.g. 8 items) so RAM stays bounded (~8 × 3.7 MB). Keep per-file try/except so error attribution is unchanged, and drain the pool before mark_work_shard_done so a shard is only 'done' after all its saves landed.",
+     "expected_gain": "~1.1-1.4x stage wall-clock on the HDD dataset (hides essentially all save latency behind inference); bigger when use_tensorrt makes inference faster and save becomes a larger fraction.",
+     "benchmarkable": false,
+     "risk": "medium — written bytes per file identical, but completion ordering of partial-CSV rows changes and shard-done semantics must wait on the writer pool; MossFormer2 ONNX absent on this node so end-to-end gain can't be measured here (save-path cost alone can be timed)."
+    },
+    {
+     "title": "Denoising dataloader rebuilds the torchaudio resample kernel for every file",
+     "locations": [
+      "src/utils/datasets/denoising.py:55-60"
+     ],
+     "category": "cpu-hotloop",
+     "description": "DenoisingDataset.__getitem__ calls torchaudio.functional.resample per file. The functional API recomputes the sinc kernel on every call; torchaudio's own docs state transforms.Resample 'precomputes and reuses the resampling kernel'. Verified in the installed torchaudio source on this node. Source material is not 48 kHz (the model rate), so effectively every production file pays a kernel build (~1-5 ms for awkward ratios like 44.1k→48k where gcd=300 gives a 147→160 polyphase kernel) on top of the conv. At hundreds of thousands of files that is tens of CPU-minutes burned inside loader workers, which directly throttles GPU feed rate when decode is the bottleneck.",
+     "proposed_fix": "Keep a module-level (or dataset-instance) dict {orig_freq: torchaudio.transforms.Resample(orig_freq, 48000)} and reuse it; same kernel parameters → bit-identical output tensors. One-line vectorization-style fix, no numba needed.",
+     "expected_gain": "~1-5 ms saved per resampled file; ~10-40 CPU-minutes per 500 k files inside loader workers, and correspondingly higher loader throughput when decode-bound (typical with batch_size=2 and 4 workers).",
+     "benchmarkable": true,
+     "risk": "low — outputs bit-identical (same kernel math, just cached); measurable loader-only on the 250-wav bench sample with a forced source rate."
+    },
+    {
+     "title": "Denoising loader workers run with unlimited torch intra-op threads — CPU oversubscription against ORT and the second GPU worker",
+     "locations": [
+      "src/utils/datasets/denoising.py:107-133",
+      "src/utils/datasets/preprocess.py:52 (existing repo precedent)",
+      "src/denoising/denoising.py:69 (ORT_THREADS=4)"
+     ],
+     "category": "parallelism",
+     "description": "create_denoising_dataloader sets no worker_init_fn, so each spawned loader worker inherits torch's default intra-op thread count (up to all 48 threads on this node). With 2 GPU workers × num_workers=4 (config) that is up to 8 decode processes each spinning a full OMP team for resample conv1d and channel mean — potentially hundreds of runnable threads contending with the two ORT sessions (4 intra + 4 inter threads each) and tqdm/CSV threads. The crest/preprocess dataset already fixed this exact problem with torch.set_num_threads(1) in its worker init (preprocess.py:52); denoising never got the same treatment.",
+     "proposed_fix": "Add worker_init_fn=lambda _: torch.set_num_threads(1) (mirroring crest_factor_worker_init) to the denoising DataLoader. Per-file work is already parallelized across the 4 workers, so per-op threading only adds scheduler thrash.",
+     "expected_gain": "Typically 1.1-1.5x loader throughput and much lower context-switch load on a 48-thread box also running the user's training dataloaders; zero VRAM/RAM cost.",
+     "benchmarkable": true,
+     "risk": "low — conv1d parallelizes over output positions (per-output reduction order unchanged), so resampled tensors should stay bit-identical; cheap to verify by diffing loader outputs at 1 vs default threads on the bench sample."
+    },
+    {
+     "title": "TensorRT optimization profile for denoising is tuned to 1-second inputs while real batches are 10-20 seconds",
+     "locations": [
+      "src/denoising/denoising.py:118-142",
+      "src/denoising/denoising.py:63-66"
+     ],
+     "category": "gpu",
+     "description": "add_denoising_trt_profile_options sets trt_profile_opt_shapes to {batch}x1x48000 (exactly 1 s at 48 kHz) with max {batch}x1x960000 (20 s). Length-bucketed shards mean real padded lengths cluster at the duration buckets, typically 5-15 s (240k-720k samples) — 5-15x the opt point. TRT selects kernel tactics at the opt shape, so the engine actually used for nearly every batch runs with tactics tuned for sequences an order of magnitude shorter; for attention/FFT-heavy MossFormer2 blocks that commonly costs real throughput. Also trt_timing_cache_enable is set without a trt_timing_cache_path, and trt_detailed_build_log=True spams logs on every engine build.",
+     "proposed_fix": "Make the opt shape configurable (denoising.trt_opt_seconds, default ≈ the dominant bucket, e.g. 720000 = 15 s) and pass trt_timing_cache_path next to the engine cache. One-time engine rebuild per node (cached thereafter).",
+     "expected_gain": "Unknown without the model — plausibly 1.2-2x TRT-path throughput on long buckets based on typical tactic-mismatch penalties; zero change when use_tensorrt=False.",
+     "benchmarkable": false,
+     "risk": "medium — outputs can shift within fp16 tactic tolerance (the path is already fp16 via runtime.trt_fp16), and the engine rebuilds once; gate behind the new config knob and validate against CUDA-EP outputs when the ONNX file is available."
+    },
+    {
+     "title": "A single >20 s file kills a denoising GPU worker mid-shard (collate raises through the DataLoader, shard abandoned)",
+     "locations": [
+      "src/utils/datasets/denoising.py:88-92",
+      "src/denoising/denoising.py:368-388",
+      "src/denoising/denoising.py:443-460 (durations already known here)"
+     ],
+     "category": "other",
+     "description": "denoising_collate raises RuntimeError when padded length exceeds max_padded_len=960000 (20 s @48 kHz). That exception propagates out of the DataLoader iterator, escapes _process_files (no try around the loop body for iterator errors), kills run_worker, and the worker process exits — its claimed shard stays .running.N (never done) and the worker claims nothing further for the rest of the run. With the default 15 s overflow bucket (len_ge_015s) holding ALL >15 s files, one 21 s chunk dooms the entire overflow shard (up to 10 k files of wasted/lost work) and halves GPU capacity for the remainder of the run. main() already has every file's duration in hand at sharding time (denoising.py:443) but never uses it to enforce the model's hard input cap. Related edge: batches whose padded length is below the TRT min profile (8000 samples, i.e. all-sub-0.17 s batches padded to 384) would similarly fail the profile check.",
+     "proposed_fix": "At shard-prep time, split paths with duration > MODEL_MAX_PADDED_LEN/48000 (minus a safety margin for resample rounding) into a logged skip list written to stage status (or route them to a future chunked overlap-add path); optionally also wrap the dataloader iteration so an unexpected iterator error fails the shard, marks it, and lets the worker continue with the next shard.",
+     "expected_gain": "Avoids losing a GPU worker plus an entire 10 k-file shard per oversized file — on a multi-day production run this is the difference between a logged skip and a silent 2x slowdown/abort.",
+     "benchmarkable": true,
+     "risk": "low — pure-CPU repro (no model needed); behavior change is crash → explicit documented skip for files the model cannot accept anyway; processed-file outputs unchanged."
+    }
+   ],
+   "area_summary": "Phonemizer (stage 10) is in good shape after the §4.9 FastG2P rewrite — the only material residual is the orchestration around it: run_per_gpu_pool still submits one future per file (punctuation already moved to slabs), costing ~0.26 ms/file IPC and 1-2 GB of parent futures-RAM at 2 M pending. Denoising (stage 11, analysis-only since the MossFormer2 ONNX is absent here) has four open items: the synchronous in-loop save, per-file resample-kernel rebuild, uncapped torch threads in loader workers, and a TRT opt-profile tuned to 1 s inputs; plus a robustness/throughput trap where any >20 s file kills a worker and abandons its shard. Checked-and-fine: pending_sidecar_chain/DirNameCache scans (already scandir-cached), the ONNX graph-metadata input-name read (§4.6 applied), int16 IPC between loader and worker (halves shared-memory bytes, model expects int16-range floats), pin_memory=False (correct for ORT/numpy), PartialCsvWriter per-row flush (buffered, no fsync — cheap), and work-shard claim/glob costs (trivial at ~200 shards/2 M files). Trivia worth recording: process_text re-stats the already-pending output (phonemizer.py:35, one extra HDD stat/file, kept as a cheap resume guard); each phonemizer worker holds the 93 MB G2P dict (measured) plus a rules memo capped ~100 MB — fine at the configured 1 worker/GPU but multiplies if num_workers is raised (a marisa-trie or shared-memory dict would cut it ~5-10x); denoising noise padding uses unseeded torch.randn so outputs are already nondeterministic run-to-run and batch-composition-dependent (pre-existing, worth documenting before any 'outputs unchanged' claim for this stage); torchaudio.save_with_torchcodec overwrites the SOURCE audio in place non-atomically — a kill mid-save permanently corrupts the input with no partial row recording it (pre-existing data-loss risk, fix is tmp+rename like the phonemizer sidecar); mp.Value counters use non-atomic += across processes (status-accounting only)."
+  },
+  {
+   "area": "orchestration-config",
+   "findings": [
+    {
+     "title": "Spawned workers ignore the configured log level: per-row/per-batch DEBUG lines emit to stderr in production hot loops",
+     "locations": [
+      "src/utils/logging_setup.py:45-91",
+      "src/separation/distillmos_process.py:105-146",
+      "src/utils/datasets/separation.py:36,50,187,194",
+      "src/utils/datasets/preprocess.py:37-47",
+      "src/utils/parallel.py:91-94",
+      "src/punctuation/punctuation.py:22",
+      "src/accents/accents.py:21",
+      "src/phonemizer/phonemizer.py:23",
+      "src/transcription/transcription.py:420"
+     ],
+     "category": "cpu-hotloop",
+     "description": "setup_logging() (INFO sinks, per runtime.log_level) is only called in each stage's main(). Every heavy stage then uses mp spawn (set_start_method('spawn') in 11 stage files) for its per-GPU workers / ProcessPoolExecutor initializers, and none of the worker entrypoints (run_inference_worker, init_process, worker_init_fn) reconfigure loguru. A spawned child freshly imports loguru, which installs its DEFAULT stderr sink at level DEBUG — verified empirically on this node: a spawn child emits logger.debug() even when the parent configured INFO-only sinks. DataLoader workers fork from those spawned workers and inherit the same DEBUG sink. Consequence: the per-batch perf lines (distillmos_process.py:116,125), the PER-ROW partial_write line (distillmos_process.py:142), and the PER-FILE dataloader_audio_load lines in dataset __getitem__ (datasets/separation.py:36/50/187/194, datasets/preprocess.py:37-47; similar in denoising) all emit unconditionally in production. At 2M files that is ~4-6M loguru record builds + stderr writes per GPU stage (~20-50us each, the per-row one serialized with the inference loop) ~= 2-5 minutes of pure logging per stage, interleaved with tqdm bars; and because the default sink is stderr-only, none of it reaches the rotating file sink, so the DEBUG perf data is also lost when you actually want it. Additionally all these debug f-strings are formatted eagerly even where the level does filter (main-process loops), ~1-2us/row.",
+     "proposed_fix": "Add a tiny configure_worker_logging() in logging_setup.py that does logger.remove() + re-adds stderr (and optionally the file sink) at os.environ['BALALAIKA_LOG_LEVEL'] (already exported by base.sh and inherited by spawn children), and call it first thing in every spawned worker entry: run_inference_worker-style functions, the three pool init_process functions, and as worker_init_fn for DataLoaders (or rely on inheritance once the GPU worker is fixed). Optionally guard the per-row debug calls with a precomputed `debug_on` bool or logger.opt(lazy=True) to skip eager f-string formatting.",
+     "expected_gain": "Minutes per GPU stage at 2M-file scale (4-6M stderr emits removed), correct log-level control in workers, DEBUG perf lines actually captured in the rotating file when enabled; seconds saved from eager f-string formatting",
+     "benchmarkable": true,
+     "risk": "low — logging only; pipeline data outputs provably unchanged"
+    },
+    {
+     "title": "Dead `import torch` in src/utils/utils.py makes every CPU-only stage pay ~4s startup and ~500MB peak RSS",
+     "locations": [
+      "src/utils/utils.py:4",
+      "src/collate.py:12",
+      "src/report.py:27",
+      "src/to_webdataset.py:16",
+      "src/separation/distillmos_filter.py:31",
+      "src/separation/antispoofing_filter.py:28",
+      "src/download/download.py:13"
+     ],
+     "category": "startup",
+     "description": "src/utils/utils.py imports torch at module level but never uses it (grep confirms `torch` appears only on line 4). load_config/read_file_content live in this module, so every stage entry module imports it — including the six stages whose import chains are otherwise torch-free: download (0), distillmos_filter (5.5), antispoofing_filter (6.5), collate (12), to_webdataset (13), report (14). csv_manager/sidecars/audit do not import torch at module level (audit's torchaudio probe is lazy). Measured on this node, warm cache: `import torch` = 5.3s wall and 628MB peak RSS vs 1.5s/110MB for yaml+loguru+pandas — i.e. ~3.8s and ~500MB of pure waste per CPU-only stage process. The RSS matters most for collate/to_webdataset, which already hold multi-GB dataframes/metadata on this 31GB node.",
+     "proposed_fix": "Delete line 4 of src/utils/utils.py (also consider making `import torch` lazy inside src/utils/parallel.py, which only needs it for torch.cuda.device_count, though all its current callers import torch anyway). No vectorization/numba needed — pure dead-code removal.",
+     "expected_gain": "~4s x 6 stages ≈ 23s per full pipeline run; ~500MB lower peak RSS in collate/to_webdataset/report/filter stages (first-class win on the 31GB node)",
+     "benchmarkable": true,
+     "risk": "low — torch is unused in the module and torch-needing stages import it themselves; outputs unchanged"
+    },
+    {
+     "title": "cudf.pandas is blanket-injected into all 16 stages (GPU multiprocessing stages included) on cudf-equipped nodes",
+     "locations": [
+      "base.sh:112-152"
+     ],
+     "category": "startup",
+     "description": "base.sh probes `import cudf.pandas` once and, if present, launches EVERY stage via the runpy shim that calls cudf.pandas.install() in the stage parent. On this node cudf is not installed (verified), so today the cost is only the failed probe (~0.1s). But on any cudf-equipped node the design charges every stage parent a multi-second cuDF import plus a cuDF CUDA context (hundreds of MB of VRAM) — including the GPU multiprocessing stages (ASR, DistillMOS, antispoofing, denoising, music_detect) whose parents do little pandas work, and on a GPU shared with a training job that extra context is an OOM risk, not just overhead. It also now overlaps with the already-applied pyarrow CSV fast path in csv_manager (report.md §4.1): cudf.pandas intercepts pandas calls, so the optimized pandas/pyarrow path would be re-routed and its measured wins/memory profile no longer apply as benchmarked.",
+     "proposed_fix": "Gate the cudf prefix to an allowlist of CSV-bound stages (collate, distillmos_filter, antispoofing_filter, report) or flip the default to opt-in (BALALAIKA_ENABLE_CUDF=1), keeping BALALAIKA_DISABLE_CUDF for back-compat; fold the probe into the existing runtime_env python invocation so startup does one interpreter start instead of two.",
+     "expected_gain": "On cudf nodes: multi-second import + 300-800MB VRAM saved per GPU-stage parent and removal of an OOM failure mode; on this node: ~0.1s probe only",
+     "benchmarkable": false,
+     "risk": "low on this node (no cudf → no behavior change); medium on cudf nodes — CSV ops move back to CPU pandas/pyarrow, values identical but stage wall-clock there changes; gate via config knob"
+    },
+    {
+     "title": "No thread-pool hygiene: ORT sessions default to physical-core intra-op pools with spinning; no OMP/BLAS caps exported for workers",
+     "locations": [
+      "src/transcription/transcription.py:211-218",
+      "src/separation/antispoofing.py:111-112",
+      "src/denoising/denoising.py:69,166-170",
+      "base.sh:123-160",
+      "src/utils/runtime_env.py:32-50"
+     ],
+     "category": "parallelism",
+     "description": "Nothing in the orchestration exports OMP_NUM_THREADS/OPENBLAS_NUM_THREADS/MKL_NUM_THREADS (repo-wide grep: only torch.set_num_threads(1) in the crest worker_init), and most ORT sessions are created without thread settings: onnx_asr.load_model in transcription gets no sess_options (ORT default intra_op = physical cores = 24 here, inter-op 1+, busy-spin enabled), antispoofing builds SessionOptions but only sets graph_optimization_level. With 2 GPU workers per stage that is ~48 spinning ORT CPU threads per ASR/antispoofing stage that mostly wait on GPU EPs but burn cycles between Run() calls — on this box the CPU is shared with the user's training job and with up to 16 DataLoader workers per GPU worker plus pyarrow's own 48-thread pool in the parent during flushes. Denoising already demonstrates the fix pattern (ORT_THREADS=4 at denoising.py:69,169-170). torch DataLoader workers are safe (torch auto-caps to 1 thread in _worker_loop), so the exposure is ORT pools + any OpenBLAS use in forked workers (default pool = 48 threads per process, lazily created).",
+     "proposed_fix": "(a) Pass sess_options to onnx_asr.load_model (verified: signature accepts sess_options) and to the antispoofing session with intra_op_num_threads ≈ 2-4, inter_op_num_threads=1, and session config 'session.intra_op.allow_spinning'='0' for GPU-EP sessions; (b) add a runtime.threads_per_worker knob in runtime_env.py and export OMP_NUM_THREADS/OPENBLAS_NUM_THREADS/MKL_NUM_THREADS/NUMEXPR_NUM_THREADS in base.sh run_python so all stage processes and their forked children inherit sane caps.",
+     "expected_gain": "5-15% wall-clock on CPU-contended runs (this node always is, with the training job) and markedly less interference with the co-resident training; tens of MB of thread stacks saved per worker",
+     "benchmarkable": true,
+     "risk": "medium — if some ASR/preprocessing ops actually execute on CPU, an aggressive intra_op cap can slow them (must measure per model); changing CPU-op thread counts can change float reduction order in CPU-executed kernels, so outputs need re-verification or a config knob defaulting to current behavior"
+    },
+    {
+     "title": "runtime_cfg/get_onnx_providers re-parse the YAML config and re-mkdir the TRT cache dir on every session build",
+     "locations": [
+      "src/utils/gpu.py:58-60",
+      "src/utils/runtime_env.py:53-71"
+     ],
+     "category": "io",
+     "description": "Every TRT-enabled session creation calls get_onnx_providers → runtime_cfg → _load_runtime, which re-opens and yaml.safe_load's the entire config plus Path.mkdir(parents=True) on the cache dir. Transcription does this once per model per GPU worker per run (5 models × 2 workers, workers respawned per model), antispoofing/denoising/sortformer once per worker; benchmarking/warmup loops call it repeatedly. The config is immutable during a run, so this is pure redundant parse + syscalls — small in absolute terms (~1-3ms + 2 syscalls per call, tens of calls per stage) but a free 2-line fix and it removes config-file IO from worker startup on the HDD-resident production checkouts.",
+     "proposed_fix": "functools.lru_cache on runtime_cfg keyed by the resolved config path (returning a copy or an immutable mapping to keep callers from mutating the cache), and cache the mkdir per (cache_path, cuda_id).",
+     "expected_gain": "Negligible wall-clock (<0.1s/stage); removes redundant config-file reads/mkdirs from every worker startup — cleanliness/IO-hygiene win",
+     "benchmarkable": true,
+     "risk": "low — values are read-only during a run; outputs unchanged"
+    }
+   ],
+   "area_summary": "Read base.sh, src/stage_runner.sh, src/utils/runtime_env.py, configs/config.yaml, src/utils/logging_setup.py end-to-end, plus the helpers they feed (gpu.py, parallel.py, utils.py, stage worker entries and dataset __getitem__ paths) and verified prior-pass items from .claude/analysis/orchestration.json against current code. Already fixed and NOT re-reported: cpu_affinity now defaults to \"\" with NUMA guidance (config.yaml:91-100), stage_runner.sh now mirrors base.sh's nvidia/TensorRT LD_LIBRARY_PATH (stage_runner.sh:35-47), and the flush_every_rows comment. The orchestration shell itself is thin and cheap; the real remaining costs are in process bootstrap: (1) spawned workers fall back to loguru's default DEBUG stderr sink (empirically verified), making per-row/per-file debug f-strings in hot loops emit at production scale; (2) a dead `import torch` in src/utils/utils.py charges ~4s + ~500MB peak RSS to six otherwise torch-free stages (measured 5.3s/628MB for torch import on this node); (3) the cudf.pandas blanket injection (inactive here — cudf absent — but a VRAM/OOM hazard and a pyarrow-path conflict on cudf nodes); (4) missing thread caps for ORT sessions and OMP/BLAS in a 48-thread box shared with the user's training job (denoising already caps to 4 threads, others don't; onnx_asr.load_model accepts sess_options so the fix is plumbing). Trivia merged here rather than as findings: base.sh does 3 interpreter cold-starts before any stage (runtime_env dump — which runs on the SYSTEM python3 before venv activation and thus needs system PyYAML, a portability footgun; the sys.version probe at base.sh:89 replaceable with python3 -V parsing; the cudf probe) totaling ~1-2s one-off; --strict mode spawns one python3 per stage just to read an int from stage_N_status.json (~15 cold starts, could be a sentinel file or grep); logging_setup.py:108 basicConfig(level=0) routes every stdlib record from every library through the intercept handler (record build + depth-6 frame walk) even when sinks reject it — should pass the resolved level; stage_to_units forks 3 subshells per stage gate (negligible); base.sh defaults stage=11/stop_stage=14 so a bare `bash base.sh` silently skips stages 0-10 (footgun, not perf). The fixed ~5-7s interpreter+framework import per stage launch (16 stages ≈ 1.5min/run) is structural and amortized at production scale; its only cheaply-removable component is the dead torch import (finding 2) — transcription's per-model worker respawn is already report.md §9.1 and was not re-reported."
+  },
+  {
+   "area": "ram-io-sweep",
+   "findings": [
+    {
+     "title": "to_webdataset ships the FULL 2M-row metadata dict to every export worker (report claim not actually implemented) — OOM risk at 31 GB",
+     "locations": [
+      "src/to_webdataset.py:201",
+      "src/to_webdataset.py:210-214",
+      "src/to_webdataset.py:66-73",
+      "src/to_webdataset.py:75"
+     ],
+     "category": "ram",
+     "description": "load_metadata() materializes one dict-of-dicts for the whole CSV (2M rows x ~15 metadata keys ≈ 2-3 GB of Python dicts), then main() passes that same full `metadata_dict` to EVERY ProcessPoolExecutor worker (executor.submit(worker_fn, ..., metadata_dict, ...) at line 212). Under spawn, each of the N workers pickles+unpickles its own complete copy: parent 3 GB + 4 workers x 3 GB ≈ 15 GB before any tar buffering — on the 31 GB node (≈21 GB free) this OOMs at production scale. IMPORTANT: report.md §8 claims 'webdataset workers now receive only their shard's metadata instead of the full dict' — the code shows this was never applied; the claim is currently false.",
+     "proposed_fix": "Each worker's chunk of audio paths determines exactly which stems it needs: before submit, compute `chunk_stems = {os.path.splitext(os.path.basename(p))[0] for p in chunk}` and pass `{k: metadata_dict[k] for k in chunk_stems & metadata_dict.keys()}`. Optionally also free the parent's full dict after slicing (per-chunk dicts are disjoint). No worker logic changes; identical tar/json output. Then fix the report.md §8 sentence.",
+     "expected_gain": "Worker-side RAM drops from N x full-dict to 1/N each (~8-12 GB saved at 2M rows, 4 workers); pickle volume per submit drops ~N x. Turns a near-certain OOM at 2M+ rows into a flat ~3-4 GB stage.",
+     "benchmarkable": true,
+     "risk": "low — pure data-plumbing change; every worker receives a superset-equal view of the keys it can ever look up, so outputs are byte-identical. Pinned testable via existing tests/test_to_webdataset.py plus an RSS measurement on a synthetic 2M-row metadata fixture."
+    },
+    {
+     "title": "Collate holds every sidecar text for the whole dataset in RAM 3x over (list-of-dicts + DataFrame + Arrow) — est. 12-18 GB peak at 2M rows",
+     "locations": [
+      "src/collate.py:252-284",
+      "src/collate.py:290-296",
+      "src/collate.py:145-176"
+     ],
+     "category": "ram",
+     "description": "Stage 12 accumulates ALL per-file sidecar texts into `results` (2M dicts x ~10 text fields x 200-600 B + ~640 B dict overhead ≈ 6-9 GB), then builds `extracted_df = pd.DataFrame(results)` while `results` is still alive, merges with the metadata frame into `final_df`, runs add_asr_consistency (which transiently concats 5 full text columns into one 10M-element series for factorize), and finally `to_parquet` converts everything into Arrow buffers (string data copied again, +4-7 GB transient). Estimated peak RSS 12-18 GB at 2M rows — borderline OOM with ~21 GB free, certain OOM at 4M+. The §4.2 optimizations fixed CPU (apply→vectorized, sidecar slab reads) but not this peak.",
+     "proposed_fix": "Stream instead of materialize: iterate the existing slabs in order, build a pandas/Arrow record batch per slab (merge with the corresponding metadata rows via an index on filepath), compute asr_consistency per batch (it is row-local — within-row equality of normalized transcripts; per-batch factorize codes preserve within-row equality, so results are identical), and append batches to one pyarrow.parquet.ParquetWriter with a fixed unified schema. Drop `results`/`extracted_df` entirely. executor.map already yields slabs in submission order, so row order in the parquet is unchanged.",
+     "expected_gain": "Peak RSS from O(dataset) to O(slab) — roughly 12-18 GB → 2-3 GB at 2M rows; unlocks 10M-row collation on this node. Wall time roughly unchanged (same reads, same factorize work in pieces).",
+     "benchmarkable": true,
+     "risk": "medium — output parquet should be value-identical and row-order-identical, but the file's internal row-group layout changes and the unified schema must be fixed up-front (a late-appearing sidecar column would otherwise change dtypes). Pin with a round-trip comparison test on the existing bench_collate fixture (values + row order, not bytes)."
+    },
+    {
+     "title": "DistillMOS re-probes audio lengths SERIALLY per shard via torchaudio.info and thrashes a JSON sort cache, despite shards already being duration-sorted from the CSV",
+     "locations": [
+      "src/utils/datasets/separation.py:64-115",
+      "src/utils/datasets/separation.py:125",
+      "src/separation/distillmos_process.py:97-103",
+      "src/separation/distillmos_process.py:286-304"
+     ],
+     "category": "io",
+     "description": "main() already calls ensure_audio_durations (parallel probe + balalaika.csv total_duration cache) and prepare_length_bucketed_work_shards, so every shard file list is ALREADY sorted by duration. Yet _process_files builds the dataloader through sort_by_length(), which on the first shard probes every file with serial torchaudio.info under tqdm in the GPU worker, and on every SUBSEQUENT shard finds the JSON cache 'stale' (cached set = previous shard, disjoint from current) → re-probes its whole shard serially and rewrites distillmos_sorted_files.json on the production HDD. At 2M files / 10k shard_size = 200 shards x 10k random header reads (~3-8 ms each on cold HDD) ≈ 1.7-4.5 h of GPU-idle serial probing per run, plus 200 JSON rewrites and a write race between GPU workers sharing one cache file.",
+     "proposed_fix": "Remove the per-shard sort_by_length call (and the JSON cache): pass shard files to DistillMOSDataset in shard order, which is already duration-sorted by the same total_duration values. If exact batch-composition parity with current behavior is wanted, keep a knob `distillmos.sort_in_loader: true` defaulting to false, or sort by the durations dict already loaded in main (ship per-shard durations in the shard files as 'path\\tduration' lines).",
+     "expected_gain": "Eliminates ~2M redundant HDD header reads + 200 JSON rewrites per run (hours of wall time at 2M files; ~50 s GPU idle per 10k shard). Zero extra RAM.",
+     "benchmarkable": true,
+     "risk": "medium — per-file MOS scores can shift marginally for files whose batch neighbors change, because pad_sequence zero-padding depends on batch composition and the model gets no length mask; CSV durations are rounded to 4 dp vs probed exact floats, so within-bucket ordering can differ. Gate by the config knob and validate on the 250-wav bench sample (DistillMOS package + GPU are present)."
+    },
+    {
+     "title": "music_detect calls ensure_audio_durations PER SHARD inside every GPU worker — full-CSV duration scan + possible full-CSV rewrite under flock, 200x per run; the cache loader itself is a per-row Python loop",
+     "locations": [
+      "src/separation/music_detect.py:126-130",
+      "src/separation/music_detect.py:77-87",
+      "src/utils/audio_durations.py:52-88",
+      "src/utils/audio_durations.py:160-166"
+     ],
+     "category": "io",
+     "description": "Unlike distillmos/antispoofing/denoising (which ensure durations once in main), music_detect's _process_files runs ensure_audio_durations for every claimed shard: each call reads balalaika.csv's filepath+total_duration columns AND runs _csv_duration_cache's per-row Python loop (normalize_path_string + set lookup under tqdm) over ALL 2M rows (~4-7 s/call), per shard, per GPU worker → ~15-25 min of redundant CSV parsing at 200 shards, all competing for the same file. Worse, any shard with rows missing total_duration triggers upsert_columns — a FULL CSV read+merge+rewrite under the global flock from inside a GPU worker, serializing both workers and the periodic merger. create_loader also re-downloads/parses AutoFeatureExtractor.from_pretrained and respawns loader workers per shard.",
+     "proposed_fix": "Hoist ensure_audio_durations to main() (exactly like distillmos_process.py:286), write 'path\\tduration' shard lines or pass a per-shard durations dict, and instantiate AutoFeatureExtractor once per worker. Independently, vectorize _csv_duration_cache: `s = _normalize_path_series(df['filepath']); m = s.isin(requested_norms)` then dict(zip(s[m], durations[m])) — removes the 2M-iteration loop for every stage that uses durations (distillmos, antispoofing, denoising, transcription x5 models).",
+     "expected_gain": "music_detect: removes ~200 full-CSV scans + any mid-stage full-CSV rewrites (tens of minutes + large HDD I/O at 2M rows). Vectorized cache loader: ~4-7 s → <1 s per call, x (number of duration-using stage launches, ≈9 per pipeline run).",
+     "benchmarkable": true,
+     "risk": "low — same durations end up in the same shards; per-shard skip logic unchanged. The music model file is absent on this node so only the duration-layer half is micro-benchmarkable here (2M-row CSV fixture exists); the hoist is structurally identical to the distillmos pattern already validated."
+    },
+    {
+     "title": "Periodic CSV flush amplification: full-CSV rewrite every 600 s on long stages, plus a full existence re-scan (drop_missing_files) and 2M-path bootstrap re-normalization on EVERY flush — all redundant for crash safety",
+     "locations": [
+      "src/utils/csv_manager.py:962-1016",
+      "src/utils/csv_manager.py:544-555",
+      "src/utils/csv_manager.py:144-189",
+      "src/preprocess/crest_factor_remover.py:372-378",
+      "src/separation/music_detect.py:334-341",
+      "src/preprocess/preprocess_existing_chunks.py:528-535"
+     ],
+     "category": "io",
+     "description": "PeriodicCsvMerger flushes whenever 100k new rows OR 600 s elapse with any new rows (config flush_every_seconds: 600). Each flush = read all partials + read full main CSV + outer merge + rewrite full CSV (~15 s CPU and ~0.3-0.5 GB write at 2M rows). A 10 h stage → ~60 flushes ≈ 15 min CPU and ~20-30 GB of HDD reads+writes. Crest and music additionally pass drop_missing_files=True to the MERGER, so every flush also runs _paths_exist_mask over all 2M rows — one scandir per unique directory (~50k dirs on HDD, several minutes each flush, cache rebuilt from scratch per flush). preprocess_existing_chunks passes bootstrap_audio_paths to the merger, so every flush re-normalizes + concats + dedupes all 2M bootstrap paths. None of this is needed for crash safety: partials are never deleted by the merger and the post-stage absorb_partial_csvs replays everything — periodic flushes only keep balalaika.csv 'fresh' for observers.",
+     "proposed_fix": "(a) Default flush_every_seconds much higher (e.g. 3600) or 0, keeping flush_every_rows as the only trigger, and document that resume safety comes from partials. (b) Stop passing drop_missing_files=True and bootstrap_audio_paths into PeriodicCsvMerger (keep both on the final absorb only) — final CSV state is identical because the final absorb prunes/bootstraps anyway. (c) Optionally make _count_partial_rows incremental (remember per-file offset, count only appended bytes).",
+     "expected_gain": "Removes ~50-90% of mid-stage CSV I/O on long runs: tens of GB of HDD writes and many full-tree scandir passes per filter stage at 2M rows; scales linearly with dataset size. Final balalaika.csv provably unchanged.",
+     "benchmarkable": true,
+     "risk": "low for (b)/(c) — final-state equality is exact (absorb does the same work once). Low-medium for (a): mid-run balalaika.csv is staler, and a crash window of up to flush interval relies on partial-absorb at next start (already the designed recovery path). All gated by existing csv: config knobs."
+    },
+    {
+     "title": "accents/phonemizer submit one ProcessPool future per FILE: ~2M Future+WorkItem objects (~1-2 GB) in the parent plus per-item pickling; punctuation's slab pattern not propagated",
+     "locations": [
+      "src/utils/parallel.py:96-97",
+      "src/accents/accents.py:70-77",
+      "src/phonemizer/phonemizer.py:82-94",
+      "src/utils/sidecars.py:34-77",
+      "src/utils/sidecars.py:109-129"
+     ],
+     "category": "ram",
+     "description": "run_per_gpu_pool submits every item as its own future and keeps a future_to_item dict over all of them; as_completed additionally registers waiters on each. Stage 8 (punctuation) was converted to batch_size slabs in the prior pass, but accents (stage 9) and phonemizer (stage 10) still pass the raw pending-file list: at 2M pending files that is ~2M Future + _WorkItem + dict entries ≈ 1-2 GB parent RSS, 2M individual pickle/IPC round trips (~20-30 µs each ≈ 1-2 min pure dispatch), and a tqdm update per item. Supporting RAM costs in the same path: pending lists are built as Path objects (~2-3x the bytes of plain strings, several hundred MB at 2M), and DirNameCache._names grows unbounded — it retains every directory's full name set including all sidecars (~10-12M names ≈ 1-1.5 GB) for the whole scan even though inputs arrive grouped by directory.",
+     "proposed_fix": "Slab accents and phonemizer exactly like punctuation.py:121-124 (work_fn loops over a list; per-file error handling stays inside the slab fn — outputs unchanged since both work_fns are independent per file). Return str paths instead of Path from pending scans. Bound DirNameCache with a small LRU (e.g. keep last 64 dirs — inputs from CSV order are directory-grouped, so hit rate stays ~100%).",
+     "expected_gain": "Parent RSS during stages 9/10 drops by ~2-4 GB at 2M files; dispatch overhead shrinks ~slab_size x (minutes saved); behavior identical. LRU bound caps scan RAM at ~MBs instead of ~1.5 GB.",
+     "benchmarkable": true,
+     "risk": "low — same function applied per file inside slabs; punctuation already validated this pattern end-to-end. LRU eviction only costs re-scandir on out-of-order inputs (correctness unchanged)."
+    },
+    {
+     "title": "preprocess (stage 1) accumulates every chunk-metadata row in BOTH the GPU worker and the parent, only to compute len() and a duration sum — rows are already persisted via partial CSVs",
+     "locations": [
+      "src/preprocess/preprocess.py:740",
+      "src/preprocess/preprocess.py:793",
+      "src/preprocess/preprocess.py:816",
+      "src/preprocess/preprocess.py:890",
+      "src/preprocess/preprocess.py:935",
+      "src/preprocess/preprocess.py:961-967"
+     ],
+     "category": "ram",
+     "description": "_run_diarization_shard appends every written segment dict to `results` for the lifetime of the worker (line 793) even though each row was just streamed to preprocess_part_<gpu>.csv; process_gpu_batch then pickles the whole list back through future.result() (line 816), and main() extends `all_results` with everything (line 935). The ONLY uses are hours_out = sum(total_duration) and files_out = len(all_results) (lines 961-967). At ~2M chunks x ~10-key dict ≈ 2-4 GB held in the parent plus a matching transient copy during IPC unpickling — on top of the diarization dataloader's prefetched full-length podcasts (a 2 h source decoded to 16 kHz float32 is ~0.45 GB per item x workers x prefetch_factor).",
+     "proposed_fix": "Have _run_diarization_shard return only {chunk_count, duration_sum_s, crest_audit}; replace all_results with two accumulators. (Equivalent data for the audit could also be derived from the final absorb's partials_df, like crest does.) One-line semantics, no output change to balalaika.csv or filter_summary.csv values.",
+     "expected_gain": "~2-4 GB parent + ~2-4 GB transient IPC RAM removed at 2M chunks; removes a multi-GB pickle between processes. Matters most exactly when stage 1 runs at full dataset scale on this 31 GB node.",
+     "benchmarkable": false,
+     "risk": "low — record_stage_summary receives identical numbers (sum/len are computed from the same rows). Not end-to-end benchmarkable on this node (sortformer/SmartTurn ONNX absent), but the accumulation cost is provable with a synthetic row generator."
+    },
+    {
+     "title": "Transcription get_valid_paths and ROVER pending scan stat every audio file individually (per model pass) instead of using the existing DirNameCache — 10M+ random HDD stats per pipeline run",
+     "locations": [
+      "src/transcription/transcription.py:283-299",
+      "src/transcription/transcription.py:262-276",
+      "src/transcription/rover.py:52-66",
+      "src/utils/sidecars.py:80-96"
+     ],
+     "category": "io",
+     "description": "Stage 7 runs get_valid_paths once per ASR model (5x): for each of 2M audio paths it calls text_sidecar_complete(sidecar) → Path.exists() + stat (one or two syscalls per file, random order on the HDD), i.e. ~2M stats x 5 models = 10M syscalls; cold-cache HDD at 3-8 ms/seek is potentially hours for the first pass, and consensus mode adds up to len(processed) more existence probes + file reads per candidate. ROVER's _pending_audio_paths repeats the same per-file pattern for _rover.txt. The prior pass already built DirNameCache (one scandir per directory, validated identical pending sets) and applied it to stages 8-10 (report §4.7) — these two scans were missed.",
+     "proposed_fix": "Use DirNameCache in get_valid_paths and ROVERWrapper._pending_audio_paths (and check_consensus's existence probes) — same pattern as sidecars.pending_audio_to_sidecar. One semantic edge to preserve/document: text_sidecar_complete(retry_empty=True) needs st_size, which scandir entries provide via entry.stat() from the same directory read (still batched); ENAMETOOLONG names become 'missing' instead of 'complete' (the same documented trade already accepted for stages 8-10).",
+     "expected_gain": "Pending-scan syscalls drop from O(files x models) to O(directories x models): ~10M stats → ~250k scandirs at 2M files/50k dirs. On the production HDD this is the difference between hours and minutes for cold scans; on warm caches it is still a 40x syscall reduction.",
+     "benchmarkable": true,
+     "risk": "low — equivalence of DirNameCache vs per-file exists was already verified on a 50k fixture for the sibling stages; ASR models for stage 7 are present locally so the scan phase can be timed end-to-end on the bench sample."
+    }
+   ],
+   "area_summary": "Cross-cutting RAM/I-O sweep over all of src/ (csv_manager, work_shards, parallel, audio_durations, sidecars, audit, all dataset loaders, stages 1-13 incl. download/report/recovery skimmed). The CSV state layer is genuinely well-optimized after the prior pass (pyarrow read/write, hardlink .bak, vectorized normalization, scandir caches) — the remaining material problems are (1) whole-dataset materialization in parents (collate ~12-18 GB peak, webdataset full-metadata-dict-per-worker which report.md §8 incorrectly claims is fixed, preprocess all_results), (2) per-shard redundant work inside GPU workers (distillmos serial length re-probe + JSON cache thrash, music_detect full-CSV duration scan per shard), and (3) avoidable mid-stage I/O amplification (600 s full-CSV rewrite flushes plus drop_missing/bootstrap work per flush that the final absorb redoes anyway; per-file stat storms in transcription/rover pending scans). Estimated peak RSS at 2M rows: collate 12-18 GB and webdataset 12-15 GB are the two OOM candidates on 31 GB; heavy filter stages sit at ~5-8 GB (upsert outer-merge + Arrow write transients, acceptable but worth watching at 10M rows where Parquet state — already on the report's next-steps list — becomes necessary). Minor items folded here rather than reported: PartialCsvWriter still flushes per row (~2M small write syscalls/stage, seconds — page cache absorbs it); _count_partial_rows re-reads whole partials each 30 s poll (could be offset-incremental); claim_work_shard does a sorted glob per claim (trivial at ≤2000 shards); every dataset __getitem__ builds loguru debug f-strings + 2 perf_counter calls even at INFO level (~10-30 s/2M files); each per-shard DataLoader respawn under spawn costs ~4-6 s torch import per loader worker (~10-25 min/stage at 200 shards — fixable by an iterable dataset fed from claimed shards, medium-risk restructure); preprocess_existing_chunks' fused path decodes each chunk twice (16 kHz for diarization + native for crest/loudness — fixing would alter diarization input, output-changing); antispoofing decodes+resamples full files for a fixed 64600-sample random crop (output-changing to fix, left alone). unprocessed_paths/ensure_main_csv still read all CSV columns where 2 would do (folded into the flush finding's state-layer scope; ~1-2 GB and ~2 s saved per stage start). numba 0.65.1 is installed but none of these wins need it — they are structural I/O/RAM fixes, not kernel rewrites."
+  },
+  {
+   "area": "transcription",
+   "area_summary": "Stage 7 (transcription.py + datasets/transcription.py) and ROVER (rover.py) were read end-to-end together with every helper they call (work_shards, audio_durations, parallel, gpu, sidecars, csv_manager) and the third-party hot paths (onnx_asr adapters/asr.py/gigaam.py/kaldi.py/preprocessors, crowdkit ROVER). The report.md §9.1 lead is confirmed and quantified: each of the 5 configured models re-decodes every file from HDD (datasets/transcription.py:21) and respawns GPU workers (transcription.py:378), but two larger un-reported costs were found: the RNNT/Kaldi greedy decode runs 200+ batch=1 ONNX session calls per file (why giga_rnnt is 7.3 it/s vs ~60 for CTC — it sets the stage critical path), and crowdkit ROVER is a pure-Python DP with deepcopy in the backtrace (prime numba candidate; numba 0.65.1 is installed). ROVER shards are disk-claimed, not pickled, so the 'shards pickled to rover workers' concern is a non-issue; workers re-read sidecars from disk themselves (covered in finding 4). VAD path is config-off (use_vad: False) — if enabled, segment-iterator results would misalign with paths in save_results (zip truncates silently) — pre-existing, flagged in .claude/analysis/transcription.json. Other trivia not worth findings: processed/errors mp.Value '+=' is non-atomic across 2 GPU workers (undercount only, transcription.py:147/171/184); vosk & vosk_small share one sidecar suffix (already in report §6 known issues); np.asarray(waveforms.numpy()) rewrap is a no-op; claim_work_shard's O(S²) glob is negligible at ~200 shards; pin_memory=False is correct here (inputs go to ORT as numpy); ROVER stats-queue drain with 1s timeout can undercount logged stats only. All 5 ASR models (gigaam-v3 ctc/e2e/rnnt, vosk, t-one) are present locally, so findings 1, 2, 6, 7 are end-to-end benchmarkable on the 250-wav bench sample; 3-5 are benchmarkable with CPU fixtures.",
+   "findings": [
+    {
+     "title": "5x redundant audio decode + HDD re-read: share one decode across all ASR models",
+     "locations": [
+      "src/utils/datasets/transcription.py:18-29",
+      "src/transcription/transcription.py:339-386",
+      "src/transcription/transcription.py:378",
+      "src/utils/parallel.py:118-176"
+     ],
+     "category": "io",
+     "description": "The per-model loop (transcription.py:339) re-runs the entire pipeline for each of the 5 configured models: TranscriptionDataset.__getitem__ does a full torchcodec decode + mono mixdown + resample for every file on every model pass (datasets/transcription.py:21-26), and run_per_gpu_processes spawns fresh per-GPU processes per model (5 spawns x 2 GPUs, each paying torch import + CUDA context + ORT/TRT session init, ~15-60 s each). 4 of 5 models want 16 kHz; tone wants 8 kHz (verified onnx_asr/models/tone.py:48). On the production HDD (/mnt/hdd_6tb_1) each audio file (~100-500 KB) is randomly read 5x; 31 GB RAM cannot page-cache a production dataset, so at 1M files the 4 redundant passes cost roughly 4M extra seeks+reads (~5-15 ms each cold = 11-33 disk-hours) plus 4M redundant decodes (~5-15 ms CPU each, ~11-17 CPU-hours spread over 16 loader workers). This is the report.md §9.1 item, now concretized.",
+     "proposed_fix": "Restructure to one long-lived worker per GPU that loads all 5 models (config-gated, e.g. transcription.share_decode: true): DataLoader decodes each file ONCE at native rate; the worker resamples each batch from native to 16 kHz (gigaam x3 + vosk) and to 8 kHz (tone) — resampling from native per target keeps inputs bit-identical to today's per-model resample — then runs the models sequentially on the same batch, writing each model's sidecar as now. Per-model skip/consensus masks are computed per item: pending-per-model from one sidecar scan, and consensus for models 4-5 evaluated in-memory from texts produced in the same pass (also kills finding 4's consensus re-reads). VRAM for 5 resident ONNX sessions is ~2-4 GB — gate the knob and fall back to the current per-model loop on VRAM-poor nodes. No numba/CUDA needed; this is orchestration.",
+     "expected_gain": "Removes ~80% of stage-7 audio IO and decode CPU and 4 of 5 worker spawn cycles; on the HDD production node, estimated 2-4x stage wall-clock once the RNNT decode bottleneck (finding 2) is also addressed; at minimum tens of disk-hours per 1M files.",
+     "benchmarkable": true,
+     "risk": "medium — structural change to stage 7; outputs provably unchanged per model on the 250-wav sample (same decode + same per-target resample + same models), consensus semantics preserved by evaluating the same rule in-memory; gate behind a config knob with the current path as fallback."
+    },
+    {
+     "title": "RNNT/Kaldi greedy decode: 200+ sequential batch=1 ONNX calls per file (giga_rnnt is the stage critical path)",
+     "locations": [
+      "onnx_asr/asr.py:185-230 (site-packages)",
+      "onnx_asr/models/gigaam.py:114-133 (site-packages)",
+      "onnx_asr/models/kaldi.py:85-89 (site-packages)",
+      "src/transcription/transcription.py:218",
+      "src/utils/datasets/transcription.py:65-68"
+     ],
+     "category": "gpu",
+     "description": "_AsrWithTransducerDecoding._decoding loops file-by-file and frame-by-frame: for gigaam-v3 RNNT (subsampling_factor=4, 25 frames/s) an 8 s clip does >=200 joiner.run() calls plus a decoder.run() per emitted token, each a tiny CUDA/TRT session call with H2D copy + launch + D2H sync (~100-300 us each, so ~50-120 ms/file of pure round-trip overhead). I verified the gigaam decoder/joint graphs have FIXED batch=1 input dims (x:[1,1], h/c:[1,1,320], enc:[1,768,1]), while vosk's decoder/joiner have dynamic batch 'N'. This is exactly why warmup measured giga_rnnt at 7.3 it/s with batching HURTING, vs ~60 it/s for the CTC models: at 1M files giga_rnnt alone is ~38 GPU-hours vs ~4.5 h per CTC model — it sets the whole stage's critical path and the shared-decode win (finding 1) is capped by it.",
+     "proposed_fix": "Three tiers, in-repo via a small onnx_asr subclass/post-load patch (precedent: fast_g2p): (a) LOW RISK: after onnx_asr.load_model, rebuild the decoder and joiner InferenceSessions on CPUExecutionProvider only (inputs/outputs are tiny numpy arrays already; 320/768-dim matmuls run in ~10-30 us on CPU, eliminating per-step GPU round trips) — keep the encoder on GPU; (b) vosk: batch the greedy loop across the batch dimension (graphs are dynamic-'N'; process all items' frame t together with done-masks, preserving per-item emission logic); (c) gigaam: ONNX dim surgery to make batch dynamic (LSTM + joint ops are batch-agnostic), then batched decode as in (b). Verify transcripts byte-identical on the 250-wav sample (fp32 CPU vs fp32 GPU argmax-tie risk, same class of check as the G2P TF32 work).",
+     "expected_gain": "(a) alone: estimated 2-5x on giga_rnnt and vosk (the two slowest models, 7.3 and 7.4-10.3 it/s); (b)+(c): 5-15x, pulling giga_rnnt off the critical path. At 1M files this is tens of GPU-hours per run.",
+     "benchmarkable": true,
+     "risk": "medium — (a) is a provider swap with output verification needed (argmax ties); (b)/(c) reimplement greedy decode and must reproduce emission/step semantics exactly; all verifiable transcript-for-transcript on local models."
+    },
+    {
+     "title": "ROVER alignment is pure-Python DP with deepcopy backtrace — numba rewrite candidate",
+     "locations": [
+      "src/transcription/rover.py:129",
+      ".dev_venv/lib/python3.12/site-packages/crowdkit/aggregation/texts/rover.py:147-267"
+     ],
+     "category": "cpu-hotloop",
+     "description": "crowdkit ROVER._align fills an O(n*m) DP table in pure Python: per cell it allocates 3-4 option tuples, does dict-key membership on word strings, and min(options, key=lambda) — ~3-6 us/cell; the backtrace then does deepcopy(ref_edges) (a dict of attr-class AlignmentEdge objects) for EVERY aligned token position. Per task (5 hypotheses, ~15-30 words for 5-15 s clips): 4 alignment passes x ~400-900 cells + ~25 deepcopies = ~5-15 ms, plus pandas groupby overhead. At 1M files that is ~2-4 CPU-hours through rover_workers=4 (~30-60 min wall), all GC-churning Python. numba 0.65.1 is confirmed installed in .dev_venv.",
+     "proposed_fix": "Replace crowdkit with an in-repo ROVER: per task, map tokens to int ids; run the DP cost matrix + action backtrace in an @njit kernel over int32 arrays (alignment-set membership becomes a per-column int-id set encoded as a small sorted array or bitmask over the <=5-model vocab of that column); build the word-transition network in Python from the returned action sequence WITHOUT deepcopy (construct fresh dicts). Must preserve crowdkit's exact tie-breaking: min() takes the FIRST minimal option in order (CORRECT/SUBSTITUTION, DELETION, INSERTION) and _get_result's max() orders by (sources_count, len(word), word). Validate output-identical against crowdkit on real per-model sidecars from the bench sample plus edge cases (empty texts, single hypothesis, ties).",
+     "expected_gain": "10-50x on the aggregation phase (even a no-numba rewrite that drops attr objects, per-cell tuple allocs and deepcopy gives ~5-10x); ~30-60 min saved per 1M-file run, more if rover_workers is then reduced to free CPU for ASR loader workers.",
+     "benchmarkable": true,
+     "risk": "low-medium — outputs must match crowdkit exactly including tie-breaks; fully testable offline on CPU, no model involvement."
+    },
+    {
+     "title": "Sidecar stat/read storm: pending scans, consensus re-reads, and ROVER's double pass ignore the existing DirNameCache",
+     "locations": [
+      "src/transcription/transcription.py:279-316",
+      "src/transcription/transcription.py:262-276",
+      "src/transcription/rover.py:52-66",
+      "src/transcription/rover.py:68-96",
+      "src/utils/sidecars.py:34-96"
+     ],
+     "category": "io",
+     "description": "get_valid_paths probes each file's sidecar with text_sidecar_complete (exists + stat with retry_empty=True) and then RE-stats the same sidecar (exists + stat again) just to count retries (transcription.py:294-296) — 2-4 syscalls per file PER MODEL (x5). check_consensus (models idx>=3, i.e. vosk and tone with consensus_num=3) additionally opens and fully reads 3-4 prior ~200-byte .txt sidecars per pending file, with no early exit once consensus is provable. ROVER then does ANOTHER full stat pass (_pending_audio_paths) followed by a second pass doing path_exists + open/read for all 5 model sidecars per file. At 1M files: ~15-20M metadata syscalls + ~7M tiny-file random reads; on the cold production HDD this is hours of seeking before/around the actual GPU work. Report §4.7's DirNameCache (one scandir per directory) was applied to the text stages' pending() helper but transcription and rover never use it.",
+     "proposed_fix": "Extend DirNameCache (src/utils/sidecars.py:34) with an optional size map (entry.stat() during the scandir — directory-local, sequential) and use it in get_valid_paths (resolving existence + zero-size in one directory pass per model, dropping the redundant re-stat) and in ROVER, merging _pending_audio_paths and _records_for_audio_paths into ONE directory-ordered walk that resolves rover-pending and reads the 5 model sidecars in the same visit. Add an early exit in check_consensus when any text count reaches consensus_num. Note the cache must be rebuilt per model pass (earlier models write sidecars that later passes must see) — still 5 readdir sweeps instead of ~20M random stats. With finding 1's shared pass, the consensus reads disappear entirely (texts are in memory).",
+     "expected_gain": "2-4x fewer syscalls plus sequential directory locality instead of random seeks; on HDD, stage-start scans drop from hours to tens of minutes at 1M files; identical pending sets (same equivalence check as report §4.7).",
+     "benchmarkable": true,
+     "risk": "low — same pattern already validated for text stages; pending-set equality is directly testable on a fixture tree."
+    },
+    {
+     "title": "Per-model repeated CSV reads, per-row Python duration-cache loop, and Path-object/dict RAM doubling",
+     "locations": [
+      "src/transcription/transcription.py:283",
+      "src/transcription/transcription.py:352-356",
+      "src/utils/audio_durations.py:52-88",
+      "src/utils/audio_durations.py:174-179",
+      "src/transcription/rover.py:240"
+     ],
+     "category": "algorithmic",
+     "description": "Inside the per-model loop, discover_audio_paths re-reads balalaika.csv for every model and once more for ROVER (6 reads x ~4.6 s at 2M rows), and ensure_audio_durations re-reads the full CSV AND re-normalizes every filepath in a per-row Python loop under tqdm (audio_durations.py:72-83 — the exact pattern report §4.1 vectorized elsewhere) for every model (5 x ~15-25 s at 2M rows), plus a locked full-CSV upsert writeback per model when any duration was probed. The durations are identical across models. RAM side: get_valid_paths materializes a list[Path] for the entire dataset per model (transcription.py:283, ~200-400 B/object), and ensure_audio_durations returns its dict keyed by BOTH original and normalized strings (audio_durations.py:174-179 — 2x entries, hundreds of MB at production scale on a 31 GB node), which is then held alongside the buckets dict during shard prep.",
+     "proposed_fix": "Hoist to main() before the model loop: one discover_audio_paths call and one ensure_audio_durations call over the union of paths (durations don't change between models); reuse for ROVER. Replace the per-row loop in _csv_duration_cache with the existing vectorized normalize_path_values (csv_manager.py:109) over the column. Keep paths as strings in get_valid_paths (sidecar names via string ops, precedent: csv_manager string-ops dedupe) and return only normalized keys from ensure_audio_durations (callers already normalize). Pure caching/vectorization, no model involvement.",
+     "expected_gain": "~2-4 min per run at 2M rows (linear in dataset size — ~10-20 min at 10M); a few hundred MB lower peak RAM at production scale, which matters at 31 GB total.",
+     "benchmarkable": true,
+     "risk": "low — outputs unchanged (same paths, same durations); testable with the existing 2M-row CSV fixture from bench_csv_ops."
+    },
+    {
+     "title": "DataLoader (16 workers) rebuilt for every 10k-file shard — GPU idles between shards",
+     "locations": [
+      "src/transcription/transcription.py:135-141",
+      "src/transcription/transcription.py:231-251",
+      "src/utils/datasets/transcription.py:44-62"
+     ],
+     "category": "parallelism",
+     "description": "_process_files constructs a brand-new DataLoader per claimed shard, so its 16 loader workers (config num_workers: 16) are torn down and respawned every 10k files even though persistent_workers=True is set (it only persists within one loader's lifetime). At 2M files that is 200 shards/model x 5 models = 1000 loader builds, each stalling the GPU ~0.5-2 s for worker startup + first-batch prefetch warmup, i.e. ~8-30 min of GPU idle per full run, plus ~16k worker process forks competing with the user's training job for the 48 CPU threads.",
+     "proposed_fix": "Keep ONE DataLoader alive per (worker, model): wrap shard claiming in an IterableDataset whose iterator claims shards via claim_work_shard and yields file paths continuously (claim coordination in the worker process, mark_work_shard_done driven from the consuming loop via shard-boundary sentinels in the stream); or simpler, have the GPU worker pre-claim all its shards' paths into one Dataset when shard counts are modest. Per-file error reporting (load_errors tuples in collate) is unaffected. Subsumed by finding 1's restructure if that is done first — implement there rather than twice.",
+     "expected_gain": "~8-30 min per full 5-model run at 2M files; grows linearly with shard count; also smooths CPU load (no fork storms).",
+     "benchmarkable": true,
+     "risk": "medium — multiprocessing/ordering complexity around shard-done marking and crash-resume semantics (a shard must only be marked done after all its files were attempted); outputs unchanged."
+    },
+    {
+     "title": "TRT misconfiguration for ASR: profile max batch 16 vs auto batch sizes, TRT-first on per-step decoder/joiner, un-gated fp16 for transcripts",
+     "locations": [
+      "src/utils/gpu.py:42-74",
+      "configs/config.yaml:281",
+      "configs/config.yaml:118",
+      "onnx_asr/onnx.py:32-59 (site-packages)",
+      "onnx_asr/models/gigaam.py:76-80 (site-packages)"
+     ],
+     "category": "gpu",
+     "description": "transcription.use_tensorrt: True sends the TRT-first provider list from get_onnx_providers to EVERY onnx_asr session. Three issues: (1) onnx_asr pins encoder TRT profiles to batch<=16 / <=30 s (TensorRtOptions.profile_max_shapes) — the node profile recommends tone at batch 64 (report §2, 'still climbing'), so batch_size: auto would push shapes outside the profile and force multi-minute TRT engine rebuilds mid-run (and ORT caches engines per shape range, so each new range rebuilds); (2) the RNNT/Kaldi decoder and joiner sessions are created with the raw providers and NO profile (gigaam.py:79-80) — TRT engine builds for trivial [1,1]-shaped per-step graphs buy nothing and add startup cost (interacts with finding 2: these sessions should be CPU); (3) runtime.trt_fp16: True is a flag shared with Spectra-0, so ASR encoders run fp16 — onnx_asr even carries a workaround (use_low_precision clamps encoder_out_lens, asr.py:199-201) — meaning transcripts can diverge from CUDA-EP fp32 with no transcription-specific knob or documented check (report §7 validated fp16 fidelity for Spectra only).",
+     "proposed_fix": "In get_onnx_providers (or a transcription-specific wrapper): pass trt_profile_min/opt/max_shapes derived from the RESOLVED per-model batch size and max_bucket_duration instead of relying on onnx_asr defaults (onnx_asr merges caller provider options over its defaults — verified in update_onnx_providers); exclude TRT (and CUDA) from decoder/joiner sessions as part of finding 2(a); add transcription.trt_fp16 (default False until transcripts are verified identical-or-documented on the 250-wav sample) instead of inheriting the global flag.",
+     "expected_gain": "Avoids per-shape-range TRT engine rebuild stalls (minutes each, per model per GPU) once batch_size: auto is used; removes pointless engine builds for per-step graphs; makes the existing fp16 transcript divergence explicit and gated.",
+     "benchmarkable": true,
+     "risk": "low for the profile/provider plumbing (behavior-preserving); the fp16 default change is a config-semantics decision — flag it, with the verification run as evidence either way."
+    }
+   ]
+  },
+  {
+   "area": "numba-cuda-sweep",
+   "findings": [
+    {
+     "title": "ROVER word-alignment DP runs in pure Python with attrs objects and deepcopy backtrace (crowdkit) — prime numba candidate",
+     "locations": [
+      ".dev_venv/lib/python3.12/site-packages/crowdkit/aggregation/texts/rover.py:158-267 (_align: DP + backtrace)",
+      ".dev_venv/lib/python3.12/site-packages/crowdkit/aggregation/texts/rover.py:247 (deepcopy per backtrace step)",
+      "src/transcription/rover.py:129 (ROVER(...).fit_predict call site)"
+     ],
+     "category": "cpu-hotloop",
+     "description": "Stage 7's ROVER aggregation calls crowdkit's _align once per extra hypothesis per file (5 ASR models => 4 alignments/file). The DP fills an O(N*M) table where every cell builds a 3-element options list of nested tuples, allocates AlignmentEdge attr-objects, and calls min(options, key=lambda) (rover.py:184-235); the backtrace then deepcopy()s a dict of attr objects per aligned position (rover.py:247). For typical <=15 s chunks (~30-50 words) that is ~10-12k DP cells * ~2-4 us/cell + ~100 deepcopies * 10-30 us = roughly 30-50 ms of pure Python per audio file, i.e. ~4-7 CPU-hours per 500k files — the single largest remaining Python compute kernel in the pipeline that report.md has not touched (transcription.json flagged ROVER's sidecar I/O, not the DP itself). The recurrence is data-dependent in both axes, so numpy cannot vectorize it; this is exactly the true-scalar-loop case where numba wins.",
+     "proposed_fix": "Vendor a fast ROVER into src/transcription/ (config-gated): (1) tokenize and intern words to int ids per task; (2) precompute the bool membership matrix is_hyp_in_ref[i,j] and has_empty[j] with Python sets (cheap); (3) run the DP cost table + int8 backpointers in a numba @njit kernel, reproducing min()'s tie-break order exactly (CORRECT/SUBSTITUTION preferred over DELETION over INSERTION at equal cost — min returns the first minimum); (4) backtrace in njit returning action codes, then rebuild the WTN edge dicts in Python replacing deepcopy with a shallow dict rebuild ({w: Edge(w, e.sources_count)}). Pin equivalence with tests comparing aggregated texts against stock crowdkit on varied fixtures (ties, empty transcripts, single-model tasks). numba 0.65.1 is already installed in .dev_venv, so no new dependency.",
+     "expected_gain": "DP cell cost drops from ~2-4 us to ~10-20 ns (100x+ on the DP); end-to-end ROVER stage compute ~10-30x. At 500k files: ~4-7 CPU-hours -> ~15-30 CPU-minutes; also less GC pressure in rover worker processes.",
+     "benchmarkable": true,
+     "risk": "medium — output must stay character-identical; tie-break order and the ''-edge sources_count accounting must be replicated bit-for-bit, so gate behind a config knob and pin with A/B tests against stock crowdkit (pure CPU, fully testable on this node)."
+    },
+    {
+     "title": "pyloudnorm gating loop squares every sample 4x in a per-block Python loop — vectorizable with bitwise-identical output",
+     "locations": [
+      ".dev_venv/lib/python3.12/site-packages/pyloudnorm/meter.py:80-93 (per-channel per-block np.sum(np.square(...)))",
+      ".dev_venv/lib/python3.12/site-packages/pyloudnorm/meter.py:89-110 (per-block scalar log10 list comps)",
+      "src/preprocess/audio_postprocessing.py:62-73 (normalize_audio_loudness -> meter.integrated_loudness)",
+      "src/preprocess/preprocess.py:396-417,499-515 (called once per produced chunk in fused preprocessing)",
+      "src/preprocess/preprocess_existing_chunks.py:242-253"
+     ],
+     "category": "cpu-hotloop",
+     "description": "integrated_loudness computes gated blocks with 75% overlap in a nested Python loop: each 0.4 s block re-runs np.square over its slice, so every sample is squared 4x and a fresh ~17k-element temp is allocated per block (~150 blocks for a 15 s chunk). The block stats and both threshold passes then go through per-block scalar numpy list comprehensions. Per produced chunk this is ~2-5 ms of avoidable work + allocator churn inside the stage-1 GPU workers' serial path (loudness runs between decode and encode for every kept chunk); at 500k chunks that is ~20-40 CPU-minutes per full run. preprocess-vad-postprocess.json flagged 'replace pyloudnorm gating' but the key constraint — report.md S5 pinned byte-identical normalized audio — was not addressed there.",
+     "proposed_fix": "Vendor/monkeypatch a fast integrated_loudness used by audio_postprocessing.py: square each channel ONCE into a contiguous array, then z[i,j] = np.sum(squared[l:u]) — same elements, same order, same dtype => numpy pairwise summation is bitwise identical to the current np.sum(np.square(block)), so the measured LUFS and the normalized audio bytes cannot change. Optionally go further with sliding_window_view(squared, win)[::step].sum(axis=-1) and vectorized log10 over the block array (verify bit-identity in a test; fall back to the square-once variant if any file differs). Pure numpy beats numba here (simple reductions).",
+     "expected_gain": "integrated_loudness block section ~5-10x faster (~2-5 ms -> ~0.3-0.5 ms per chunk); ~20-40 CPU-minutes saved per 500k-chunk run plus reduced allocation churn in preprocess workers. Small but zero-risk in its square-once form.",
+     "benchmarkable": true,
+     "risk": "low — square-once variant is provably bitwise identical; the fully vectorized variant changes summation order (1-ulp class) and should be gated behind a verified test against the 250-file bench sample (report.md already has the byte-identity harness for loudness output)."
+    },
+    {
+     "title": "Sortformer CPU post-processing kernels (_binarize, silence-profile running mean, spkcache gather/topk) are scalar Python loops",
+     "locations": [
+      "src/preprocess/sortformer_onnx.py:359-417 (_binarize: per-frame per-speaker loop)",
+      "src/preprocess/sortformer_onnx.py:253-260 (_update_silence_profile: sequential running mean over up to 124 frames)",
+      "src/preprocess/sortformer_onnx.py:318-343 (_get_topk_indices: Python sort/loops over 188 entries)",
+      "src/preprocess/sortformer_onnx.py:345-357 (_gather_spkcache: per-row copy loop)",
+      "src/preprocess/sortformer_onnx.py:310-316 (_boost_topk_scores: full argsort where argpartition suffices)"
+     ],
+     "category": "cpu-hotloop",
+     "description": "Refines report.md S9.2 (analyzed, not applied) with numba-vs-numpy verdicts and kernel-level benchmarkability. _binarize iterates preds[t,spk] frame by frame: ~45k frames/hour x 4 speakers = 180k numpy scalar indexings (~60-120 ms CPU per audio-hour). _update_silence_profile updates a 512-dim running mean one frame at a time (up to 124 sequential vector ops per FIFO pop, ~0.5-1 ms per ~10 s chunk). _get_topk_indices/_gather_spkcache loop over the 188-slot cache per compression. All are minor vs ONNX inference but execute serially in the stage-1 GPU worker between model calls, and all are pure-numpy functions that can be unit-benchmarked on this node with synthetic preds/embs arrays even though the sortformer .onnx itself is absent.",
+     "proposed_fix": "(a) _binarize: with the default onset==offset==0.5 (DiarizationConfig defaults are used at preprocess.py:103) the hysteresis degenerates to a plain threshold — vectorize with np.flatnonzero(np.diff(np.concatenate([[0], (preds[:,spk]>=0.5).view(np.int8), [0]]))) to get rise/fall indices; keep a numba @njit fallback for onset!=offset (true hysteresis is sequential, numba's case). The merge/min-duration/pad passes stay as-is (interval lists are short). (b) _update_silence_profile: keep the exact sequential float32 update but inside a numba @njit loop — numba reproduces the scalar op order bit-exactly, unlike a batched (mean*n + sum)/ (n+k) rewrite which drifts at ~1e-7 and would perturb spkcache embeddings fed back into the model. (c) _gather_spkcache: replace the row loop with fancy indexing (np.where on the disabled mask); _boost_topk_scores: np.argpartition instead of full argsort. (d) is identical-output; verify (a)/(c) with property tests over random preds.",
+     "expected_gain": "~0.1-0.2 s of worker CPU per audio-hour returned to the decode/VAD path; matters when sortformer ONNX runs fast on GPU and CPU post-proc serializes the loop. Kernel-level: _binarize ~50-100x, gather ~20x.",
+     "benchmarkable": true,
+     "risk": "low for _binarize/_gather/_boost (bit-identical outputs, property-testable); the silence-profile change is only safe in the numba bit-exact form — flag the batched variant as output-changing. End-to-end stage validation impossible on this node (model file absent), kernel-level benchmarks fully possible."
+    },
+    {
+     "title": "get_chunk_metrics is O(final_chunks x raw_segments) per episode — full diarization segment scan per chunk",
+     "locations": [
+      "src/preprocess/preprocess.py:292-336 (get_chunk_metrics)",
+      "src/preprocess/preprocess.py:463-472 (called once per final segment inside cut_audio)",
+      "src/preprocess/preprocess_existing_chunks.py:180-216 (same pattern for backfill)"
+     ],
+     "category": "algorithmic",
+     "description": "For every cut chunk, get_chunk_metrics linearly scans ALL raw diarization segments of the whole episode (line 304) to find overlaps. A 2 h episode with ~2-3k raw segments and ~500-700 final chunks does 1-2 M Python iterations (~0.3-0.6 s) — quadratic in episode length and executed serially inside the stage-1 GPU worker between chunk decodes/writes. At ~10k long episodes this is 1-2 CPU-hours and adds directly to per-file wall time since nothing overlaps it.",
+     "proposed_fix": "raw_segments is already sorted by start (diarize_audio returns sorted). Precompute numpy arrays starts/ends once per episode plus a running prefix-max of ends; per chunk use np.searchsorted(starts, c_end) to bound candidates and the prefix-max to skip segments ending before c_start, then build the small overlap list and KEEP the existing Python merge/sum/round logic over it so the arithmetic (and round(x,2) outputs) stays exactly identical. Pure numpy/bisect; numba unnecessary.",
+     "expected_gain": "20-30x on this function: ~0.3-0.6 s -> ~10-20 ms per 2 h episode; total ~1-2 CPU-hours saved per 10k-episode run, all of it on the stage-1 critical path.",
+     "benchmarkable": true,
+     "risk": "low — selection is changed, arithmetic is not; equivalence checkable with property tests on random segment sets (this is CPU-only, no model needed)."
+    },
+    {
+     "title": "audio_durations._csv_duration_cache walks the full main CSV row-by-row under tqdm; transcription re-runs it per ASR model, music_detect per shard",
+     "locations": [
+      "src/utils/audio_durations.py:72-88 (per-row loop: normalize_path_string + tqdm per row)",
+      "src/transcription/transcription.py:352-356 (ensure_audio_durations inside the per-model loop => 5x per run)",
+      "src/separation/music_detect.py:126-130 (ensure_audio_durations inside _process_files => once per claimed shard, full CSV re-read each time)"
+     ],
+     "category": "cpu-hotloop",
+     "description": "ensure_audio_durations reads filepath/total_duration from balalaika.csv and then loops over every row in Python calling normalize_path_string and updating tqdm (lines 72-82). At 2 M rows that is ~5-10 s of pure Python per call — and it is called once per ASR model in transcription (5x) and once per work shard in music_detect (each call also re-parses the CSV from disk, ~3 s with the new pyarrow path). This is the same per-row pattern S4.1 removed from csv_manager but left behind in this helper. Net waste: roughly 1-2 minutes per transcription run at 2 M rows plus N_shards x (read+loop) in music_detect, scaling linearly with dataset size.",
+     "proposed_fix": "Vectorize: reuse csv_manager._normalize_path_series (already exists, csv_manager.py:135) on the filepath column, mask with .isin(requested_norms) and pd.to_numeric(...)>0, then dict(zip(...)) on the filtered frame — drop the per-row tqdm. Additionally hoist the duration load out of the per-shard path in music_detect (load once per worker or pass from the parent like distillmos_filter now does). Identical semantics: same normalization function, same positive-duration filter, same key set.",
+     "expected_gain": "Per call at 2 M rows: ~5-10 s -> <1 s; transcription saves ~30-50 s per run (5 models), music_detect saves (read+loop) per shard which can be minutes on many-shard runs. Scales linearly with rows.",
+     "benchmarkable": true,
+     "risk": "low — same normalize function applied vectorized; pin with a test comparing the returned dict against the loop version on the existing 2 M-row bench fixture."
+    },
+    {
+     "title": "Stage-7 pending scans bypass DirNameCache: per-file stat per model in get_valid_paths, plus 1+5 stats per file in ROVER discovery",
+     "locations": [
+      "src/transcription/transcription.py:283-316 (get_valid_paths: text_sidecar_complete per file, executed once per model => 5 passes)",
+      "src/transcription/transcription.py:262-276 (check_consensus: up to 5 more stats + reads per file when consensus_num>0)",
+      "src/transcription/rover.py:52-66 (_pending_audio_paths: one stat per audio file)",
+      "src/transcription/rover.py:68-96 (_records_for_audio_paths: path_exists per model per file = 5 stats/file in workers)",
+      "src/utils/sidecars.py:34-77 (DirNameCache already exists, used only by stages 8-10)"
+     ],
+     "category": "io",
+     "description": "Report S4.7 converted the stage 8-10 pending scans to one-scandir-per-directory via DirNameCache, but stage 7 kept the per-file pattern: get_valid_paths stats one sidecar per audio file and runs once per model (5 x 500k = 2.5 M stats per run), and ROVER adds ~500k stats in _pending_audio_paths plus up to 5 path_exists stats per file again inside _records_for_audio_paths. On the production HDD with cold dentry caches, per-file stats are random seeks (~ms class) while a scandir streams a directory in a few reads — this is the same dominant-on-HDD pattern S4.7 measured. Audio chunks cluster ~50-500 per episode directory, so the syscall count drops by 2-3 orders of magnitude.",
+     "proposed_fix": "Thread a DirNameCache through get_valid_paths and ROVER: one cache instance per scan, sidecar existence = cache.exists(p.with_name(...)); for retry_empty (needs st_size) keep the stat only for names the cache says exist (rare). In _records_for_audio_paths, transcripts live next to the audio, so the same per-directory name set answers all 5 models at once. Equivalence argument is the same one already validated for S4.7 (identical pending sets on a 50k fixture).",
+     "expected_gain": "Stage-7 startup scans: 3-5 M stats -> ~one scandir per episode dir (thousands). Warm cache: tens of seconds saved per run at 500k files; cold HDD: minutes-to-hours class, same as the S4.7 measurement rationale.",
+     "benchmarkable": true,
+     "risk": "low — mechanism already proven in S4.7; pin with the same identical-pending-set test on a fixture tree. retry_empty path needs care (size check), keep a stat fallback for it."
+    },
+    {
+     "title": "DistillMOS sort_by_length probes every file serially with torchaudio.info and races on a shared JSON cache, ignoring durations already in balalaika.csv",
+     "locations": [
+      "src/utils/datasets/separation.py:64-75 (estimate_audio_lengths: serial torchaudio.info per file)",
+      "src/utils/datasets/separation.py:78-116 (sort_by_length: per-call JSON cache, json.dump not atomic, shared across workers)",
+      "src/utils/datasets/separation.py:125 (called inside create_distillmos_dataloader => once per worker per shard)",
+      "src/separation/distillmos_process.py:96-101 (call site, cache_dir=podcasts_path)"
+     ],
+     "category": "io",
+     "description": "Verified still unapplied (was flagged in separation-music-distillmos.json). On a cold cache every DistillMOS worker serially header-probes each file of its shard before any GPU work starts (~3-10 ms per file on HDD => ~25-80 min for 500k files), blocking the GPU. All workers share one distillmos_sorted_files.json keyed by full path lists; concurrent json.dump from multiple workers is non-atomic (a reader can see a truncated file) and the partial-hit path rewrites the entire JSON per shard. Meanwhile total_duration for every file already exists in balalaika.csv (written by the crest stage) and music_detect already consumes it via ensure_audio_durations — the probe is fully redundant data.",
+     "proposed_fix": "Replace estimate_audio_lengths with ensure_audio_durations (CSV-backed, parallel probe only for genuinely missing rows) and sort by those durations; drop the JSON cache or at minimum write it atomically (tmp+rename) under a lock. Combine with finding #5 so the CSV is read once per worker, not per shard.",
+     "expected_gain": "Cold-start: minutes-to-an-hour of serial HDD probing removed per run; steady-state: removes a per-shard subset-check + possible whole-JSON rewrite. Also removes a real corrupt-cache race.",
+     "benchmarkable": true,
+     "risk": "medium — sort order is only a batching heuristic, but changing the duration source can reorder ties and change batch composition; pad_sequence padding then differs, and DistillMOS scores on padded batches are not provably invariant to batch composition. Gate behind a config knob and A/B the 250-file bench sample scores (report S5 harness exists), or keep byte-conservative by sorting on identical values where both sources agree."
+    }
+   ],
+   "area_summary": "Cross-cutting sweep of all of src/ for compute kernels and leftover per-element Python loops, with numba 0.65.1 confirmed installed in .dev_venv. Read end-to-end: rover.py + the installed crowdkit ROVER, sortformer_onnx.py, preprocess.py timeline/metrics/cut paths, audio_postprocessing.py + installed pyloudnorm, crest_factor_remover.py, all utils/datasets/* loaders, transcription.py, punctuation/accents/fast_g2p, distillmos/music_detect/antispoofing/denoising, collate.py, report.py, audio_durations.py, sidecars.py. The previously optimized layers (CSV manager, collate consistency, webdataset, G2P, RUPunct batching, crest streaming stats) check out as done in current code and were not re-reported. The remaining hot Python concentrates in two third-party pure-Python kernels the pipeline inherits (crowdkit's ROVER alignment DP — the biggest unclaimed win, ~30-50 ms/file of object-heavy Python; pyloudnorm's gating block loop with 4x redundant squaring, fixable bitwise-identically), in Sortformer's CPU post-processing (report S9.2 leads refined here with numba-vs-numpy verdicts and a note that the kernels ARE benchmarkable on this node with synthetic arrays despite the missing .onnx), and in a few leftover per-row/per-file scan loops (audio_durations CSV walk run 5x per transcription run and per-shard in music_detect; stage-7/ROVER pending scans still doing per-file stats despite DirNameCache existing; distillmos sort_by_length serially probing files whose durations are already in balalaika.csv, with a racy shared JSON cache). Numba verdict overall: it clearly wins only for the ROVER DP (data-dependent recurrence) and for bit-exact preservation of Sortformer's sequential float32 running mean and the onset!=offset hysteresis; everything else is better served by plain numpy vectorization or searchsorted-style algorithmic fixes, so no broad numba adoption is warranted. No CUDA-kernel candidates found: GPU-adjacent loops are already batched, SmartVAD already uses DLPack IOBinding, and the remaining GPU items (SmartVAD cross-segment batching, Sortformer IOBinding, shared ASR decode) are report S9 items not re-reported here. Minor still-open trivia confirmed against current code but left to their owning areas: report.py _read_csv_missing_summary per-cell csv.DictReader loop (~24M iterations at 2M rows, already in denoising-export.json), recovery_from_meta.py iterrows (tiny meta files), distillmos_filter 10-bin histogram loop, process_token/format_timestamps (model-dominated), and the per-segment timeline builders in preprocess.py (linear and short)."
+  }
+ ]
+}

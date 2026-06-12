@@ -430,9 +430,19 @@ def main(args):
     audit = audit_from_filter_partials(combined)
 
     if audit["files_in"] == 0 and audio_paths:
-        # Fallback: workers wrote nothing (e.g. all read failures).
-        # Probe a few files so the report still has *some* hours_in number.
-        fallback_hours = sum(safe_audio_duration(p) for p in audio_paths) / 3600.0
+        # Fallback: workers wrote nothing (e.g. all read failures). Probe a
+        # bounded sample and extrapolate so the report still has *some*
+        # hours_in number — probing every file serially could take hours on
+        # large datasets, for an audit-only estimate.
+        sample_cap = 2000
+        sample = audio_paths[:sample_cap]
+        sampled_hours = sum(safe_audio_duration(p) for p in sample) / 3600.0
+        fallback_hours = sampled_hours * (len(audio_paths) / max(1, len(sample)))
+        if len(audio_paths) > sample_cap:
+            logger.warning(
+                f"Audit fallback: extrapolated hours_in from {sample_cap} of "
+                f"{len(audio_paths)} files."
+            )
         audit["files_in"] = len(audio_paths)
         audit["hours_in"] = fallback_hours
         audit["hours_out"] = fallback_hours

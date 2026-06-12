@@ -1,0 +1,199 @@
+{
+  "area": "benchmarking-harness",
+  "data_flow": "END-TO-END FLOW (entrypoints: benchmarking/run_benchmark.sh -> benchmarking/bench.py -> benchmarking/cli.py:main):\n\n1. run_benchmark.sh sources .dev_venv, reads env vars (TARGET, DATASET, REPEATS, etc.) into ARGS[], then `exec python3 bench.py ...`. bench.py just prepends REPO_ROOT to sys.path and calls cli.main().\n\n2. cli.parse_args() builds the argparse namespace. cli.main(): if --list-targets, calls targets.list_targets() and exits. Otherwise validates --target against targets.TARGETS, loads the WHOLE config.yaml (common.load_full_config -> yaml.safe_load), resolves the source dataset (runner.resolve_source_dataset: uses --dataset or infers podcasts_path from config sections), queries GPU inventory once (resources.query_gpu_inventory -> one nvidia-smi subprocess), picks gpu_ids (runner.selected_gpu_ids), builds the child env (runner.make_env: copies os.environ, sets PYTHONPATH, LD_LIBRARY_PATH from resources.build_runtime_library_paths(), CUDA_VISIBLE_DEVICES).\n\n3. sampling.collect_source_samples() does the dataset discovery: get_audio_paths() (src/utils/utils.py:36 — 5 separate rglob passes over the whole tree for mp3/wav/flac/ogg/opus), sorts them, then for EVERY file builds a SampleRecord: checks required_sidecars exist (os.stat), stat()s the file for size, and calls common.get_audio_duration() (torchaudio.info, falling back to soundfile.info) PER FILE to get duration. In \"first\" mode it stops after num_examples eligible; in \"random\" mode it builds ALL records first, then shuffles with a seeded Random and slices.\n\n4. cli.main() writes selected_samples.json and a summary_stub (git info via 3 subprocess git calls, host metadata, gpu inventory). If --dry-run, prints and exits.\n\n5. For each warmup repeat then each measured repeat, runner.run_single_repeat():\n   - Creates repeat_root/dataset, calls sampling.copy_benchmark_dataset() which shutil.rmtree + recreates the dir, then shutil.copy2 EACH audio file + its copied_sidecars into the work dataset (full physical copy, repeated per repeat).\n   - deepcopy(base_config), applies target.mutator (targets.patch_*) which rewrites podcasts_path/cache_path and injects worker/batch overrides into the relevant config section, then writes config.yaml (common.write_yaml).\n   - targets.build_commands() turns target.modules into argv lists: `[sys.executable, '-m', <module>, '--config_path', <config.yaml>]` — one fresh Python subprocess per pipeline stage module.\n   - For each command, runner.run_command() opens a log file, Popen()s the stage (cwd=REPO_ROOT, stdout+stderr->log), starts a resources.ResourceSampler thread on the child PID, waits for exit, stops the sampler. Stops the whole repeat on first non-zero exit code.\n   - Aggregates: total_audio_sec = sum of selected durations; wall_time_sec = SUM of per-command wall times; rtf = wall/audio; x_realtime = audio/wall. Writes resource_samples.jsonl, preserves balalaika.csv/parquet (common.preserve_repeat_artifacts), then rmtree's the work dataset unless --keep-workdirs.\n\n6. ResourceSampler._run() loop (resources.py:277): every interval_sec it walks ALL of /proc (process_tree_snapshot scans every numeric pid dir, reads /proc/<pid>/stat+statm), computes process-tree CPU% and RSS, reads /proc/stat and /proc/meminfo for system metrics, AND spawns a fresh `nvidia-smi` subprocess (resources._query_gpu) every tick.\n\n7. cli.main() assembles report.json (summary_stub + warmups + repeats + aggregate via runner.aggregate_repeats), writes it, prints a one-line final_summary JSON, returns 0/1 on success.\n\nTARGETS (targets.py:186-336): per-stage isolated targets (preprocess.stage/.vad/.crest_factor/.audio_normalize; separation.stage/.music_detect/.nisqa/.distillmos/.diarization/.silence_detect; transcription.stage + one per model in TRANSCRIPTION_MODELS; punctuation.stage; accents.stage; phonemizer.stage; collate.stage) plus pipeline.base (whole base pipeline). Each TargetSpec carries modules to run, required/copied sidecars (so the work dataset has the inputs a mid-pipeline stage needs), a config mutator, and uses_gpu.\n\nHOW A BATCH-SIZE WARMUP/AUTOTUNE SCRIPT SHOULD REUSE THIS:\n- The natural seam is targets.TARGETS + the --batch-size-override / --cpu-workers-per-gpu / --num-examples / --repeats CLI knobs, plus the report.json aggregate (rtf, x_realtime, gpu_util_percent, gpu_vram_mb, rss_gb). An autotuner can loop over candidate batch sizes, invoke a single per-model target (e.g. transcription.<model>, separation.music_detect, separation.distillmos) with --repeats 1 --warmup-repeats 1 --num-examples N, parse report.json's aggregate.x_realtime and gpu_vram_mb, and pick the largest batch that does not OOM (return_code!=0) and maximizes x_realtime. The harness already records VRAM avg/max per GPU, which is exactly the OOM-headroom signal an autotuner needs on the shared 16GB cards.\n- BUT before an autotuner can trust this: (a) --batch-size-override is currently broken for transcription and a no-op for distillmos (see bugs), so the swept knob never reaches the model; (b) gpu_vram_mb is whole-device usage from nvidia-smi (includes the other training job's 12-14GB), not per-process, so headroom math must subtract a baseline idle sample; (c) the per-repeat full dataset copy + per-stage process spawn dominates short autotune runs, so the autotuner should pass --num-examples small, --keep-workdirs off, and ideally reuse one copied dataset across batch-size trials (the harness re-copies every repeat). Best: add a knob to copy the work dataset once and only rewrite config.yaml between trials. Recommend driving the autotuner through cli.main() in-process (import and call run_single_repeat with a mutated args) rather than re-spawning bench.py, to avoid re-running collect_source_samples (the per-file duration probe) on every trial.",
+  "operations": [
+    {
+      "name": "audio discovery (rglob x5)",
+      "what": "sampling.collect_source_samples calls get_audio_paths (src/utils/utils.py:36) which does 5 full-tree rglob passes (mp3/wav/flac/ogg/opus) then sorts; sampling.py:23",
+      "cost": "moderate"
+    },
+    {
+      "name": "per-file duration probe",
+      "what": "sampling.py build_record calls common.get_audio_duration per file (common.py:103) -> torchaudio.info or soundfile.info; one header decode per candidate file, plus stat() for size and per-sidecar exists() checks; sampling.py:30-36",
+      "cost": "heavy"
+    },
+    {
+      "name": "random-mode full materialization",
+      "what": "in random mode ALL records are built (every file duration-probed) before shuffle+slice, even when num_examples is tiny; sampling.py:73-80",
+      "cost": "heavy"
+    },
+    {
+      "name": "full dataset physical copy per repeat",
+      "what": "copy_benchmark_dataset rmtree+recreate then shutil.copy2 every audio file + sidecars into work dataset, repeated for EACH warmup and measured repeat; sampling.py:84-97, called runner.py:140",
+      "cost": "dominant"
+    },
+    {
+      "name": "config deepcopy + mutate + yaml dump",
+      "what": "copy.deepcopy(base_config) then mutator then write_yaml per repeat; runner.py:142-147",
+      "cost": "light"
+    },
+    {
+      "name": "per-stage process spawn",
+      "what": "build_commands creates one subprocess.Popen per module (python -m <module>), each paying full interpreter + torch/onnxruntime import startup; targets.py:12-19, runner.py:37",
+      "cost": "heavy"
+    },
+    {
+      "name": "resource sampler /proc full scan",
+      "what": "ResourceSampler._run every interval_sec walks ALL /proc numeric dirs reading stat+statm (process_tree_snapshot), reads /proc/stat and /proc/meminfo; resources.py:132-161,277-325",
+      "cost": "moderate"
+    },
+    {
+      "name": "nvidia-smi spawn per sample tick",
+      "what": "_query_gpu spawns a fresh nvidia-smi subprocess every interval_sec for the whole run; resources.py:233-275, called resources.py:322",
+      "cost": "heavy"
+    },
+    {
+      "name": "GPU inventory query (once)",
+      "what": "query_gpu_inventory one nvidia-smi at startup; resources.py:164-198, cli.py:76",
+      "cost": "light"
+    },
+    {
+      "name": "git metadata (3 subprocesses)",
+      "what": "run_git called 3x for branch/commit/status; common.py:89, cli.py:108-110",
+      "cost": "trivial"
+    },
+    {
+      "name": "resource_samples.jsonl write",
+      "what": "writes every sampled dict as a JSON line per repeat; runner.py:173-176",
+      "cost": "light"
+    },
+    {
+      "name": "report.json + selected_samples.json dump",
+      "what": "json.dump of full report incl. all raw samples nested per command; cli.py:99-101,186-189",
+      "cost": "light"
+    },
+    {
+      "name": "artifact preservation copy",
+      "what": "preserve_repeat_artifacts shutil.copy2 of balalaika.csv/parquet per repeat; common.py:51-64, runner.py:197",
+      "cost": "trivial"
+    },
+    {
+      "name": "aggregate/summarize",
+      "what": "summarize_resource_samples + aggregate_repeats iterate samples; resources.py:355, bench/runner.py:66",
+      "cost": "trivial"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Copy the benchmark dataset once, not every repeat",
+      "location": "benchmarking/runner.py:140 (copy_benchmark_dataset), sampling.py:84-97",
+      "description": "copy_benchmark_dataset rmtree+full-copies every audio file and sidecar into a fresh work dir for EACH warmup and measured repeat. For repeats=3 + warmups, the same N files are physically copied 4+ times. Copy the immutable inputs once into a shared dataset dir and only re-run the stages (re-create per-repeat output sidecars by copying the small input set, or snapshot/restore). Even better: hardlink (os.link) or reflink (cp --reflink=auto on the SSD/btrfs) instead of shutil.copy2 so the data is not byte-duplicated.",
+      "expected_gain": "Eliminates (repeats+warmups-1)x of total dataset copy IO; on large audio sets this is the dominant non-compute cost and can cut harness overhead by 3-5x for short runs.",
+      "risk": "medium",
+      "low_resource_note": "Huge win on low-RAM/SSD nodes where page cache cannot hold the dataset and copies hit disk. Hardlinks need same-filesystem work dir; add a fallback to shutil.copy2 when os.link fails (cross-device)."
+    },
+    {
+      "title": "Avoid re-running collect_source_samples / per-file duration probe across autotune trials",
+      "location": "benchmarking/cli.py:81 -> sampling.py:36 (get_audio_duration per file)",
+      "description": "Every bench.py invocation re-discovers files (5 rglobs) and duration-probes EVERY candidate (torchaudio.info/soundfile.info opens each file header). An autotune sweep that re-spawns bench.py per batch size pays this every trial. Cache selected_samples.json (already written at cli.py:99) and add a --samples-from <json> path to skip discovery+probing; or drive trials in-process via run_single_repeat so sampling runs once.",
+      "expected_gain": "Removes one full-tree rglob + N header decodes per trial; for a 20-trial batch sweep over thousands of files this saves minutes of pure overhead.",
+      "low_resource_note": "Especially helps weak-CPU nodes where torchaudio.info import + per-file open is GIL-bound and serial.",
+      "risk": "low"
+    },
+    {
+      "title": "Parallelize / lazy-limit duration probing in random mode",
+      "location": "benchmarking/sampling.py:73-80",
+      "description": "Random mode materializes ALL records (probing every file's duration) before shuffle+slice, even when num_examples is small. Instead shuffle the path list first, then probe lazily until num_examples eligible records are collected (matching the 'first' mode early-exit at sampling.py:65). Also the duration probe is a serial Python loop; a ThreadPoolExecutor over get_audio_duration would overlap the IO-bound header reads.",
+      "expected_gain": "O(N) probes -> O(num_examples) in random mode; thread pool gives ~Nx on IO-bound header reads up to thread count.",
+      "low_resource_note": "Lazy limit is pure win even on weak nodes; keep thread count modest (e.g. min(8, cpu)) on low-CPU nodes to avoid oversubscription.",
+      "risk": "low"
+    },
+    {
+      "title": "Replace per-tick nvidia-smi subprocess with a persistent NVML handle",
+      "location": "benchmarking/resources.py:233-275 (_query_gpu) and 164-198",
+      "description": "ResourceSampler spawns a brand-new `nvidia-smi` process every interval_sec (default 0.5s) for the entire run — for a 10-minute stage that is ~1200 process spawns, each ~30-80ms, adding measurable CPU load that pollutes the very CPU% metric being recorded. Use pynvml (nvmlDeviceGetUtilizationRates / nvmlDeviceGetMemoryInfo) with handles opened once, falling back to nvidia-smi only if NVML import fails.",
+      "expected_gain": "Removes ~2 subprocess spawns/sec; lowers sampler CPU overhead and reduces measurement skew on the benchmarked process.",
+      "low_resource_note": "Critical on the 48-thread Haswell node where subprocess fork+exec contends with the workload; if pynvml unavailable, at least raise the default sample_interval_sec for CPU-only targets.",
+      "risk": "low"
+    },
+    {
+      "title": "Reduce /proc full-tree scan cost in the sampler",
+      "location": "benchmarking/resources.py:132-161 (process_tree_snapshot)",
+      "description": "Each tick iterates EVERY pid in /proc and reads two files per pid to rebuild the parent->child map, just to find the descendants of one root pid. On a busy 48-thread node with many processes this is wasteful. Cache the child map and only refresh pids not already known, or read /proc/<root>/task and walk children via /proc/<pid>/children, or accept that descendants rarely change and re-scan less often than CPU sampling.",
+      "expected_gain": "Cuts sampler syscall volume per tick from O(all procs) toward O(tracked tree); meaningful when interval is 0.5s over long runs.",
+      "low_resource_note": "Helps weak nodes most; gate behind interval so CPU-only low-core nodes can sample less frequently.",
+      "risk": "medium"
+    },
+    {
+      "title": "Don't store raw resource_samples in report.json",
+      "location": "benchmarking/cli.py:186-189; samples already persisted at runner.py:173-176",
+      "description": "report.json embeds the full per-command resource_summary; resource_samples are popped (runner.py:166) into resource_samples.jsonl, good — but command_results still carry per-tick data nesting. For very long runs the JSON dump grows large and json.dump is single-pass in memory. Keep report.json to summaries only (already mostly true) and rely on the jsonl for raw data; verify no full-sample arrays leak into the report.",
+      "expected_gain": "Smaller report, faster final dump, less peak RAM at end of run.",
+      "low_resource_note": "Matters on 31GB node for pipeline.base with thousands of samples across 10 stages.",
+      "risk": "low"
+    },
+    {
+      "title": "Spawn one nvidia-smi/inventory call instead of duplicating queries",
+      "location": "benchmarking/resources.py:164-198 and 233-275 share format logic",
+      "description": "query_gpu_inventory (startup) and _query_gpu (per tick) both shell out and parse CSV. Minor: the inventory call could be folded into the first sampler tick. Low priority next to the persistent-NVML change.",
+      "expected_gain": "One fewer startup subprocess.",
+      "low_resource_note": "Negligible; skip on constrained nodes in favor of the NVML rewrite.",
+      "risk": "low"
+    },
+    {
+      "title": "Allow shared/in-process repeats to amortize subprocess import startup",
+      "location": "benchmarking/targets.py:12-19 (build_commands), runner.py:37 (Popen per command)",
+      "description": "Every stage is launched as a fresh `python -m <module>`, paying torch+onnxruntime+CUDA-context import on each repeat/stage. For autotune where only batch size changes, the model re-loads each trial. Consider a long-lived worker mode (or at least documenting that repeats include cold-start cost). At minimum, separate measured 'steady-state' time from import/startup time so the autotuner optimizes throughput, not startup.",
+      "expected_gain": "Removes seconds of import+CUDA-init per trial; for many short autotune trials this can dominate.",
+      "low_resource_note": "Cold-start cost is proportionally larger on weak CPUs (slow imports); a steady-state metric prevents the autotuner from being misled toward tiny batches on slow-import nodes.",
+      "risk": "high"
+    }
+  ],
+  "bugs": [
+    {
+      "title": "--batch-size-override silently dropped for ALL transcription targets",
+      "location": "benchmarking/targets.py:116-134 vs src/transcription/transcription.py:128,190",
+      "description": "patch_transcription_stage / patch_transcription_model write batch_size into a NESTED subsection chosen by transcription_batch_section() (e.g. config['transcription']['giga']['batch_size']). But the transcription worker reads batch_size from the TOP of the transcription section: `config.get('batch_size', 16)` at transcription.py:128 and :190. The nested value is never read, so --batch-size-override is a no-op and every transcription benchmark silently runs at the hardcoded default 16. This makes any transcription batch-size autotune meaningless. Fix: set section['batch_size'] directly (and/or per-model if the worker is taught to read the nested key).",
+      "severity": "high"
+    },
+    {
+      "title": "--batch-size-override is a no-op for separation.distillmos",
+      "location": "benchmarking/targets.py:73-75 (patch_separation_distillmos) vs src/separation/distillmos_process.py:79",
+      "description": "distillmos reads batch_size/num_workers from a TOP-LEVEL config key config['distillmos'] (distillmos_process.py:79-81). patch_separation_distillmos only calls patch_separation_common and never sets any distillmos batch_size or worker count, so --batch-size-override and --cpu-workers-per-gpu have zero effect on the DistillMOS target. Autotuning distillmos via this harness cannot change the swept parameter.",
+      "severity": "high"
+    },
+    {
+      "title": "wall_time_sec sums sequential per-stage times -> RTF wrong for multi-module/parallel targets",
+      "location": "benchmarking/runner.py:179-181 and bench.py aggregate",
+      "description": "For multi-module targets (separation.stage runs 5 modules, pipeline.base runs 10), wall_time_sec is the SUM of each command's wall time (runner.py:179). RTF=wall/audio then reports the serialized total, which is correct for sequential stages but misrepresents throughput if stages were meant to overlap, and conflates per-stage cost. Also total_audio_sec is the input audio duration of the SELECTED files; after the VAD/chunking stage the downstream stages process a different (chunked) set, so RTF for downstream-only targets is computed against the wrong audio basis. Document or compute per-stage RTF.",
+      "severity": "medium"
+    },
+    {
+      "title": "gpu_vram_mb is whole-device (includes other jobs), reported as if attributable",
+      "location": "benchmarking/resources.py:265-271 (memory_used_mb from nvidia-smi), summarized at resources.py:328-352",
+      "description": "memory_used_mb comes from nvidia-smi --query-gpu=memory.used, which is total device usage including the unrelated 12-14GB training job mentioned in the node context. The report's avg_gpu_vram_mb (cli.py:198) presents this as the benchmark's footprint. An OOM-headroom autotuner using this will mis-estimate available VRAM. Should subtract an idle baseline sample or use per-process accounting (nvmlDeviceGetComputeRunningProcesses filtered by the child PID tree).",
+      "severity": "medium"
+    },
+    {
+      "title": "LD_LIBRARY_PATH points at nvidia/cu13 while node stack is CUDA 12",
+      "location": "benchmarking/resources.py:22 (nvidia_root / 'cu13' / 'lib')",
+      "description": "build_runtime_library_paths lists `nvidia/cu13/lib` first. The node context specifies torch 2.8 cu128 / onnxruntime-gpu CUDA 12 / tensorrt-cu12. The cu13 dir likely does not exist (so .exists() filters it out, masking the issue), but if a cu13 dir ever appears it would prepend the wrong CUDA major to LD_LIBRARY_PATH ahead of cu12 libs, risking loader mismatches. Should target cu12 to match the installed stack.",
+      "severity": "medium"
+    },
+    {
+      "title": "host_metadata physical_cpu_count hardcoded to None (dead field)",
+      "location": "benchmarking/runner.py:206-213",
+      "description": "physical_cpu_count is always None, so the report cannot distinguish the 24 physical / 48 logical cores. For CPU-bound stage analysis and worker-count autotuning this field lies by omission. Populate from /proc/cpuinfo or os.sched_getaffinity / counting unique core ids.",
+      "severity": "low"
+    },
+    {
+      "title": "Sampler can record zero samples for fast stages, yielding null metrics",
+      "location": "benchmarking/resources.py:277-325 (_run loop with leading is_set check) and summarize_numeric (common.py:136-144)",
+      "description": "The sampler loop checks _stop_event before the first sample and waits interval_sec at the END; a stage that finishes in <interval_sec (default 0.5s) — common for tiny --num-examples autotune trials — can produce 0 or 1 samples, so cpu/gpu/vram summaries become null (summarize_numeric returns avg=None). aggregate_repeats then averages over Nones. Take at least one sample immediately at loop entry and force a final sample at stop() so short trials still report metrics.",
+      "severity": "low"
+    },
+    {
+      "title": "selected_gpu_ids returns [] when inventory query fails, silently forcing CPU/no-GPU env",
+      "location": "benchmarking/runner.py:98-101 and cli.py:76-79",
+      "description": "If query_gpu_inventory errors (nvidia-smi missing/timeout), it returns {'gpus': []} (resources.py:181), so selected_gpu_ids returns [] and make_env sets no CUDA_VISIBLE_DEVICES restriction logic treats []=='no gpu', potentially making GPU targets run without the intended device scoping while still claiming uses_gpu. The failure is swallowed (only stored as gpu_query_error). A GPU target should fail loudly rather than benchmark in a degraded config.",
+      "severity": "low"
+    },
+    {
+      "title": "min_input_duration_from_config is wired but no target sets it (dead capability)",
+      "location": "benchmarking/targets.py:343-356 (min_duration_for_target), models.py:34",
+      "description": "min_duration_for_target reads target.min_input_duration_from_config, but no TargetSpec in TARGETS sets that field, so minimum_duration is always None and the duration filter at sampling.py:42 never fires. Either populate it for stages with a min-length requirement (so benchmarks don't feed sub-minimum clips that the real stage would skip, skewing RTF) or remove the dead path.",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "REUSABLE TIMING/DEBUG HOOKS:\n\nIn the harness itself:\n- runner.run_command records per-command wall_time_sec, started/finished UTC, return_code, and a full resource_summary (runner.py:52-63). report.json.aggregate exposes wall_time_sec, rtf, x_realtime, cpu_util_percent, rss_gb, gpu_util_percent, gpu_vram_mb avg/max/min (bench.py/runner.py:66-90) — directly consumable by an autotuner.\n- ResourceSampler emits per-tick cpu_util_percent, cpu_cores_used, rss_gb, system_cpu_percent, system_ram_used_gb/percent, and per-GPU gpu_util_percent + memory_used_mb (resources.py:311-323), persisted to resource_samples.jsonl per repeat (runner.py:173-176). summarize_gpu_samples gives per-GPU breakdown (resources.py:328-352).\n- --warmup-repeats already separates cold-start warmups from measured repeats (cli.py:148-178); an autotuner should use --warmup-repeats 1 to exclude CUDA/import cold start.\n\nIn the stages the harness launches (rich 'perf ...' logger.debug lines the harness captures to its per-command .log files):\n- src/separation/distillmos_process.py: `perf dataloader_config` (line 103), `perf dataloader_wait` (114), `perf model=distillmos event=inference ... seconds=` per batch (123-124), `perf partial_write seconds=` (140-141), and total shard time `Finished ... in {elapsed:.2f}s` (220-222).\n- src/separation/music_detect.py: `perf dataloader_config` (140), `perf model=music_detect event=predict_proba seconds=` (149-150), `perf audio_delete seconds=` (172-173), `perf partial_write seconds=` (192-193).\n- src/transcription/transcription.py: per-model `=== [i/N] model ===` headers (335), work_plan shard counts (366), batch fallback logs on OOM (single-file fallback path 145-167). Note batch_size logged here reflects the (broken) value the worker actually uses, useful for catching the override bug.\nThese 'perf ...' lines are grep-able from the command_NN_*.log files under each repeat_root and give per-batch inference seconds + dataloader-wait, which is exactly the steady-state throughput signal an autotuner should parse INSTEAD of the harness wall-time (which includes import/cold-start). src/separation/* and distillmos call apply_torch_perf_defaults() (gpu.py) at import, so TF32/SDP defaults are already applied and consistent across trials."
+}
