@@ -91,7 +91,10 @@ def record_stage_summary(
 # up an ffmpeg StreamReader per call). mp3 and other estimated-length
 # containers keep the torchaudio-first order (VBR mp3 frame counts from
 # libsndfile can disagree with ffmpeg's).
-_SOUNDFILE_EXACT_SUFFIXES = {".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif"}
+# .ogg is intentionally excluded: libsndfile omits Vorbis padding frames that
+# torchaudio/ffmpeg counts, producing ~28-31 ms shorter durations per file and
+# drifting dataset-hours stats vs the pre-rewrite pipeline.
+_SOUNDFILE_EXACT_SUFFIXES = {".wav", ".flac", ".opus", ".aiff", ".aif"}
 
 
 def _soundfile_duration(p: str) -> float:
