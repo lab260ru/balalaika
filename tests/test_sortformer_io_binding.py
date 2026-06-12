@@ -114,8 +114,18 @@ def synthetic_model():
     yield path
 
 
+def _cuda_device_usable() -> bool:
+    # get_available_providers() reflects the ORT *build*, not the machine: with
+    # CUDA_VISIBLE_DEVICES="" it still lists CUDAExecutionProvider while session
+    # creation falls back to CPU, so the parity assertions compare mismatched
+    # paths. Gate on an actually-usable device instead.
+    import torch
+
+    return torch.cuda.is_available()
+
+
 _PROVIDER_SETS = [["CPUExecutionProvider"]]
-if "CUDAExecutionProvider" in ort.get_available_providers():
+if "CUDAExecutionProvider" in ort.get_available_providers() and _cuda_device_usable():
     _PROVIDER_SETS.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
 
 
