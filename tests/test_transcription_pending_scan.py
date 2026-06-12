@@ -22,9 +22,11 @@ from typing import List, Optional
 import pandas as pd
 import pytest
 
+from loguru import logger
+
 import src.transcription.rover as rover_mod
 import src.transcription.transcription as tr
-from src.utils.sidecars import DirNameCache
+from src.utils.sidecars import DirNameCache, pending
 
 MODELS = ["giga_rnnt", "giga_ctc", "tone", "vosk", "parakeet_v2"]
 SUFFIXES = ["giga_rnnt", "giga_ctc", "tone", "vosk", "parakeet_v2"]
@@ -294,6 +296,51 @@ def test_dirnamecache_size_and_symlinks(tmp_path):
     assert not cache.sidecar_complete(d / "dangling.txt", retry_empty=True)
     assert cache.sidecar_complete(d / "empty_link.txt")                 # retry off
     assert not cache.sidecar_complete(d / "empty_link.txt", retry_empty=True)
+
+
+def test_dirnamecache_name_too_long_treated_as_complete(tmp_path):
+    """A sidecar whose name exceeds NAME_MAX can never appear in a directory
+    listing, so the old per-file helpers caught the ENAMETOOLONG OSError and
+    treated such outputs as already complete (skip once, forever). Restore
+    that: ``exists`` / ``sidecar_complete`` report True and ``pending``
+    excludes the file, so stages 7-10 don't re-run the model + crash on the
+    even-longer ``.tmp`` write every run. Normal names are unaffected.
+    """
+    d = tmp_path / "dir"
+    d.mkdir()
+    # ~300 bytes, comfortably over the 255-byte NAME_MAX on typical filesystems.
+    too_long = d / (("x" * 300) + ".txt")
+
+    sink: List[str] = []
+    handle = logger.add(sink.append, level="WARNING", format="{message}")
+    try:
+        cache = DirNameCache()
+        assert cache.exists(too_long)
+        assert cache.sidecar_complete(too_long)
+        assert cache.sidecar_complete(too_long, retry_empty=True)
+        # Re-probing the same offending name does not re-log the warning.
+        cache.exists(too_long)
+        cache.sidecar_complete(too_long, retry_empty=True)
+    finally:
+        logger.remove(handle)
+
+    warnings = [m for m in sink if "NAME_MAX" in m]
+    assert len(warnings) == 1, sink
+
+    # The pending scan must exclude the over-long output (no reprocess loop)
+    # while still keeping a genuinely missing normal sidecar.
+    (d / "src_a.txt").write_text("a", encoding="utf-8")
+    (d / "src_b.txt").write_text("b", encoding="utf-8")
+    (d / "out_b.txt").write_text("done", encoding="utf-8")  # b already done
+    long_stem = "y" * 300
+
+    def derive(p: Path) -> Path:
+        if p.name == "src_a.txt":
+            return d / (long_stem + ".txt")   # over-NAME_MAX output
+        return d / p.name.replace("src_", "out_")
+
+    todo = pending([d / "src_a.txt", d / "src_b.txt"], derive)
+    assert todo == []  # a's output is "complete" (too long), b's output exists
 
 
 def test_dirnamecache_one_scandir_per_dir(tmp_path, monkeypatch):
