@@ -44,7 +44,12 @@ class DenoisingDataset(Dataset):
         self.sample_rate = int(sample_rate)
         # Cache one transforms.Resample per source rate. torchaudio.functional
         # .resample rebuilds the (sinc) polyphase kernel on EVERY call; the
-        # transform precomputes and reuses it. Same kernel parameters => the
+        # transform precomputes and reuses it. dtype MUST be pinned to float32:
+        # transforms.Resample builds its kernel in float64 by default (then
+        # casts), whereas functional.resample on a float32 waveform builds a
+        # float32 kernel -- the two kernels are NOT equal, so an unpinned
+        # transform diverges from the functional call (~2e-5 float drift, which
+        # flips int16 LSBs after normalize_to_int16). With dtype=float32 the
         # resampled tensor is bit-identical, just without the per-file rebuild.
         # Each loader worker gets its own dataset copy, so this dict is
         # process-local and needs no locking.
@@ -59,6 +64,7 @@ class DenoisingDataset(Dataset):
             resampler = torchaudio.transforms.Resample(
                 orig_freq=source_sample_rate,
                 new_freq=self.sample_rate,
+                dtype=torch.float32,
             )
             self._resamplers[source_sample_rate] = resampler
         return resampler(waveform)

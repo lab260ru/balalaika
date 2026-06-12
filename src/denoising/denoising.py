@@ -40,7 +40,11 @@ from src.utils.datasets.denoising import (
     DENOISING_SAMPLE_RATE,
     create_denoising_dataloader,
 )
-from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
+from src.utils.gpu import (
+    apply_torch_perf_defaults,
+    get_onnx_providers,
+    onnx_first_input_name,
+)
 from src.utils.logging_setup import setup_logging
 from src.utils.node_profile import resolve_batch_size
 from src.utils.parallel import run_per_gpu_processes
@@ -172,18 +176,6 @@ def add_denoising_trt_profile_options(
     return patched
 
 
-def _onnx_first_input_name(model_path: Path) -> str:
-    """First graph input name, without instantiating an InferenceSession."""
-    import onnx
-
-    model = onnx.load(str(model_path), load_external_data=False)
-    initializers = {init.name for init in model.graph.initializer}
-    for graph_input in model.graph.input:
-        if graph_input.name not in initializers:
-            return graph_input.name
-    raise ValueError(f"No graph inputs found in {model_path}")
-
-
 def create_session(
     model_path: Path,
     rank: int,
@@ -203,7 +195,7 @@ def create_session(
     # Read the input name from graph metadata instead of building a throwaway
     # CPU InferenceSession (which loaded and optimized the full model once per
     # worker just to learn one string).
-    input_name = _onnx_first_input_name(model_path)
+    input_name = onnx_first_input_name(model_path)
 
     use_tensorrt = bool(cfg.get("use_tensorrt", True))
     providers = get_onnx_providers(rank, use_tensorrt=use_tensorrt, config_path=config_path)

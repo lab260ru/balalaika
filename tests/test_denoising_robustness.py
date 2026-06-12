@@ -86,15 +86,17 @@ def test_resampler_cached_and_bit_identical():
     import torchaudio
 
     ds = DenoisingDataset(["x"], sample_rate=DENOISING_SAMPLE_RATE)
-    wav = torch.randn(1, 16_000)
+    wav = torch.randn(1, 16_000, dtype=torch.float32)
     out1 = ds._resample(wav, 16_000)
     # Same source rate reuses the same transform object (no rebuild).
     assert 16_000 in ds._resamplers
     cached = ds._resamplers[16_000]
     out2 = ds._resample(wav, 16_000)
     assert ds._resamplers[16_000] is cached
-    # The cached transform produces the same kernel math as a fresh transform.
-    ref = torchaudio.transforms.Resample(16_000, DENOISING_SAMPLE_RATE)(wav)
+    # The cached transform must reproduce the functional.resample call it
+    # replaces bit-for-bit (this is why the transform pins dtype=float32; the
+    # float64-default kernel would diverge -- see test_denoising_resample_parity).
+    ref = torchaudio.functional.resample(wav, 16_000, DENOISING_SAMPLE_RATE)
     assert torch.equal(out1, ref)
     assert torch.equal(out2, ref)
 
