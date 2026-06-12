@@ -44,6 +44,10 @@ class ROVERWrapper:
         self.tokenizer = lambda s: s.lower().split()
         self.detokenizer = lambda tokens: ' '.join(tokens)
         self.excluded_patterns = ('_rover', '_phonemes', '_accent')
+        # Per-instance count of FastROVER -> crowd-kit fallbacks. Surfaced in
+        # the worker / orchestrator end-of-run summary so a run that silently
+        # mixed fast and stock aggregations is greppable.
+        self.fast_path_fallbacks = 0
 
     def _make_aggregator(self):
         if self.use_fast_rover:
@@ -52,10 +56,15 @@ class ROVERWrapper:
 
                 return FastROVER(self.tokenizer, self.detokenizer)
             except Exception as exc:
+                self.fast_path_fallbacks += 1
                 logger.warning(
                     f"FastROVER unavailable ({exc}); falling back to crowd-kit ROVER"
                 )
         return ROVER(self.tokenizer, self.detokenizer)
+
+    def log_fallback_summary(self, label: str = "") -> None:
+        prefix = f"{label} " if label else ""
+        logger.info(f"ROVER {prefix}fast-path fallbacks: {self.fast_path_fallbacks}")
 
     def _model_suffix(self, model_name: str) -> str:
         return 'vosk' if 'vosk' in model_name else model_name
@@ -301,6 +310,9 @@ class ROVERWrapper:
             f"{total_tasks} task(s) with transcripts, {total_seen} pending audio file(s) seen, "
             f"{failed_shards} failed shard(s)."
         )
+        # Sequential path aggregates on this instance; the parallel path's
+        # per-worker counts are logged in each worker's own summary.
+        self.log_fallback_summary()
 
 
 def _rover_worker_main(
@@ -347,3 +359,4 @@ def _rover_worker_main(
             f"ROVER worker {worker_id} finished: {stats['claimed_shards']} shard(s), "
             f"{stats['saved']} result(s), {stats['failed_shards']} failed shard(s)."
         )
+        wrapper.log_fallback_summary(label=f"worker {worker_id}")

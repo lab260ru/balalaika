@@ -25,6 +25,12 @@ apply_torch_perf_defaults()
 
 accentizer = None
 
+# Per-worker count of fast-path fallbacks (process_batch -> stock per-file
+# path). The pool-chunked runner has no end-of-worker hook, so the running
+# total is surfaced in a greppable line at each fallback rather than once at
+# shutdown; a non-zero count means this worker mixed fast and stock outputs.
+_FAST_PATH_FALLBACKS = 0
+
 
 def init_process(
     model_name: str,
@@ -108,7 +114,12 @@ def process_chunk(chunk) -> list:
         # A batch-level failure must not silently drop the slab: fall back to
         # per-file processing so good files still complete and only the
         # offending file is reported.
-        logger.warning(f"Accent batch failed ({exc}); falling back to per-file.")
+        global _FAST_PATH_FALLBACKS
+        _FAST_PATH_FALLBACKS += 1
+        logger.warning(
+            f"Accent batch failed ({exc}); falling back to per-file. "
+            f"fast-path fallbacks: {_FAST_PATH_FALLBACKS}"
+        )
         outputs = None
 
     if outputs is None:
