@@ -79,7 +79,7 @@ def log_fast_path_fallbacks(cuda_id: int) -> None:
     logger.info(f"Worker {cuda_id}: fast-path fallbacks: {_FAST_PATH_FALLBACKS}")
 
 
-def maybe_patch_fast_rnnt(model, config: dict):
+def maybe_patch_fast_rnnt(model, config: dict, config_path: Optional[str] = None):
     """Install batched stateful RNN-T greedy decode on a loaded onnx-asr model.
 
     No-op for CTC / non-transducer / unrecognized topologies and when
@@ -97,7 +97,10 @@ def maybe_patch_fast_rnnt(model, config: dict):
     if not config.get('use_fast_rnnt', True):
         return model
     try:
-        return _patch_fast_rnnt(model)
+        # config_path delivers runtime.threads_per_worker's intra-op cap to the
+        # rebuilt decoder/joiner sessions (None falls back to the shell-exported
+        # path / repo default inside fast_rnnt, so the cap still applies).
+        return _patch_fast_rnnt(model, config_path=config_path)
     except Exception as exc:  # never let the fast path break a worker
         global _FAST_PATH_FALLBACKS
         _FAST_PATH_FALLBACKS += 1
@@ -319,7 +322,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
             vad = onnx_asr.load_vad("silero", **vad_params)
             model = model.with_vad(vad)
 
-        model = maybe_patch_fast_rnnt(model, config)
+        model = maybe_patch_fast_rnnt(model, config, config_path=config_path)
 
         target_sample_rate = int(model.asr._get_sample_rate()) if hasattr(model, "asr") else TARGET_SAMPLE_RATE
 
@@ -416,7 +419,7 @@ def _load_group_model(
         vad = onnx_asr.load_vad("silero", **config.get('vad_params', {}))
         model = model.with_vad(vad)
 
-    model = maybe_patch_fast_rnnt(model, config)
+    model = maybe_patch_fast_rnnt(model, config, config_path=config_path)
 
     sample_rate = int(model.asr._get_sample_rate()) if hasattr(model, "asr") else TARGET_SAMPLE_RATE
     return _GroupModelSpec(

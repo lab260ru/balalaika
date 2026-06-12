@@ -38,6 +38,8 @@ exact for argmax token streams; pinned by tests/test_fast_rnnt.py and the
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -46,6 +48,22 @@ import onnxruntime as rt
 from loguru import logger
 
 from src.utils.gpu import make_session_options
+
+# Fall back to the shell-exported config path (or the repo default) when no
+# explicit path is threaded through the patch call, mirroring io_profile.py so
+# the runtime.threads_per_worker intra-op cap still lands on the rebuilt
+# decoder/joiner sessions on call paths that lose the parameter.
+CONFIG_PATH_ENV = "BALALAIKA_CONFIG_PATH"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "config.yaml"
+
+
+def _resolve_config_path(config_path: str | os.PathLike | None):
+    """Explicit path > ``$BALALAIKA_CONFIG_PATH`` > repo ``configs/config.yaml``."""
+    if config_path:
+        return config_path
+    return os.environ.get(CONFIG_PATH_ENV) or str(DEFAULT_CONFIG_PATH)
+
 
 # log_softmax lives in the installed package; import defensively so a future
 # onnx-asr layout change degrades to "no fast path" rather than crashing.
@@ -65,6 +83,8 @@ def _rebuild_dynamic_batch(
     session: rt.InferenceSession,
     input_batch_axis: dict,
     output_batch_axis: dict,
+    *,
+    config_path: str | os.PathLike | None = None,
 ) -> rt.InferenceSession:
     """Clone ``session`` with the named tensors' batch axis made symbolic.
 
@@ -98,8 +118,10 @@ def _rebuild_dynamic_batch(
     # sessions inherit runtime.threads_per_worker's intra-op cap (+ no-spin)
     # like every other ORT session the ASR worker builds; OMP_NUM_THREADS alone
     # does not reliably bound ORT's own intra-op pool. It sets ORT_ENABLE_ALL
-    # graph optimization, matching the prior hand-rolled options.
-    sess_options = make_session_options()
+    # graph optimization, matching the prior hand-rolled options. The config
+    # path must be a real one for the cap to apply (config_path=None loads
+    # defaults only, leaving intra_op uncapped) — hence the env/repo fallback.
+    sess_options = make_session_options(config_path=_resolve_config_path(config_path))
 
     providers = session.get_providers()
     provider_options = list(session.get_provider_options().values())
@@ -119,7 +141,7 @@ class _GigaamBackend:
 
     PRED_HIDDEN = 320
 
-    def __init__(self, asr) -> None:
+    def __init__(self, asr, *, config_path: str | os.PathLike | None = None) -> None:
         self._asr = asr
         self._blank_idx = asr._blank_idx
         self._pred_hidden = getattr(asr, "PRED_HIDDEN", self.PRED_HIDDEN)
@@ -128,12 +150,14 @@ class _GigaamBackend:
             asr._decoder,
             input_batch_axis={"x": 0, "h.1": 1, "c.1": 1},
             output_batch_axis={"dec": 0, "h": 1, "c": 1},
+            config_path=config_path,
         )
         # joiner: enc[B,768,1], dec[B,320,1] -> joint[B,1,1,V]
         self._joiner = _rebuild_dynamic_batch(
             asr._joiner,
             input_batch_axis={"enc": 0, "dec": 0},
             output_batch_axis={"joint": 0},
+            config_path=config_path,
         )
 
     def initial_state(self, n: int) -> Tuple[npt.NDArray, npt.NDArray]:
@@ -179,7 +203,11 @@ class _KaldiBackend:
     decoder call.  The joiner graph is already dynamic-batch.
     """
 
-    def __init__(self, asr) -> None:
+    def __init__(self, asr, *, config_path: str | os.PathLike | None = None) -> None:
+        # Kaldi/Vosk graphs already carry a dynamic batch dim, so the stock
+        # decoder/joiner sessions are reused as-is (no rebuild, hence no new
+        # SessionOptions); config_path is accepted only for a uniform backend
+        # signature with _GigaamBackend.
         self._asr = asr
         self._blank_idx = asr._blank_idx
         self._context_size = asr.CONTEXT_SIZE
@@ -383,7 +411,7 @@ def _resolve_asr(model):
     return asr
 
 
-def _make_backend(asr):
+def _make_backend(asr, *, config_path: str | os.PathLike | None = None):
     """Build the batched backend for ``asr``'s topology, or ``None`` if the
     topology is not one we batch (caller then leaves stock decode in place)."""
     cls_names = {c.__name__ for c in type(asr).__mro__}
@@ -391,7 +419,7 @@ def _make_backend(asr):
     if "GigaamV2Rnnt" in cls_names:
         if not (hasattr(asr, "_decoder") and hasattr(asr, "_joiner")):
             return None, None
-        return _GigaamBackend(asr), "gigaam"
+        return _GigaamBackend(asr, config_path=config_path), "gigaam"
     # Kaldi / Vosk transducer: context predictor, already dynamic-batch.
     if "KaldiTransducer" in cls_names:
         if not (
@@ -400,11 +428,16 @@ def _make_backend(asr):
             and hasattr(asr, "CONTEXT_SIZE")
         ):
             return None, None
-        return _KaldiBackend(asr), "kaldi"
+        return _KaldiBackend(asr, config_path=config_path), "kaldi"
     return None, None
 
 
-def patch_model(model, *, strict: bool = False):
+def patch_model(
+    model,
+    *,
+    strict: bool = False,
+    config_path: str | os.PathLike | None = None,
+):
     """Patch a loaded onnx-asr transducer model for batched greedy decode.
 
     Monkeypatches ``asr._decoding`` — the single method that
@@ -421,6 +454,12 @@ def patch_model(model, *, strict: bool = False):
         strict: if True, re-raise build errors instead of falling back
             (used by tests).  Default False: any failure logs a warning and
             leaves stock decode untouched.
+        config_path: path to the balalaika YAML, threaded into the rebuilt
+            decoder/joiner ``SessionOptions`` so ``runtime.threads_per_worker``
+            caps their intra-op pool inside the ASR worker. When ``None`` it
+            falls back to ``$BALALAIKA_CONFIG_PATH`` / ``configs/config.yaml``
+            (see :func:`_resolve_config_path`); ``None`` with no fallback would
+            load only defaults and leave the cap a no-op.
 
     Returns:
         ``model`` (mutated in place when patched).
@@ -432,7 +471,7 @@ def patch_model(model, *, strict: bool = False):
         return model
 
     try:
-        backend, kind = _make_backend(asr)
+        backend, kind = _make_backend(asr, config_path=config_path)
     except Exception as exc:
         if strict:
             raise

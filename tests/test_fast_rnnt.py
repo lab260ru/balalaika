@@ -372,55 +372,87 @@ class _FakeSession:
         return {"CPUExecutionProvider": {}}
 
 
-def test_rebuild_dynamic_batch_uses_make_session_options(tmp_path, monkeypatch):
-    """The dynamic-batch decoder/joiner sessions must build their
-    SessionOptions through src.utils.gpu.make_session_options so the
-    runtime.threads_per_worker intra-op cap is honoured inside the spawned
-    ASR workers (rather than a hand-rolled SessionOptions that bypasses it)."""
-    import onnxruntime as rt
+def _write_threads_config(tmp_path, threads):
+    """tmp YAML pinning runtime.threads_per_worker, like the real config."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        f"runtime:\n  threads_per_worker: {threads}\n", encoding="utf-8"
+    )
+    return cfg
 
-    from src.utils import gpu
+
+@pytest.fixture
+def _capture_session_options(monkeypatch):
+    """Record the SessionOptions + config_path that reach the rebuild.
+
+    Captures the actual ``sess_options`` object handed to ``rt.InferenceSession``
+    (so we can read its ``intra_op_num_threads``) and the ``config_path`` kwarg
+    that reached ``make_session_options``. The fake session never runs ONNX —
+    it just stores the args — so the test pins the *contract* (cap applied),
+    not merely that ``make_session_options`` was called.
+    """
+    from src.utils import gpu, runtime_env
+
+    runtime_env._runtime_cfg_cached.cache_clear()
+
+    rec = {"opts": [], "config_paths": []}
+    real_make = gpu.make_session_options
+
+    def _recording_make(*args, **kwargs):
+        rec["config_paths"].append(kwargs.get("config_path"))
+        return real_make(*args, **kwargs)
+
+    class _CapturingSession:
+        def __init__(self, _model_bytes, sess_options, **_kwargs):
+            rec["opts"].append(sess_options)
+
+    monkeypatch.setattr(fast_rnnt, "make_session_options", _recording_make, raising=True)
+    monkeypatch.setattr(fast_rnnt.rt, "InferenceSession", _CapturingSession, raising=True)
+    yield rec
+    runtime_env._runtime_cfg_cached.cache_clear()
+
+
+def test_rebuild_dynamic_batch_applies_threads_cap(
+    tmp_path, monkeypatch, _capture_session_options
+):
+    """The dynamic-batch decoder/joiner sessions must build SessionOptions
+    through make_session_options *with a real config path*, so the
+    runtime.threads_per_worker intra-op cap actually lands on the session
+    inside the spawned ASR worker. Asserting only that make_session_options
+    was called passes even when config_path=None leaves the cap a no-op."""
+    cfg = _write_threads_config(tmp_path, 3)
+    monkeypatch.setenv("BALALAIKA_CONFIG_PATH", str(cfg))
 
     model_path = tmp_path / "tiny.onnx"
     _tiny_onnx_batch1(model_path)
-
-    calls = []
-    real_make = gpu.make_session_options
-
-    def _recorder(*args, **kwargs):
-        calls.append((args, kwargs))
-        return real_make(*args, **kwargs)
-
-    # Patch the name as fast_rnnt references it (mirrors transcription.py's
-    # `from src.utils.gpu import make_session_options`).
-    monkeypatch.setattr(fast_rnnt, "make_session_options", _recorder, raising=True)
 
     sess = _FakeSession(model_path)
-    out = fast_rnnt._rebuild_dynamic_batch(
+    fast_rnnt._rebuild_dynamic_batch(
         sess, input_batch_axis={"x": 0}, output_batch_axis={"y": 0}
     )
-    assert isinstance(out, rt.InferenceSession)
-    assert len(calls) == 1, "make_session_options not used to build ORT options"
+
+    rec = _capture_session_options
+    assert len(rec["opts"]) == 1, "rebuild did not build exactly one session"
+    assert rec["config_paths"][0] not in (None, ""), (
+        "make_session_options got no config_path; thread cap can never apply"
+    )
+    assert rec["opts"][0].intra_op_num_threads == 3, (
+        "configured runtime.threads_per_worker (3) did not reach the rebuilt "
+        f"session: got intra_op_num_threads={rec['opts'][0].intra_op_num_threads}"
+    )
 
 
-def test_gigaam_backend_builds_both_sessions_via_make_session_options(
-    tmp_path, monkeypatch
+def test_gigaam_backend_applies_threads_cap_to_both_sessions(
+    tmp_path, monkeypatch, _capture_session_options
 ):
-    """Both the decoder and the joiner dynamic-batch sessions must be built
-    through make_session_options (two calls for a GigaAM backend)."""
-    from src.utils import gpu
+    """Both the decoder and joiner dynamic-batch sessions must receive the
+    configured runtime.threads_per_worker intra-op cap (two capped sessions
+    for a GigaAM backend)."""
+    cfg = _write_threads_config(tmp_path, 3)
+    monkeypatch.setenv("BALALAIKA_CONFIG_PATH", str(cfg))
 
     model_path = tmp_path / "tiny.onnx"
     _tiny_onnx_batch1(model_path)
-
-    calls = []
-    real_make = gpu.make_session_options
-
-    def _recorder(*args, **kwargs):
-        calls.append((args, kwargs))
-        return real_make(*args, **kwargs)
-
-    monkeypatch.setattr(fast_rnnt, "make_session_options", _recorder, raising=True)
 
     # Rebuild relabels axis 0 on "x"/"y"; reuse the same tiny graph for both
     # the decoder and joiner stand-ins so _GigaamBackend.__init__ runs.
@@ -434,17 +466,26 @@ def test_gigaam_backend_builds_both_sessions_via_make_session_options(
 
     real_rebuild = fast_rnnt._rebuild_dynamic_batch
 
-    def _rebuild(session, input_batch_axis, output_batch_axis):
+    def _rebuild(session, input_batch_axis, output_batch_axis, **kwargs):
         return real_rebuild(
-            session, input_batch_axis={"x": 0}, output_batch_axis={"y": 0}
+            session, input_batch_axis={"x": 0}, output_batch_axis={"y": 0}, **kwargs
         )
 
     monkeypatch.setattr(fast_rnnt, "_rebuild_dynamic_batch", _rebuild, raising=True)
 
     fast_rnnt._GigaamBackend(_Asr())
-    assert len(calls) == 2, (
-        "expected make_session_options for both decoder and joiner sessions, "
-        f"got {len(calls)}"
+
+    rec = _capture_session_options
+    assert len(rec["opts"]) == 2, (
+        "expected one session for the decoder and one for the joiner, "
+        f"got {len(rec['opts'])}"
+    )
+    assert all(p not in (None, "") for p in rec["config_paths"]), (
+        "a config_path failed to reach make_session_options"
+    )
+    assert all(o.intra_op_num_threads == 3 for o in rec["opts"]), (
+        "configured runtime.threads_per_worker (3) did not reach both "
+        f"sessions: got {[o.intra_op_num_threads for o in rec['opts']]}"
     )
 
 
@@ -527,7 +568,7 @@ def test_patch_is_idempotent():
     import src.transcription.fast_rnnt as fr
 
     orig = fr._make_backend
-    fr._make_backend = lambda a: (FakeGigaBackend(a), "gigaam")
+    fr._make_backend = lambda a, **kw: (FakeGigaBackend(a), "gigaam")
     try:
         fr.patch_model(m)
         assert fr.is_patched(m)
@@ -552,7 +593,7 @@ def test_patched_decode_matches_stock_through_recognize_path():
     m = M()
     m.asr = fast_asr
     orig = fr._make_backend
-    fr._make_backend = lambda a: (FakeGigaBackend(a), "gigaam")
+    fr._make_backend = lambda a, **kw: (FakeGigaBackend(a), "gigaam")
     try:
         fr.patch_model(m)
     finally:
@@ -584,7 +625,7 @@ def test_fallback_on_broken_backend():
     m = M()
     m.asr = asr
     orig = fr._make_backend
-    fr._make_backend = lambda a: (BrokenBackend(a), "gigaam")
+    fr._make_backend = lambda a, **kw: (BrokenBackend(a), "gigaam")
     try:
         fr.patch_model(m)
     finally:
