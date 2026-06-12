@@ -323,6 +323,89 @@ def test_end_to_end_missing_duration_kept_file_not_probed(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Symlinked dataset root: the deletion audit must count files from the
+# candidate partials, not by matching resolve_path()-resolved partial paths
+# against the verbatim (symlink-form) baseline paths. On a symlinked root the
+# two path forms differ, so a baseline-mask audit reports 0 deleted / 0 hours.
+# --------------------------------------------------------------------------- #
+def make_symlinked_dataset(tmp_path, rows):
+    """Like ``make_dataset`` but with a symlinked dataset root.
+
+    Real wavs live under ``tmp_path/real_data``; ``tmp_path/data`` is a symlink
+    to it and is used as ``podcasts_path``. balalaika.csv stores the
+    *symlink-form* absolute paths (``.../data/...``) exactly as ``load_main_csv``
+    would keep them (it trusts absolute paths verbatim). A worker deletes
+    through the symlink but writes the partial with ``resolve_path`` (the
+    ``.../real_data/...`` form), so the two path forms diverge.
+    """
+    real_root = tmp_path / "real_data"
+    real_root.mkdir(parents=True, exist_ok=True)
+    link_root = tmp_path / "data"
+    link_root.symlink_to(real_root, target_is_directory=True)
+
+    link_paths = []
+    csv_rows = []
+    for i, row in enumerate(rows):
+        mos, csv_dur, real_dur = row[0], row[1], row[2]
+        rel = Path("pl") / "pod" / f"chunk_{i}.wav"
+        _write_wav(real_root / rel, real_dur)
+        link_path = str(link_root / rel)  # symlink-form absolute path, verbatim
+        link_paths.append(link_path)
+        csv_rows.append(
+            {"filepath": link_path, "DistillMOS": mos, "total_duration": csv_dur}
+        )
+    pd.DataFrame(csv_rows).to_csv(link_root / "balalaika.csv", index=False)
+    return link_root, link_paths
+
+
+def test_symlinked_root_audit_counts_deleted_files_and_hours(tmp_path):
+    """Symlinked root: deleted/hours must come from the partials, not a
+    baseline path-mask. One candidate is deleted; its duration is 7200 s = 2 h.
+    A baseline-mask audit would report 0 deleted / 0.0 hours.
+    """
+    rows = [
+        (2.0, 7200.0, 7200.0),  # 0 candidate -> deleted, 2.0 hours
+        (4.0, 3600.0, 3600.0),  # 1 kept
+    ]
+    link_root, link_paths = make_symlinked_dataset(tmp_path, rows)
+
+    _run_main(link_root, threshold=3.0, num_workers=1)
+
+    assert not os.path.exists(link_paths[0])  # deleted through the symlink
+    assert os.path.exists(link_paths[1])
+
+    fs = pd.read_csv(link_root / "filter_summary.csv").iloc[-1]
+    audit = _read_summary(link_root)
+    assert audit["files_deleted"] == 1
+    # hours_removed is recorded as hours_in - hours_out by record_stage_summary.
+    assert float(fs.hours_removed) == 2.0
+    assert audit["hours_in"] - audit["hours_out"] == 2.0
+
+
+def test_non_symlinked_root_audit_unchanged(tmp_path):
+    """Same scenario without a symlink: the audit numbers are identical to the
+    symlinked case (1 deleted, 2.0 h removed). Guards against the fix changing
+    the normal-root behaviour.
+    """
+    rows = [
+        (2.0, 7200.0),  # 0 candidate -> deleted, 2.0 hours
+        (4.0, 3600.0),  # 1 kept
+    ]
+    paths = make_dataset(tmp_path, rows, real_wavs=True)
+
+    _run_main(tmp_path, threshold=3.0, num_workers=1)
+
+    assert not os.path.exists(paths[0])
+    assert os.path.exists(paths[1])
+
+    fs = pd.read_csv(tmp_path / "filter_summary.csv").iloc[-1]
+    audit = _read_summary(tmp_path)
+    assert audit["files_deleted"] == 1
+    assert float(fs.hours_removed) == 2.0
+    assert audit["hours_in"] - audit["hours_out"] == 2.0
+
+
+# --------------------------------------------------------------------------- #
 # I/O win: count per-file duration probes before vs. after.
 # --------------------------------------------------------------------------- #
 def test_probe_count_scales_with_candidates(tmp_path, monkeypatch):
