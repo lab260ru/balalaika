@@ -290,6 +290,21 @@ def probe_antispoofing(cfg: Dict, device_index: int, args) -> ProbeOutcome:
         del session
 
 
+def denoising_probe_frames(args) -> int:
+    """Frame count to probe the denoising stage with.
+
+    The runtime stage pads every batch up to ``MODEL_MAX_PADDED_LEN`` before
+    inference (see ``src/denoising/denoising.py``), so that is the activation
+    footprint the VRAM guard must measure. Probing the shorter ``--probe-seconds``
+    clip under-measures memory and lets ``batch_size: auto`` OOM at runtime on
+    the first shard with a long clip. ``args`` is accepted for signature parity
+    with the other probes but the worst-case padded length is independent of it.
+    """
+    from src.denoising.denoising import MODEL_MAX_PADDED_LEN
+
+    return MODEL_MAX_PADDED_LEN
+
+
 def probe_denoising(cfg: Dict, device_index: int, args) -> ProbeOutcome:
     import numpy as np
     import onnxruntime as ort
@@ -319,8 +334,10 @@ def probe_denoising(cfg: Dict, device_index: int, args) -> ProbeOutcome:
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
 
-    frames = int(MODEL_SAMPLE_RATE * min(args.probe_seconds, 10.0))
-    frames -= frames % 384  # MODEL_PAD_TO_MULTIPLE
+    # Probe the runtime worst case: the stage pads every batch up to
+    # MODEL_MAX_PADDED_LEN, so the VRAM guard must see that activation footprint
+    # (a shorter --probe-seconds clip would under-measure and OOM at runtime).
+    frames = denoising_probe_frames(args)
     rng = np.random.default_rng(0)
 
     def make_batch(bs: int):
@@ -575,7 +592,9 @@ def main() -> int:
                     help="Maximum batch size for the doubling ladder (default: 512). "
                          "The VRAM guard and plateau detector still stop the sweep early when needed.")
     ap.add_argument("--probe-seconds", type=float, default=10.0,
-                    help="synthetic clip duration for variable-length models")
+                    help="synthetic clip duration for variable-length models "
+                         "(denoising ignores this and probes its runtime padded "
+                         "length so the VRAM guard sees the real worst case)")
     ap.add_argument("--audio-dir", type=str, default=None,
                     help="optional dir with real .wav files for ASR probes")
     ap.add_argument("--output", type=Path, default=DEFAULT_PROFILE_PATH)

@@ -343,6 +343,112 @@ def test_kaldi_context_cache_shared_across_batch():
 
 
 # ===================================================================== #
+#  dynamic-batch rebuild routes ORT options through make_session_options #
+# ===================================================================== #
+def _tiny_onnx_batch1(path) -> None:
+    """Write a minimal ONNX model with a batch-1 leading dim to relabel."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
+    node = helper.make_node("Identity", ["x"], ["y"])
+    graph = helper.make_graph([node], "g", [x], [y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+    onnx.save(model, str(path))
+
+
+class _FakeSession:
+    """Stand-in for an onnxruntime InferenceSession with a real model file."""
+
+    def __init__(self, model_path):
+        self._model_path = str(model_path)
+
+    def get_providers(self):
+        return ["CPUExecutionProvider"]
+
+    def get_provider_options(self):
+        return {"CPUExecutionProvider": {}}
+
+
+def test_rebuild_dynamic_batch_uses_make_session_options(tmp_path, monkeypatch):
+    """The dynamic-batch decoder/joiner sessions must build their
+    SessionOptions through src.utils.gpu.make_session_options so the
+    runtime.threads_per_worker intra-op cap is honoured inside the spawned
+    ASR workers (rather than a hand-rolled SessionOptions that bypasses it)."""
+    import onnxruntime as rt
+
+    from src.utils import gpu
+
+    model_path = tmp_path / "tiny.onnx"
+    _tiny_onnx_batch1(model_path)
+
+    calls = []
+    real_make = gpu.make_session_options
+
+    def _recorder(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_make(*args, **kwargs)
+
+    # Patch the name as fast_rnnt references it (mirrors transcription.py's
+    # `from src.utils.gpu import make_session_options`).
+    monkeypatch.setattr(fast_rnnt, "make_session_options", _recorder, raising=True)
+
+    sess = _FakeSession(model_path)
+    out = fast_rnnt._rebuild_dynamic_batch(
+        sess, input_batch_axis={"x": 0}, output_batch_axis={"y": 0}
+    )
+    assert isinstance(out, rt.InferenceSession)
+    assert len(calls) == 1, "make_session_options not used to build ORT options"
+
+
+def test_gigaam_backend_builds_both_sessions_via_make_session_options(
+    tmp_path, monkeypatch
+):
+    """Both the decoder and the joiner dynamic-batch sessions must be built
+    through make_session_options (two calls for a GigaAM backend)."""
+    from src.utils import gpu
+
+    model_path = tmp_path / "tiny.onnx"
+    _tiny_onnx_batch1(model_path)
+
+    calls = []
+    real_make = gpu.make_session_options
+
+    def _recorder(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_make(*args, **kwargs)
+
+    monkeypatch.setattr(fast_rnnt, "make_session_options", _recorder, raising=True)
+
+    # Rebuild relabels axis 0 on "x"/"y"; reuse the same tiny graph for both
+    # the decoder and joiner stand-ins so _GigaamBackend.__init__ runs.
+    class _Asr:
+        PRED_HIDDEN = PRED_HIDDEN
+
+        def __init__(self):
+            self._blank_idx = 5
+            self._decoder = _FakeSession(model_path)
+            self._joiner = _FakeSession(model_path)
+
+    real_rebuild = fast_rnnt._rebuild_dynamic_batch
+
+    def _rebuild(session, input_batch_axis, output_batch_axis):
+        return real_rebuild(
+            session, input_batch_axis={"x": 0}, output_batch_axis={"y": 0}
+        )
+
+    monkeypatch.setattr(fast_rnnt, "_rebuild_dynamic_batch", _rebuild, raising=True)
+
+    fast_rnnt._GigaamBackend(_Asr())
+    assert len(calls) == 2, (
+        "expected make_session_options for both decoder and joiner sessions, "
+        f"got {len(calls)}"
+    )
+
+
+# ===================================================================== #
 #  patch_model safety / fallback                                       #
 # ===================================================================== #
 class _FakeCtcModel:
