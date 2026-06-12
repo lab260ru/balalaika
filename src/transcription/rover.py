@@ -11,7 +11,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from src.utils.csv_manager import discover_audio_paths
-from src.utils.sidecars import path_exists, text_sidecar_complete
+from src.utils.sidecars import DirNameCache
 from src.utils.utils import read_file_content
 from src.utils.work_shards import (
     claim_work_shard,
@@ -32,6 +32,7 @@ class ROVERWrapper:
         shard_size: Optional[int] = None,
         workers: int = 1,
         retry_empty_outputs: bool = False,
+        use_fast_rover: bool = True,
     ):
         self.podcasts_path = Path(podcasts_path)
         self.model_names = model_names
@@ -39,9 +40,22 @@ class ROVERWrapper:
         self.shard_size = max(1, int(shard_size)) if shard_size else None
         self.workers = max(1, int(workers or 1))
         self.retry_empty_outputs = retry_empty_outputs
+        self.use_fast_rover = use_fast_rover
         self.tokenizer = lambda s: s.lower().split()
         self.detokenizer = lambda tokens: ' '.join(tokens)
         self.excluded_patterns = ('_rover', '_phonemes', '_accent')
+
+    def _make_aggregator(self):
+        if self.use_fast_rover:
+            try:
+                from src.transcription.fast_rover import FastROVER
+
+                return FastROVER(self.tokenizer, self.detokenizer)
+            except Exception as exc:
+                logger.warning(
+                    f"FastROVER unavailable ({exc}); falling back to crowd-kit ROVER"
+                )
+        return ROVER(self.tokenizer, self.detokenizer)
 
     def _model_suffix(self, model_name: str) -> str:
         return 'vosk' if 'vosk' in model_name else model_name
@@ -52,14 +66,17 @@ class ROVERWrapper:
     def _pending_audio_paths(self, audio_paths: Iterable[str]) -> List[str]:
         pending: List[str] = []
         total = len(audio_paths) if hasattr(audio_paths, "__len__") else None
+        # One scandir per directory replaces one _rover.txt stat per audio
+        # file. Built per-process: this runs in the orchestrator before shards
+        # are dispatched, never across the spawn boundary.
+        cache = DirNameCache()
         for raw_path in tqdm(audio_paths, total=total, desc="find_rover_pending"):
             audio_path = Path(raw_path)
             if any(pattern in audio_path.stem for pattern in self.excluded_patterns):
                 continue
-            if text_sidecar_complete(
+            if cache.sidecar_complete(
                 self._rover_output_path(audio_path),
                 retry_empty=self.retry_empty_outputs,
-                label="ROVER",
             ):
                 continue
             pending.append(str(audio_path))
@@ -68,6 +85,11 @@ class ROVERWrapper:
     def _records_for_audio_paths(self, audio_paths: Iterable[str]) -> pd.DataFrame:
         records = []
         total = len(audio_paths) if hasattr(audio_paths, "__len__") else None
+        # Per-shard cache: built fresh in whatever (possibly spawned) worker
+        # process owns this shard. A shard's files cluster in a handful of
+        # episode directories, so one scandir per directory amortizes across
+        # all model-suffix probes for every file in that directory.
+        cache = DirNameCache()
         for raw_path in tqdm(audio_paths, total=total, desc="load_rover_transcripts"):
             audio_path = Path(raw_path)
             if any(pattern in audio_path.stem for pattern in self.excluded_patterns):
@@ -77,9 +99,9 @@ class ROVERWrapper:
                 suffix = self._model_suffix(model_name)
                 transcript_path = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
 
-                if not path_exists(transcript_path, missing_on_too_long=True, label="Transcript"):
+                if not cache.exists(transcript_path):
                     continue
-                
+
                 try:
                     text = read_file_content(transcript_path)
                     if not text:
@@ -126,7 +148,7 @@ class ROVERWrapper:
             f"Running ROVER on shard {label}: "
             f"{task_count} audio file(s), {len(df)} transcript(s)."
         )
-        result = ROVER(self.tokenizer, self.detokenizer).fit_predict(df)
+        result = self._make_aggregator().fit_predict(df)
         saved = self._save_results(result)
         return len(audio_paths), task_count, saved
 
@@ -186,6 +208,7 @@ class ROVERWrapper:
                         str(self.podcasts_path),
                         list(self.model_names),
                         self.retry_empty_outputs,
+                        self.use_fast_rover,
                         stats_queue,
                     ),
                     name=f"rover-worker-{worker_id}",
@@ -286,12 +309,14 @@ def _rover_worker_main(
     podcasts_path: str,
     model_names: List[str],
     retry_empty_outputs: bool,
+    use_fast_rover: bool,
     stats_queue,
 ) -> None:
     wrapper = ROVERWrapper(
         podcasts_path=podcasts_path,
         model_names=model_names,
         retry_empty_outputs=retry_empty_outputs,
+        use_fast_rover=use_fast_rover,
     )
     stats = {
         "seen": 0,

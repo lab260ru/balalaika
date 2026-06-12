@@ -25,24 +25,36 @@ def process_audio_file(
         dest_dir = os.path.join(podcasts_path, str(playlist_id), str(podcast_id))
         os.makedirs(dest_dir, exist_ok=True)
 
-        audio = AudioSegment.from_mp3(audio_path)
-
-        saved = False
+        # Compute every output segment's path FIRST (names depend only on the
+        # metadata, not the audio). If all segments already exist, return before
+        # decoding the whole episode into RAM — on resume this turns a full
+        # re-decode of every completed episode (eternal, since `saved` would stay
+        # False and the source was kept) into a metadata-only no-op. Same files
+        # produced/skipped and same source-removal semantics as before.
+        pending = []  # (start_ms, end_ms, dest_path) for segments not yet written
         for _, row in episode_meta.iterrows():
             start_sec = float(row['start'])
             end_sec = float(row['end'])
-            
+
             start_ms = int(start_sec * 1000)
             end_ms = int(end_sec * 1000)
-            
-            segment = audio[start_ms:end_ms]
-            
+
             new_name = f"{start_sec:.2f}_{end_sec:.2f}_{playlist_id}_{podcast_id}.mp3"
             dest_path = os.path.join(dest_dir, new_name)
-            
+
             if os.path.exists(dest_path):
                 continue
+            pending.append((start_ms, end_ms, dest_path))
 
+        if not pending:
+            # Nothing to export -> original kept the source (saved == False).
+            return
+
+        audio = AudioSegment.from_mp3(audio_path)
+
+        saved = False
+        for start_ms, end_ms, dest_path in pending:
+            segment = audio[start_ms:end_ms]
             segment.export(dest_path, format="mp3")
             saved = True
 

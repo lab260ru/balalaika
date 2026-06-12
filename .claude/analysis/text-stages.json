@@ -1,0 +1,183 @@
+{
+  "area": "text-stages (punctuation / accents / phonemizer)",
+  "data_flow": "All three stages share an identical skeleton. main() calls setup_logging + load_config, then resolves a list of pending input .txt sidecars, then hands them to src/utils/parallel.run_per_gpu_pool which round-robin shards items across CUDA GPUs and runs one ProcessPoolExecutor per GPU (num_workers_per_gpu workers each). Each worker process runs an initializer once (loads the model into a module global), then work_fn is submitted once per item. Each work_fn: derives the output path, returns early if it exists, reads the input text via read_file_content (open+read+strip), runs the model on the single string, and writes the output with Path.write_text. Finally write_stage_status records processed/error counts.\n\nStage 8 punctuation: input *_rover.txt -> output *_punct.txt. Model is a HuggingFace transformers \"ner\" pipeline (RUPunct/RUPunct_big, a BERT) with aggregation_strategy=\"first\". make_punct_txt calls model(src_text) on the WHOLE document string as one call (pipeline default batch_size=1, so internally it is one forward per chunk of the string), then rebuilds the string by mapping each predicted token through process_token (utils.py:47). Pending discovery: pending_audio_to_sidecar -> discover_audio_paths (config audio_paths_source=csv, so reads balalaika.csv filepath column) then for each audio path does two Path.exists() stat calls (in_path, out_path).\n\nStage 9 accents: input *_punct.txt -> output *_accent.txt. Model is RUAccent (fork NikiPshg/ruaccent) loaded with use_dictionary=True, tiny_mode=False; this loads 4 separate ONNX InferenceSessions (omograph, accent, yo_homograph, stress_usage) plus several gzip JSON dictionaries. process_file calls accentizer.process_all(text) which splits into sentences, and per-sentence (with an lru_cache(4096) on the SENTENCE string) runs stress-usage prediction, yo resolution, omograph ONNX classification, and accent ONNX model. Pending discovery: pending_sidecar_chain -> discover_audio_paths(csv) then derives *_punct.txt per audio path then pending() does input-exists + output-exists stats.\n\nStage 10 phonemizer: input *_rover.txt -> output *_rover_phonemes.txt. Model is tryiparu.G2PModel(load_dataset=True), a torch transformer compiled with torch.compile(mode=\"max-autotune\"). process_text calls g2p_model(text); __call__ splits text into word/punct tokens and for EACH alphabetic word not in an in-memory data_dict runs greedy_decode — an autoregressive loop up to 63 steps, each step a full encoder/decoder forward + an .item() GPU->CPU sync, building the sequence one token at a time. Found words are cached in self.data_dict (process-local, lost on worker exit). Outputs joined with spaces and written.",
+  "operations": [
+    {
+      "name": "pending discovery (all 3 stages)",
+      "what": "punctuation.py:62 pending_audio_to_sidecar / accents.py:58 + phonemizer.py:44 pending_sidecar_chain -> sidecars.py:97/127 discover_audio_paths reads balalaika.csv (csv_manager.py:1033 pd.read_csv usecols=filepath) then _dedupe_paths iterates with tqdm and 2x Path.exists per row; with audio_paths_source=rglob it is 5x rglob over the tree (utils.py:36-44)",
+      "cost": "moderate"
+    },
+    {
+      "name": "ProcessPoolExecutor spawn + model load per worker",
+      "what": "parallel.py:89 one pool per GPU, initializer loads model in each worker (punctuation init_process:21 HF pipeline; accents init_process:21 4 ONNX sessions + gzip JSON dicts; phonemizer init_process:21 torch model + torch.compile max-autotune + reads cleaned_dataset.csv to dict)",
+      "cost": "heavy"
+    },
+    {
+      "name": "torch.compile(max-autotune) in phonemizer",
+      "what": "tryiparu.py:49 compiles the G2P model with mode=max-autotune at worker init; first inference triggers a long autotune/compile (tens of seconds to minutes) per worker process",
+      "cost": "dominant"
+    },
+    {
+      "name": "read input text",
+      "what": "punctuation.py:43 / accents.py:40 / phonemizer.py:32 read_file_content (utils.py:29) open+read+strip, one tiny file per item",
+      "cost": "trivial"
+    },
+    {
+      "name": "punctuation NER forward",
+      "what": "punctuation.py:47 model(src_text) one HF pipeline call per document, batch_size=1, BERT forward; long docs (>512 tokens) silently truncated/handled per pipeline default — likely only first 512 tokens punctuated",
+      "cost": "moderate"
+    },
+    {
+      "name": "punctuation token reassembly",
+      "what": "punctuation.py:48-50 generator over preds calling process_token (utils.py:47) a 30-branch if-ladder per token, pure-Python GIL-bound",
+      "cost": "light"
+    },
+    {
+      "name": "accent process_all",
+      "what": "accents.py:44 process_all -> per-sentence _process_sentence_cached (ruaccent.py:247 lru_cache 4096): stress_usage ONNX + yo ONNX + omograph ONNX classify (omograph_model.py:67, per-hypothesis loop with one session.run per hypothesis when num_hypotheses odd) + accent ONNX, all batch=1 per sentence",
+      "cost": "heavy"
+    },
+    {
+      "name": "phonemizer per-word greedy decode",
+      "what": "phonemizer.py:33 g2p_model(text) -> tryiparu __call__ loops words; greedy_decode (tryiparu.py:107) autoregressive up to 63 steps/word, each step model.decode+fc_out+argmax+.item() GPU sync, building decoder_input by torch.cat one token at a time; cache miss only",
+      "cost": "dominant"
+    },
+    {
+      "name": "write output",
+      "what": "punctuation.py:51 / accents.py:44 / phonemizer.py:34 Path.write_text, one small file per item",
+      "cost": "trivial"
+    },
+    {
+      "name": "result collection",
+      "what": "parallel.py:98-107 as_completed loop, fut.result() per item in main process, tqdm.update(1) per item",
+      "cost": "light"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Batch the RUPunct NER pipeline across many files",
+      "location": "src/punctuation/punctuation.py:47",
+      "description": "Currently make_punct_txt calls model(src_text) once per file with the HF pipeline default batch_size=1, and the whole stage submits one future per file so there is no cross-file batching at all — pure latency-bound GPU calls with Python overhead between each. Refactor to feed the pipeline a list/Dataset of document strings with a tuned batch_size (e.g. pipeline(..., batch_size=N) and call model(list_of_texts)), or use a KeyDataset, so the BERT forward saturates the GPU. Group submissions into chunks rather than one-future-per-file. Keep process_token reassembly per-document.",
+      "expected_gain": "3-8x on the punctuation stage GPU throughput (BERT batch=16-32 vs 1)",
+      "risk": "medium",
+      "low_resource_note": "Make batch_size a config knob (default small, e.g. 4); on a single low-VRAM GPU a smaller batch still helps because it removes per-call Python+launch overhead. On CPU-only fallback nodes batch>1 still helps amortize tokenizer overhead."
+    },
+    {
+      "title": "Cap/handle long documents in punctuation explicitly",
+      "location": "src/punctuation/punctuation.py:47",
+      "description": "model(src_text) is called on the entire *_rover.txt with no chunking. RUPunct_big is a 512-token BERT; the pipeline will truncate, so long transcripts get only their first window punctuated (silent correctness loss AND wasted re-tokenization). Pre-split into ~400-token overlapping windows and concatenate, or set a documented max and stride. This is both a correctness fix and lets you batch the windows.",
+      "expected_gain": "Correctness on long files; modest throughput from controlled batching",
+      "risk": "medium",
+      "low_resource_note": "Windowing adds CPU work but bounds peak memory, which is good on low-RAM nodes."
+    },
+    {
+      "title": "Persist phonemizer data_dict (word->phoneme) cache across runs/workers",
+      "location": "src/phonemizer/phonemizer.py:23 and tryiparu.py:72-78",
+      "description": "tryiparu caches greedy_decode results in self.data_dict, but it is a process-local in-memory dict thrown away when the worker exits, and each of N workers warms it independently. Russian transcripts have huge word-frequency skew, so most decode calls after warmup are cache hits — but every fresh run and every new worker re-decodes the long tail. Seed data_dict from a shared on-disk phoneme dictionary (the package already ships cleaned_dataset.csv as the seed) and periodically persist newly decoded words to a shared sqlite/parquet so subsequent runs/workers skip the autoregressive decode entirely.",
+      "expected_gain": "Large on re-runs and multi-worker (potentially 2-10x fewer greedy_decode calls); the decode loop is the dominant cost",
+      "risk": "medium",
+      "low_resource_note": "A shared on-disk cache is pure win on weak nodes — it turns GPU decode into a dict lookup. Needs a lock/merge for concurrent writers (or write per-worker shards and merge post-stage like the CSV partials pattern)."
+    },
+    {
+      "title": "Batch phonemizer greedy_decode over unique words",
+      "location": "src/phonemizer/phonemizer.py:33 / tryiparu.py:64-104,107-168",
+      "description": "greedy_decode runs one word at a time with a per-step .item() GPU->CPU sync and torch.cat growing the sequence — maximally latency-bound. Within a document (and across documents if you batch files), collect the set of unique cache-miss words and decode them as a padded batch with a single autoregressive loop (batched argmax, no per-token .item()). The library does not expose this, so it requires either a thin batched-decode wrapper or upstream patch. Even batching unique words within one file removes most syncs.",
+      "expected_gain": "Potentially 5-20x on cache-miss-heavy documents (GPU goes from batch=1 seq-by-token to batch=B)",
+      "risk": "high",
+      "low_resource_note": "Needs a batch-size knob; on a busy/low-VRAM GPU keep B modest. The .item()-per-step removal alone (async decode) helps even at batch=1."
+    },
+    {
+      "title": "torch.compile max-autotune cost vs short runs",
+      "location": "tryiparu.py:49 (triggered via phonemizer.py:23 init_process)",
+      "description": "Each phonemizer worker compiles with mode='max-autotune' at init; first inference pays a long compile/autotune. With spawn + one pool per GPU + num_workers default 4, that compile happens 4x per GPU. For batch=1 dynamic-shape autoregressive decode, max-autotune yields little and recompiles on each new sequence length. Consider mode='reduce-overhead' or no compile, or share a compiled-graph cache (TORCHINDUCTOR_CACHE_DIR) across workers so only the first pays.",
+      "expected_gain": "Saves tens of seconds to minutes of startup per worker; faster stage start",
+      "risk": "medium",
+      "low_resource_note": "On low-CPU Haswell nodes the inductor autotune is especially slow; setting TORCHINDUCTOR_CACHE_DIR (shared, persistent) is a big win. Expose compile mode as a config knob."
+    },
+    {
+      "title": "Constrain ONNXRuntime thread pools in accents workers",
+      "location": "src/accents/accents.py:25-31 and ruaccent omograph_model.py:13 etc.",
+      "description": "RUAccent loads 4 InferenceSessions and the fork passes only providers (no SessionOptions), so each session defaults intra_op_num_threads to all 48 logical cores. With num_workers_per_gpu>1 (or the other text stages running) this massively oversubscribes the 48-thread, 2-NUMA box and thrashes. The stage cannot set SessionOptions through the current RUAccent.load API, so either set OMP_NUM_THREADS/ORT_* env per worker before load, or extend the fork's load() to accept sess_options. Also note: the omograph classify path runs CUDAExecutionProvider only when providers say CUDA, but the per-hypothesis branch (omograph_model.py:78-88) does one session.run per hypothesis — batch them.",
+      "expected_gain": "Avoids thread thrash; can be 1.5-3x with multiple workers on the shared box",
+      "risk": "low",
+      "low_resource_note": "Critical on the low-CPU node. Set intra_op threads = total_threads / total_concurrent_workers. This is the single most impactful accents knob on a contended host."
+    },
+    {
+      "title": "Pin accents ONNX sessions to GPU and verify they are actually on CUDA",
+      "location": "src/accents/accents.py:23 get_onnx_providers + ruaccent load",
+      "description": "get_onnx_providers returns CUDAExecutionProvider with device_id when use_tensorrt False, but config sets use_tensorrt: False AND the inner sessions only honor the provider list passed through. Verify all 4 sessions actually land on CUDA (the upstream non-fork falls back to CPU). If some run on CPU they bottleneck the stage and fight the CPU thread pools. TensorRT is explicitly disabled due to UINT8 casts (config comment accents:294), so CUDA EP is the ceiling here.",
+      "expected_gain": "Depends on current placement; if any session is silently CPU, large",
+      "risk": "low",
+      "low_resource_note": "On single-GPU low-VRAM nodes, 4 sessions + the other GPU stages may not fit; provide a CPU-fallback knob rather than OOM."
+    },
+    {
+      "title": "Avoid per-file double stat storms and rglob in pending discovery",
+      "location": "src/utils/sidecars.py:103-110, 76-82 and src/utils/utils.py:36-44",
+      "description": "pending discovery iterates all audio paths and does 2 Path.exists() per file (input sidecar + output sidecar); with rglob source it does 5 full-tree rglob passes (utils.py:39-43). With audio_paths_source=csv this is the csv read (good) but still 2 stat() per row over the whole corpus every stage launch. For millions of files this is an I/O storm at startup. Batch with os.scandir per directory, or cache a directory listing, or carry sidecar-presence in balalaika.csv so the stat() per file disappears.",
+      "expected_gain": "Seconds-to-minutes off stage startup on large corpora; reduces SSD random-IO",
+      "risk": "low",
+      "low_resource_note": "Pure win on weak nodes (less RAM churn, less IO). The csv source already avoids rglob; ensure rglob is never the default for big trees."
+    },
+    {
+      "title": "Use threads instead of process pool for accents (and possibly punctuation)",
+      "location": "src/accents/accents.py:70 / src/punctuation/punctuation.py:74 via parallel.run_per_gpu_pool",
+      "description": "Each item is tiny and the heavy work is in ONNX/torch C++ that releases the GIL. ProcessPoolExecutor with spawn pays full model-load and (phonemizer) torch.compile per worker, and IPC-pickles each path. For ONNXRuntime-backed accents, a single process with one set of sessions + an internal request batch, or a ThreadPool sharing one session, avoids N model copies (4 ONNX sessions x num_workers) and the spawn overhead. Note config already defaults num_workers=1 for all three, so the multi-process machinery mostly adds startup cost without parallelism today.",
+      "expected_gain": "Lower memory (1 model copy vs N) and faster startup; enables real intra-process batching",
+      "risk": "medium",
+      "low_resource_note": "Big RAM win on the 31GB node: today num_workers>1 would multiply 4 ONNX sessions + dictionaries per worker. Keep a process-per-GPU but thread/batch within it."
+    },
+    {
+      "title": "Chunk futures / use map with chunksize instead of one submit per file",
+      "location": "src/utils/parallel.py:95-96",
+      "description": "futures.append(ex.submit(work_fn, item)) submits one future per file and holds all of them in a list; for millions of tiny text files this is heavy scheduling + IPC overhead and a giant futures list in the parent. Use executor.map with a chunksize, or submit batches, so per-task IPC is amortized.",
+      "expected_gain": "Reduces scheduler/IPC overhead at high file counts; modest but real",
+      "risk": "low",
+      "low_resource_note": "Helps the low-CPU node where Python scheduling overhead is relatively larger."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "run_per_gpu_pool returns a 3-tuple on empty items but a 2-tuple otherwise",
+      "location": "src/utils/parallel.py:71 vs 114",
+      "description": "Early-return on empty items is `return 0, [], []` (3 values) while the normal return is `return error_count, error_details` (2 values) and the docstring/signature say 2. All three text stages unpack exactly two: `error_count, error_details = run_per_gpu_pool(...)` (punctuation.py:74, accents.py:70, phonemizer.py:56). If items is non-empty but all shards happen to route... actually the empty branch fires whenever `items` is falsy. Since the stages already early-return on `not pending_files`, this path is rarely hit, but any caller that passes an empty list gets `ValueError: too many values to unpack`.",
+      "severity": "low"
+    },
+    {
+      "title": "error_details records the wrong/last `item` (closure-over-loop-var)",
+      "location": "src/utils/parallel.py:106",
+      "description": "In the as_completed loop, on failure it does `error_details.append({\"item\": str(item), ...})`, but `item` is the loop variable from the earlier submission loop (parallel.py:95) and is NOT bound to the failing future. After submission `item` holds the LAST submitted item, so every error_detail blames the same (last) file. The failing path is unknowable. Should map future->item (e.g. dict {fut: item}).",
+      "severity": "medium"
+    },
+    {
+      "title": "process_token returns None for unrecognized labels, crashing the join",
+      "location": "src/utils/utils.py:47-113 used at src/punctuation/punctuation.py:48-50",
+      "description": "process_token is a chain of `if` with no final else/return, so any label not in the hardcoded set returns None. punctuation.py then does `\" \".join(process_token(...) for ...)` which raises `TypeError: sequence item N: expected str instance, NoneType found`, failing the whole file. If RUPunct ever emits a label/casing variant not enumerated (or aggregation produces an unexpected group), the file errors out and is lost. Should default to returning the bare token.",
+      "severity": "medium"
+    },
+    {
+      "title": "make_punct_txt has no try/except — one bad file is opaque and aborts its future",
+      "location": "src/punctuation/punctuation.py:37-51",
+      "description": "Unlike process_file in accents.py:34-46 (wrapped in try/except) and despite phonemizer.py:26-34 also lacking one, make_punct_txt has no error handling. Any exception (e.g. the None-join above, OOM on a long doc, tokenizer error) propagates to fut.result() and is counted as a generic error with the wrong filename (see bug above). No partial output, no per-file diagnostics. Inconsistent with the sibling stages.",
+      "severity": "low"
+    },
+    {
+      "title": "phonemizer process_text does not guard empty/whitespace text",
+      "location": "src/phonemizer/phonemizer.py:32-34",
+      "description": "Unlike accents.py:41 which checks `if not text or not text.strip(): return`, phonemizer reads text and immediately calls g2p_model(text) with no emptiness guard. read_file_content returns '' for a missing/empty file (utils.py:33-34), so an empty *_rover.txt feeds '' into the G2P model and then writes an empty *_phonemes.txt, marking the file 'done' with garbage/empty output. Also no try/except, so a decode error (e.g. tryiparu.py:113 'Input sequence too long' for a >62-char token) aborts the future.",
+      "severity": "medium"
+    },
+    {
+      "title": "phonemizer can raise on long tokens (no length guard)",
+      "location": "tryiparu.py:112-116 via src/phonemizer/phonemizer.py:33",
+      "description": "greedy_decode raises ValueError when an alphabetic token tokenizes to more than max_length-2 (=62) subword ids ('Input sequence too long'). Long concatenated/garbage tokens in ASR output (URLs, runs of letters) will throw and, with no try/except in process_text, kill that file's future. The stage should pre-filter or catch per-word.",
+      "severity": "low"
+    },
+    {
+      "title": "Accents skip-existing check is not atomic with write (duplicate work on crash)",
+      "location": "src/accents/accents.py:36-44 (and same pattern in punctuation/phonemizer)",
+      "description": "accent_path.exists() check then write_text is not atomic; a worker killed mid-write leaves a truncated *_accent.txt that subsequent runs treat as complete (exists() is True) and skip — silently shipping a partial transcript. The transcription stage uses retry_empty/atomic patterns (sidecars.py:34-50) but these text stages write directly. Use tmp+rename. Minor for short text files but real under SIGKILL.",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "No stage-local timing exists in the three files. Reusable hooks: (1) tqdm progress bar in run_per_gpu_pool (parallel.py:98-107) already gives per-item throughput/ETA per stage — wrap with a start/end logger or read tqdm rate for files/sec. (2) write_stage_status (called at punctuation.py:82, accents.py:78, phonemizer.py:64) records processed/skipped/errors/error_details to ./logs — a coarse per-stage success counter; extend it with elapsed wall time for benchmarking. (3) loguru setup_logging (logging_setup.py) with enqueue=True writes structured logs per stage and logs 'launching N workers on GPU X for M items' (parallel.py:85) plus 'Found N files' (each main) — gives item counts for normalizing throughput. (4) tryiparu builds a per-process self.data_dict cache (tryiparu.py:72-78); instrumenting hit/miss ratio there would directly quantify phonemizer GPU-decode load. (5) ruaccent _process_sentence_cached uses lru_cache(4096) (ruaccent.py:246) whose .cache_info() can be logged to measure sentence-cache effectiveness. For GPU-side timing you must add torch.cuda.synchronize/Event around model() calls — none present today."
+}

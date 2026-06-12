@@ -21,7 +21,6 @@ from src.utils.audit import record_stage_summary, safe_audio_duration
 from src.utils.csv_manager import (
     PartialCsvWriter,
     absorb_partial_csvs,
-    audit_from_filter_partials,
     discover_audio_paths,
     ensure_main_csv,
     load_main_csv,
@@ -97,6 +96,9 @@ def print_histogram(df: pd.DataFrame, bins: int = 10) -> None:
     else:
         logger.warning("'total_duration' column not found in CSV — hour estimates will be 0")
         durations = pd.Series(0, index=df.index)
+    # Align durations to the scored rows so a NaN-MOS row can't misalign the
+    # boolean mask (``vals`` has the post-dropna index).
+    durations = durations.reindex(vals.index).fillna(0)
 
     print(f"\n  Histogram ({bins} bins, width={bin_width:.4f}):")
     print(f"  {'Range':>20}  {'Files':>10}  {'Hours':>10}")
@@ -164,23 +166,51 @@ def determine_threshold(
             return None
 
 
+def deletion_candidates(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Rows whose DistillMOS is present and strictly below ``threshold``.
+
+    These are the only files the deletion phase needs to touch. Mirrors the
+    candidate-only sharding used by :mod:`src.separation.antispoofing_filter`.
+    """
+    if COLUMN not in df.columns:
+        return df.iloc[0:0].copy()
+    mos = pd.to_numeric(df[COLUMN], errors="coerce")
+    return df[mos.notna() & (mos < float(threshold))].copy()
+
+
+def preview_counts(df: pd.DataFrame, threshold: float) -> tuple[int, float, int, float]:
+    """Delete/save counts and hours at ``threshold`` from the dataframe alone.
+
+    Returns ``(delete_count, delete_hours, save_count, save_hours)`` computed
+    purely from ``DistillMOS`` and the authoritative ``total_duration`` column.
+    These are the canonical audit numbers recorded in ``filter_summary.csv`` —
+    the deletion workers no longer need to touch kept files to reproduce them.
+    """
+    scored = df[df[COLUMN].notna()]
+    if "total_duration" in df.columns:
+        durations = pd.to_numeric(df["total_duration"], errors="coerce").fillna(0.0)
+    else:
+        logger.warning("'total_duration' column not found in CSV — hour estimates will be 0")
+        durations = pd.Series(0.0, index=df.index)
+
+    # Index-aligned masks over the full dataframe index (robust to NaN-MOS rows).
+    delete_mask = pd.to_numeric(scored[COLUMN], errors="coerce") < float(threshold)
+    delete_idx = scored.index[delete_mask]
+    save_idx = scored.index[~delete_mask]
+
+    delete_count = int(len(delete_idx))
+    save_count = int(len(save_idx))
+    delete_hours = float(durations.loc[delete_idx].sum() / 3600.0)
+    save_hours = float(durations.loc[save_idx].sum() / 3600.0)
+    return delete_count, delete_hours, save_count, save_hours
+
+
 def print_preview(df: pd.DataFrame, threshold: float) -> tuple[int, float, int, float]:
     """Show how many files/hours would be deleted/saved at the given threshold.
 
-    Returns (delete_count, delete_hours, save_count, save_hours).
+    Returns the same tuple as :func:`preview_counts`.
     """
-    vals = df[COLUMN].dropna()
-    if "total_duration" in df.columns:
-        durations = df["total_duration"].fillna(0)
-    else:
-        logger.warning("'total_duration' column not found in CSV — hour estimates will be 0")
-        durations = pd.Series(0, index=df.index)
-
-    mask = vals < threshold
-    delete_count = int(mask.sum())
-    save_count = len(vals) - delete_count
-    delete_hours = float(durations[mask].sum() / 3600.0)
-    save_hours = float(durations[~mask].sum() / 3600.0)
+    delete_count, delete_hours, save_count, save_hours = preview_counts(df, threshold)
 
     print("\n" + "-" * 60)
     print(f"  Threshold: {threshold:.4f}")
@@ -193,14 +223,25 @@ def print_preview(df: pd.DataFrame, threshold: float) -> tuple[int, float, int, 
 
 def run_worker(
     rank: int,
-    my_paths: List[str],
+    my_items: List[tuple],
     threshold: float,
     podcasts_path_str: str,
     processed_counter,
     deleted_counter,
     errors_counter,
 ) -> None:
-    """Worker process: delete files with DistillMOS < threshold, write partial CSV."""
+    """Worker process: delete deletion-candidate files, write a partial CSV.
+
+    ``my_items`` is a list of ``(path, mos, duration_s)`` tuples prepared by
+    the parent from ONE read of balalaika.csv (workers loading the whole
+    multi-GB CSV each would multiply startup time and RAM by the worker
+    count) and already contains only deletion candidates (``DistillMOS`` <
+    threshold), so the worker only touches files it might delete. A file's
+    duration is probed (one HDD seek) only when the CSV had no
+    ``total_duration`` for it — rare, and limited to actual candidates. The
+    per-candidate partial row is what lets a stopped run resume and is the
+    authoritative record of which files were really removed.
+    """
     podcasts_path = Path(podcasts_path_str)
     threshold_f = float(threshold)
 
@@ -214,47 +255,41 @@ def run_worker(
                     f"Worker {rank}: {len(already_done)} files already in partial; skipping."
                 )
 
-            df = load_main_csv(podcasts_path)
-            df_indexed = df.set_index("filepath") if "filepath" in df.columns else None
-
-            for path_str in my_paths:
+            for path_str, mos_val, duration_s in my_items:
                 resolved = resolve_path(path_str)
 
                 if resolved in already_done:
                     continue
 
-                mos_val = None
-                duration_s = 0.0
-
-                if df_indexed is not None and resolved in df_indexed.index:
-                    row = df_indexed.loc[resolved]
-                    if isinstance(row, pd.DataFrame):
-                        row = row.iloc[0]
-                    mos_val = row.get(COLUMN)
-                    if pd.notna(mos_val):
-                        mos_val = float(mos_val)
-                    dur = row.get("total_duration")
-                    if pd.notna(dur):
-                        duration_s = float(dur)
-
                 if mos_val is None or pd.isna(mos_val):
                     continue
+                mos_val = float(mos_val)
 
-                deleted = False
-                if mos_val < threshold_f:
-                    try:
-                        os.remove(path_str)
-                        deleted = True
-                        deleted_counter.value += 1
-                    except OSError as exc:
-                        logger.warning(f"Could not delete {path_str}: {exc}")
-                        errors_counter.value += 1
+                # Only candidates reach a worker, but keep the guard so a stale
+                # shard can never delete a now-above-threshold file.
+                if not (mos_val < threshold_f):
+                    continue
 
+                # Probe BEFORE deletion so a candidate that lacked a stored
+                # duration still records one (only the rare missing-duration
+                # candidate pays the extra seek).
                 if duration_s <= 0:
                     try:
                         duration_s = safe_audio_duration(path_str)
                     except Exception:
                         duration_s = 0.0
+
+                deleted = False
+                try:
+                    os.remove(path_str)
+                    deleted = True
+                    deleted_counter.value += 1
+                except FileNotFoundError:
+                    deleted = True
+                    deleted_counter.value += 1
+                except OSError as exc:
+                    logger.warning(f"Could not delete {path_str}: {exc}")
+                    errors_counter.value += 1
 
                 writer.write({
                     "filepath": resolved,
@@ -263,6 +298,7 @@ def run_worker(
                     "duration_s": round(duration_s, 4),
                     "deleted": deleted,
                 })
+                already_done.add(resolved)
                 processed_counter.value += 1
 
         logger.info(f"Worker {rank} done.")
@@ -279,26 +315,56 @@ def run_deletion_workers(
 ) -> tuple:
     """Spawn workers to delete files below threshold in parallel.
 
+    Only deletion candidates (``DistillMOS`` < threshold) are sharded to
+    workers, so the kept ≥95% of scored files are never touched (no
+    ``resolve_path`` lstat chain, no duration probe, no partial-row write).
+    Kept files are accounted for by the caller straight from the dataframe.
+
     Returns (processed, deleted, errors) counts.
     """
     from multiprocessing import Process, Value
 
-    audio_paths = discover_audio_paths(podcasts_path, config_path=config_path)
-    if not audio_paths:
-        logger.warning("No audio files found.")
+    df = load_main_csv(podcasts_path)
+    candidates = deletion_candidates(df, threshold)
+    if candidates.empty or "filepath" not in candidates.columns:
+        logger.info("No deletion candidates below threshold.")
         return 0, 0, 0
 
-    # Split paths into shards
+    # ONE main-CSV read in the parent; workers receive (path, mos, duration)
+    # tuples for their candidate shard instead of each re-reading the whole
+    # CSV (×N-workers RAM and startup at production scale).
+    if "total_duration" in candidates.columns:
+        durs = pd.to_numeric(candidates["total_duration"], errors="coerce").fillna(0.0)
+    else:
+        durs = pd.Series(0.0, index=candidates.index)
+    mos_vals = pd.to_numeric(candidates[COLUMN], errors="coerce")
+    items = list(
+        zip(
+            candidates["filepath"].astype(str),
+            mos_vals.astype(float),
+            durs.astype(float),
+        )
+    )
+    candidate_count = len(items)
+    scored_count = int(pd.to_numeric(df[COLUMN], errors="coerce").notna().sum())
+    del df, candidates, mos_vals, durs
+
+    # Split items into shards
     shards = []
     for i in range(num_workers):
-        shard = audio_paths[i::num_workers]
+        shard = items[i::num_workers]
         if shard:
             shards.append(shard)
 
     if not shards:
+        logger.info("No scored files to filter.")
         return 0, 0, 0
 
-    logger.info(f"Deletion phase: {len(audio_paths)} files, {num_workers} workers, threshold={threshold}")
+    logger.info(
+        f"Deletion phase: {candidate_count} candidates "
+        f"(of {scored_count} scored), "
+        f"{num_workers} workers, threshold={threshold}"
+    )
 
     processed = Value("i", 0)
     deleted = Value("i", 0)
@@ -417,11 +483,23 @@ def main(args):
             f"Absorbed {absorbed} rows from leftover {PARTIAL_PREFIX}_part_*.csv"
         )
 
+    # Audit baseline is the post-prune dataframe (missing-on-disk rows have just
+    # been dropped). files_in / hours_in come straight from this frame's scored
+    # rows and its authoritative total_duration column — no need to touch the
+    # kept files on the HDD. This reproduces the print_preview numbers exactly.
+    baseline = load_main_csv(podcasts_path)
+    base_delete_count, base_delete_hours, base_save_count, base_save_hours = preview_counts(
+        baseline, threshold
+    )
+    files_in = base_delete_count + base_save_count
+    hours_in = base_delete_hours + base_save_hours
+
     processed, deleted, errors = run_deletion_workers(
         podcasts_path, threshold, num_workers, args.config_path
     )
 
-    # Merge partials + audit
+    # Merge partials back (keeps the resume contract and any duration probed for
+    # a candidate that lacked one). The audit no longer depends on these rows.
     new_partials_df, _ = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
@@ -431,20 +509,39 @@ def main(args):
     )
 
     combined = pd.concat(
-        [df for df in (leftover_partials, new_partials_df) if df is not None and not df.empty],
+        [d for d in (leftover_partials, new_partials_df) if d is not None and not d.empty],
         ignore_index=True,
     ) if (leftover_partials is not None or new_partials_df is not None) else pd.DataFrame()
 
-    audit = audit_from_filter_partials(combined)
+    # files_deleted / hours_deleted reflect the files actually removed (from the
+    # candidate partials), exactly as the old all-rows audit did. In the normal
+    # case every candidate is removed and this equals the preview delete counts.
+    deleted_paths = set()
+    if not combined.empty and "deleted" in combined.columns:
+        deleted_mask = combined["deleted"].astype(str).str.lower().isin(
+            {"true", "1", "yes"}
+        )
+        deleted_paths = set(
+            combined.loc[deleted_mask, "filepath"].astype(str).tolist()
+        )
+
+    base_durations = (
+        pd.to_numeric(baseline["total_duration"], errors="coerce").fillna(0.0)
+        if "total_duration" in baseline.columns
+        else pd.Series(0.0, index=baseline.index)
+    )
+    base_deleted_mask = baseline["filepath"].astype(str).isin(deleted_paths)
+    files_deleted = int(base_deleted_mask.sum())
+    hours_deleted = float(base_durations[base_deleted_mask].sum() / 3600.0)
 
     record_stage_summary(
         podcasts_path=podcasts_path,
         stage="distillmos_filter",
-        files_in=audit["files_in"],
-        files_out=audit["files_out"],
-        hours_in=audit["hours_in"],
-        hours_out=audit["hours_out"],
-        params={"threshold": threshold, "deleted": audit["files_deleted"]},
+        files_in=files_in,
+        files_out=files_in - files_deleted,
+        hours_in=hours_in,
+        hours_out=hours_in - hours_deleted,
+        params={"threshold": threshold, "deleted": files_deleted},
     )
 
     write_stage_status(
