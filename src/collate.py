@@ -6,7 +6,11 @@ from typing import Dict, Iterable, Optional
 import concurrent.futures
 from loguru import logger
 
-from src.utils.csv_manager import discover_audio_paths, fast_read_csv
+from src.utils.csv_manager import (
+    discover_audio_paths,
+    read_state_dataframe,
+    state_path,
+)
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import write_stage_status
 from src.utils.utils import load_config, read_file_content
@@ -68,6 +72,32 @@ def drop_csv_text_columns(df: pd.DataFrame, extra_columns: Optional[set[str]] = 
     if drop_cols:
         logger.info(f"Dropping text columns from CSV metadata: {drop_cols}")
     return df.drop(columns=drop_cols)
+
+
+def read_state_for_collate(
+    base_path: Path | str,
+    sidecar_columns: set[str],
+    config_path: str | None,
+) -> pd.DataFrame:
+    """Load the pipeline-state frame collate folds sidecars into.
+
+    Reads the active state (``balalaika.parquet`` in parquet mode, else
+    ``balalaika.csv``) so direct upserters — e.g. stage-7's duration cache —
+    that write only the parquet state are reflected even though the CSV export
+    may be stale. Falls back to bootstrapping from the audio tree when no state
+    file exists yet. Drops duplicate filepaths and the text/sidecar columns
+    (those are re-sourced from the sidecar files).
+    """
+    if state_path(base_path).exists():
+        logger.info(f"Loading existing dataframe from {state_path(base_path)}")
+        df = read_state_dataframe(base_path)
+        df.drop_duplicates(subset="filepath", inplace=True)
+        df = drop_csv_text_columns(df, extra_columns=sidecar_columns)
+    else:
+        logger.info("No existing dataframe found. Creating new one from audio paths.")
+        audio_paths = discover_audio_paths(base_path, config_path=config_path)
+        df = pd.DataFrame({"filepath": audio_paths})
+    return df.reset_index(drop=True)
 
 
 def sidecar_specs(model_names: Iterable[str]) -> Dict[str, str]:
@@ -320,18 +350,7 @@ def main(args):
         f"({len(model_names)} ASR model(s), {len(configured_timestamp_models)} timestamp-capable)."
     )
 
-    df_path = Path(base_path) / "balalaika.csv"
-    if df_path.exists():
-        logger.info(f"Loading existing dataframe from {df_path}")
-        df = fast_read_csv(df_path)
-        df.drop_duplicates(subset='filepath', inplace=True)
-        df = drop_csv_text_columns(df, extra_columns=sidecar_columns)
-    else:
-        logger.info(f"No existing dataframe found. Creating new one from audio paths.")
-        audio_paths = discover_audio_paths(base_path, config_path=args.config_path)
-        df = pd.DataFrame({'filepath': audio_paths})
-
-    df = df.reset_index(drop=True)
+    df = read_state_for_collate(base_path, sidecar_columns, args.config_path)
     n_rows = len(df)
     logger.info(f"Starting chunked processing of {n_rows} rows with {num_workers} workers")
 

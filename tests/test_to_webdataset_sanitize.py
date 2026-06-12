@@ -97,3 +97,34 @@ def test_from_fast_read_csv(tmp_path):
     )
     df = fast_read_csv(p).drop(columns=["filepath"])
     _assert_records_match(df)
+
+
+def test_nullable_int64_with_na():
+    """Nullable Int64 + pd.NA: null cells -> None, present cells -> int, no crash.
+
+    Parquet read-back yields pandas' nullable ``Int64`` (not numpy int64) for
+    integer columns that contain missing values. The int branch must honour the
+    null mask exactly like the float branch instead of calling ``int(pd.NA)``.
+    """
+    df = pd.DataFrame(
+        {
+            "podcast_id": pd.array([10, pd.NA, 30], dtype="Int64"),
+        }
+    )
+    records = _sanitize_records(df)
+    assert [r["podcast_id"] for r in records] == [10, None, 30]
+
+
+def test_nullable_boolean_with_na():
+    """Nullable boolean + pd.NA: null cells -> None, present cells -> bool, no crash.
+
+    Parquet read-back yields pandas' nullable ``boolean`` dtype; ``bool(pd.NA)``
+    raises ``TypeError`` (ambiguous), so the bool branch must honour the mask.
+    """
+    df = pd.DataFrame(
+        {
+            "is_single_speaker": pd.array([True, pd.NA, False], dtype="boolean"),
+        }
+    )
+    records = _sanitize_records(df)
+    assert [r["is_single_speaker"] for r in records] == [True, None, False]
