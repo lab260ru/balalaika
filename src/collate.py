@@ -201,8 +201,14 @@ def process_audio_file(
             try:
                 names = {entry.name for entry in os.scandir(target_dir)}
             except OSError:
-                names = set()
-            _dir_names[target_dir] = names
+                # Transient failure (EMFILE, concurrent rename, ...): never
+                # cache the error. Fall through to the direct per-file read
+                # path for THIS call (names=None) so the file is read loudly
+                # instead of every later file in this dir silently reading ''.
+                # The next call for the same dir retries scandir.
+                names = None
+            else:
+                _dir_names[target_dir] = names
 
     results: Dict[str, Optional[str]] = {'filepath': audio_path_str}
     for key, suffix in file_types.items():
@@ -366,13 +372,40 @@ def main(args):
                     if writer is None:
                         # Lock the schema from the first slab; every metadata
                         # column comes from one CSV read so dtypes are stable,
-                        # and sidecar columns are always strings.
+                        # and sidecar columns are always strings. A metadata
+                        # column that is all-NaN across the whole first slab is
+                        # inferred as pyarrow ``null`` -- promote those fields to
+                        # ``string`` so a later slab carrying strings in that
+                        # column casts cleanly (null->string) instead of raising
+                        # 'Unsupported cast from string to null' and silently
+                        # truncating the parquet to slab 0.
+                        promoted = pa.schema(
+                            [
+                                pa.field(f.name, pa.string()) if pa.types.is_null(f.type) else f
+                                for f in table.schema
+                            ]
+                        )
+                        if not promoted.equals(table.schema):
+                            table = table.cast(promoted)
                         schema = table.schema
                         writer = pq.ParquetWriter(
                             output_path, schema, compression=parquet_compression
                         )
                     else:
-                        table = table.cast(schema)
+                        try:
+                            table = table.cast(schema)
+                        except (pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError) as exc:
+                            locked = {f.name: f.type for f in schema}
+                            mismatched = [
+                                f.name
+                                for f in table.schema
+                                if f.name not in locked or not f.type.equals(locked[f.name])
+                            ]
+                            raise RuntimeError(
+                                f"collate slab at rows [{start}:{start + slab_rows}] "
+                                f"could not be cast to the locked parquet schema; "
+                                f"column(s) {mismatched} disagree with slab 0"
+                            ) from exc
                     writer.write_table(table)
                     bar.update(len(metadata_slab))
     finally:
