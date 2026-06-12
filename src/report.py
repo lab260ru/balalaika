@@ -87,35 +87,81 @@ def _read_parquet_missing_summary(path: Path) -> Tuple[List[Dict[str, str]], int
     schema = parquet_file.schema_arrow
     missing_counts = {name: 0 for name in schema.names}
     dtypes = {field.name: str(field.type) for field in schema}
-    total_rows = 0
+    total_rows = parquet_file.metadata.num_rows
 
-    for batch in parquet_file.iter_batches(batch_size=MISSING_VALUE_BATCH_SIZE):
-        total_rows += batch.num_rows
-        for idx, column in enumerate(batch.schema.names):
-            array = batch.column(idx)
-            missing = int(array.null_count)
-            field_type = batch.schema.field(idx).type
-            if pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
-                empty_mask = pc.equal(array, "")
-                empty_count = pc.sum(pc.fill_null(empty_mask, False)).as_py()
-                missing += int(empty_count or 0)
-            missing_counts[column] += missing
+    def _is_string(field_type) -> bool:
+        return pa.types.is_string(field_type) or pa.types.is_large_string(field_type)
+
+    string_columns = [f.name for f in schema if _is_string(f.type)]
+    nonstring_columns = [f.name for f in schema if not _is_string(f.type)]
+
+    # Non-string columns: their only "missing" notion is nulls, already in the
+    # per-row-group statistics — pull from metadata instead of decoding the data.
+    # Fall back to a decode for any column whose stats lack null_count.
+    md = parquet_file.metadata
+    schema_index = {name: i for i, name in enumerate(schema.names)}
+    needs_decode_for_nulls: set[str] = set()
+    for column in nonstring_columns:
+        col_idx = schema_index[column]
+        total_null = 0
+        ok = True
+        for rg in range(md.num_row_groups):
+            stats = md.row_group(rg).column(col_idx).statistics
+            if stats is None or not stats.has_null_count:
+                ok = False
+                break
+            total_null += stats.null_count
+        if ok:
+            missing_counts[column] = total_null
+        else:
+            needs_decode_for_nulls.add(column)
+
+    # String columns must be scanned (empty-string count is not in statistics);
+    # also decode any non-string column whose null_count stat was missing.
+    decode_columns = list(string_columns) + sorted(needs_decode_for_nulls)
+    if decode_columns:
+        for batch in parquet_file.iter_batches(
+            batch_size=MISSING_VALUE_BATCH_SIZE, columns=decode_columns
+        ):
+            for idx, column in enumerate(batch.schema.names):
+                array = batch.column(idx)
+                missing = int(array.null_count)
+                if _is_string(batch.schema.field(idx).type):
+                    empty_mask = pc.equal(array, "")
+                    empty_count = pc.sum(pc.fill_null(empty_mask, False)).as_py()
+                    missing += int(empty_count or 0)
+                missing_counts[column] += missing
 
     return _missing_rows(missing_counts, total_rows, dtypes), total_rows
 
 
 def _read_csv_missing_summary(path: Path) -> Tuple[List[Dict[str, str]], int]:
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        columns = reader.fieldnames or []
-        missing_counts = {column: 0 for column in columns}
-        total_rows = 0
-        for row in reader:
-            total_rows += 1
-            for column in columns:
-                value = row.get(column)
-                if value is None or str(value).strip() == "":
-                    missing_counts[column] += 1
+    import pandas as pd
+
+    # Read every cell as a string with NA detection OFF so the count matches the
+    # old csv.DictReader logic exactly: a cell is "missing" iff it is empty or
+    # whitespace-only (literal "NA"/"NaN"/"null" are NOT missing), and a short
+    # row's absent trailing cells read back as "" (== the DictReader None case).
+    # Chunked so peak RAM stays bounded on multi-million-row CSVs.
+    columns: List[str] = []
+    missing_counts: Dict[str, int] = {}
+    total_rows = 0
+    reader = pd.read_csv(
+        path,
+        dtype=str,
+        keep_default_na=False,
+        na_filter=False,
+        chunksize=MISSING_VALUE_BATCH_SIZE,
+    )
+    for chunk in reader:
+        if not columns:
+            columns = list(chunk.columns)
+            missing_counts = {column: 0 for column in columns}
+        total_rows += len(chunk)
+        # Vectorised: empty or whitespace-only counts as missing (per column).
+        for column in columns:
+            missing_counts[column] += int(chunk[column].str.strip().eq("").sum())
+
     return _missing_rows(missing_counts, total_rows), total_rows
 
 

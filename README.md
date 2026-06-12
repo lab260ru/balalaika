@@ -113,6 +113,22 @@ on-disk work-shard sizing. Heavy stages write work queues under
 `<podcasts_path>/.balalaika_work/<stage>/` so multiprocessing workers claim
 small shard files instead of receiving millions of paths through pickle.
 
+### Per-node batch-size autotuning
+
+Run once on every new machine:
+
+```bash
+python -m benchmarking.warmup --config_path configs/config.yaml
+```
+
+This probes each tunable model with growing batch sizes (respecting free
+VRAM, safe even while other jobs share the GPU) and writes
+`cache/node_profile.json`. Any model `batch_size` in the config can then be
+set to `auto` to use the profiled optimum; plain integers keep working as
+before. Transcription resolves per-model optima (`transcription.<model>`),
+which matters: on one test node `tone` was 29x faster at batch 64 while
+`giga_rnnt` was fastest at batch 1. See `report.md` for measurements.
+
 ---
 
 ## Audio Quality

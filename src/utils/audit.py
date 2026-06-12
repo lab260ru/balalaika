@@ -86,31 +86,56 @@ def record_stage_summary(
     return path
 
 
+# Containers whose frame counts libsndfile reads exactly from the header —
+# for these soundfile.info (~90 us) replaces torchaudio.info (~2.4 ms, spins
+# up an ffmpeg StreamReader per call). mp3 and other estimated-length
+# containers keep the torchaudio-first order (VBR mp3 frame counts from
+# libsndfile can disagree with ffmpeg's).
+_SOUNDFILE_EXACT_SUFFIXES = {".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif"}
+
+
+def _soundfile_duration(p: str) -> float:
+    import soundfile as sf
+
+    with sf.SoundFile(p) as f:
+        if f.samplerate > 0:
+            return float(f.frames) / float(f.samplerate)
+    return 0.0
+
+
+def _torchaudio_duration(p: str) -> float:
+    import torchaudio
+
+    info = torchaudio.info(p)
+    sr = int(getattr(info, "sample_rate", 0) or 0)
+    n = int(getattr(info, "num_frames", 0) or 0)
+    if sr > 0 and n > 0:
+        return n / float(sr)
+    return 0.0
+
+
 def safe_audio_duration(path: os.PathLike | str) -> float:
     """Best-effort fast probe of an audio file duration in seconds.
 
-    Tries ``torchaudio.info`` first (no full decode), then ``soundfile``.
+    soundfile reads the header directly (~90 us); torchaudio.info goes
+    through an ffmpeg StreamReader (~2.4 ms) but understands every
+    container. Probe order depends on the extension; both are tried.
     Returns 0.0 if both probes fail (e.g. corrupted file).
     """
     p = str(path)
-    try:
-        import torchaudio
-
-        info = torchaudio.info(p)
-        sr = int(getattr(info, "sample_rate", 0) or 0)
-        n = int(getattr(info, "num_frames", 0) or 0)
-        if sr > 0 and n > 0:
-            return n / float(sr)
-    except Exception:
-        pass
-    try:
-        import soundfile as sf
-
-        with sf.SoundFile(p) as f:
-            if f.samplerate > 0:
-                return float(f.frames) / float(f.samplerate)
-    except Exception:
-        pass
+    sf_first = os.path.splitext(p)[1].lower() in _SOUNDFILE_EXACT_SUFFIXES
+    probes = (
+        (_soundfile_duration, _torchaudio_duration)
+        if sf_first
+        else (_torchaudio_duration, _soundfile_duration)
+    )
+    for probe in probes:
+        try:
+            duration = probe(p)
+            if duration > 0:
+                return duration
+        except Exception:
+            pass
     return 0.0
 
 

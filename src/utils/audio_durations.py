@@ -16,7 +16,16 @@ from loguru import logger
 from tqdm import tqdm
 
 from src.utils.audit import safe_audio_duration
-from src.utils.csv_manager import csv_path, normalize_path_string, upsert_columns
+from src.utils.csv_manager import (
+    _normalize_path_series,
+    _read_state_narrow,
+    _state_header,
+    csv_path,
+    normalize_path_string,
+    state_path,
+    upsert_columns,
+)
+from src.utils.io_profile import effective_workers, resolve_io_profile
 
 TOTAL_DURATION_COLUMN = "total_duration"
 DEFAULT_DURATION_PROBE_WORKERS = 4
@@ -50,16 +59,31 @@ def _normalise_requested_paths(paths: Iterable[str | Path]) -> list[tuple[str, s
 
 
 def _csv_duration_cache(podcasts_path: str | Path, requested_norms: set[str]) -> dict[str, float]:
-    target = csv_path(podcasts_path)
+    # Prefer the active state file (parquet projection is cheap); fall back to
+    # the CSV export when the state file doesn't exist yet.
+    target = state_path(podcasts_path)
+    if not target.exists():
+        target = csv_path(podcasts_path)
     if not target.exists() or not requested_norms:
         return {}
 
+    # Sniff the header first (one line for CSV, schema for parquet) so we can
+    # skip the body read entirely when the duration column does not exist yet,
+    # and so the narrow read uses the multithreaded pyarrow engine / parquet
+    # projection. The previous callable-`usecols` form forced the single-
+    # threaded C engine and then ran a multi-million-row Python loop; the narrow
+    # read + vectorized build below produces an identical
+    # {normalized filepath -> positive duration} dict.
+    header = _state_header(target)
+    if header is None:
+        return {}
+
+    if "filepath" not in header or TOTAL_DURATION_COLUMN not in header:
+        logger.info(f"{target.name} has no {TOTAL_DURATION_COLUMN} column yet.")
+        return {}
+
     try:
-        df = pd.read_csv(
-            target,
-            usecols=lambda col: col in {"filepath", TOTAL_DURATION_COLUMN},
-            low_memory=False,
-        )
+        df = _read_state_narrow(target, ["filepath", TOTAL_DURATION_COLUMN])
     except Exception as exc:
         logger.warning(f"Could not read {TOTAL_DURATION_COLUMN} from {target}: {exc}")
         return {}
@@ -68,18 +92,17 @@ def _csv_duration_cache(podcasts_path: str | Path, requested_norms: set[str]) ->
         logger.info(f"{target.name} has no {TOTAL_DURATION_COLUMN} column yet.")
         return {}
 
-    durations: dict[str, float] = {}
-    for filepath, raw_duration in tqdm(
-        zip(df["filepath"], df[TOTAL_DURATION_COLUMN]),
-        total=len(df),
-        desc="load_total_duration",
-    ):
-        normalized = normalize_path_string(filepath)
-        if normalized not in requested_norms:
-            continue
-        duration = _positive_duration(raw_duration)
-        if duration is not None:
-            durations[normalized] = duration
+    # Vectorized equivalent of the old per-row loop: normalize the filepath
+    # column once, coerce durations to numeric (non-numeric -> NaN, matching
+    # _positive_duration's TypeError/ValueError branch), keep only requested,
+    # positive (>0) values. dict() over the masked, last-wins ordering matches
+    # the loop's "later row overwrites earlier" semantics.
+    paths = _normalize_path_series(df["filepath"])
+    durations_num = pd.to_numeric(df[TOTAL_DURATION_COLUMN], errors="coerce")
+    mask = durations_num.gt(0) & paths.isin(requested_norms)
+    durations: dict[str, float] = dict(
+        zip(paths[mask].tolist(), durations_num[mask].astype(float).tolist())
+    )
 
     logger.info(
         f"Loaded {len(durations)} cached {TOTAL_DURATION_COLUMN} values "
@@ -141,6 +164,14 @@ def ensure_audio_durations(
         for _, normalized in requested
         if _positive_duration(durations_by_norm.get(normalized)) is None
     ]
+    # Header probes in path order sweep the disk directory-by-directory
+    # instead of seeking in CSV-row order; values are keyed by path, so the
+    # result is order-independent. HDD datasets also cap probe fan-out: more
+    # concurrent random readers on one spindle only multiply seeks.
+    missing.sort()
+    num_workers = effective_workers(
+        num_workers, resolve_io_profile(str(podcasts_path)), role="probe"
+    )
 
     probed = _probe_missing_durations(missing, num_workers=num_workers)
     positive_probed = {

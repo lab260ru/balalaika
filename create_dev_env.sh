@@ -19,11 +19,16 @@ create_venv_env() {
         fi
         
         uv pip install -r "$requirements_file"
-        
-        echo "Installing ONNX Runtime GPU (CUDA 13 nightly)..."
+
+        # ONNX Runtime GPU: stable CUDA-12 build. The CUDA-13 nightly feed
+        # needs a CUDA 13 driver (>= 580); nodes on CUDA 12.x drivers cannot
+        # load it at all. TensorRT must stay on the 10.x line: onnxruntime-gpu
+        # links libnvinfer.so.10, while a plain `pip install tensorrt-cu12`
+        # now resolves to TensorRT 11 (libnvinfer.so.11) and the TRT provider
+        # silently falls back to CPU.
+        echo "Installing ONNX Runtime GPU (CUDA 12 stable) + TensorRT 10..."
         uv pip install coloredlogs flatbuffers numpy packaging protobuf sympy
-        uv pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
-        uv pip install tensorrt-cu13
+        uv pip install onnxruntime-gpu "tensorrt-cu12==10.*"
         uv pip install onnx-asr[gpu,hub]
         
         deactivate

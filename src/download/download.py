@@ -56,7 +56,13 @@ def download_episode(client, part, info_podcast, folder_podcast):
         )
         return
 
-    with open(track_file, 'wb') as f:
+    # Write to a temp file in the SAME directory, tag it there, then atomically
+    # rename into place. This halves HDD write bytes (music_tag no longer reads
+    # back and rewrites the final file) and gives crash safety: a crash leaves a
+    # stray <id>.mp3.part, never a half-written/untagged file at the final path.
+    tmp_file = track_file.with_name(track_file.name + '.part')
+
+    with open(tmp_file, 'wb') as f:
         response = requests.get(part_download_link)
         f.write(response.content)
 
@@ -65,7 +71,7 @@ def download_episode(client, part, info_podcast, folder_podcast):
         f"podcast '{info_podcast['title']}'."
     )
 
-    mp3 = music_tag.load_file(track_file)
+    mp3 = music_tag.load_file(tmp_file)
     mp3['tracktitle'] = part['title']
     mp3['discnumber'] = part['albums'][0]['track_position']['volume']
     mp3['tracknumber'] = part['albums'][0]['track_position']['index']
@@ -74,6 +80,8 @@ def download_episode(client, part, info_podcast, folder_podcast):
     mp3['album_artist'] = info_podcast['title']
     mp3['comment'] = part['short_description']
     mp3.save()
+
+    os.replace(tmp_file, track_file)
 
     return (
         f"Successfully downloaded episode: {part['title']} "

@@ -227,7 +227,16 @@ def resolve_source_dataset(args: argparse.Namespace, config: Dict[str, Any], tar
         if preferred:
             return Path(preferred).resolve()
 
-    for key in ("preprocess", "separation", "transcription", "punctuation", "accent", "phonemizer", "download"):
+    for key in (
+        "preprocess",
+        "separation",
+        "transcription",
+        "punctuation",
+        "accent",
+        "phonemizer",
+        "denoising",
+        "download",
+    ):
         value = ensure_dict(config, key).get("podcasts_path")
         if value:
             return Path(value).resolve()
