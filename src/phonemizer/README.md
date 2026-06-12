@@ -1,7 +1,13 @@
 ## Phonemizer (TryIParu)
 
-Grapheme → IPA from **`{stem}_rover.txt`** using **`tryiparu.G2PModel`**
-(workers call `load_dataset=True` at init).
+Grapheme → IPA from **`{stem}_rover.txt`** using **`src.phonemizer.fast_g2p.FastG2P`**
+— a drop-in, token-identical replacement for `tryiparu.G2PModel` (same weights,
+tokenizer and rules) that greedy-decodes the unique OOV words of a file as one
+padded batch (~21-37× per word), loads the 398k-word dictionary from a pickle
+cache (`cache/g2p_dict.pkl`), memoizes rule splits per unique word, and
+persists OOV decodes across runs/workers (`oov_cache_path` config knob,
+weights-fingerprint keyed). Equivalence to stock is pinned by
+`tests/test_phonemizer_fast_g2p.py` and report.md §4.9.
 
 Multi-GPU pool orchestration, sidecar discovery, and skip-already-done
 filtering come from `src/utils`; the stage script is just `init_process` +
@@ -16,7 +22,9 @@ bash src/phonemizer/phonemizer_yaml.sh configs/config.yaml
 
 ## Parameters
 
-See **`phonemizer`** in `configs/config.yaml` (`podcasts_path`, `num_workers`).
+See **`phonemizer`** in `configs/config.yaml` (`podcasts_path`, `num_workers`,
+`device` — set `cpu` to run the tiny d=128 model on CPU when GPUs are busy,
+`g2p_batch_size`, `oov_cache_path` — `""` disables the persistent OOV cache).
 
 ## Output
 

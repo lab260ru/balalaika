@@ -21,6 +21,7 @@ flake8>=6.0.0
 coloredlogs
 flatbuffers
 numpy
+onnx
 packaging
 protobuf
 sympy

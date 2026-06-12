@@ -36,6 +36,64 @@ SIL_THRESHOLD = 0.2
 MAX_INDEX = 999999
 
 
+def _silence_running_mean_py(mean_row: np.ndarray, n: int, sil_embs: np.ndarray):
+    """Verbatim sequential float32 running-mean update (Python reference).
+
+    ``mean_row`` is updated in place. Returns ``(mean_row, n_after)``. The
+    expression mirrors the original ``(mean * n + emb) / (n + 1)`` where
+    ``mean`` is a float32 array and ``n`` a Python int, so numpy keeps every
+    intermediate in float32.
+    """
+    for emb in sil_embs:
+        mean_row = (mean_row * n + emb) / (n + 1)
+        n += 1
+    return mean_row, n
+
+
+def _make_silence_running_mean():
+    """Return a bit-exact silence running-mean updater.
+
+    Prefers a numba ``njit`` kernel (the per-frame loop is sequential, so
+    numpy cannot vectorize it without changing summation order). The kernel
+    uses explicit ``float32`` casts so each scalar op matches numpy's
+    ``float32_array * python_int -> float32`` promotion exactly; this was
+    verified bit-identical against the Python reference on randomized inputs.
+    Falls back to the pure-Python loop if numba is unavailable or fails to
+    compile, so behavior is identical everywhere.
+    """
+    try:
+        import numba  # noqa: F401
+
+        @numba.njit(cache=True)
+        def _kernel(mean_row, n, sil_embs):  # pragma: no cover - jitted
+            out = mean_row.copy()
+            nn = n
+            for i in range(sil_embs.shape[0]):
+                nf = np.float32(nn)
+                np1 = np.float32(nn + 1)
+                for d in range(out.shape[0]):
+                    out[d] = (out[d] * nf + sil_embs[i, d]) / np1
+                nn += 1
+            return out, nn
+
+        def _runner(mean_row, n, sil_embs):
+            if sil_embs.shape[0] == 0:
+                return mean_row, n
+            out, nn = _kernel(
+                np.ascontiguousarray(mean_row, dtype=np.float32),
+                n,
+                np.ascontiguousarray(sil_embs, dtype=np.float32),
+            )
+            return out, int(nn)
+
+        return _runner
+    except Exception:  # numba missing or broken -> exact Python loop
+        return _silence_running_mean_py
+
+
+_silence_running_mean = _make_silence_running_mean()
+
+
 class DiarizationConfig:
     def __init__(self, onset=0.5, offset=0.5, pad_onset=0.0, pad_offset=0.0,
                  min_duration_on=0.0, min_duration_off=0.0, median_window=1):
@@ -55,6 +113,7 @@ class Sortformer:
         config: DiarizationConfig = None,
         providers: List[str] = None,
         device: str = "cpu",
+        use_io_binding: bool = False,
     ):
         if config is None:
             self.config = DiarizationConfig()
@@ -70,18 +129,26 @@ class Sortformer:
                 # (
                 #     "TensorrtExecutionProvider",
                 #     {
-                #         "trt_max_workspace_size": 6 * 1024**3, 
+                #         "trt_max_workspace_size": 6 * 1024**3,
                 #         "trt_fp16_enable": True,
                 #         "trt_engine_cache_enable": True,
-                #         "trt_engine_cache_path": "./trt_cache",  
+                #         "trt_engine_cache_path": "./trt_cache",
                 #     }
                 # ),
                 "CUDAExecutionProvider",
                 "CPUExecutionProvider"
             ]
-            
+
         self.session = ort.InferenceSession(model_path, providers=providers)
-        
+        # IOBinding keeps the streaming session's input/output tensors resident
+        # on the device across the per-chunk loop instead of round-tripping
+        # every state tensor through numpy. Same graph + same execution provider
+        # => identical numerics (proven against the numpy path on a synthetic
+        # ONNX model in tests); residency is the only difference. Default off so
+        # production behavior is byte-for-byte the current numpy path until it is
+        # measured on a node that has the real model.
+        self._setup_io_binding(use_io_binding)
+
         meta = self.session.get_modelmeta().custom_metadata_map
         self.chunk_len = int(meta.get("chunk_len", CHUNK_LEN))
         self.fifo_len = int(meta.get("fifo_len", FIFO_LEN))
@@ -98,6 +165,64 @@ class Sortformer:
         self.window = torch.hann_window(WIN_LENGTH, device=self.device)
         
         self.reset_state()
+
+    def _setup_io_binding(self, use_io_binding: bool) -> None:
+        self._stream_output_names = ["spkcache_fifo_chunk_preds", "chunk_pre_encode_embs"]
+        self.use_io_binding = bool(use_io_binding)
+        self._io_binding = None
+        self._iobinding_device = "cpu"
+        self._iobinding_device_id = 0
+        if not self.use_io_binding:
+            return
+        # Bind inputs/outputs on the device the CUDA EP runs on; if the session
+        # has no CUDA provider (CPU-only node) bind on CPU — still numerically
+        # identical, just no residency win. ``run_with_iobinding`` over device
+        # OrtValues avoids ORT re-copying state H2D/D2H on every chunk.
+        try:
+            session_providers = self.session.get_providers()
+            if "CUDAExecutionProvider" in session_providers:
+                self._iobinding_device = "cuda"
+                if self.device.type == "cuda" and self.device.index is not None:
+                    self._iobinding_device_id = int(self.device.index)
+            self._io_binding = self.session.io_binding()
+        except Exception as exc:  # pragma: no cover - defensive
+            from loguru import logger
+
+            logger.warning(
+                f"Sortformer IOBinding setup failed ({exc}); using numpy session.run path."
+            )
+            self.use_io_binding = False
+            self._io_binding = None
+
+    def _run_session(self, inputs: dict) -> List[np.ndarray]:
+        """Run the streaming session for one chunk, returning numpy outputs.
+
+        Two residency paths sharing one input/output contract:
+
+        * numpy (default): ``session.run`` — ORT copies inputs H2D and outputs
+          D2H internally, the historical behavior.
+        * IOBinding: inputs are wrapped as device ``OrtValue``s and outputs are
+          bound on-device, so state tensors stay resident across chunks. Same
+          graph and EP, so outputs are bit-identical (pinned in tests).
+        """
+        if not self.use_io_binding or self._io_binding is None:
+            return self.session.run(self._stream_output_names, inputs)
+
+        iob = self._io_binding
+        iob.clear_binding_inputs()
+        iob.clear_binding_outputs()
+        for name, arr in inputs.items():
+            arr = np.ascontiguousarray(arr)
+            iob.bind_ortvalue_input(
+                name,
+                ort.OrtValue.ortvalue_from_numpy(
+                    arr, self._iobinding_device, self._iobinding_device_id
+                ),
+            )
+        for name in self._stream_output_names:
+            iob.bind_output(name, self._iobinding_device, self._iobinding_device_id)
+        self.session.run_with_iobinding(iob)
+        return iob.copy_outputs_to_cpu()
 
     def reset_state(self):
         self.spkcache = np.zeros((1, 0, EMB_DIM), dtype=np.float32)
@@ -207,8 +332,8 @@ class Sortformer:
             "fifo_lengths": np.array([fifo_len], dtype=np.int64)
         }
 
-        outputs = self.session.run(["spkcache_fifo_chunk_preds", "chunk_pre_encode_embs"], inputs)
-        
+        outputs = self._run_session(inputs)
+
         preds = outputs[0]
         new_embs = outputs[1]
         
@@ -255,9 +380,16 @@ class Sortformer:
         sil_mask = sums < SIL_THRESHOLD
         if np.any(sil_mask):
             sil_embs = embs[sil_mask]
-            for emb in sil_embs:
-                self.mean_sil_emb[0] = (self.mean_sil_emb[0] * self.n_sil_frames + emb) / (self.n_sil_frames + 1)
-                self.n_sil_frames += 1
+            # The running mean is updated one frame at a time so the result
+            # feeds back into the model; the float32 rounding of that exact
+            # scalar op order must be preserved (a closed-form
+            # (mean*n + sum)/(n+k) drifts ~1e-7 and would perturb embeddings).
+            # ``_silence_running_mean`` reproduces the verbatim sequential
+            # arithmetic bit-for-bit — a numba kernel when available (with the
+            # same explicit float32 casts), else the original Python loop.
+            self.mean_sil_emb[0], self.n_sil_frames = _silence_running_mean(
+                self.mean_sil_emb[0], int(self.n_sil_frames), sil_embs
+            )
 
     def _compress_spkcache(self):
         if self.spkcache_preds is None: return
@@ -308,39 +440,44 @@ class Sortformer:
         return scores
 
     def _boost_topk_scores(self, scores: np.ndarray, n_boost: int, scale_factor: float) -> np.ndarray:
-        for s in range(NUM_SPEAKERS):
-            col = scores[:, s].copy()
-            top_idx = np.argsort(col)[::-1][:n_boost]
-            valid_mask = scores[top_idx, s] != -np.inf
-            scores[top_idx[valid_mask], s] -= scale_factor * np.log(0.5)
+        if n_boost <= 0:
+            return scores
+        # Per-column descending top-n_boost, vectorized across speakers. The
+        # per-column ``np.argsort(col)[::-1]`` tie-order is preserved because
+        # ``np.argsort(scores, axis=0)[::-1]`` reverses the same stable
+        # ascending sort independently per column.
+        order = np.argsort(scores, axis=0)[::-1][:n_boost]
+        cols = np.arange(NUM_SPEAKERS)
+        valid = scores[order, cols] != -np.inf
+        sel_rows = order[valid]
+        sel_cols = np.broadcast_to(cols, order.shape)[valid]
+        scores[sel_rows, sel_cols] -= scale_factor * np.log(0.5)
         return scores
 
     def _get_topk_indices(self, scores: np.ndarray, n_frames_no_sil: int) -> Tuple[List[int], List[bool]]:
         n_frames = scores.shape[0]
-        flat_scores = scores.flatten('F') 
-        sorted_flat_idx = np.argsort(flat_scores)[::-1]
-        
-        topk_flat = []
-        for idx in sorted_flat_idx[:self.spkcache_len]:
-            if flat_scores[idx] == -np.inf:
-                topk_flat.append(MAX_INDEX)
-            else:
-                topk_flat.append(idx)
-        topk_flat.sort()
+        flat_scores = scores.flatten('F')
+        sorted_flat_idx = np.argsort(flat_scores)[::-1][:self.spkcache_len]
+        # -inf entries map to the sentinel MAX_INDEX, then the whole top-k list
+        # is sorted ascending (sentinels sink to the end). Fully vectorized;
+        # the trailing slots stay at their defaults when fewer than
+        # spkcache_len entries exist (matches the original list semantics).
+        topk = np.where(
+            flat_scores[sorted_flat_idx] == -np.inf, MAX_INDEX, sorted_flat_idx
+        ).astype(np.int64)
+        topk.sort()
 
-        is_disabled = [False] * self.spkcache_len
-        frame_indices = [0] * self.spkcache_len
-
-        for i, flat_idx in enumerate(topk_flat):
-            if flat_idx == MAX_INDEX:
-                is_disabled[i] = True
-            else:
-                frame_idx = flat_idx % n_frames
-                if frame_idx >= n_frames_no_sil:
-                    is_disabled[i] = True
-                else:
-                    frame_indices[i] = frame_idx
-        return frame_indices, is_disabled
+        is_disabled = np.zeros(self.spkcache_len, dtype=bool)
+        frame_indices = np.zeros(self.spkcache_len, dtype=np.int64)
+        k = topk.shape[0]
+        if k:
+            is_sentinel = topk == MAX_INDEX
+            frame_idx = np.where(is_sentinel, 0, topk % n_frames)
+            disabled_k = is_sentinel | (frame_idx >= n_frames_no_sil)
+            is_disabled[:k] = disabled_k
+            keep = ~disabled_k
+            frame_indices[:k][keep] = frame_idx[keep]
+        return frame_indices.tolist(), is_disabled.tolist()
 
     def _gather_spkcache(self, indices: List[int], is_disabled: List[bool]) -> Tuple[np.ndarray, np.ndarray]:
         new_embs = np.zeros((1, self.spkcache_len, EMB_DIM), dtype=np.float32)
@@ -348,34 +485,67 @@ class Sortformer:
         cache_preds = self.spkcache_preds[0]
         cache_embs = self.spkcache[0]
 
-        for i, (idx, disabled) in enumerate(zip(indices, is_disabled)):
-            if disabled:
-                new_embs[0, i, :] = self.mean_sil_emb[0]
-            elif idx < cache_embs.shape[0]:
-                new_embs[0, i, :] = cache_embs[idx]
-                new_preds[0, i, :] = cache_preds[idx]
+        idx = np.asarray(indices, dtype=np.int64)
+        disabled = np.asarray(is_disabled, dtype=bool)
+        new_embs[0, disabled, :] = self.mean_sil_emb[0]
+        valid = (~disabled) & (idx < cache_embs.shape[0])
+        valid_idx = idx[valid]
+        new_embs[0, valid, :] = cache_embs[valid_idx]
+        new_preds[0, valid, :] = cache_preds[valid_idx]
         return new_embs, np.expand_dims(new_preds[0], axis=0)
+
+    @staticmethod
+    def _threshold_intervals(active: np.ndarray, spk: int) -> List[list]:
+        """Rise/fall edge detection for a boolean activity mask (onset==offset).
+
+        Equivalent to the per-frame state machine when ``onset == offset``:
+        a segment opens on the first frame with ``p >= onset`` and closes on
+        the first subsequent frame with ``p < offset``. With a single
+        threshold those two events are exactly the rising/falling edges of the
+        boolean mask, found vectorized via ``np.diff`` over a zero-padded
+        int8 view. Returns ``[start_s, end_s, spk]`` intervals in frame order.
+        """
+        if not active.any():
+            return []
+        padded = np.concatenate(([0], active.view(np.int8), [0]))
+        diff = np.diff(padded)
+        starts = np.flatnonzero(diff == 1)
+        ends = np.flatnonzero(diff == -1)
+        return [
+            [float(s) * FRAME_DURATION, float(e) * FRAME_DURATION, spk]
+            for s, e in zip(starts, ends)
+        ]
 
     def _binarize(self, preds: np.ndarray, audio_duration_sec: float) -> List[str]:
         raw_segments = []
         num_frames = preds.shape[0]
+        # The default DiarizationConfig uses onset == offset (0.5), which turns
+        # the per-frame hysteresis into a plain threshold; that case is
+        # vectorized with edge detection. True hysteresis (onset != offset) is
+        # sequential by nature, so it keeps the verbatim per-frame loop.
+        single_threshold = self.config.onset == self.config.offset
 
         for spk in range(NUM_SPEAKERS):
-            raw_intervals = []
-            in_seg = False
-            start_t = 0.0
+            if single_threshold:
+                raw_intervals = self._threshold_intervals(
+                    preds[:, spk] >= self.config.onset, spk
+                )
+            else:
+                raw_intervals = []
+                in_seg = False
+                start_t = 0.0
 
-            for t in range(num_frames):
-                p = preds[t, spk]
-                if p >= self.config.onset and not in_seg:
-                    in_seg = True
-                    start_t = t * FRAME_DURATION
-                elif p < self.config.offset and in_seg:
-                    in_seg = False
-                    raw_intervals.append([start_t, t * FRAME_DURATION, spk])
+                for t in range(num_frames):
+                    p = preds[t, spk]
+                    if p >= self.config.onset and not in_seg:
+                        in_seg = True
+                        start_t = t * FRAME_DURATION
+                    elif p < self.config.offset and in_seg:
+                        in_seg = False
+                        raw_intervals.append([start_t, t * FRAME_DURATION, spk])
 
-            if in_seg:
-                raw_intervals.append([start_t, num_frames * FRAME_DURATION, spk])
+                if in_seg:
+                    raw_intervals.append([start_t, num_frames * FRAME_DURATION, spk])
 
             if not raw_intervals:
                 continue
