@@ -6,16 +6,20 @@ reads audio concurrently multiplies seek distance instead of throughput.
 Stages therefore clamp their DataLoader / probe-pool worker counts when the
 dataset resolves to a rotational device. SSDs keep the configured values.
 
-Resolution order for the profile:
+Resolution order for the profile (highest priority first):
 
-1. explicit ``runtime.io_profile: hdd|ssd`` in the YAML config (via
-   :func:`load_io_profile`),
-2. ``$BALALAIKA_IO_PROFILE`` (``hdd``/``ssd``),
+1. ``$BALALAIKA_IO_PROFILE`` (``hdd``/``ssd``),
+2. ``runtime.io_profile: hdd|ssd`` in the YAML config — read through
+   :func:`src.utils.runtime_env.runtime_cfg`, the single source of truth for
+   the ``runtime`` block (env-over-YAML precedence + caching),
 3. ``auto``: sysfs rotational flag of the device backing the dataset path
    (partitions and device-mapper/LVM stacks are walked to the physical
    disks; a stack containing any rotational member counts as ``hdd``),
 4. unknown hardware (containers without sysfs, network mounts): ``ssd``,
    i.e. no behavior change.
+
+``auto`` / empty at either the env or YAML layer means "fall through to the
+next source"; only ``hdd``/``ssd`` short-circuit the chain.
 """
 from __future__ import annotations
 
@@ -26,7 +30,12 @@ from typing import Optional
 
 from loguru import logger
 
+from src.utils.runtime_env import runtime_cfg
+
 IO_PROFILE_ENV = "BALALAIKA_IO_PROFILE"
+CONFIG_PATH_ENV = "BALALAIKA_CONFIG_PATH"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "config.yaml"
 
 # Conservative concurrency caps for one spindle. Loader workers keep some
 # parallelism because consecutive batches read path-adjacent files (short
@@ -96,12 +105,33 @@ def is_rotational(path: str) -> Optional[bool]:
         return None
 
 
+def _configured_io_profile() -> Optional[str]:
+    """``runtime.io_profile`` from the YAML config, or ``None`` if unset.
+
+    Reads through :func:`runtime_cfg` (the single source of truth for the
+    ``runtime`` block, with its own caching) rather than re-parsing the YAML
+    here. The config path follows the ``BALALAIKA_CONFIG_PATH`` env var the
+    shell bootstrap exports, defaulting to ``configs/config.yaml``; a missing
+    file yields the ``"auto"`` default, i.e. no behavior change.
+    """
+    config_path = os.environ.get(CONFIG_PATH_ENV) or str(DEFAULT_CONFIG_PATH)
+    return runtime_cfg(config_path).get("io_profile")
+
+
 @lru_cache(maxsize=None)
 def resolve_io_profile(dataset_path: str, configured: Optional[str] = None) -> str:
-    """Return ``"hdd"`` or ``"ssd"`` for ``dataset_path``."""
+    """Return ``"hdd"`` or ``"ssd"`` for ``dataset_path``.
+
+    ``configured`` is an explicit per-call override; when it is ``None`` the
+    YAML ``runtime.io_profile`` is consulted, so the documented knob takes
+    effect for every stage without threading the config path through each
+    caller. Precedence: ``configured`` / ``$BALALAIKA_IO_PROFILE`` > YAML
+    ``runtime.io_profile`` > sysfs auto-detect.
+    """
     for source, value in (
-        ("config runtime.io_profile", configured),
+        ("explicit override", configured),
         (IO_PROFILE_ENV, os.environ.get(IO_PROFILE_ENV)),
+        ("config runtime.io_profile", _configured_io_profile()),
     ):
         if value is None:
             continue
@@ -119,23 +149,6 @@ def resolve_io_profile(dataset_path: str, configured: Optional[str] = None) -> s
     profile = "hdd" if rotational else "ssd"
     logger.info(f"I/O profile for {dataset_path}: {profile} (auto-detected).")
     return profile
-
-
-def load_io_profile(config_path: Optional[os.PathLike | str], dataset_path: os.PathLike | str) -> str:
-    """Resolve the profile honoring ``runtime.io_profile`` from YAML."""
-    configured: Optional[str] = None
-    if config_path:
-        try:
-            import yaml
-
-            with open(config_path, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-            runtime = raw.get("runtime", {}) if isinstance(raw, dict) else {}
-            if isinstance(runtime, dict):
-                configured = runtime.get("io_profile")
-        except Exception as exc:
-            logger.warning(f"Could not read runtime.io_profile from {config_path}: {exc}.")
-    return resolve_io_profile(str(dataset_path), configured)
 
 
 def clamp_loader_workers(num_workers: int, file_paths) -> int:
