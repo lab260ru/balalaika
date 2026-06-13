@@ -225,6 +225,35 @@ def test_check_consensus_equivalent(tree, monkeypatch):
             assert new == ref, f"consensus mismatch {p} cn={cn}"
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Привет, мир!", "привет мир"),
+        ("«Как дела?» — Хорошо…", "как дела хорошо"),
+        ("слово,слово; слово", "слово слово слово"),
+        ("  МНОГО\tПРОБЕЛОВ\n", "много пробелов"),
+        ("по-русски (тест)", "по русски тест"),
+    ],
+)
+def test_normalize_consensus_text(text, expected):
+    assert tr.normalize_consensus_text(text) == expected
+
+
+def test_check_consensus_ignores_case_and_punctuation(tmp_path, monkeypatch):
+    audio = tmp_path / "chunk.wav"
+    audio.touch()
+    variants = {
+        "giga_rnnt": "Привет, мир!",
+        "giga_ctc": "привет мир",
+        "tone": "«ПРИВЕТ — МИР...»",
+    }
+    for model, text in variants.items():
+        (tmp_path / f"chunk_{model}.txt").write_text(text, encoding="utf-8")
+
+    monkeypatch.setattr(tr, "read_file_content", _reader)
+    assert tr.check_consensus(audio, list(variants), 3, DirNameCache())
+
+
 def test_shared_cache_matches_per_call_cache(tree, monkeypatch):
     """The grouped-decode path reuses one cache across suffix sweeps; the
     result must match independent per-suffix scans."""

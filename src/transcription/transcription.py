@@ -2,6 +2,7 @@ import argparse
 import multiprocessing as mp
 import os
 import tempfile
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -623,6 +624,15 @@ def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
             error_details.append({"worker": cuda_id, "model": ",".join(group_models), "reason": str(e)})
 
 
+def normalize_consensus_text(text: str) -> str:
+    """Normalize model text for consensus without changing saved sidecars."""
+    without_punctuation = (
+        " " if unicodedata.category(char).startswith("P") else char
+        for char in text.casefold()
+    )
+    return " ".join("".join(without_punctuation).split())
+
+
 def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int,
                     cache: Optional[DirNameCache] = None) -> bool:
     texts = []
@@ -634,7 +644,9 @@ def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int
             try:
                 t = read_file_content(tp)
                 if t:
-                    texts.append(t.lower().strip())
+                    normalized = normalize_consensus_text(t)
+                    if normalized:
+                        texts.append(normalized)
             except Exception:
                 pass
     if len(texts) < consensus_num:
