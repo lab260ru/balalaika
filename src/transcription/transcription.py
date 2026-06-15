@@ -352,9 +352,10 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
                 files = read_work_shard(shard_path)
                 claimed += 1
                 logger.info(f"Worker {cuda_id}: processing {len(files)} files from {shard_path.name}")
+                progress_desc = f"ASR {model_name} GPU {cuda_id} shard {claimed}"
                 if loader is not None:
                     _process_batches(
-                        tqdm(loader.iter_shard(files), desc=f"ASR-{cuda_id}", position=cuda_id),
+                        tqdm(loader.iter_shard(files), desc=progress_desc, position=cuda_id, unit="batch"),
                         cuda_id, model_name, model, output_suffix, do_timestamps,
                         target_sample_rate, processed_counter, errors_counter, error_details,
                     )
@@ -596,10 +597,11 @@ def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
                 items = read_annotated_work_shard(shard_path)
                 claimed += 1
                 logger.info(f"Worker {cuda_id}: group-processing {len(items)} files from {shard_path.name}")
+                progress_desc = f"ASR group GPU {cuda_id} shard {claimed}"
                 if loader is not None:
                     files, needed = _group_shard_inputs(specs, items)
                     _process_group_batches(
-                        tqdm(loader.iter_shard(files), desc=f"ASR-group-{cuda_id}", position=cuda_id),
+                        tqdm(loader.iter_shard(files), desc=progress_desc, position=cuda_id, unit="batch"),
                         specs, needed, all_names,
                         processed_counter, errors_counter, error_details,
                     )
@@ -677,7 +679,8 @@ def get_valid_paths(src_path: str, output_suffix: str,
 
     valid = []
     retry_empty_count = 0
-    for p in all_paths:
+    scan_desc = f"Pending scan [{output_suffix}]"
+    for p in tqdm(all_paths, desc=scan_desc, unit="file", mininterval=0.5):
         sidecar = p.with_name(f"{p.stem}_{output_suffix}.txt")
         if cache.sidecar_complete(sidecar, retry_empty=retry_empty_outputs):
             continue
@@ -691,7 +694,8 @@ def get_valid_paths(src_path: str, output_suffix: str,
     if consensus_num > 0 and len(processed) >= consensus_num:
         skipped = 0
         filtered = []
-        for p in valid:
+        consensus_desc = f"Consensus scan [{output_suffix}]"
+        for p in tqdm(valid, desc=consensus_desc, unit="file", mininterval=0.5):
             if check_consensus(p, processed, consensus_num, cache):
                 skipped += 1
             else:
@@ -752,7 +756,11 @@ def main(args):
         # walks the same audio tree, so the directory listings (and any size
         # probes for retry_empty) are scanned once instead of once per model.
         group_cache = DirNameCache()
-        for model_name in grouped_models:
+        for model_name in tqdm(
+            grouped_models,
+            desc="Preparing shared-decode models",
+            unit="model",
+        ):
             output_suffix = 'vosk' if 'vosk' in model_name else model_name
             for p in get_valid_paths(src_path, output_suffix, [], consensus_num, retry_empty_outputs, args.config_path, cache=group_cache):
                 needed.setdefault(p, []).append(model_name)
@@ -761,6 +769,7 @@ def main(args):
             logger.info(f"No files to process for group {grouped_models}")
         else:
             union_paths = list(needed.keys())
+            total_group_results = sum(len(models) for models in needed.values())
             durations = ensure_audio_durations(
                 src_path,
                 union_paths,
@@ -792,6 +801,9 @@ def main(args):
                 run_group_worker,
                 num_gpus=num_gpus,
                 args=(grouped_models, str(work_plan.work_dir), config, args.config_path, processed, errors, error_details_list),
+                progress_counter=processed,
+                progress_total=total_group_results,
+                progress_desc=f"Transcribing group ({len(grouped_models)} models)",
             )
             if worker_errors:
                 errors.value += worker_errors
@@ -838,6 +850,9 @@ def main(args):
             run_worker,
             num_gpus=num_gpus,
             args=(model_name, str(work_plan.work_dir), config, args.config_path, processed, errors, error_details_list),
+            progress_counter=processed,
+            progress_total=work_plan.total_items,
+            progress_desc=f"Transcribing [{model_name}]",
         )
         if worker_errors:
             errors.value += worker_errors

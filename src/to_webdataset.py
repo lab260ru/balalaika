@@ -41,6 +41,18 @@ TEXT_COLUMNS = {
 }
 
 
+def _open_shard_exclusive(path: str):
+    """Never truncate an existing shard when a start index is reused."""
+    return open(path, "xb")
+
+
+def resolve_output_dir(podcasts_path: Path, output_path: str | None) -> Path:
+    """Resolve the exact directory that will contain WebDataset tar shards."""
+    if output_path and str(output_path).strip():
+        return Path(output_path).expanduser()
+    return podcasts_path.parent / f"{podcasts_path.name}_webdataset" / "train"
+
+
 def load_metadata(podcasts_path: Path) -> Dict[str, dict]:
     """Загружает состояние пайплайна и делает словарь с ключом по базовому имени файла.
 
@@ -148,7 +160,15 @@ def _sanitize_records(df: pd.DataFrame) -> List[dict]:
         for i in range(n)
     ]
 
-def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata_dict: Dict[str, dict], max_shard_size: int, max_shard_count: int):
+def worker_fn(
+    worker_id: int,
+    audio_paths: List[str],
+    output_dir: Path,
+    metadata_dict: Dict[str, dict],
+    max_shard_size: int,
+    max_shard_count: int,
+    shard_start_index: int = 0,
+):
     if not audio_paths:
         return 0, 0
 
@@ -157,7 +177,13 @@ def worker_fn(worker_id: int, audio_paths: List[str], output_dir: Path, metadata
     errors_count = 0
     dir_cache: Dict[str, set] = {}
 
-    with wds.ShardWriter(pattern, maxsize=max_shard_size, maxcount=max_shard_count) as sink:
+    with wds.ShardWriter(
+        pattern,
+        maxsize=max_shard_size,
+        maxcount=max_shard_count,
+        start_shard=shard_start_index,
+        opener=_open_shard_exclusive,
+    ) as sink:
         for audio_str in tqdm(audio_paths, desc=f"Worker {worker_id}", position=worker_id):
             audio_path = Path(audio_str)
             
@@ -254,10 +280,13 @@ def main(config, config_path: str | None = None):
 
     max_shard_size = config.get('max_shard_size', 512 * 1024 * 1024)
     max_shard_count = config.get('max_shard_count', 10000)
+    shard_start_index = int(config.get('shard_start_index', 0))
+    if shard_start_index < 0:
+        raise ValueError("export.shard_start_index must be >= 0")
         
     podcasts_path = Path(podcasts_path_str)
 
-    wds_output_dir = podcasts_path.parent / f"{podcasts_path.name}_webdataset" / "train"
+    wds_output_dir = resolve_output_dir(podcasts_path, config.get('output_path'))
     wds_output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"WebDataset shards will be saved to: {wds_output_dir}")
 
@@ -275,6 +304,9 @@ def main(config, config_path: str | None = None):
     chunks = [all_audio_paths[i:i + chunk_size] for i in range(0, len(all_audio_paths), chunk_size)]
 
     logger.info(f"Starting {len(chunks)} workers to build WebDataset from {len(all_audio_paths)} audio files...")
+    logger.info(
+        f"Shard numbering starts at {shard_start_index}; existing shard files will not be overwritten."
+    )
 
     def chunk_metadata(chunk: List[str]) -> Dict[str, dict]:
         # Ship each worker only its own chunk's records — the full dict is
@@ -286,7 +318,16 @@ def main(config, config_path: str | None = None):
     total_errors = 0
     with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
         futures = [
-            executor.submit(worker_fn, worker_id, chunk, wds_output_dir, chunk_metadata(chunk), max_shard_size, max_shard_count)
+            executor.submit(
+                worker_fn,
+                worker_id,
+                chunk,
+                wds_output_dir,
+                chunk_metadata(chunk),
+                max_shard_size,
+                max_shard_count,
+                shard_start_index,
+            )
             for worker_id, chunk in enumerate(chunks)
         ]
 

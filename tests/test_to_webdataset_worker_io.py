@@ -146,3 +146,51 @@ def test_metadata_and_sibling_packed(tmp_path):
     assert meta["speaker"] == "s1"
     assert meta["dur"] == 1.5
     assert meta["transcript"] == "hello world"
+
+
+def test_shard_start_index_preserves_worker_name_format(tmp_path):
+    audio = []
+    for index in range(2):
+        path = tmp_path / f"clip{index}.wav"
+        path.write_bytes(f"audio-{index}".encode())
+        audio.append(str(path))
+
+    out = tmp_path / "out"
+    out.mkdir()
+    processed, errors = worker_fn(
+        worker_id=1,
+        audio_paths=audio,
+        output_dir=out,
+        metadata_dict={},
+        max_shard_size=10 * 1024 * 1024,
+        max_shard_count=1,
+        shard_start_index=50,
+    )
+
+    assert (processed, errors) == (2, 0)
+    assert sorted(path.name for path in out.glob("*.tar")) == [
+        "shard_001_0050.tar",
+        "shard_001_0051.tar",
+    ]
+
+
+def test_existing_shard_is_not_overwritten(tmp_path):
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"new audio")
+    out = tmp_path / "out"
+    out.mkdir()
+    existing = out / "shard_000_0042.tar"
+    existing.write_bytes(b"already uploaded")
+
+    with pytest.raises(FileExistsError):
+        worker_fn(
+            worker_id=0,
+            audio_paths=[str(audio)],
+            output_dir=out,
+            metadata_dict={},
+            max_shard_size=10 * 1024 * 1024,
+            max_shard_count=1000,
+            shard_start_index=42,
+        )
+
+    assert existing.read_bytes() == b"already uploaded"

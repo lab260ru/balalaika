@@ -456,9 +456,13 @@ shards for efficient streaming training.
    - Replaces dots in keys with underscores for HuggingFace/WebDataset compatibility.
    - Writes `{safe_key}.{ext}` (audio) + `{safe_key}.json` (metadata) samples.
 3. Sharded into `.tar` files: `shard_{worker_id:03d}_{shard_id:04d}.tar`.
+   Set `export.shard_start_index` to one greater than the last uploaded local
+   shard index. For example, after `shard_000_0049.tar`, use `50`, producing
+   `shard_000_0050.tar`. Existing shard files are never overwritten.
 4. Default max shard size: 512 MiB; max samples per shard: 10,000.
 
-**Output:** `{podcasts_path}_webdataset/train/shard_*.tar` — WebDataset shards.
+**Output:** `export.output_path/shard_*.tar`. If `output_path` is empty, the
+legacy `{podcasts_path}_webdataset/train` directory is used.
 
 **GPU parallelism:** CPU-bound `ProcessPoolExecutor`. Each worker writes its own
 shard series.

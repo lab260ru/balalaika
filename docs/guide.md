@@ -194,6 +194,12 @@ config (keep it aligned with the dataset root).
 
 `to_webdataset.py` writes WebDataset shards. Audio bytes are written as-is so
 the chunked container is preserved end-to-end (no extra encode at export).
+Set `export.output_path` to the exact directory for `.tar` files when the source
+dataset and exported WebDataset live on different disks. Leaving it empty keeps
+the legacy directory next to the source dataset.
+For partial exports, set `export.shard_start_index` to the next unused local
+shard number. After `shard_000_0049.tar`, use `50`; the exporter then starts at
+`shard_000_0050.tar` and refuses to overwrite an existing `.tar` file.
 
 **Run**:
 

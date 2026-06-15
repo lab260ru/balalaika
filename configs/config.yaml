@@ -101,7 +101,7 @@ csv:
 # -----------------------------------------------------------------------------
 runtime:
   # Python virtualenv that base.sh / *_yaml.sh activate.
-  venv_path: .dev_venv
+  venv_path: /home/nikita/balalaika/.dev_venv
   # CPU range passed to `taskset -c` for CPU-bound stages. Empty ("") disables
   # pinning entirely, which is the safe default: an explicit range that exceeds
   # the host's core count (e.g. "0-80" on a 48-core box) is silently clamped by
@@ -130,7 +130,7 @@ runtime:
   # or legacy (pre-2026-06 input/duration order).
   io_profile: auto
   # Root for TensorRT engine cache. Each session appends /trt_cache_<gpu_id>.
-  trt_cache_path: ./cache/trt
+  trt_cache_path: /home/nikita/balalaika/cache/trt
   # Per-session TensorRT workspace size in bytes (4 GiB by default).
   trt_workspace_bytes: 4294967296
   # Enable FP16 for TensorRT sessions when supported.
@@ -371,7 +371,7 @@ transcription:
     - tone
   consensus_num: 3
   with_timestamps: True
-  use_tensorrt: True
+  use_tensorrt: False
   use_vad: False
   use_rover: True
   # Decode/resample each audio file ONCE for the first consensus_num models
@@ -409,12 +409,12 @@ transcription:
   # composition: measured on 250 knife-edge bench clips (CPU, giga_ctc and
   # e2e-ctc), ~15% of transcripts shift by ~1 character (~1.2% of characters);
   # each order is itself fully deterministic. Recommended "path" on HDD.
-  shard_order: duration
+  shard_order: path
   # CPU processes for ROVER shard aggregation.
   rover_workers: 4
-  batch_size: 8
-  num_workers: 16
-  prefetch_factor: 4
+  batch_size: 4
+  num_workers: 4
+  prefetch_factor: 2
   # Keep DataLoader workers alive across work shards. Each GPU worker claims
   # 10k-file shards in a loop; the old flow built a fresh DataLoader (spawning
   # up to num_workers loader processes + refilling prefetch) per shard, idling
@@ -425,7 +425,7 @@ transcription:
   # byte-identical. Only active when num_workers > 0. Set False to restore the
   # per-shard loader construction exactly.
   persistent_loaders: True
-  retry_empty_outputs: True
+  retry_empty_outputs: False
 
 punctuation:
   podcasts_path: /mnt/hdd_6tb_1/yandex_data
@@ -523,8 +523,17 @@ denoising:
 
 export:
   podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  # Exact directory where shard_*.tar files are written. This may be on a
+  # different disk from podcasts_path. Empty keeps the legacy location:
+  # <podcasts_path parent>/<podcasts_path name>_webdataset/train.
+  output_path: /mnt/hdd_6tb_1/yandex_data_webdataset/train
   # Parallel processes writing WebDataset shards.
   num_workers: 1
+  # Local shard number each worker starts from. For a partial export, set this
+  # to one greater than the last uploaded shard index. Example: after
+  # shard_000_0049.tar, use 50; worker 0 then starts at shard_000_0050.tar.
+  # Existing tar files are opened exclusively and will never be overwritten.
+  shard_start_index: 0
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.
   max_shard_size: 536870912
   # Max samples per shard file.

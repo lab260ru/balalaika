@@ -17,6 +17,7 @@ stage can finalize state (merge partials, etc.).
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 import torch
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, List, Optional, Sequence, Tuple
@@ -218,6 +219,10 @@ def run_per_gpu_processes(
     num_gpus: int,
     args: tuple = (),
     join: bool = True,
+    *,
+    progress_counter=None,
+    progress_total: Optional[int] = None,
+    progress_desc: str = "GPU workers",
 ) -> tuple[int, list[dict]]:
     """Spawn exactly one :class:`multiprocessing.Process` per GPU.
 
@@ -235,6 +240,11 @@ def run_per_gpu_processes(
     processes: List[mp.Process] = []
     error_count = 0
     error_details: list[dict] = []
+    progress_start = (
+        int(progress_counter.value)
+        if progress_counter is not None and progress_total is not None
+        else 0
+    )
 
     try:
         for gpu_id in range(num_gpus):
@@ -250,8 +260,27 @@ def run_per_gpu_processes(
         if not join:
             return 0, []
 
+        progress_bar = (
+            tqdm(total=progress_total, desc=progress_desc, unit="result")
+            if progress_counter is not None and progress_total is not None
+            else None
+        )
+        while any(proc.is_alive() for proc in processes):
+            if progress_bar is not None:
+                completed = max(0, int(progress_counter.value) - progress_start)
+                progress_bar.n = min(completed, progress_total)
+                progress_bar.refresh()
+            for proc in processes:
+                proc.join(timeout=0.2)
+            time.sleep(0.05)
+
+        if progress_bar is not None:
+            completed = max(0, int(progress_counter.value) - progress_start)
+            progress_bar.n = min(completed, progress_total)
+            progress_bar.refresh()
+            progress_bar.close()
+
         for proc in processes:
-            proc.join()
             if proc.exitcode not in (0, None):
                 logger.error(f"{proc.name} exited with code {proc.exitcode}")
                 error_count += 1
@@ -272,4 +301,3 @@ def run_per_gpu_processes(
         raise
 
     return error_count, error_details
-

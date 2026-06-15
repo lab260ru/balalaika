@@ -7,7 +7,17 @@ import tarfile
 import numpy as np
 import pandas as pd
 
-from src.to_webdataset import load_metadata, worker_fn
+from src.to_webdataset import load_metadata, resolve_output_dir, worker_fn
+
+
+def test_resolve_output_dir_supports_separate_disk(tmp_path):
+    podcasts_path = tmp_path / "ssd" / "dataset"
+    custom = tmp_path / "hdd" / "exports" / "train"
+
+    assert resolve_output_dir(podcasts_path, str(custom)) == custom
+    assert resolve_output_dir(podcasts_path, "") == (
+        podcasts_path.parent / "dataset_webdataset" / "train"
+    )
 
 
 def test_worker_fn_roundtrip(tmp_path):
