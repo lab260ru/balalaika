@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 DISTILLMOS_SAMPLE_RATE = 16_000
 ANTISPOOF_SAMPLE_RATE = 16_000
 ANTISPOOF_NUM_SAMPLES = 64_600
+MUSICDETECT_SAMPLE_RATE = 16_000
 
 # Containers/subtypes for which a soundfile ranged read has been proven to
 # reproduce torchcodec's full-decode float32 values bit-exactly (torch.equal).
@@ -66,7 +67,9 @@ class DistillMOSDataset(Dataset):
         return path_str, waveform.squeeze(0).contiguous()
 
 
-def distillmos_collate(batch: List[Tuple[str, torch.Tensor]]) -> Tuple[List[str], torch.Tensor]:
+def distillmos_collate(
+    batch: List[Tuple[str, torch.Tensor]],
+) -> Tuple[List[str], torch.Tensor]:
     paths, waves = zip(*batch)
     padded = pad_sequence(waves, batch_first=True)
     return list(paths), padded
@@ -98,7 +101,11 @@ def sort_by_length(file_paths: List[str], cache_dir: str = "") -> List[str]:
 
         if cached_set.issubset(current_set):
             new_files = sorted(current_set - cached_set)
-            logger.info("Cache partial hit: %d cached + %d new files", len(cached), len(new_files))
+            logger.info(
+                "Cache partial hit: %d cached + %d new files",
+                len(cached),
+                len(new_files),
+            )
             lengths = estimate_audio_lengths(new_files)
             new_sorted = sorted(new_files, key=lambda p: lengths.get(p, 0.0))
             result = cached + new_sorted
@@ -106,7 +113,11 @@ def sort_by_length(file_paths: List[str], cache_dir: str = "") -> List[str]:
                 json.dump(result, f)
             return result
 
-        logger.info("Cache stale (%d cached vs %d current), rebuilding", len(cached), len(file_paths))
+        logger.info(
+            "Cache stale (%d cached vs %d current), rebuilding",
+            len(cached),
+            len(file_paths),
+        )
 
     logger.info("Scanning %d audio files for length sorting...", len(file_paths))
     lengths = estimate_audio_lengths(file_paths)
@@ -116,7 +127,9 @@ def sort_by_length(file_paths: List[str], cache_dir: str = "") -> List[str]:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, "w") as f:
             json.dump(sorted_paths, f)
-        logger.info("Saved sorted file list (%d files) to %s", len(sorted_paths), cache_file)
+        logger.info(
+            "Saved sorted file list (%d files) to %s", len(sorted_paths), cache_file
+        )
 
     return sorted_paths
 
@@ -132,7 +145,9 @@ def create_distillmos_dataloader(
     # Work shards from prepare_length_bucketed_work_shards are already
     # duration-sorted; re-probing every file (and thrashing the shared JSON
     # cache, which never hits across disjoint shards) is dead work.
-    ordered = file_paths if assume_sorted else sort_by_length(file_paths, cache_dir=cache_dir)
+    ordered = (
+        file_paths if assume_sorted else sort_by_length(file_paths, cache_dir=cache_dir)
+    )
     dataset = DistillMOSDataset(ordered)
     num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
@@ -300,11 +315,20 @@ def antispoofing_collate(batch):
     paths, waveforms, lengths, errors = zip(*batch)
     valid_indices = [idx for idx, error in enumerate(errors) if not error]
     valid_paths = [paths[idx] for idx in valid_indices]
-    valid_lengths = torch.tensor([lengths[idx] for idx in valid_indices], dtype=torch.int64)
-    valid_errors = [(paths[idx], errors[idx]) for idx in range(len(paths)) if errors[idx]]
+    valid_lengths = torch.tensor(
+        [lengths[idx] for idx in valid_indices], dtype=torch.int64
+    )
+    valid_errors = [
+        (paths[idx], errors[idx]) for idx in range(len(paths)) if errors[idx]
+    ]
 
     if not valid_indices:
-        return [], torch.empty(0, 0, dtype=torch.float32), torch.empty(0, dtype=torch.int64), valid_errors
+        return (
+            [],
+            torch.empty(0, 0, dtype=torch.float32),
+            torch.empty(0, dtype=torch.int64),
+            valid_errors,
+        )
 
     batch_tensor = torch.stack([waveforms[idx] for idx in valid_indices]).contiguous()
     return valid_paths, batch_tensor, valid_lengths, valid_errors
@@ -332,6 +356,128 @@ def create_antispoofing_dataloader(
         "num_workers": num_workers,
         "pin_memory": False,
         "collate_fn": antispoofing_collate,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["worker_init_fn"] = dataloader_worker_init
+    return DataLoader(dataset, **loader_kwargs)
+
+
+class MusicDetectionDataset(Dataset):
+    """Mono 16 kHz waveform loader for the WavLM music detector.
+
+    Replaces the former ``musicdetection.MusicDetectionDataset`` plus
+    ``transformers.AutoFeatureExtractor`` pair so the music-detect stage no
+    longer imports either package. The wavlm-base-plus feature extractor is
+    configured with ``do_normalize=false`` (verified from its
+    ``preprocessor_config.json``), so feature extraction reduces to
+    pad-to-longest plus an attention mask — done in :func:`musicdetect_collate`.
+    Decoding here mirrors the other separation datasets (torchcodec decode +
+    ``functional.resample``).
+    """
+
+    def __init__(
+        self,
+        file_paths: List[str],
+        sample_rate: int = MUSICDETECT_SAMPLE_RATE,
+    ):
+        self.file_paths = file_paths
+        self.sample_rate = int(sample_rate)
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+    def __getitem__(self, idx: int):
+        path_str = self.file_paths[idx]
+        started_at = time.perf_counter()
+        try:
+            waveform, source_sample_rate = torchaudio.load_with_torchcodec(path_str)
+            waveform = waveform.to(dtype=torch.float32)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0)
+            else:
+                waveform = waveform.squeeze(0)
+            if int(source_sample_rate) != self.sample_rate:
+                waveform = torchaudio.functional.resample(
+                    waveform,
+                    int(source_sample_rate),
+                    self.sample_rate,
+                )
+            length = int(waveform.numel())
+            if length <= 0:
+                raise ValueError("empty audio")
+            loguru_logger.debug(
+                f"dataloader_audio_load dataset=music_detect path={path_str} "
+                f"seconds={time.perf_counter() - started_at:.6f} "
+                f"sample_rate={self.sample_rate} frames={length}"
+            )
+            return path_str, waveform.contiguous(), length, ""
+        except Exception as exc:
+            loguru_logger.debug(
+                f"dataloader_audio_load dataset=music_detect path={path_str} "
+                f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
+            )
+            return path_str, torch.empty(0, dtype=torch.float32), 0, str(exc)
+
+
+def musicdetect_collate(batch):
+    """Pad mono waveforms to the batch max and build a 0/1 attention mask.
+
+    Returns ``(paths, input_values, attention_mask, lengths, errors)`` where
+    ``input_values`` is ``float32 [B, T]`` (padding value 0.0) and
+    ``attention_mask`` is ``int32 [B, T]`` (1 = real sample, 0 = pad), matching
+    the ONNX graph's declared input dtypes.
+    """
+    paths, waveforms, lengths, errors = zip(*batch)
+    valid_indices = [idx for idx, error in enumerate(errors) if not error]
+    valid_errors = [
+        (paths[idx], errors[idx]) for idx in range(len(paths)) if errors[idx]
+    ]
+
+    if not valid_indices:
+        return (
+            [],
+            torch.empty(0, 0, dtype=torch.float32),
+            torch.empty(0, 0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int64),
+            valid_errors,
+        )
+
+    valid_paths = [paths[idx] for idx in valid_indices]
+    valid_waveforms = [waveforms[idx] for idx in valid_indices]
+    valid_lengths = torch.tensor(
+        [lengths[idx] for idx in valid_indices], dtype=torch.int64
+    )
+    input_values = pad_sequence(valid_waveforms, batch_first=True)
+    max_len = int(input_values.shape[1])
+    attention_mask = (torch.arange(max_len)[None, :] < valid_lengths[:, None]).to(
+        torch.int32
+    )
+    return (
+        valid_paths,
+        input_values.contiguous(),
+        attention_mask.contiguous(),
+        valid_lengths,
+        valid_errors,
+    )
+
+
+def create_music_detect_dataloader(
+    file_paths: List[str],
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    sample_rate: int = MUSICDETECT_SAMPLE_RATE,
+) -> DataLoader:
+    dataset = MusicDetectionDataset(file_paths, sample_rate=sample_rate)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": False,
+        "collate_fn": musicdetect_collate,
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:

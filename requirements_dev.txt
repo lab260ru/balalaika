@@ -31,4 +31,3 @@ pyloudnorm
 git+https://github.com/NikiPshg/ruaccent.git
 git+https://github.com/lab260ru/TryIPaG2P.git
 git+https://github.com/Toloka/crowd-kit.git
-# git+https://github.com/NikiPshg/musicdetection

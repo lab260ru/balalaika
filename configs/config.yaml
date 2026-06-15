@@ -304,19 +304,28 @@ separation:
   podcasts_path: /mnt/hdd_6tb_1/yandex_data
 
   music_detect:
+    # WavLM music detector exported to ONNX. If missing, the stage downloads it
+    # from Hugging Face (repo_id/repo_filename below).
+    onnx_path: ./models/music_detection.onnx
+    repo_id: lab260/MusicDetection
+    repo_filename: music_detection.onnx
     # Inference batch size for music classifier.
     bs: 8
-    # DataLoader worker processes per GPU worker.
+    # DataLoader worker processes / prefetched batches per GPU worker.
     num_workers: 8
-    # Fine-tuned WavLM music-detector weights (safetensors).
-    music_detect_model: ./models/music_detection.safetensors
+    prefetch_factor: 2
     # If P(music) > threshold, the file is deleted and its CSV row removed.
     # music_prob is saved to balalaika.csv for all processed files.
     threshold: 0.6
-    # Optional: HF model id for WavLM backbone (default microsoft/wavlm-base-plus in code).
-    # base_model: microsoft/wavlm-base-plus
-    # Optional: directory for per-worker audio length cache (default ./cache).
-    # cache_path: ./cache
+    # TensorRT EP. Off by default: this model scores variable-length audio, so
+    # TRT spans a wide dynamic-shape profile and FP16 is force-disabled here (it
+    # yields NaNs / class flips for this model regardless of runtime.trt_fp16).
+    # CUDA EP handles variable lengths without per-shape engine rebuilds. When
+    # True, tune trt_opt_seconds / trt_max_seconds to your clip lengths; shapes
+    # beyond the profile fall back to CUDA EP automatically.
+    use_tensorrt: False
+    # trt_opt_seconds: 15.0
+    # trt_max_seconds: 30.0
 
   distillmos:
     # DistillMOS inference batch size per GPU worker.
