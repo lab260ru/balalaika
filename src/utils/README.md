@@ -190,6 +190,13 @@ shell variables (`BALALAIKA_VENV`, `BALALAIKA_LOG_DIR`,
 same block via `runtime_cfg(config_path)` so values stay aligned between
 shell and Python.
 
+`BALALAIKA_MALLOC_TRIM_EVERY` is emitted from the `runtime.malloc_trim_every`
+key (default `128`, `0` disables) and read by
+`src/utils/datasets/transcription.py` to control the per-worker heap trim. Set
+it in `config.yaml` like the other runtime knobs; a shell `export` still wins
+for one-off overrides since the dataset reads the env var directly. See
+`src/utils/datasets/README.md`.
+
 ## `logging_setup.py`
 
 ```python

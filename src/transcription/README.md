@@ -58,6 +58,27 @@ Transcription does **not** touch `balalaika.csv`; per-file results live in the
 * `transcription.rover_workers` controls how many CPU processes claim ROVER
   shards in parallel.
 
+## Memory / OOM safety
+
+Audio decoding (torchcodec/ffmpeg) churns the glibc heap, so each DataLoader
+worker's RSS climbs to a multi-GB high-water mark and — with
+`persistent_loaders: True` — never falls, which can OOM-kill workers on a
+RAM-tight box (the failure surfaces as `DataLoader worker (pid …) exited
+unexpectedly`). The transcription datasets call `malloc_trim(0)` every N decoded
+items to return that memory to the OS, holding a worker near ~1 GB instead of
+~4.5 GB.
+
+Tune via the **`runtime.malloc_trim_every`** key in `configs/config.yaml`
+(default `128`; `0` disables), exported by `base.sh` as
+**`BALALAIKA_MALLOC_TRIM_EVERY`**. A shell `export` overrides it for a one-off
+run since the dataset reads the env var directly:
+
+```bash
+BALALAIKA_MALLOC_TRIM_EVERY=64 bash src/transcription/transcription_yaml.sh configs/config.yaml
+```
+
+See `src/utils/datasets/README.md` for the measured numbers and rationale.
+
 ## Dependencies
 
 `create_dev_env.sh` typically installs nightly **onnxruntime-gpu** for your CUDA, **`tensorrt-cu13`** (or matching wheel), and **`onnx-asr[gpu,hub]`** — pin versions there.

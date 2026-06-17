@@ -260,6 +260,15 @@ def _paths_exist_mask(paths: Sequence[str], *, desc: str) -> List[bool]:
 
 def _pandas_is_cudf_proxy() -> bool:
     try:
+        import cudf.pandas as cudf_pandas
+
+        is_proxy_object = getattr(cudf_pandas, "is_proxy_object", None)
+        if callable(is_proxy_object) and is_proxy_object(pd.DataFrame()):
+            return True
+    except Exception:
+        pass
+
+    try:
         return "cudf" in type(pd.DataFrame()).__module__
     except Exception:
         return False

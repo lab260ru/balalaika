@@ -672,6 +672,8 @@ def get_valid_paths(src_path: str, output_suffix: str,
     boundary into workers.
     """
     all_paths = [Path(p) for p in discover_audio_paths(src_path, config_path=config_path)]
+    return all_paths
+
     if not all_paths:
         return []
 

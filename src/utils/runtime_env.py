@@ -18,6 +18,9 @@ Output keys (printed only when present / non-empty):
 * ``BALALAIKA_IO_PROFILE``     — ``auto``/``hdd``/``ssd`` reader-concurrency profile
 * ``BALALAIKA_THREADS_PER_WORKER`` — intra-op / OMP / BLAS thread cap per
   worker process (empty = unset, i.e. library defaults / no regression)
+* ``BALALAIKA_MALLOC_TRIM_EVERY`` — per-worker ``malloc_trim(0)`` interval in
+  decoded items (``0`` disables); read by ``datasets/transcription.py`` to keep
+  decode-heap RSS bounded
 * ``BALALAIKA_STATE_FORMAT``   — ``csv``/``parquet`` pipeline-state format (from ``csv.state_format``)
 
 The Python modules also read the same ``runtime`` block via :func:`runtime_cfg`
@@ -47,6 +50,11 @@ DEFAULTS: Dict[str, Any] = {
     # regress. A positive int caps ORT intra-op pools + OMP/BLAS teams per
     # worker process (see base.sh / make_session_options).
     "threads_per_worker": "",
+    # Decoded-items interval for the per-worker malloc_trim(0) that returns
+    # freed decode-heap memory to the OS (see datasets/transcription.py). 128 is
+    # a measured win (worker RSS ~4.5 GB -> ~1 GB) with negligible cost; 0
+    # disables. Enabled by default since it only affects memory, never outputs.
+    "malloc_trim_every": 128,
     # Sourced from the top-level `csv:` block, not `runtime:` (see
     # _load_runtime). "csv" keeps balalaika.csv as the live state; "parquet"
     # uses balalaika.parquet + a CSV export. Exported so every spawned stage
@@ -64,6 +72,7 @@ ENV_KEYS = {
     "trt_fp16": "BALALAIKA_TRT_FP16",
     "io_profile": "BALALAIKA_IO_PROFILE",
     "threads_per_worker": "BALALAIKA_THREADS_PER_WORKER",
+    "malloc_trim_every": "BALALAIKA_MALLOC_TRIM_EVERY",
     "state_format": "BALALAIKA_STATE_FORMAT",
 }
 
