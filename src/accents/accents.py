@@ -200,7 +200,7 @@ def main(args):
         **pool_kwargs,
     )
     write_stage_status(
-        stage=9,
+        stage=10,
         stage_name="accents",
         log_dir=args.log_dir or "./logs",
         processed=len(pending_files) - error_count,

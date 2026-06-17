@@ -113,8 +113,8 @@ your working dataset root, or collate will look in the wrong place.
 ### 4. Run order
 
 `base.sh` is a Kaldi-style runner with `--stage` / `--stop_stage` flags
-(stages 0..13 plus stage 5.5, see [docs/guide.md](guide.md) for the table).
-With no flags it runs stages 1..9: chunking through phonemization.
+(stages 0..15 plus `.5` sub-stages, see [docs/guide.md](guide.md) for the table).
+With no flags it runs stages 12..15: denoising through the filter report.
 
 ```bash
 bash base.sh --config_path configs/config.yaml
@@ -123,13 +123,13 @@ bash base.sh --config_path configs/config.yaml
 Full local pipeline without Yandex download:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 14
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 15
 ```
 
 Include Yandex download:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 14
+bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 15
 ```
 
 Just preprocess and audio normalization:
@@ -138,9 +138,9 @@ Just preprocess and audio normalization:
 bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
 ```
 
-Stage 11 runs an ONNX Runtime / TensorRT export of ClearerVoice-Studio
+Stage 12 runs an ONNX Runtime / TensorRT export of ClearerVoice-Studio
 `MossFormer2_SE_48K` denoising / speech enhancement and overwrites audio in
-place at 48 kHz. The last stage (14) runs
+place at 48 kHz. The last stage (15) runs
 `src/report.py`, which materializes
 `filter_report.md` next to your dataset so you can see how much audio (in
 hours) was filtered at each step.

@@ -881,7 +881,7 @@ def main(args):
     logger.info("Transcription pipeline complete!")
 
     write_stage_status(
-        stage=7,
+        stage=8,
         stage_name="transcription",
         log_dir=args.log_dir or "./logs",
         processed=processed.value,

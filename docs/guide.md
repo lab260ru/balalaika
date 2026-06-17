@@ -204,8 +204,8 @@ shard number. After `shard_000_0049.tar`, use `50`; the exporter then starts at
 **Run**:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 12 --stop_stage 12
 bash base.sh --config_path configs/config.yaml --stage 13 --stop_stage 13
+bash base.sh --config_path configs/config.yaml --stage 14 --stop_stage 14
 ```
 
 ---
@@ -214,8 +214,8 @@ bash base.sh --config_path configs/config.yaml --stage 13 --stop_stage 13
 
 After filtering stages finish, `src.report` reads `filter_summary.csv` and
 writes `<podcasts_path>/filter_report.md` summarising hours filtered at every
-stage. It is stage 14 in `base.sh`; it runs only when your selected
-`--stage`/`--stop_stage` range includes 14.
+stage. It is stage 15 in `base.sh`; it runs only when your selected
+`--stage`/`--stop_stage` range includes 15.
 
 ---
 
@@ -223,7 +223,7 @@ stage. It is stage 14 in `base.sh`; it runs only when your selected
 
 `base.sh` is a Kaldi-style orchestrator with numbered stages
 (`--stage` / `--stop_stage` like CosyVoice's `run.sh`). With no stage flags it
-runs stages 11..14: denoising, parquet collation, WebDataset export, and
+runs stages 12..15: denoising, parquet collation, WebDataset export, and
 the final report.
 
 ```bash
@@ -234,13 +234,13 @@ Run all local processing stages, including denoising, parquet, WebDataset export
 report:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 14
+bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 15
 ```
 
 Include Yandex Music download as well:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 14
+bash base.sh --config_path configs/config.yaml --stage 0 --stop_stage 15
 ```
 
 Run a contiguous subrange (e.g. preprocess only):
@@ -252,7 +252,7 @@ bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
 Run a single stage (e.g. transcription) after data is already chunked:
 
 ```bash
-bash base.sh --config_path configs/config.yaml --stage 7 --stop_stage 7
+bash base.sh --config_path configs/config.yaml --stage 8 --stop_stage 8
 ```
 
 Stage map:
@@ -268,14 +268,16 @@ Stage map:
 | 5.5 | Separation: DistillMOS filter | `src.separation.distillmos_filter` |
 | 6 | Separation: Spectra-0 raw scoring | `src.separation.antispoofing` |
 | 6.5 | Separation: anti-spoofing filter | `src.separation.antispoofing_filter` |
-| 7 | Transcription | `src.transcription.transcription` |
-| 8 | Punctuation | `src.punctuation.punctuation` |
-| 9 | Accents | `src.accents.accents` |
-| 10 | Phonemizer | `src.phonemizer.phonemizer` |
-| 11 | Denoising / enhancement | `src.denoising.denoising` |
-| 12 | Collate (parquet) | `src.collate` |
-| 13 | Export (WebDataset) | `src.to_webdataset` |
-| 14 | Filter report | `src.report` |
+| 7 | Separation: TTS-suitability scoring | `src.separation.tts_suitability` |
+| 7.5 | Separation: TTS-suitability filter | `src.separation.tts_suitability_filter` |
+| 8 | Transcription | `src.transcription.transcription` |
+| 9 | Punctuation | `src.punctuation.punctuation` |
+| 10 | Accents | `src.accents.accents` |
+| 11 | Phonemizer | `src.phonemizer.phonemizer` |
+| 12 | Denoising / enhancement | `src.denoising.denoising` |
+| 13 | Collate (parquet) | `src.collate` |
+| 14 | Export (WebDataset) | `src.to_webdataset` |
+| 15 | Filter report | `src.report` |
 
 `base.sh` reads runtime parameters (venv path, CPU affinity, log dir, TRT cache
 and workspace) from the **`runtime`** block in the YAML via

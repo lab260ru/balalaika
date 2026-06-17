@@ -214,7 +214,7 @@ def main(args):
         )
     )
     write_stage_status(
-        stage=8,
+        stage=9,
         stage_name="punctuation",
         log_dir=args.log_dir or "./logs",
         processed=produced,

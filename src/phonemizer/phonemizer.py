@@ -117,7 +117,7 @@ def main(args):
         **pool_kwargs,
     )
     write_stage_status(
-        stage=10,
+        stage=11,
         stage_name="phonemizer",
         log_dir=args.log_dir or "./logs",
         processed=len(pending_files) - error_count,

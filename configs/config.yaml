@@ -83,7 +83,7 @@ csv:
   # migrated to parquet on first load; a stale parquet under csv mode is
   # ignored with a warning. Measured at 2 M rows: ~1.9x faster atomic write,
   # cheaper narrow reads; the CSV export round-trips byte-identical.
-  state_format: csv
+  state_format: parquet
   # Fold worker partial CSVs into the state file after every N rows of
   # cumulative progress across workers. 0 disables periodic flushing
   # (only the post-stage merge runs). 100 000 rows ≈ a few seconds of pandas
@@ -177,7 +177,7 @@ preprocess:
   #   file and backfill the same metadata columns that raw preprocess writes
   #   (speaker_id, start/end, total_duration, playlist_id/podcast_id,
   #   silence_percent, max_silence_duration, is_single_speaker).
-  input_mode: existing_chunks
+  input_mode: raw
   # Used only with input_mode: existing_chunks. Defaults to auto so a fresh
   # pre-chunked dataset can be discovered even when runtime.audio_paths_source
   # is set to csv for later stages.
@@ -370,6 +370,31 @@ separation:
     # Parallel CPU workers used only for deleting selected files.
     num_workers: 8
 
+  tts_suitability:
+    # lab260/TTS-Suitability-Classifier ONNX model (wav2vec2-300M head). If
+    # missing, the stage downloads it from Hugging Face (repo_id/repo_filename).
+    onnx_path: ./models/tts_suitability.onnx
+    repo_id: lab260/TTS-Suitability-Classifier
+    repo_filename: model.onnx
+    # Files per DataLoader batch. Inference is per file (each clip is layer-
+    # normalized, split into 10 s chunks and its per-chunk logits averaged), so
+    # this controls loader grouping/prefetch, not the ONNX batch dimension.
+    batch_size: 8
+    num_workers: 4
+    prefetch_factor: 2
+    # TensorRT off by default: inputs are variable-length / variable-chunk, so a
+    # single dynamic-shape profile cannot cover the range and each new shape
+    # would rebuild the engine. The CUDA EP handles variable shapes directly.
+    use_tensorrt: False
+
+  tts_suitability_filter:
+    # Delete when not_tts_score - tts_score > threshold (model leans "not TTS").
+    # 0.0 is the raw argmax decision (equivalently p_tts < 0.5); null enables
+    # interactive selection.
+    threshold: 0.0
+    # Parallel CPU workers used only for deleting selected files.
+    num_workers: 8
+
 transcription:
   podcasts_path: /mnt/hdd_6tb_1/yandex_data
   model_names:
@@ -422,8 +447,8 @@ transcription:
   # CPU processes for ROVER shard aggregation.
   rover_workers: 4
   batch_size: 4
-  num_workers: 4
-  prefetch_factor: 2
+  num_workers: 2
+  prefetch_factor: 1
   # Keep DataLoader workers alive across work shards. Each GPU worker claims
   # 10k-file shards in a loop; the old flow built a fresh DataLoader (spawning
   # up to num_workers loader processes + refilling prefetch) per shard, idling
@@ -513,7 +538,7 @@ denoising:
   # Number of stage worker processes. 0 = one process per visible GPU.
   processes: 0
   # TensorRT EP uses the shared runtime.trt_cache_path cache.
-  use_tensorrt: True
+  use_tensorrt: False
   # Optimization-profile "opt" length in seconds for the TRT engine. TensorRT
   # tunes kernel tactics at this shape. 1.0 (default) reproduces the historical
   # 1 s opt point byte-for-byte; real length-bucketed batches cluster at

@@ -20,14 +20,16 @@ The main entrypoint is `base.sh`. It runs numbered stages from
 | 5.5 | `src.separation.distillmos_filter` | DistillMOS threshold filtering. |
 | 6 | `src.separation.antispoofing` | Store raw Spectra-0 class scores. |
 | 6.5 | `src.separation.antispoofing_filter` | Filter by spoof-vs-bonafide score margin. |
-| 7 | `src.transcription.transcription` | ASR with `onnx-asr` and optional ROVER. |
-| 8 | `src.punctuation.punctuation` | Punctuation restoration. |
-| 9 | `src.accents.accents` | Accent restoration. |
-| 10 | `src.phonemizer.phonemizer` | G2P / phonemization. |
-| 11 | `src.denoising.denoising` | ONNX Runtime / TensorRT denoising / speech enhancement. |
-| 12 | `src.collate` | Merge sidecars into parquet. |
-| 13 | `src.to_webdataset` | Export WebDataset shards. |
-| 14 | `src.report` | Build filter report. |
+| 7 | `src.separation.tts_suitability` | Store raw TTS-suitability not_tts/tts logits. |
+| 7.5 | `src.separation.tts_suitability_filter` | Filter by not_tts-vs-tts logit margin. |
+| 8 | `src.transcription.transcription` | ASR with `onnx-asr` and optional ROVER. |
+| 9 | `src.punctuation.punctuation` | Punctuation restoration. |
+| 10 | `src.accents.accents` | Accent restoration. |
+| 11 | `src.phonemizer.phonemizer` | G2P / phonemization. |
+| 12 | `src.denoising.denoising` | ONNX Runtime / TensorRT denoising / speech enhancement. |
+| 13 | `src.collate` | Merge sidecars into parquet. |
+| 14 | `src.to_webdataset` | Export WebDataset shards. |
+| 15 | `src.report` | Build filter report. |
 
 Run a single stage:
 
@@ -41,7 +43,7 @@ Run from a checkpoint:
 bash base.sh --config_path configs/config.yaml --stage 4
 ```
 
-By default, `base.sh` runs stages 11..14. Use `--stage 1 --stop_stage 14`
+By default, `base.sh` runs stages 12..15. Use `--stage 1 --stop_stage 15`
 to run the full local pipeline from preprocessing through the final report. Use
 `--strict` when the orchestrator should abort after any stage writes a status
 file with non-zero errors.

@@ -15,24 +15,26 @@
 #   5.5 DistillMOS filter            (src.separation.distillmos_filter)
 #   6  Anti-spoofing scoring        (src.separation.antispoofing)
 #   6.5 Anti-spoofing filter         (src.separation.antispoofing_filter)
-#   7  Transcription                (src.transcription.transcription)
-#   8  Punctuation                  (src.punctuation.punctuation)
-#   9  Accents                      (src.accents.accents)
-#   10 Phonemizer                   (src.phonemizer.phonemizer)
-#   11 Denoising / enhancement      (src.denoising.denoising)
-#   12 Collate -> parquet           (src.collate)
-#   13 Export -> WebDataset         (src.to_webdataset)
-#   14 Filter report                (src.report)
+#   7  TTS-suitability scoring      (src.separation.tts_suitability)
+#   7.5 TTS-suitability filter       (src.separation.tts_suitability_filter)
+#   8  Transcription                (src.transcription.transcription)
+#   9  Punctuation                  (src.punctuation.punctuation)
+#   10 Accents                      (src.accents.accents)
+#   11 Phonemizer                   (src.phonemizer.phonemizer)
+#   12 Denoising / enhancement      (src.denoising.denoising)
+#   13 Collate -> parquet           (src.collate)
+#   14 Export -> WebDataset         (src.to_webdataset)
+#   15 Filter report                (src.report)
 #
-# Run a single stage:    bash base.sh --stage 7 --stop_stage 7
+# Run a single stage:    bash base.sh --stage 8 --stop_stage 8
 # Run from a checkpoint: bash base.sh --stage 4
 # =============================================================================
 set -euo pipefail
 
 # ---- defaults ---------------------------------------------------------------
 config_path="configs/config.yaml"
-stage=11
-stop_stage=14
+stage=12
+stop_stage=15
 strict_mode=0
 
 while [[ $# -gt 0 ]]; do
@@ -46,7 +48,7 @@ while [[ $# -gt 0 ]]; do
         --strict)
             strict_mode=1; shift ;;
         --help|-h)
-            sed -n '2,28p' "$0"
+            sed -n '2,30p' "$0"
             exit 0 ;;
         *)
             # Backwards-compat: accept positional config path as before.
@@ -298,51 +300,63 @@ if stage_active 6.5; then
 fi
 
 if stage_active 7; then
-    echo "Stage 7: Transcription — onnx-asr + ROVER"
-    run_python src.transcription.transcription
+    echo "Stage 7: TTS-suitability — raw classifier scoring"
+    run_python src.separation.tts_suitability
     check_stage_status 7
 fi
 
+if stage_active 7.5; then
+    echo "Stage 7.5: TTS-suitability filter — not_tts-margin deletion"
+    run_python src.separation.tts_suitability_filter
+    check_stage_status 7.5
+fi
+
 if stage_active 8; then
-    echo "Stage 8: Punctuation — RUPunct"
-    run_python src.punctuation.punctuation
+    echo "Stage 8: Transcription — onnx-asr + ROVER"
+    run_python src.transcription.transcription
     check_stage_status 8
 fi
 
 if stage_active 9; then
-    echo "Stage 9: Accents — ruAccent"
-    run_python src.accents.accents
+    echo "Stage 9: Punctuation — RUPunct"
+    run_python src.punctuation.punctuation
     check_stage_status 9
 fi
 
 if stage_active 10; then
-    echo "Stage 10: Phonemizer — TryIParu G2P"
-    run_python src.phonemizer.phonemizer
+    echo "Stage 10: Accents — ruAccent"
+    run_python src.accents.accents
     check_stage_status 10
 fi
 
 if stage_active 11; then
-    echo "Stage 11: Denoising — ClearVoice MossFormer2_SE_48K"
-    run_python src.denoising.denoising
+    echo "Stage 11: Phonemizer — TryIParu G2P"
+    run_python src.phonemizer.phonemizer
     check_stage_status 11
 fi
 
 if stage_active 12; then
-    echo "Stage 12: Collate — balalaika.parquet"
-    run_python src.collate
+    echo "Stage 12: Denoising — ClearVoice MossFormer2_SE_48K"
+    run_python src.denoising.denoising
     check_stage_status 12
 fi
 
 if stage_active 13; then
-    echo "Stage 13: Export — WebDataset shards"
-    run_python src.to_webdataset
+    echo "Stage 13: Collate — balalaika.parquet"
+    run_python src.collate
     check_stage_status 13
 fi
 
 if stage_active 14; then
-    echo "Stage 14: Filter report — filter_report.md"
-    run_python src.report --quiet
+    echo "Stage 14: Export — WebDataset shards"
+    run_python src.to_webdataset
     check_stage_status 14
+fi
+
+if stage_active 15; then
+    echo "Stage 15: Filter report — filter_report.md"
+    run_python src.report --quiet
+    check_stage_status 15
 fi
 
 echo -e "\n\033[1;32mPipeline finished (stages ${stage}..${stop_stage})\033[0m"

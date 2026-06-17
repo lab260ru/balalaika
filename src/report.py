@@ -363,7 +363,7 @@ def main(args):
         print(report_md)
 
     write_stage_status(
-        stage=14,
+        stage=15,
         stage_name="report",
         log_dir=args.log_dir or "./logs",
         processed=1,

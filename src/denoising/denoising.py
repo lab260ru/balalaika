@@ -623,7 +623,7 @@ def main():
     )
 
     write_stage_status(
-        stage=11,
+        stage=12,
         stage_name="denoising",
         log_dir=args.log_dir or "./logs",
         processed=processed.value,

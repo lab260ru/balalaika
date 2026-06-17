@@ -1,6 +1,6 @@
 ## Overview
 
-Stage 11 performs in-place speech enhancement / denoising on chunked clips.
+Stage 12 performs in-place speech enhancement / denoising on chunked clips.
 The current implementation runs a dynamic ONNX export of
 **[MossFormer2_SE_48K](https://huggingface.co/alibabasglab/MossFormer2_SE_48K)**,
 a 48 kHz speech-enhancement model from **ClearerVoice-Studio**. The original
@@ -25,8 +25,8 @@ is a no-op unless files are missing the `denoised` value.
 ## Run
 
 ```bash
-# As stage 11 of the main runner:
-bash base.sh --config_path configs/config.yaml --stage 11 --stop_stage 11
+# As stage 12 of the main runner:
+bash base.sh --config_path configs/config.yaml --stage 12 --stop_stage 12
 
 # Or the per-stage wrapper:
 bash src/denoising/denoising_yaml.sh configs/config.yaml

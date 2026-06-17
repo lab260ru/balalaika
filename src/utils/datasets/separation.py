@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
@@ -23,6 +24,10 @@ DISTILLMOS_SAMPLE_RATE = 16_000
 ANTISPOOF_SAMPLE_RATE = 16_000
 ANTISPOOF_NUM_SAMPLES = 64_600
 MUSICDETECT_SAMPLE_RATE = 16_000
+TTS_SUITABILITY_SAMPLE_RATE = 16_000
+# 10 s windows at 16 kHz; long clips are split into this many frames per chunk
+# and the model's logits are averaged across chunks (see inference.py upstream).
+TTS_SUITABILITY_CHUNK_FRAMES = 160_000
 
 # Containers/subtypes for which a soundfile ranged read has been proven to
 # reproduce torchcodec's full-decode float32 values bit-exactly (torch.equal).
@@ -478,6 +483,136 @@ def create_music_detect_dataloader(
         "num_workers": num_workers,
         "pin_memory": False,
         "collate_fn": musicdetect_collate,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["worker_init_fn"] = dataloader_worker_init
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def _tts_layer_norm(waveform: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+    """Whole-waveform layer norm, bit-faithful to the upstream inference.py
+    (float64 mean/variance with ddof=0, eps=1e-5, cast back to float32)."""
+    mean = waveform.mean(dtype=np.float64)
+    variance = waveform.var(dtype=np.float64)
+    return ((waveform - mean) / np.sqrt(variance + eps)).astype(np.float32)
+
+
+def _tts_chunk_waveform(waveform: np.ndarray, chunk_frames: int) -> np.ndarray:
+    """Split a 1-D waveform into ``[n_chunks, max_chunk_len]`` exactly as the
+    upstream inference.py does: clips no longer than one chunk are returned as a
+    single unpadded row, longer clips are split every ``chunk_frames`` samples
+    with the trailing chunk zero-padded to the longest chunk length."""
+    if chunk_frames <= 0 or waveform.size <= chunk_frames:
+        return waveform[None, :]
+    chunks = [
+        waveform[start : start + chunk_frames]
+        for start in range(0, waveform.size, chunk_frames)
+    ]
+    max_length = max(chunk.size for chunk in chunks)
+    batch = np.zeros((len(chunks), max_length), dtype=np.float32)
+    for index, chunk in enumerate(chunks):
+        batch[index, : chunk.size] = chunk
+    return batch
+
+
+class TTSSuitabilityDataset(Dataset):
+    """Mono 16 kHz loader for the TTS-suitability classifier.
+
+    Each item is one file decoded to mono float32, resampled to 16 kHz,
+    layer-normalized and chunked into 10 s windows. Because every file produces
+    a variable number of chunks of differing length (and wav2vec2 has no
+    attention-mask input), files cannot be padded together into one batch — the
+    stage runs inference per file and averages logits across that file's chunks.
+    """
+
+    def __init__(
+        self,
+        file_paths: List[str],
+        sample_rate: int = TTS_SUITABILITY_SAMPLE_RATE,
+        chunk_frames: int = TTS_SUITABILITY_CHUNK_FRAMES,
+    ):
+        self.file_paths = file_paths
+        self.sample_rate = int(sample_rate)
+        self.chunk_frames = int(chunk_frames)
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+    def __getitem__(self, idx: int):
+        path_str = self.file_paths[idx]
+        started_at = time.perf_counter()
+        try:
+            waveform, source_sample_rate = torchaudio.load_with_torchcodec(path_str)
+            waveform = waveform.to(dtype=torch.float32)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0)
+            else:
+                waveform = waveform.squeeze(0)
+            if int(source_sample_rate) != self.sample_rate:
+                waveform = torchaudio.functional.resample(
+                    waveform,
+                    int(source_sample_rate),
+                    self.sample_rate,
+                )
+            samples = waveform.contiguous().numpy()
+            if samples.size <= 0:
+                raise ValueError("empty audio")
+            normalized = _tts_layer_norm(samples)
+            chunks = _tts_chunk_waveform(normalized, self.chunk_frames)
+            num_chunks = int(chunks.shape[0])
+            loguru_logger.debug(
+                f"dataloader_audio_load dataset=tts_suitability path={path_str} "
+                f"seconds={time.perf_counter() - started_at:.6f} "
+                f"sample_rate={self.sample_rate} chunks={num_chunks} "
+                f"frames={int(samples.size)}"
+            )
+            return path_str, torch.from_numpy(chunks), num_chunks, ""
+        except Exception as exc:
+            loguru_logger.debug(
+                f"dataloader_audio_load dataset=tts_suitability path={path_str} "
+                f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
+            )
+            return path_str, torch.empty(0, 0, dtype=torch.float32), 0, str(exc)
+
+
+def tts_suitability_collate(batch):
+    """Group per-file chunk tensors without stacking (shapes differ per file).
+
+    Returns ``(paths, chunk_batches, errors)`` where ``chunk_batches[i]`` is the
+    ``[n_chunks, frames]`` float32 tensor for ``paths[i]``.
+    """
+    paths, chunk_batches, _num_chunks, errors = zip(*batch)
+    valid_indices = [idx for idx, error in enumerate(errors) if not error]
+    valid_errors = [
+        (paths[idx], errors[idx]) for idx in range(len(paths)) if errors[idx]
+    ]
+    valid_paths = [paths[idx] for idx in valid_indices]
+    valid_chunks = [chunk_batches[idx] for idx in valid_indices]
+    return valid_paths, valid_chunks, valid_errors
+
+
+def create_tts_suitability_dataloader(
+    file_paths: List[str],
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    sample_rate: int = TTS_SUITABILITY_SAMPLE_RATE,
+    chunk_frames: int = TTS_SUITABILITY_CHUNK_FRAMES,
+) -> DataLoader:
+    dataset = TTSSuitabilityDataset(
+        file_paths,
+        sample_rate=sample_rate,
+        chunk_frames=chunk_frames,
+    )
+    num_workers = clamp_loader_workers(num_workers, file_paths)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": False,
+        "collate_fn": tts_suitability_collate,
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
