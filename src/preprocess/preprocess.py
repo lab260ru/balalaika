@@ -56,7 +56,7 @@ from src.utils.csv_manager import (
 from src.utils.datasets.preprocess import create_diarization_dataloader
 from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
-from src.utils.stage_status import write_stage_status
+from src.utils.stage_status import last_line, write_stage_status
 from src.utils.utils import load_config
 
 apply_torch_perf_defaults()
@@ -1076,7 +1076,7 @@ def main(args):
                     except Exception as e:
                         logger.error(f"Failed to aggregate results from a GPU batch: {e}")
                         errors += 1
-                        error_details.append({"reason": str(e)})
+                        error_details.append({"reason": last_line(e)})
     except KeyboardInterrupt:
         logger.warning("Preprocess stage interrupted; final partial absorb still runs.")
 

@@ -1,4 +1,5 @@
 import argparse
+import gc
 import multiprocessing as mp
 import os
 import tempfile
@@ -32,7 +33,7 @@ from src.utils.node_profile import resolve_batch_size
 from src.utils.parallel import run_per_gpu_processes
 from src.utils.csv_manager import discover_audio_paths
 from src.utils.sidecars import DirNameCache, text_sidecar_complete
-from src.utils.stage_status import write_stage_status
+from src.utils.stage_status import last_line, write_stage_status
 from src.utils.utils import load_config, read_file_content
 from src.utils.work_shards import (
     claim_work_shard,
@@ -216,7 +217,7 @@ def _process_batches(batch_iter, cuda_id: int, model_name: str, model, output_su
             if errors_counter is not None:
                 errors_counter.value += 1
             if error_details is not None:
-                error_details.append({"file": path_str, "model": model_name, "reason": reason})
+                error_details.append({"file": path_str, "model": model_name, "reason": last_line(reason)})
 
         if not paths:
             continue
@@ -240,7 +241,7 @@ def _process_batches(batch_iter, cuda_id: int, model_name: str, model, output_su
                     if errors_counter is not None:
                         errors_counter.value += 1
                     if error_details is not None:
-                        error_details.append({"file": path_str, "model": model_name, "seconds": seconds, "reason": str(e2)})
+                        error_details.append({"file": path_str, "model": model_name, "seconds": seconds, "reason": last_line(e2)})
 
         if not isinstance(results, list):
             results = [results]
@@ -386,7 +387,7 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
         if errors_counter is not None:
             errors_counter.value += 1
         if error_details is not None:
-            error_details.append({"worker": cuda_id, "model": model_name, "reason": str(e)})
+            error_details.append({"worker": cuda_id, "model": model_name, "reason": last_line(e)})
 
 @dataclass
 class _GroupModelSpec:
@@ -461,7 +462,7 @@ def _recognize_chunk(spec: _GroupModelSpec, paths: List[str], waveforms, lengths
                 if errors_counter is not None:
                     errors_counter.value += 1
                 if error_details is not None:
-                    error_details.append({"file": path_str, "model": spec.name, "seconds": seconds, "reason": str(e2)})
+                    error_details.append({"file": path_str, "model": spec.name, "seconds": seconds, "reason": last_line(e2)})
         return results
 
 
@@ -493,7 +494,7 @@ def _process_group_batches(batch_iter, specs: List[_GroupModelSpec],
                 if errors_counter is not None:
                     errors_counter.value += 1
                 if error_details is not None:
-                    error_details.append({"file": path_str, "model": name, "reason": reason})
+                    error_details.append({"file": path_str, "model": name, "reason": last_line(reason)})
 
         if not paths:
             continue
@@ -623,7 +624,7 @@ def run_group_worker(cuda_id: int, world_size: int, group_models: List[str],
         if errors_counter is not None:
             errors_counter.value += 1
         if error_details is not None:
-            error_details.append({"worker": cuda_id, "model": ",".join(group_models), "reason": str(e)})
+            error_details.append({"worker": cuda_id, "model": ",".join(group_models), "reason": last_line(e)})
 
 
 def normalize_consensus_text(text: str) -> str:
@@ -765,6 +766,13 @@ def main(args):
             for p in get_valid_paths(src_path, output_suffix, [], consensus_num, retry_empty_outputs, args.config_path, cache=group_cache):
                 needed.setdefault(p, []).append(model_name)
 
+        # The scan-time directory cache holds every filename in the dataset
+        # tree (audio + all sidecars) — multiple GB. It is only used by
+        # get_valid_paths above; drop it before the multi-hour processing phase
+        # so the parent does not carry it as dead weight while the per-GPU
+        # workers (separate processes) run.
+        del group_cache
+
         if not needed:
             logger.info(f"No files to process for group {grouped_models}")
         else:
@@ -791,6 +799,14 @@ def main(args):
             del union_paths
             del durations
             del needed
+            # annotations are now persisted in the shard files on disk; the
+            # spawned workers read them back via read_annotated_work_shard and
+            # never receive this dict (≈one entry per pending file). Free it and
+            # return the freed pages to the OS before launching the workers, so
+            # the parent's resident set drops from ~13 GB to ~1-2 GB for the
+            # whole processing phase (critical headroom on multi-GPU runs).
+            del annotations
+            gc.collect()
 
             logger.info(
                 f"{work_plan.total_items} files to process for group {grouped_models} "

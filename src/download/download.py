@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from src.utils.logging_setup import setup_logging
-from src.utils.stage_status import write_stage_status
+from src.utils.stage_status import last_line, write_stage_status
 from src.utils.utils import load_config
 
 def init_client(client_key):
@@ -202,7 +202,7 @@ def main(args):
         except Exception as e:
             logger.error(f"Error when downloading a podcast {url}: {e}")
             errors += 1
-            error_details.append({"podcast": str(url), "reason": str(e)})
+            error_details.append({"podcast": str(url), "reason": last_line(e)})
 
     write_stage_status(
         stage=0,

@@ -12,7 +12,7 @@ from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_pool_chunked
 from src.utils.sidecars import pending_sidecar_chain
-from src.utils.stage_status import write_stage_status
+from src.utils.stage_status import last_line, write_stage_status
 from src.utils.utils import load_config, read_file_content
 
 apply_torch_perf_defaults()
@@ -65,7 +65,7 @@ def process_chunk(chunk) -> list:
             _process_one(text_path)
         except Exception as exc:
             logger.error(f"Error processing {Path(text_path).name}: {exc}")
-            failures.append({"item": str(text_path), "reason": str(exc)})
+            failures.append({"item": str(text_path), "reason": last_line(exc)})
     return failures
 
 

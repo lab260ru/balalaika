@@ -18,7 +18,7 @@ from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_pool_chunked
 from src.utils.sidecars import pending_sidecar_chain, replace_in_stem
-from src.utils.stage_status import write_stage_status
+from src.utils.stage_status import last_line, write_stage_status
 from src.utils.utils import load_config, read_file_content
 
 apply_torch_perf_defaults()
@@ -103,7 +103,7 @@ def process_chunk(chunk) -> list:
             texts.append(text)
         except Exception as exc:
             logger.error(f"Error reading {punct_path.name}: {exc}")
-            failures.append({"item": str(punct_path), "reason": str(exc)})
+            failures.append({"item": str(punct_path), "reason": last_line(exc)})
 
     if not texts:
         return failures
@@ -128,7 +128,7 @@ def process_chunk(chunk) -> list:
                 _write_accent(punct_path, accentizer.process_all(text))
             except Exception as exc:
                 logger.error(f"Error processing {punct_path.name}: {exc}")
-                failures.append({"item": str(punct_path), "reason": str(exc)})
+                failures.append({"item": str(punct_path), "reason": last_line(exc)})
         return failures
 
     for punct_path, accented in zip(paths, outputs):
@@ -136,7 +136,7 @@ def process_chunk(chunk) -> list:
             _write_accent(punct_path, accented)
         except Exception as exc:
             logger.error(f"Error writing {punct_path.name}: {exc}")
-            failures.append({"item": str(punct_path), "reason": str(exc)})
+            failures.append({"item": str(punct_path), "reason": last_line(exc)})
     return failures
 
 

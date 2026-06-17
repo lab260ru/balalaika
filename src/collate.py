@@ -12,7 +12,7 @@ from src.utils.csv_manager import (
     state_path,
 )
 from src.utils.logging_setup import setup_logging
-from src.utils.stage_status import write_stage_status
+from src.utils.stage_status import last_line, write_stage_status
 from src.utils.utils import load_config, read_file_content
 
 SUPPORTED_TIMESTAMP_MODELS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
@@ -385,7 +385,7 @@ def main(args):
                     for path, exc in slab_errors:
                         logger.error(f'{path} generated an exception: {exc}')
                         errors += 1
-                        error_details.append({"file": str(path), "reason": str(exc)})
+                        error_details.append({"file": str(path), "reason": last_line(exc)})
 
                     table = pa.Table.from_pandas(slab, preserve_index=False)
                     if writer is None:

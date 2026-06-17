@@ -25,6 +25,8 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 from loguru import logger
 from tqdm import tqdm
 
+from src.utils.stage_status import last_line
+
 
 
 def shard_round_robin(items: Sequence[Any], num_shards: int) -> List[List[Any]]:
@@ -105,7 +107,7 @@ def run_per_gpu_pool(
                     item = future_to_item[fut]
                     logger.error(f"{desc}: task failed for {item}: {exc}")
                     error_count += 1
-                    error_details.append({"item": str(item), "reason": str(exc)})
+                    error_details.append({"item": str(item), "reason": last_line(exc)})
                 bar.update(1)
     except KeyboardInterrupt:
         logger.warning(f"{desc}: interrupted by user; shutting down workers...")
@@ -193,7 +195,7 @@ def run_per_gpu_pool_chunked(
                         error_details.append(
                             {
                                 "item": str(fail.get("item")),
-                                "reason": str(fail.get("reason")),
+                                "reason": last_line(fail.get("reason")),
                             }
                         )
                 except Exception as exc:
@@ -203,7 +205,7 @@ def run_per_gpu_pool_chunked(
                     logger.error(f"{desc}: chunk of {len(chunk)} failed: {exc}")
                     for item in chunk:
                         error_count += 1
-                        error_details.append({"item": str(item), "reason": str(exc)})
+                        error_details.append({"item": str(item), "reason": last_line(exc)})
                 bar.update(len(chunk))
     except KeyboardInterrupt:
         logger.warning(f"{desc}: interrupted by user; shutting down workers...")
