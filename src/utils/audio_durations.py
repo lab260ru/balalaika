@@ -20,7 +20,6 @@ from src.utils.csv_manager import (
     _normalize_path_series,
     _read_state_narrow,
     _state_header,
-    csv_path,
     normalize_path_string,
     state_path,
     upsert_columns,
@@ -59,11 +58,8 @@ def _normalise_requested_paths(paths: Iterable[str | Path]) -> list[tuple[str, s
 
 
 def _csv_duration_cache(podcasts_path: str | Path, requested_norms: set[str]) -> dict[str, float]:
-    # Prefer the active state file (parquet projection is cheap); fall back to
-    # the CSV export when the state file doesn't exist yet.
+    # Read the duration column from the parquet state (projection is cheap).
     target = state_path(podcasts_path)
-    if not target.exists():
-        target = csv_path(podcasts_path)
     if not target.exists() or not requested_norms:
         return {}
 

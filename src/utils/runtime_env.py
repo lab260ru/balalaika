@@ -21,7 +21,6 @@ Output keys (printed only when present / non-empty):
 * ``BALALAIKA_MALLOC_TRIM_EVERY`` — per-worker ``malloc_trim(0)`` interval in
   decoded items (``0`` disables); read by ``datasets/transcription.py`` to keep
   decode-heap RSS bounded
-* ``BALALAIKA_STATE_FORMAT``   — ``csv``/``parquet`` pipeline-state format (from ``csv.state_format``)
 
 The Python modules also read the same ``runtime`` block via :func:`runtime_cfg`
 so the values stay aligned between shell and Python.
@@ -55,11 +54,6 @@ DEFAULTS: Dict[str, Any] = {
     # a measured win (worker RSS ~4.5 GB -> ~1 GB) with negligible cost; 0
     # disables. Enabled by default since it only affects memory, never outputs.
     "malloc_trim_every": 128,
-    # Sourced from the top-level `csv:` block, not `runtime:` (see
-    # _load_runtime). "csv" keeps balalaika.csv as the live state; "parquet"
-    # uses balalaika.parquet + a CSV export. Exported so every spawned stage
-    # worker sees the same format.
-    "state_format": "csv",
 }
 
 ENV_KEYS = {
@@ -73,7 +67,6 @@ ENV_KEYS = {
     "io_profile": "BALALAIKA_IO_PROFILE",
     "threads_per_worker": "BALALAIKA_THREADS_PER_WORKER",
     "malloc_trim_every": "BALALAIKA_MALLOC_TRIM_EVERY",
-    "state_format": "BALALAIKA_STATE_FORMAT",
 }
 
 
@@ -87,11 +80,6 @@ def _load_runtime(config_path: str) -> Dict[str, Any]:
         return {}
     block = data.get("runtime", {})
     cfg: Dict[str, Any] = dict(block) if isinstance(block, dict) else {}
-    # state_format lives in the `csv:` block but is exported alongside the
-    # runtime env so base.sh propagates it to every stage/worker.
-    csv_block = data.get("csv", {})
-    if isinstance(csv_block, dict) and csv_block.get("state_format") is not None:
-        cfg.setdefault("state_format", csv_block.get("state_format"))
     return cfg
 
 

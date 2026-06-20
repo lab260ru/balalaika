@@ -15,6 +15,7 @@ not be poisoned.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -29,8 +30,19 @@ MODEL_NAMES = ["giga_ctc", "giga_rnnt", "vosk"]
 
 
 def _write_sidecars(audio_dir: Path, stem: str, mapping: dict) -> None:
+    """Translate old per-suffix sidecar contents into one ``<stem>.json``."""
+    data: dict = {}
     for suffix, content in mapping.items():
-        (audio_dir / f"{stem}{suffix}").write_text(content, encoding="utf-8")
+        name = suffix[1:]
+        if name.endswith(".tst"):
+            data.setdefault("asr_ts", {})[name[:-4]] = content
+        elif name.endswith(".txt"):
+            base = name[:-4]
+            if base in ("rover", "punct", "accent", "rover_phonemes"):
+                data[base] = content
+            else:
+                data.setdefault("asr", {})[base] = content
+    (audio_dir / f"{stem}.json").write_text(json.dumps(data), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -42,8 +54,6 @@ def test_sparse_metadata_column_survives_slab_boundary(tmp_path):
     base = tmp_path / "data"
     d = base / "1"
     d.mkdir(parents=True)
-
-    file_types = collate.sidecar_specs(MODEL_NAMES)
 
     rows = []
     for i in range(4):
@@ -60,7 +70,7 @@ def test_sparse_metadata_column_survives_slab_boundary(tmp_path):
             }
         )
     df = pd.DataFrame(rows)
-    (base / "balalaika.csv").write_text(df.to_csv(index=False), encoding="utf-8")
+    df.to_parquet(base / "balalaika.parquet", index=False)
 
     cfg = {
         "download": {
@@ -107,7 +117,7 @@ def test_residual_schema_mismatch_raises_clear_error(tmp_path, monkeypatch):
         p.write_bytes(b"x")
         rows.append({"filepath": str(p), "speaker_id": i})
     df = pd.DataFrame(rows)
-    (base / "balalaika.csv").write_text(df.to_csv(index=False), encoding="utf-8")
+    df.to_parquet(base / "balalaika.parquet", index=False)
 
     cfg = {
         "download": {

@@ -11,8 +11,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from src.utils.csv_manager import discover_audio_paths
-from src.utils.sidecars import DirNameCache
-from src.utils.utils import read_file_content
+from src.utils.chunk_json import ChunkJsonCache, get_field, update_chunk_json
 from src.utils.work_shards import (
     claim_work_shard,
     load_work_shard_size,
@@ -69,23 +68,20 @@ class ROVERWrapper:
     def _model_suffix(self, model_name: str) -> str:
         return 'vosk' if 'vosk' in model_name else model_name
 
-    def _rover_output_path(self, audio_path: Path) -> Path:
-        return audio_path.with_name(f"{audio_path.stem}_rover.txt")
-
     def _pending_audio_paths(self, audio_paths: Iterable[str]) -> List[str]:
         pending: List[str] = []
         total = len(audio_paths) if hasattr(audio_paths, "__len__") else None
-        # One scandir per directory replaces one _rover.txt stat per audio
-        # file. Built per-process: this runs in the orchestrator before shards
-        # are dispatched, never across the spawn boundary.
-        cache = DirNameCache()
+        # One scandir per directory + one chunk-JSON read per file replaces the
+        # per-audio _rover.txt stat. Built per-process: this runs in the
+        # orchestrator before shards are dispatched, never across the spawn
+        # boundary.
+        cache = ChunkJsonCache()
         for raw_path in tqdm(audio_paths, total=total, desc="find_rover_pending"):
             audio_path = Path(raw_path)
             if any(pattern in audio_path.stem for pattern in self.excluded_patterns):
                 continue
-            if cache.sidecar_complete(
-                self._rover_output_path(audio_path),
-                retry_empty=self.retry_empty_outputs,
+            if cache.field_complete(
+                audio_path, "rover", retry_empty=self.retry_empty_outputs
             ):
                 continue
             pending.append(str(audio_path))
@@ -96,50 +92,38 @@ class ROVERWrapper:
         total = len(audio_paths) if hasattr(audio_paths, "__len__") else None
         # Per-shard cache: built fresh in whatever (possibly spawned) worker
         # process owns this shard. A shard's files cluster in a handful of
-        # episode directories, so one scandir per directory amortizes across
-        # all model-suffix probes for every file in that directory.
-        cache = DirNameCache()
+        # episode directories, so one scandir per directory + one JSON read per
+        # file amortizes across all model probes for every file in that dir.
+        cache = ChunkJsonCache()
         for raw_path in tqdm(audio_paths, total=total, desc="load_rover_transcripts"):
             audio_path = Path(raw_path)
             if any(pattern in audio_path.stem for pattern in self.excluded_patterns):
                 continue
 
+            data = cache.get(audio_path)
             for model_name in self.model_names:
                 suffix = self._model_suffix(model_name)
-                transcript_path = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
-
-                if not cache.exists(transcript_path):
+                text = get_field(data, f"asr.{suffix}")
+                if not text:
                     continue
-
-                try:
-                    text = read_file_content(transcript_path)
-                    if not text:
-                        continue
-
-                    records.append({
-                        'task': str(audio_path),
-                        'worker': model_name,
-                        'text': text.lower()
-                    })
-                except Exception as e:
-                    logger.error(f"Error reading file {transcript_path}: {e}")
+                records.append({
+                    'task': str(audio_path),
+                    'worker': model_name,
+                    'text': str(text).lower()
+                })
 
         return pd.DataFrame.from_records(records, columns=['task', 'worker', 'text'])
 
     def _save_results(self, result) -> int:
         saved = 0
         for task_path, agg_text in tqdm(result.items(), desc="save_rover_results"):
-            audio_path = Path(task_path)
-            output_path = self._rover_output_path(audio_path)
-            tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-
             try:
-                with tmp_path.open("w", encoding="utf-8") as f:
-                    f.write("" if agg_text is None else str(agg_text))
-                tmp_path.replace(output_path)
+                update_chunk_json(
+                    task_path, {"rover": "" if agg_text is None else str(agg_text)}
+                )
                 saved += 1
-            except IOError as e:
-                logger.error(f"Failed to write ROVER result to {output_path}: {e}")
+            except OSError as e:
+                logger.error(f"Failed to write ROVER result to {task_path}: {e}")
 
         return saved
 

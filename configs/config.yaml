@@ -73,17 +73,13 @@ cache_path: ./cache
 # until the next run.
 # -----------------------------------------------------------------------------
 csv:
-  # Pipeline-state format. "csv" (default) keeps balalaika.csv as the live
-  # state file — zero behavior change. "parquet" keeps state in
-  # balalaika.parquet (snappy) for all hot ops (load, atomic write with .bak,
-  # periodic flush, absorb, drop_missing, narrow column reads — parquet column
-  # projection makes those genuinely cheap and preserves dtypes natively), and
-  # still writes balalaika.csv as an export at stage completion so external
-  # consumers keep working. Resume is seamless: a legacy CSV-only dataset is
-  # migrated to parquet on first load; a stale parquet under csv mode is
-  # ignored with a warning. Measured at 2 M rows: ~1.9x faster atomic write,
-  # cheaper narrow reads; the CSV export round-trips byte-identical.
-  state_format: parquet
+  # Pipeline state lives in balalaika.parquet (snappy) only — CSV state was
+  # removed as a redundant, inefficient copy. All hot ops (load, atomic write
+  # with .bak, periodic flush, absorb, drop_missing, narrow column reads) run on
+  # the parquet file; column projection keeps narrow reads cheap and dtypes are
+  # preserved natively. No balalaika.csv is produced. (The per-worker partials
+  # below are transient .csv files, streamed row-by-row for crash safety and
+  # deleted after they are folded into the parquet state.)
   # Fold worker partial CSVs into the state file after every N rows of
   # cumulative progress across workers. 0 disables periodic flushing
   # (only the post-stage merge runs). 100 000 rows ≈ a few seconds of pandas
@@ -145,6 +141,14 @@ runtime:
   # GPU-EP sessions are unaffected; CPU-executed ops change reduction order, so
   # re-verify if a stage runs ops on CPU.
   threads_per_worker: ""
+  # Per-worker malloc_trim(0) interval, in decoded audio items. torchcodec/ffmpeg
+  # decode churns the glibc heap, so each DataLoader worker's RSS ratchets up to
+  # a multi-GB high-water mark and (with transcription.persistent_loaders: True)
+  # never drops, OOM-killing workers on a RAM-tight box. The transcription
+  # datasets call malloc_trim(0) every N decoded items to hand that memory back
+  # to the OS — measured worker RSS ~4.5 GB -> ~1 GB at 128. Memory-only (never
+  # changes outputs); 0 disables. Exported as BALALAIKA_MALLOC_TRIM_EVERY.
+  malloc_trim_every: 128
   # cudf.pandas is OFF by default (it disables the pyarrow CSV fast paths and
   # adds a per-stage cuDF CUDA context that risks OOM on shared GPUs). Opt in
   # on a cudf node with the env knob BALALAIKA_ENABLE_CUDF=1 (see base.sh).
@@ -253,10 +257,19 @@ preprocess:
   chunk_format: auto
   # Minimum acceptable segment length (seconds) when filtering single-speaker
   # diarization output. Below this, the segment is dropped before EOS refinement.
-  min_segment_duration: 1.0
+  # Floor of 2.0s removes the sub-2s over-segmentation mass (1-2s fragments are
+  # mostly noise for ASR/TTS training).
+  min_segment_duration: 2.0
   # Hard floor for a chunk to actually be written to disk (seconds). Below this
   # value the chunk is silently skipped (e.g. 100 ms artefacts from VAD).
   min_save_duration: 0.5
+  # Target chunk length (seconds). A merged span longer than `duration` (the
+  # cap) is split into N balanced pieces of ~this length instead of being
+  # truncated to its trailing `duration` window. This both keeps all the audio
+  # (the old truncation discarded everything before the last window) and
+  # smooths the length distribution (the old path piled ~15% of chunks exactly
+  # at the cap). E.g. a 15s span becomes 2x7.5s rather than 1x15s.
+  preferred_chunk_duration: 8.0
   # Maximum silence gap allowed when merging same-speaker pieces before an EOS
   # boundary is reached. Low EOU is buffered, but only chunks ending with good
   # EOU are saved; overflow before the final good EOU is discarded.
@@ -446,8 +459,8 @@ transcription:
   shard_order: path
   # CPU processes for ROVER shard aggregation.
   rover_workers: 4
-  batch_size: 4
-  num_workers: 2
+  batch_size: 8
+  num_workers: 1
   prefetch_factor: 1
   # Keep DataLoader workers alive across work shards. Each GPU worker claims
   # 10k-file shards in a loop; the old flow built a fresh DataLoader (spawning

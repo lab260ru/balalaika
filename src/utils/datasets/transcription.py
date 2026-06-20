@@ -1,8 +1,5 @@
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import ctypes
-import os
-
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -12,48 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.utils.io_profile import clamp_loader_workers
 from src.utils.logging_setup import dataloader_worker_init as _worker_init
-
-
-# --------------------------------------------------------------------------- #
-# Periodic heap trim.
-#
-# torchcodec/ffmpeg decode churn leaves glibc holding freed memory: a worker's
-# RSS ratchets up to a multi-GB high-water mark and, with persistent_loaders,
-# never drops — which is what OOM-kills DataLoader workers on the shared box.
-# ``malloc_trim(0)`` hands that retained memory back to the OS (measured: heap
-# 1436 MB -> 155 MB after one call). We call it every N decoded items from
-# inside ``__getitem__`` so it runs in whichever process actually decodes (each
-# DataLoader worker keeps its own counter; also covers the inline single-GPU
-# path). No-op on non-glibc libc or when disabled via the env override.
-# --------------------------------------------------------------------------- #
-_TRIM_EVERY = int(os.environ.get("BALALAIKA_MALLOC_TRIM_EVERY", "128") or 0)
-
-
-def _load_malloc_trim():
-    if _TRIM_EVERY <= 0:
-        return None
-    try:
-        libc = ctypes.CDLL("libc.so.6", use_errno=False)
-        fn = libc.malloc_trim
-        fn.argtypes = [ctypes.c_size_t]
-        fn.restype = ctypes.c_int
-        return fn
-    except (OSError, AttributeError):
-        return None
-
-
-_MALLOC_TRIM = _load_malloc_trim()
-_decode_counter = 0
-
-
-def _periodic_malloc_trim() -> None:
-    """Return retained heap to the OS every ``_TRIM_EVERY`` decoded items."""
-    global _decode_counter
-    if _MALLOC_TRIM is None:
-        return
-    _decode_counter += 1
-    if _decode_counter % _TRIM_EVERY == 0:
-        _MALLOC_TRIM(0)
+from src.utils.mem import periodic_malloc_trim as _periodic_malloc_trim
 
 
 class TranscriptionDataset(Dataset):

@@ -1,6 +1,7 @@
 ## Phonemizer (TryIParu)
 
-Grapheme → IPA from **`{stem}_rover.txt`** using **`src.phonemizer.fast_g2p.FastG2P`**
+Grapheme → IPA from the **`rover`** text in each chunk's **`{stem}.json`** (writes
+the **`rover_phonemes`** key) using **`src.phonemizer.fast_g2p.FastG2P`**
 — a drop-in, token-identical replacement for `tryiparu.G2PModel` (same weights,
 tokenizer and rules) that greedy-decodes the unique OOV words of a file as one
 padded batch (~21-37× per word), loads the 398k-word dictionary from a pickle

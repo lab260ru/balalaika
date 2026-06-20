@@ -1,4 +1,5 @@
-"""Stage 8 — RUPunct punctuation restoration on ``*_rover.txt`` sidecars."""
+"""Stage 9 — RUPunct punctuation restoration on the ``rover`` text of each
+chunk's ``<stem>.json`` (writes the ``punct`` key)."""
 import argparse
 import multiprocessing
 from pathlib import Path
@@ -6,13 +7,20 @@ from pathlib import Path
 from loguru import logger
 from transformers import AutoTokenizer, pipeline
 
+from src.utils.chunk_json import (
+    ChunkJsonCache,
+    chunk_json_path,
+    get_field,
+    pending_chunks,
+    read_chunk_json,
+    update_chunk_json,
+)
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.node_profile import resolve_batch_size
 from src.utils.parallel import run_per_gpu_pool
-from src.utils.sidecars import DirNameCache, pending_audio_to_sidecar
 from src.utils.stage_status import write_stage_status
-from src.utils.utils import load_config, process_token, read_file_content
+from src.utils.utils import load_config, process_token
 
 apply_torch_perf_defaults()
 
@@ -66,26 +74,26 @@ def _punct_text_from_preds(preds) -> str:
     ).strip()
 
 
-def make_punct_txt(rover_path: Path) -> None:
-    rover_path = Path(rover_path)
-    punct_path = rover_path.with_name(rover_path.name.replace("_rover.txt", "_punct.txt"))
-    if punct_path.exists():
+def make_punct_txt(audio_path: Path) -> None:
+    audio_path = Path(audio_path)
+    data = read_chunk_json(chunk_json_path(audio_path))
+    if get_field(data, "punct") is not None:
         return
 
-    src_text = read_file_content(rover_path)
+    src_text = get_field(data, "rover")
     if not src_text:
         return
 
     preds = model(src_text)
-    punct_path.write_text(_punct_text_from_preds(preds), encoding="utf-8")
+    update_chunk_json(audio_path, {"punct": _punct_text_from_preds(preds)})
 
 
-def _punct_one(punct_path: Path, text: str) -> None:
+def _punct_one(audio_path: Path, text: str) -> None:
     preds = model(text)
-    punct_path.write_text(_punct_text_from_preds(preds), encoding="utf-8")
+    update_chunk_json(audio_path, {"punct": _punct_text_from_preds(preds)})
 
 
-def make_punct_batch(rover_paths) -> None:
+def make_punct_batch(audio_paths) -> None:
     """Batched RUPunct over a slab of files (one pipeline call for the slab).
 
     The NER pipeline is ~5x faster fed in batches than file-by-file (measured
@@ -108,33 +116,31 @@ def make_punct_batch(rover_paths) -> None:
     """
     pending: list[tuple[Path, str, int]] = []
     oversize: list[tuple[Path, str]] = []
-    for rover_path in rover_paths:
-        rover_path = Path(rover_path)
-        punct_path = rover_path.with_name(
-            rover_path.name.replace("_rover.txt", "_punct.txt")
-        )
-        if punct_path.exists():
+    for audio_path in audio_paths:
+        audio_path = Path(audio_path)
+        data = read_chunk_json(chunk_json_path(audio_path))
+        if get_field(data, "punct") is not None:
             continue
-        src_text = read_file_content(rover_path)
+        src_text = get_field(data, "rover")
         if not src_text:
             continue
         n_tokens = _token_count(src_text)
         if n_tokens > MODEL_MAX_TOKENS:
-            oversize.append((punct_path, src_text))
+            oversize.append((audio_path, src_text))
         else:
-            pending.append((punct_path, src_text, n_tokens))
+            pending.append((audio_path, src_text, n_tokens))
 
     failed: list[str] = []
 
     # Oversize texts: the doomed-in-a-batch ones. Process each on its own via
     # the pipeline's native 512-token chunk+aggregate (model_max_length is
     # pinned in init_process).
-    for punct_path, text in oversize:
+    for audio_path, text in oversize:
         try:
-            _punct_one(punct_path, text)
+            _punct_one(audio_path, text)
         except Exception as file_exc:
-            logger.error(f"Punctuation failed for {punct_path}: {file_exc}")
-            failed.append(punct_path.name)
+            logger.error(f"Punctuation failed for {audio_path}: {file_exc}")
+            failed.append(audio_path.name)
 
     if pending:
         # Group similar lengths together to cut padding waste in the one
@@ -145,18 +151,18 @@ def make_punct_batch(rover_paths) -> None:
                 [text for _, text, _ in pending],
                 batch_size=min(PUNCT_PIPELINE_BATCH, len(pending)),
             )
-            for (punct_path, _, _), preds in zip(pending, all_preds):
-                punct_path.write_text(
-                    _punct_text_from_preds(preds), encoding="utf-8"
+            for (audio_path, _, _), preds in zip(pending, all_preds):
+                update_chunk_json(
+                    audio_path, {"punct": _punct_text_from_preds(preds)}
                 )
         except Exception as exc:
             logger.warning(f"Batched punctuation failed ({exc}); retrying per file.")
-            for punct_path, text, _ in pending:
+            for audio_path, text, _ in pending:
                 try:
-                    _punct_one(punct_path, text)
+                    _punct_one(audio_path, text)
                 except Exception as file_exc:
-                    logger.error(f"Punctuation failed for {punct_path}: {file_exc}")
-                    failed.append(punct_path.name)
+                    logger.error(f"Punctuation failed for {audio_path}: {file_exc}")
+                    failed.append(audio_path.name)
 
     if failed:
         raise RuntimeError(f"{len(failed)} file(s) failed: {failed[:3]}...")
@@ -170,20 +176,20 @@ def main(args):
     model_name = config.get("model_name", "RUPunct/RUPunct_big")
     podcasts_path = config.get("podcasts_path", "../../../balalaika")
 
-    pending_files = pending_audio_to_sidecar(
+    pending_files = pending_chunks(
         podcasts_path,
-        in_suffix="_rover.txt",
-        out_suffix="_punct.txt",
+        out_field="punct",
+        in_field="rover",
         config_path=args.config_path,
     )
     if not pending_files:
-        logger.success("No pending _rover.txt files; punctuation already up to date.")
+        logger.success("No chunks with rover text need punctuation; up to date.")
         return
-    # Path order keeps sidecar reads directory-clustered on HDD datasets
-    # (pending order otherwise follows arbitrary CSV-row order).
+    # Path order keeps chunk-JSON reads directory-clustered on HDD datasets
+    # (pending order otherwise follows arbitrary state-row order).
     pending_files.sort()
 
-    logger.info(f"Found {len(pending_files)} _rover.txt files needing punctuation.")
+    logger.info(f"Found {len(pending_files)} chunks needing punctuation.")
 
     batch_size = resolve_batch_size("punctuation", config.get("batch_size"), 16)
     slabs = [
@@ -199,19 +205,14 @@ def main(args):
         num_workers_per_gpu=num_workers_per_gpu,
         desc="Punctuation",
     )
-    # Exact accounting: errors are per-slab now, so count produced sidecars.
-    # Use DirNameCache so this is O(#dirs) scandirs instead of O(#files)
-    # cold-cache stat() calls on the production HDD (same fix as §4.7's
-    # pending scans; identical counting semantics).
-    out_cache = DirNameCache()
+    # Exact accounting: errors are per-slab now, so count chunks that now hold a
+    # punct key. ChunkJsonCache keeps this O(#dirs) scandirs + one JSON read per
+    # produced file instead of O(#files) cold-cache stat() calls on HDD.
+    out_cache = ChunkJsonCache()
     produced = sum(
         1
-        for rover_path in map(Path, pending_files)
-        if out_cache.exists(
-            rover_path.with_name(
-                rover_path.name.replace("_rover.txt", "_punct.txt")
-            )
-        )
+        for audio_path in pending_files
+        if out_cache.field_complete(audio_path, "punct")
     )
     write_stage_status(
         stage=9,

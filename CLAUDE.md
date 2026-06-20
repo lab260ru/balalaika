@@ -67,8 +67,8 @@ and selected with `--stage` / `--stop_stage`. Each stage is an independent
 `python -m src.<area>.<module>` invocation taking `--config_path` and `--log_dir`.
 The stage map lives in `base.sh` header / README / `docs/dev.md` — keep all three
 in sync when adding a stage. Stages communicate **only through the filesystem**
-(the dataset tree, `balalaika.csv`, and per-chunk sidecar `.txt` files), never
-in-process, which is what makes arbitrary `--stage` resume work.
+(the dataset tree, the `balalaika.parquet` state, and one `<chunk>.json` sidecar
+per chunk), never in-process, which is what makes arbitrary `--stage` resume work.
 
 | Stage | Module | Purpose |
 |-------|--------|---------|
@@ -98,6 +98,37 @@ earlier stages. `src/preprocess/preprocess_existing_chunks.py` is an alternate
 stage-1 path for datasets that arrive pre-chunked (skips diarization, still runs
 Sortformer for metadata).
 
+**Stage-1 chunk-length output.** Every later stage operates on the chunks this
+stage emits, so its length distribution is load-bearing. `apply_eos_classification`
+saves a chunk at each Smart-Turn end-of-utterance; a span that exceeds `duration`
+(the cap, default 15 s) is **split into N balanced pieces of ~`preferred_chunk_duration`
+(default 8 s), never truncated** — the old path kept only the trailing `duration`
+window and discarded the leading speech, which both lost audio and piled ~15 % of
+chunks up exactly at the cap. Pieces shorter than `min_segment_duration` (default
+2 s, the floor for usable utterances) are dropped. Net output is a smooth,
+roughly bell-shaped duration distribution centred near `preferred_chunk_duration`
+with no spike at the cap and no sub-2 s fragments. Stage 1 writes 13 metadata
+columns to the `balalaika.parquet` state (`filepath`, `speaker_id`,
+`start`, `end`, `total_duration`, `playlist_id`, `podcast_id`, `silence_percent`,
+`max_silence_duration`, `is_single_speaker`, `crest_factor`, `loudness_normalized`,
+`DistillMOS`). Later scoring stages (4, 5, 6, 7) `upsert_columns` their own score
+onto these rows, while the dedicated `.5` filter stages (5.5, 6.5, 7.5 — and the
+filter half of stage 4) prune by **removing files from the tree**, so a row's
+presence already encodes "passed every filter that has run". Which score columns
+actually exist in `balalaika.parquet` therefore depends on how far the pipeline
+has been run — verify with the schema rather than assuming.
+
+**State + per-chunk text storage.** Pipeline state lives **only** in
+`balalaika.parquet` — CSV state was removed as a redundant, inefficient copy, so
+no `balalaika.csv` is produced. The text-pipeline stages (8 ASR/ROVER, 9 punct,
+10 accent, 11 phonemes) no longer scatter many `*_<model>.txt` / `*.tst` /
+`*_rover.txt` / `*_punct.txt` / `*_accent.txt` / `*_rover_phonemes.txt` files
+next to each chunk; instead each chunk has **one `<stem>.json`** holding
+`{asr:{<model>:…}, asr_ts:{…}, rover, punct, accent, rover_phonemes}` (see
+`src/utils/chunk_json.py`). Each stage writes its own key(s) via an atomic
+read-modify-write and resumes on field presence; `collate` reads that single
+JSON per chunk. This cut ~14 sidecars/chunk to 1 (inodes + collate opens).
+
 ### Config: one section per stage
 
 `configs/config.yaml` has one top-level key per stage area (`runtime`, `csv`,
@@ -121,18 +152,21 @@ stay aligned. Edit `runtime:` rather than patching the shell scripts.
 This is the most important code to understand; stages are thin glue over it.
 See `src/utils/README.md` and `docs/dev.md` for the authoritative API.
 
-- **`csv_manager.py`** — single source of truth for `<podcasts_path>/balalaika.csv`
-  (per-chunk metadata + quality scores). Atomic writes (`*.tmp`+`os.replace`+fsync),
+- **`csv_manager.py`** — single source of truth for the `<podcasts_path>/balalaika.parquet`
+  state (per-chunk metadata + quality scores). State is **parquet only** — CSV
+  state was removed; `state_format()` always returns `"parquet"` and no
+  `balalaika.csv` is written. Atomic writes (`*.tmp`+`os.replace`+fsync),
   auto-bootstrap from the audio tree, per-stage column upserts keyed on `filepath`,
-  and skip-already-processed resume. **Never hand-write CSV merge logic.** Key
+  and skip-already-processed resume. **Never hand-write state merge logic.** Key
   helpers: `ensure_main_csv`, `unprocessed_paths`, `upsert_columns`,
-  `PartialCsvWriter` (workers stream rows, flushed per-row so Ctrl+C is safe),
-  `absorb_partial_csvs` (fold worker partials into main), `PeriodicCsvMerger`
-  (daemon thread that folds partials into `balalaika.csv` mid-stage so a kill in a
-  multi-hour run loses at most `csv.flush_every_rows` rows). `preserve_existing=True`
-  (the default) means null incoming values cannot erase existing columns — pass it
-  explicitly at scoring/filter call sites. The top-level `csv:` block also supports
-  `state_format: parquet` (keeps live state in parquet, still exports `balalaika.csv`).
+  `PartialCsvWriter` (workers stream rows to transient `*_part_*.csv`, flushed
+  per-row so Ctrl+C is safe), `absorb_partial_csvs` (fold worker partials into the
+  parquet state, then delete them), `PeriodicCsvMerger` (daemon thread that folds
+  partials mid-stage so a kill in a multi-hour run loses at most
+  `csv.flush_every_rows` rows). `preserve_existing=True` (the default) means null
+  incoming values cannot erase existing columns — pass it explicitly at
+  scoring/filter call sites. (The legacy `Csv` names are kept on the partial-stream
+  helpers; the per-worker partials are transient CSVs, not persistent state.)
 
 - **`work_shards.py`** — disk-backed work queues. For million-file stages, do NOT
   pass giant path lists into `mp.spawn`/`mp.Process` (pickle OOM). The parent writes
@@ -161,9 +195,17 @@ See `src/utils/README.md` and `docs/dev.md` for the authoritative API.
   is on globally. These stages use a **fixed `batch_size`** and rely on upstream
   chunking for bounded memory; raw long files can OOM the variable-length models.
 
-- **`sidecars.py`** — pairing helpers for text-pipeline stages (`pending_audio_to_sidecar`,
-  `pending_sidecar_chain`, `replace_in_stem`). Sidecar naming convention:
-  `<chunk>_rover.txt` → `_punct.txt` → `_accent.txt`, plus `_rover_phonemes.txt`.
+- **`chunk_json.py`** — the one-`<stem>.json`-per-chunk text sidecar used by the
+  text-pipeline stages (8–11) and `collate`. `update_chunk_json` (atomic
+  read-modify-write, deep-merges nested `asr`/`asr_ts`), `read_chunk_json`,
+  `field_complete` / `pending_chunks` (resume by field presence, retry-empty
+  aware), and `ChunkJsonCache` (scandir + memoised parse, the JSON analogue of
+  `DirNameCache`). Keys: `asr.<model>`, `asr_ts.<model>`, `rover`, `punct`,
+  `accent`, `rover_phonemes`.
+
+- **`sidecars.py`** — legacy per-file sidecar pairing helpers (`DirNameCache`,
+  `pending`, …). No longer used by the stages (which moved to `chunk_json.py`);
+  retained for its `DirNameCache`/NAME_MAX semantics and tests.
 
 - **`audit.py`** + **`stage_status.py`** — filter stages append `{files_in/out,
   hours_in/out}` rows to `<podcasts_path>/filter_summary.csv` (consumed by stage 14
@@ -183,9 +225,10 @@ See `src/utils/README.md` and `docs/dev.md` for the authoritative API.
   `resolve_batch_size(config.get("batch_size", "auto"), ...)` so integer configs
   pass through unchanged.
 
-- **`audio_durations.py`** — shared duration cache backed by `balalaika.csv`'s
-  `total_duration` column. Used by length-bucketed shard preparation; probes missing
-  entries once and writes them back so downstream stages reuse the cache.
+- **`audio_durations.py`** — shared duration cache backed by the
+  `balalaika.parquet` `total_duration` column. Used by length-bucketed shard
+  preparation; probes missing entries once and writes them back so downstream
+  stages reuse the cache.
 
 ### Bundled external code
 

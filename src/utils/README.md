@@ -5,22 +5,25 @@ folder instead of duplicating boilerplate.
 
 | Module | What it provides |
 |--------|------------------|
-| `csv_manager.py` | Single source of truth for `balalaika.csv` (bootstrap, atomic writes, partial-CSV streaming, resume, filter-stage audit). |
+| `csv_manager.py` | Single source of truth for the `balalaika.parquet` state (bootstrap, atomic writes, partial-CSV streaming, resume, filter-stage audit). CSV state was removed — parquet only. |
+| `chunk_json.py` | One `<stem>.json` per chunk for stage 8–11 text outputs: `update_chunk_json` (atomic deep-merge), `read_chunk_json`, `field_complete`/`pending_chunks` (resume by field), `ChunkJsonCache`. |
 | `gpu.py` | `apply_torch_perf_defaults`, `get_onnx_providers`, `gpu_count`. |
 | `parallel.py` | `run_per_gpu_pool` (one `ProcessPoolExecutor` per GPU) and `run_per_gpu_processes` (one `mp.Process` per GPU). |
 | `work_shards.py` | Disk-backed work queues for huge multiprocessing stages; workers atomically claim shard files instead of receiving giant path lists. |
-| `sidecars.py` | `pending`, `pending_audio_to_sidecar`, `pending_sidecar_chain`, `with_suffix_at_stem`, `replace_in_stem` — for stages that pair an input `.txt` with an output `.txt`. |
+| `sidecars.py` | Legacy per-file sidecar helpers (`pending`, `DirNameCache`, `replace_in_stem`, …). Superseded by `chunk_json.py` for the stages; retained for `DirNameCache`/NAME_MAX semantics and tests. |
 | `audit.py` | `record_stage_summary`, `safe_audio_duration`, `total_hours` — appends a row to `<podcasts_path>/filter_summary.csv` for the final report. |
 | `runtime_env.py` | Reads the `runtime:` block of `configs/config.yaml`; powers `eval "$(python3 -m src.utils.runtime_env --config_path …)"` in `base.sh`. |
 | `logging_setup.py` | `setup_logging(stage, log_dir=…)` — colored stderr + rotating file sink. |
 | `utils.py` | Misc helpers: `load_config`, `get_audio_paths`, `get_txt_paths`, `read_file_content`, `process_token`, `normalize_text`, `load_audio`. |
 
-## `csv_manager.py` — `balalaika.csv` lifecycle
+## `csv_manager.py` — `balalaika.parquet` lifecycle
 
-All filter / scoring stages collaborate around one CSV at
-`<podcasts_path>/balalaika.csv`. Each stage writes one or more columns
-(`crest_factor`, `loudness_normalized`, `music_prob`, `DistillMOS`, …) and
-filter stages may delete rows whose audio was removed.
+All filter / scoring stages collaborate around one parquet state at
+`<podcasts_path>/balalaika.parquet` (CSV state was removed — parquet only).
+Each stage writes one or more columns (`crest_factor`, `loudness_normalized`,
+`music_prob`, `DistillMOS`, …) and filter stages may delete rows whose audio was
+removed. (Function/class names keep the historical `csv`/`Csv` token; the
+per-worker `*_part_*.csv` partials are transient and folded into the parquet.)
 
 ### Guarantees
 
@@ -161,25 +164,27 @@ run_per_gpu_processes(
 Both helpers handle `KeyboardInterrupt` cleanly: pools shut down with
 `cancel_futures=True`, processes are terminated and joined.
 
-## `sidecars.py`
+## `chunk_json.py`
+
+Stage 8–11 text outputs live in one `<stem>.json` per chunk (keys:
+`asr.<model>`, `asr_ts.<model>`, `rover`, `punct`, `accent`, `rover_phonemes`).
+Each stage writes its key via an atomic deep-merge and resumes on field presence.
 
 ```python
-from src.utils.sidecars import (
-    pending_audio_to_sidecar, pending_sidecar_chain,
-    with_suffix_at_stem, replace_in_stem,
-)
+from src.utils.chunk_json import pending_chunks, get_field, read_chunk_json, \
+    chunk_json_path, update_chunk_json
 
-# Punctuation: walk audio, keep .._rover.txt where matching .._punct.txt is missing
-rover_inputs = pending_audio_to_sidecar(
-    podcasts_path, in_suffix="_rover.txt", out_suffix="_punct.txt",
-)
-
-# Accents: walk every .._punct.txt, keep ones missing .._accent.txt
-punct_inputs = pending_sidecar_chain(
-    podcasts_path, in_suffix="_punct.txt",
-    out_derive=lambda p: replace_in_stem(p, "_punct", "_accent"),
-)
+# Punctuation: chunks whose JSON has `rover` but not yet `punct`.
+for audio in pending_chunks(podcasts_path, out_field="punct", in_field="rover",
+                            config_path=config_path):
+    text = get_field(read_chunk_json(chunk_json_path(audio)), "rover")
+    update_chunk_json(audio, {"punct": restore_punctuation(text)})
 ```
+
+## `sidecars.py` (legacy)
+
+Superseded by `chunk_json.py` for the stages; kept for `DirNameCache` (one
+`os.scandir` per directory + NAME_MAX handling) and its tests.
 
 ## `runtime_env.py`
 

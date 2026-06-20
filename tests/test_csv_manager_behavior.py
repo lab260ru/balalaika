@@ -21,6 +21,15 @@ from src.utils import csv_manager as cm
 from src.utils.utils import get_audio_paths
 
 
+def _write_state(df: pd.DataFrame, directory) -> None:
+    """Write the parquet pipeline state (the only state format)."""
+    df.to_parquet(Path(directory) / "balalaika.parquet", index=False)
+
+
+def _read_state(directory) -> pd.DataFrame:
+    return pd.read_parquet(Path(directory) / "balalaika.parquet")
+
+
 # ---------------------------------------------------------------------------
 # normalize_path_string / normalize_path_values
 # ---------------------------------------------------------------------------
@@ -104,7 +113,7 @@ def state_dir(tmp_path):
             "total_duration": [10.0, 11.0, 12.0],
         }
     )
-    main.to_csv(tmp_path / "balalaika.csv", index=False)
+    _write_state(main, tmp_path)
     return tmp_path
 
 
@@ -181,7 +190,7 @@ class TestUpsertColumns:
                 "crest_factor": [1.0, 2.0],
             }
         )
-        main.to_csv(tmp_path / "balalaika.csv", index=False)
+        _write_state(main, tmp_path)
         out = cm.upsert_columns(
             tmp_path, pd.DataFrame(), ["crest_factor"], drop_missing_files=True
         )
@@ -200,15 +209,15 @@ class TestUpsertColumns:
         assert cols[-1] == "zz_extra"
 
     def test_atomic_write_keeps_backup(self, state_dir):
-        before = pd.read_csv(state_dir / "balalaika.csv")
+        before = _read_state(state_dir)
         cm.upsert_columns(
             state_dir,
             pd.DataFrame({"filepath": ["/d/a.wav"], "crest_factor": [9.9]}),
             ["crest_factor"],
         )
-        bak = state_dir / "balalaika.csv.bak"
+        bak = state_dir / "balalaika.parquet.bak"
         assert bak.exists()
-        bak_df = pd.read_csv(bak)
+        bak_df = pd.read_parquet(bak)
         # .bak holds the PREVIOUS generation
         assert bak_df.set_index("filepath")["crest_factor"]["/d/a.wav"] == before.set_index("filepath")["crest_factor"]["/d/a.wav"]
 
@@ -225,7 +234,7 @@ class TestUnprocessedPaths:
                 "crest_factor": [1.0, np.nan, np.nan],
             }
         )
-        main.to_csv(tmp_path / "balalaika.csv", index=False)
+        _write_state(main, tmp_path)
         audio = ["/d/done.wav", "/d/empty.wav", "/d/nanrow.wav", "/d/new.wav", ""]
         pending = cm.unprocessed_paths(tmp_path, "crest_factor", audio)
         assert pending == ["/d/empty.wav", "/d/nanrow.wav", "/d/new.wav"]
@@ -237,14 +246,14 @@ class TestUnprocessedPaths:
                 "loudness_normalized": ["True", "  "],
             }
         )
-        main.to_csv(tmp_path / "balalaika.csv", index=False)
+        _write_state(main, tmp_path)
         pending = cm.unprocessed_paths(
             tmp_path, "loudness_normalized", ["/d/a.wav", "/d/b.wav"]
         )
         assert pending == ["/d/b.wav"]
 
     def test_missing_column_returns_all(self, tmp_path):
-        pd.DataFrame({"filepath": ["/d/a.wav"]}).to_csv(tmp_path / "balalaika.csv", index=False)
+        _write_state(pd.DataFrame({"filepath": ["/d/a.wav"]}), tmp_path)
         pending = cm.unprocessed_paths(tmp_path, "nope", ["/d/a.wav", "rel.wav"])
         assert pending == ["/d/a.wav", str(Path("rel.wav").resolve())]
 
@@ -329,9 +338,10 @@ class TestAuditAndDiscovery:
         assert out == ["/d/a.wav", "/d/c.WAV", "/d/e.opus"]
 
     def test_audio_paths_from_csv(self, tmp_path):
-        pd.DataFrame(
-            {"filepath": ["/d/a.wav", "/d/b.txt", "/d/a.wav", np.nan]}
-        ).to_csv(tmp_path / "balalaika.csv", index=False)
+        _write_state(
+            pd.DataFrame({"filepath": ["/d/a.wav", "/d/b.txt", "/d/a.wav", np.nan]}),
+            tmp_path,
+        )
         out = cm._audio_paths_from_csv(tmp_path)
         assert out == ["/d/a.wav"]
 
@@ -359,18 +369,16 @@ class TestEnsureMainCsv:
     def test_bootstrap_from_audio_paths(self, tmp_path):
         df = cm.ensure_main_csv(tmp_path, audio_paths=["/d/b.wav", "/d/a.wav", "/d/a.wav"])
         assert df["filepath"].tolist() == ["/d/a.wav", "/d/b.wav"]  # sorted unique
-        assert (tmp_path / "balalaika.csv").exists()
+        assert (tmp_path / "balalaika.parquet").exists()
 
     def test_existing_csv_loaded(self, tmp_path):
-        pd.DataFrame({"filepath": ["/d/a.wav"], "v": [1]}).to_csv(
-            tmp_path / "balalaika.csv", index=False
-        )
+        _write_state(pd.DataFrame({"filepath": ["/d/a.wav"], "v": [1]}), tmp_path)
         df = cm.ensure_main_csv(tmp_path)
         assert df["v"].tolist() == [1]
 
     def test_corrupt_csv_restored_from_bak(self, tmp_path):
         good = pd.DataFrame({"filepath": ["/d/a.wav"], "v": [1]})
-        good.to_csv(tmp_path / "balalaika.csv.bak", index=False)
-        (tmp_path / "balalaika.csv").write_text("filepath\n")  # empty -> corrupt-ish
+        good.to_parquet(tmp_path / "balalaika.parquet.bak", index=False)
+        (tmp_path / "balalaika.parquet").write_text("not a parquet file")  # corrupt
         df = cm.ensure_main_csv(tmp_path)
         assert df["filepath"].tolist() == ["/d/a.wav"]

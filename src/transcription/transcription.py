@@ -1,8 +1,6 @@
 import argparse
 import gc
 import multiprocessing as mp
-import os
-import tempfile
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
@@ -32,9 +30,9 @@ from src.utils.logging_setup import setup_logging
 from src.utils.node_profile import resolve_batch_size
 from src.utils.parallel import run_per_gpu_processes
 from src.utils.csv_manager import discover_audio_paths
-from src.utils.sidecars import DirNameCache, text_sidecar_complete
+from src.utils.chunk_json import ChunkJsonCache, get_field, update_chunk_json
 from src.utils.stage_status import last_line, write_stage_status
-from src.utils.utils import load_config, read_file_content
+from src.utils.utils import load_config
 from src.utils.work_shards import (
     claim_work_shard,
     load_work_shard_size,
@@ -117,49 +115,28 @@ def format_length_range(lengths: torch.Tensor, sample_rate: int) -> str:
     return f"min={seconds.min().item():.2f}s max={seconds.max().item():.2f}s"
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
-    """tmp+rename so a killed worker can't leave a truncated sidecar.
-
-    A partially written transcript passes the resume scan forever (only
-    zero-byte files are retried), so sidecars must appear atomically. The
-    staging file is a UNIQUE ``tempfile.mkstemp`` name in the destination
-    directory (cleaned up on error): a fixed ``<name>.tmp`` path lets an
-    orphaned worker from a crashed re-run race the same staging file and
-    publish interleaved bytes. Mirrors the peer writers in
-    ``phonemizer._process_one`` and ``accents._write_accent``.
-    """
-    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
-
-
 def save_results(paths: List[str], texts: List[Optional[str]], timestamps: Optional[List[Optional[str]]], model_suffix: str):
+    """Merge this model's transcript (and optional timestamps) into each chunk's
+    ``<stem>.json`` under ``asr[model_suffix]`` / ``asr_ts[model_suffix]``.
+
+    :func:`update_chunk_json` is an atomic read-modify-write, so a killed worker
+    never publishes a partial JSON; a re-run re-reads the last complete version.
+    """
     for i, (path_str, text) in enumerate(zip(paths, texts)):
         path = Path(path_str)
 
         if text is None:
-            logger.debug(f"No transcript result for {path.name}; leaving sidecar unchanged")
+            logger.debug(f"No transcript result for {path.name}; leaving JSON unchanged")
             continue
 
-        txt_path = path.with_name(f"{path.stem}_{model_suffix}.txt")
-        try:
-            _write_text_atomic(txt_path, text)
-        except Exception as e:
-            logger.error(f"Write TXT failed {path.name}: {e}")
-
+        updates: dict = {"asr": {model_suffix: text}}
         ts = timestamps[i] if timestamps and i < len(timestamps) else ''
         if ts:
-            tst_path = path.with_name(f"{path.stem}_{model_suffix}.tst")
-            try:
-                _write_text_atomic(tst_path, ts)
-            except Exception as e:
-                logger.error(f"Write TST failed {path.name}: {e}")
+            updates["asr_ts"] = {model_suffix: ts}
+        try:
+            update_chunk_json(path, updates)
+        except Exception as e:
+            logger.error(f"Write chunk JSON failed {path.name}: {e}")
 
 def extract_text(result) -> str:
     """Extract plain text from onnx-asr result (str or TimestampedResult)."""
@@ -637,21 +614,19 @@ def normalize_consensus_text(text: str) -> str:
 
 
 def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int,
-                    cache: Optional[DirNameCache] = None) -> bool:
+                    cache: Optional[ChunkJsonCache] = None) -> bool:
     texts = []
+    data = cache.get(audio_path) if cache is not None else None
+    if data is None:
+        from src.utils.chunk_json import read_chunk_json, chunk_json_path
+        data = read_chunk_json(chunk_json_path(audio_path))
     for mn in model_names:
         suffix = 'vosk' if 'vosk' in mn else mn
-        tp = audio_path.with_name(f"{audio_path.stem}_{suffix}.txt")
-        complete = cache.sidecar_complete(tp) if cache is not None else text_sidecar_complete(tp)
-        if complete:
-            try:
-                t = read_file_content(tp)
-                if t:
-                    normalized = normalize_consensus_text(t)
-                    if normalized:
-                        texts.append(normalized)
-            except Exception:
-                pass
+        t = get_field(data, f"asr.{suffix}")
+        if t:
+            normalized = normalize_consensus_text(t)
+            if normalized:
+                texts.append(normalized)
     if len(texts) < consensus_num:
         return False
     return max(Counter(texts).values()) >= consensus_num
@@ -661,33 +636,32 @@ def get_valid_paths(src_path: str, output_suffix: str,
                     processed: List[str], consensus_num: int,
                     retry_empty_outputs: bool = False,
                     config_path: Optional[str] = None,
-                    cache: Optional[DirNameCache] = None) -> List[str]:
+                    cache: Optional[ChunkJsonCache] = None) -> List[str]:
     """Audio files still needing ``output_suffix`` transcription.
 
-    Existence/size probes go through one ``DirNameCache`` (one scandir per
-    directory instead of two stats per audio file). Pass a shared ``cache``
-    to reuse directory listings across several suffix sweeps (the grouped
-    shared-decode pass does this); otherwise a fresh per-call cache is built.
-    The cache lives in this process only — it must not cross the spawn
-    boundary into workers.
+    Completeness is read from each chunk's ``<stem>.json`` via one
+    ``ChunkJsonCache`` (one scandir per directory + one small JSON read per
+    existing file). Pass a shared ``cache`` to reuse directory listings and
+    parsed JSONs across several model sweeps (the grouped shared-decode pass
+    does this); otherwise a fresh per-call cache is built. The cache lives in
+    this process only — it must not cross the spawn boundary into workers.
     """
     all_paths = [Path(p) for p in discover_audio_paths(src_path, config_path=config_path)]
-    return all_paths
 
     if not all_paths:
         return []
 
     if cache is None:
-        cache = DirNameCache()
+        cache = ChunkJsonCache()
 
+    field = f"asr.{output_suffix}"
     valid = []
     retry_empty_count = 0
     scan_desc = f"Pending scan [{output_suffix}]"
     for p in tqdm(all_paths, desc=scan_desc, unit="file", mininterval=0.5):
-        sidecar = p.with_name(f"{p.stem}_{output_suffix}.txt")
-        if cache.sidecar_complete(sidecar, retry_empty=retry_empty_outputs):
+        if cache.field_complete(p, field, retry_empty=retry_empty_outputs):
             continue
-        if retry_empty_outputs and cache.exists(sidecar) and (cache.size(sidecar) or 0) == 0:
+        if retry_empty_outputs and get_field(cache.get(p), field) == "":
             retry_empty_count += 1
         valid.append(p)
 
@@ -755,10 +729,10 @@ def main(args):
     if grouped_models:
         logger.info(f"=== shared-decode group: {grouped_models} ===")
         needed: Dict[str, List[str]] = {}
-        # One cache shared across the per-suffix sweeps: every grouped model
-        # walks the same audio tree, so the directory listings (and any size
-        # probes for retry_empty) are scanned once instead of once per model.
-        group_cache = DirNameCache()
+        # One cache shared across the per-model sweeps: every grouped model
+        # walks the same audio tree, so the directory listings and parsed chunk
+        # JSONs are read once instead of once per model.
+        group_cache = ChunkJsonCache()
         for model_name in tqdm(
             grouped_models,
             desc="Preparing shared-decode models",

@@ -10,7 +10,7 @@ slabs).
 """
 from __future__ import annotations
 
-import os
+import json
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +21,27 @@ import pytest
 import src.collate as collate
 
 MODEL_NAMES = ["giga_ctc", "giga_rnnt", "vosk", "tone", "gigaam-v3-e2e-ctc"]
+
+
+def _write_chunk_json(audio_dir: Path, stem: str, mapping: dict) -> None:
+    """Translate old per-suffix sidecar contents into one ``<stem>.json``.
+
+    ``_rover.txt``/``_punct.txt``/``_accent.txt``/``_rover_phonemes.txt`` ->
+    top-level keys; ``_<model>.txt`` -> ``asr.<model>``; ``_<model>.tst`` ->
+    ``asr_ts.<model>``.
+    """
+    data: dict = {}
+    for suffix, content in mapping.items():
+        name = suffix[1:]  # drop leading "_"
+        if name.endswith(".tst"):
+            data.setdefault("asr_ts", {})[name[:-4]] = content
+        elif name.endswith(".txt"):
+            base = name[:-4]
+            if base in ("rover", "punct", "accent", "rover_phonemes"):
+                data[base] = content
+            else:
+                data.setdefault("asr", {})[base] = content
+    (audio_dir / f"{stem}.json").write_text(json.dumps(data), encoding="utf-8")
 
 
 def _old_path(df: pd.DataFrame, base_path: Path, file_types, model_names) -> pd.DataFrame:
@@ -43,8 +64,7 @@ def _old_path(df: pd.DataFrame, base_path: Path, file_types, model_names) -> pd.
 
 
 def _write_sidecars(audio_dir: Path, stem: str, mapping: dict) -> None:
-    for suffix, content in mapping.items():
-        (audio_dir / f"{stem}{suffix}").write_text(content, encoding="utf-8")
+    _write_chunk_json(audio_dir, stem, mapping)
 
 
 def _build_fixture(tmp_path: Path):
@@ -239,7 +259,7 @@ def test_full_main_roundtrip(tmp_path, monkeypatch):
     import yaml
 
     df, base, file_types = _build_fixture(tmp_path)
-    (base / "balalaika.csv").write_text(df.to_csv(index=False), encoding="utf-8")
+    df.to_parquet(base / "balalaika.parquet", index=False)
 
     expected = _old_path(df, base, file_types, MODEL_NAMES)
 

@@ -1,8 +1,9 @@
 ## Accents (ruAccent)
 
-Lexical stress and text normalization from **`{stem}_punct.txt`**.
+Lexical stress and text normalization from the **`punct`** text in each chunk's
+**`{stem}.json`**, writing the **`accent`** key back.
 
-Multi-GPU pool orchestration, sidecar discovery, and skip-already-done
+Multi-GPU pool orchestration, chunk-JSON discovery, and skip-already-done
 filtering come from `src/utils`; the stage script is just `init_process` +
 `process_file` + a `main()` glue that calls
 `src.utils.parallel.run_per_gpu_pool` once.

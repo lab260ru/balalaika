@@ -1,4 +1,5 @@
-"""Stage 9 — RUAccent stress restoration on ``*_punct.txt`` sidecars.
+"""Stage 10 — RUAccent stress restoration on the ``punct`` text of each chunk's
+``<stem>.json`` (writes the ``accent`` key).
 
 Fast path (default): one :class:`~src.accents.fast_accent.FastRUAccent` per
 worker, files submitted in slabs (chunked, not one Future per file), each slab
@@ -7,19 +8,23 @@ restores the stock per-file ``RUAccent.process_all`` flow bit-for-bit.
 """
 import argparse
 import multiprocessing
-import os
-import tempfile
 from pathlib import Path
 
 from loguru import logger
 
 from src.accents.fast_accent import FastRUAccent, capped_onnx_threads
+from src.utils.chunk_json import (
+    chunk_json_path,
+    get_field,
+    pending_chunks,
+    read_chunk_json,
+    update_chunk_json,
+)
 from src.utils.gpu import apply_torch_perf_defaults, get_onnx_providers
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_pool_chunked
-from src.utils.sidecars import pending_sidecar_chain, replace_in_stem
 from src.utils.stage_status import last_line, write_stage_status
-from src.utils.utils import load_config, read_file_content
+from src.utils.utils import load_config
 
 apply_torch_perf_defaults()
 
@@ -67,43 +72,35 @@ def init_process(
         )
 
 
-def _write_accent(punct_path: Path, accented: str) -> None:
-    accent_path = replace_in_stem(punct_path, "_punct", "_accent")
-    fd, tmp = tempfile.mkstemp(dir=accent_path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(accented)
-        os.replace(tmp, accent_path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+def _write_accent(audio_path: Path, accented: str) -> None:
+    update_chunk_json(audio_path, {"accent": accented})
 
 
 def process_chunk(chunk) -> list:
-    """Process a slab of ``*_punct.txt`` paths with cross-file ONNX batching.
+    """Process a slab of audio paths with cross-file ONNX batching.
 
-    Reads every not-yet-done file, runs them through ``process_batch`` as one
-    batched group, and writes each output atomically.  Returns a list of
-    ``{"item", "reason"}`` failures so one bad file never kills its slab-mates.
+    Reads the ``punct`` text from each not-yet-done chunk JSON, runs them
+    through ``process_batch`` as one batched group, and writes each ``accent``
+    back atomically.  Returns a list of ``{"item", "reason"}`` failures so one
+    bad file never kills its slab-mates.
     """
     failures = []
     paths = []
     texts = []
-    for punct_path in chunk:
-        punct_path = Path(punct_path)
+    for audio_path in chunk:
+        audio_path = Path(audio_path)
         try:
-            accent_path = replace_in_stem(punct_path, "_punct", "_accent")
-            if accent_path.exists():
+            data = read_chunk_json(chunk_json_path(audio_path))
+            if get_field(data, "accent") is not None:
                 continue
-            text = read_file_content(punct_path)
+            text = get_field(data, "punct")
             if not text or not text.strip():
                 continue
-            paths.append(punct_path)
+            paths.append(audio_path)
             texts.append(text)
         except Exception as exc:
-            logger.error(f"Error reading {punct_path.name}: {exc}")
-            failures.append({"item": str(punct_path), "reason": last_line(exc)})
+            logger.error(f"Error reading {audio_path.name}: {exc}")
+            failures.append({"item": str(audio_path), "reason": last_line(exc)})
 
     if not texts:
         return failures
@@ -123,20 +120,20 @@ def process_chunk(chunk) -> list:
         outputs = None
 
     if outputs is None:
-        for punct_path, text in zip(paths, texts):
+        for audio_path, text in zip(paths, texts):
             try:
-                _write_accent(punct_path, accentizer.process_all(text))
+                _write_accent(audio_path, accentizer.process_all(text))
             except Exception as exc:
-                logger.error(f"Error processing {punct_path.name}: {exc}")
-                failures.append({"item": str(punct_path), "reason": last_line(exc)})
+                logger.error(f"Error processing {audio_path.name}: {exc}")
+                failures.append({"item": str(audio_path), "reason": last_line(exc)})
         return failures
 
-    for punct_path, accented in zip(paths, outputs):
+    for audio_path, accented in zip(paths, outputs):
         try:
-            _write_accent(punct_path, accented)
+            _write_accent(audio_path, accented)
         except Exception as exc:
-            logger.error(f"Error writing {punct_path.name}: {exc}")
-            failures.append({"item": str(punct_path), "reason": last_line(exc)})
+            logger.error(f"Error writing {audio_path.name}: {exc}")
+            failures.append({"item": str(audio_path), "reason": last_line(exc)})
     return failures
 
 
@@ -158,16 +155,16 @@ def main(args):
         bool(config.get("lazy_rule_engine", True)) and use_fast,
     )
 
-    pending_files = pending_sidecar_chain(
+    pending_files = pending_chunks(
         podcast_path,
-        in_suffix="_punct.txt",
-        out_derive=lambda p: replace_in_stem(p, "_punct", "_accent"),
+        out_field="accent",
+        in_field="punct",
         config_path=args.config_path,
     )
     if not pending_files:
-        logger.success("No pending _punct.txt files; accents already up to date.")
+        logger.success("No chunks with punct text need accents; up to date.")
         return
-    # Path order keeps sidecar reads directory-clustered on HDD datasets.
+    # Path order keeps chunk-JSON reads directory-clustered on HDD datasets.
     pending_files.sort()
 
     logger.info(

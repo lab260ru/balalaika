@@ -62,9 +62,14 @@ from src.utils.utils import load_config
 apply_torch_perf_defaults()
 
 DEFAULT_CHUNK_DURATION_S = 15 * 60
-DEFAULT_MIN_SEGMENT_DURATION_S = 1.0
+DEFAULT_MIN_SEGMENT_DURATION_S = 2.0
 DEFAULT_MIN_SAVE_DURATION_S = 0.5
 DEFAULT_MAX_MERGE_GAP_S = 0.5
+# Target length for a saved chunk. A span longer than ``max_duration`` is no
+# longer truncated to its trailing window (which discarded leading speech and
+# piled mass up exactly at the cap); it is split into N balanced pieces of
+# roughly this length so the duration distribution stays smooth/bell-shaped.
+DEFAULT_PREFERRED_CHUNK_DURATION_S = 8.0
 
 LOSSLESS_EXTENSIONS = {".flac", ".wav"}
 SUPPORTED_CHUNK_EXTS = {"flac", "wav", "mp3", "ogg", "opus"}
@@ -242,6 +247,7 @@ def apply_eos_classification(
     min_duration: float = DEFAULT_MIN_SEGMENT_DURATION_S,
     max_merge_gap: float = DEFAULT_MAX_MERGE_GAP_S,
     smart_vad_batch_size: int = 1,
+    preferred_duration: float = DEFAULT_PREFERRED_CHUNK_DURATION_S,
 ) -> List[Tuple[float, float, int]]:
     global smart_vad
     if not segments:
@@ -298,10 +304,28 @@ def apply_eos_classification(
     merged: List[Tuple[float, float, int]] = []
 
     def save_eou_chunk(start: float, end: float, spk: int) -> None:
-        if end - start > max_duration:
-            start = end - max_duration
-        if end - start >= min_duration:
+        span = end - start
+        if span < min_duration:
+            return
+        if span <= max_duration:
             merged.append((start, end, spk))
+            return
+        # Span exceeds the cap. Instead of dropping the leading audio and
+        # emitting one chunk pinned exactly at ``max_duration``, split the whole
+        # span into N balanced pieces of ~``preferred_duration`` (never above the
+        # cap). No audio is discarded and lengths vary continuously, so the
+        # distribution no longer spikes at the cap.
+        target = preferred_duration if preferred_duration > 0 else max_duration
+        n = max(1, int(round(span / target)))
+        while span / n > max_duration:
+            n += 1
+        piece = span / n
+        cursor = start
+        for i in range(n):
+            seg_end = end if i == n - 1 else cursor + piece
+            if seg_end - cursor >= min_duration:
+                merged.append((cursor, seg_end, spk))
+            cursor = seg_end
 
     cur_start: Optional[float] = None
     cur_end: Optional[float] = None
@@ -658,6 +682,9 @@ def process_audio_file(
     min_segment_dur = float(config.get('min_segment_duration', DEFAULT_MIN_SEGMENT_DURATION_S))
     min_save_dur = float(config.get('min_save_duration', DEFAULT_MIN_SAVE_DURATION_S))
     max_merge_gap = float(config.get('max_merge_gap', DEFAULT_MAX_MERGE_GAP_S))
+    preferred_dur = float(
+        config.get('preferred_chunk_duration', DEFAULT_PREFERRED_CHUNK_DURATION_S)
+    )
     fuse_audio = fused_audio_preprocessing_enabled(config)
     crest_audit = _new_crest_audit()
 
@@ -753,6 +780,7 @@ def process_audio_file(
             audio, sr, clean_segments, max_duration=limit_dur,
             min_duration=min_segment_dur, max_merge_gap=max_merge_gap,
             smart_vad_batch_size=int(config.get("smart_vad_batch_size", 1)),
+            preferred_duration=preferred_dur,
         )
 
         if not final_segments:
@@ -1114,6 +1142,9 @@ def main(args):
                 "min_save_duration", DEFAULT_MIN_SAVE_DURATION_S
             ),
             "max_merge_gap": config.get("max_merge_gap", DEFAULT_MAX_MERGE_GAP_S),
+            "preferred_chunk_duration": config.get(
+                "preferred_chunk_duration", DEFAULT_PREFERRED_CHUNK_DURATION_S
+            ),
             "fuse_audio_preprocessing": fuse_audio,
         },
     )

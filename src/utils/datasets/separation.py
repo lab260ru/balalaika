@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from src.utils.io_profile import clamp_loader_workers
 from src.utils.logging_setup import dataloader_worker_init
+from src.utils.mem import periodic_malloc_trim
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class DistillMOSDataset(Dataset):
         return len(self.file_paths)
 
     def __getitem__(self, idx: int) -> Tuple[str, torch.Tensor]:
+        periodic_malloc_trim()
         path_str = self.file_paths[idx]
         started_at = time.perf_counter()
         try:

@@ -1,15 +1,17 @@
-"""Tests for the stage-8 punctuation batch refinements (no model needed).
+"""Tests for the stage-9 punctuation batch refinements (no model needed).
 
 Covers:
 * make_punct_batch sorts the batched slab by token length (padding-waste cut)
   while keeping each file's output independent of batch order.
 * Oversize (>512-token) texts are routed to the per-file path and never enter
   the batched pipeline call (so one long text can't fail / 2x-rerun its slab).
-* The stage-end 'produced' count via DirNameCache matches a naive per-file
-  Path.exists() scan.
+* The stage-end 'produced' count via ChunkJsonCache matches a naive per-file
+  scan.
 
-The pipeline `model` and the `tokenizer` are monkeypatched with cheap stand-ins
-so these run on CPU with no transformers download.
+Stages read the ``rover`` text from each chunk's ``<stem>.json`` and write the
+``punct`` key back. The pipeline ``model`` and the ``tokenizer`` are
+monkeypatched with cheap stand-ins so these run on CPU with no transformers
+download.
 
 Run: .dev_venv/bin/python -m pytest tests/test_punctuation_batch.py -q
 """
@@ -20,6 +22,13 @@ from pathlib import Path
 import pytest
 
 import src.punctuation.punctuation as punct
+from src.utils.chunk_json import (
+    ChunkJsonCache,
+    chunk_json_path,
+    get_field,
+    read_chunk_json,
+    update_chunk_json,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,13 +44,7 @@ class _FakeTokenizer:
 
 class _RecordingModel:
     """Records every call. A batched call (list arg) records the batch order;
-    a single-text call (str arg) records a per-file invocation.
-
-    Returns a prediction list shaped like the HF pipeline: one list of
-    token dicts per input text, where the single token's 'word' echoes the
-    input so _punct_text_from_preds reproduces it (process_token LOWER_O
-    passes the word through unchanged).
-    """
+    a single-text call (str arg) records a per-file invocation."""
 
     def __init__(self):
         self.batch_calls: list[list[str]] = []
@@ -49,7 +52,6 @@ class _RecordingModel:
         self.single_calls: list[str] = []
 
     def _preds_for(self, text):
-        # One token group covering the whole text; LOWER_O => word unchanged.
         return [{"word": text, "entity_group": "LOWER_O"}]
 
     def __call__(self, arg, batch_size=None):
@@ -71,9 +73,19 @@ def fake_model(monkeypatch):
 
 
 def _write_rover(tmp_path: Path, stem: str, words: int) -> Path:
-    p = tmp_path / f"{stem}_rover.txt"
-    p.write_text(" ".join(["w"] * words), encoding="utf-8")
-    return p
+    """Create ``<stem>.wav`` + a chunk JSON with a rover transcript; return audio."""
+    audio = tmp_path / f"{stem}.wav"
+    audio.write_bytes(b"x")
+    update_chunk_json(audio, {"rover": " ".join(["w"] * words)})
+    return audio
+
+
+def _punct(audio: Path):
+    return get_field(read_chunk_json(chunk_json_path(audio)), "punct")
+
+
+def _rover(audio: Path):
+    return get_field(read_chunk_json(chunk_json_path(audio)), "rover")
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +93,6 @@ def _write_rover(tmp_path: Path, stem: str, words: int) -> Path:
 # ---------------------------------------------------------------------------
 
 def test_batch_is_sorted_by_token_length(tmp_path, fake_model):
-    # Three in-budget files with descending word counts in discovery order.
     paths = [
         _write_rover(tmp_path, "a", 30),
         _write_rover(tmp_path, "b", 5),
@@ -94,16 +105,11 @@ def test_batch_is_sorted_by_token_length(tmp_path, fake_model):
     word_counts = [len(t.split()) for t in batch]
     assert word_counts == sorted(word_counts), "batch not length-sorted"
     assert fake_model.single_calls == []
-    # Each output file written with its own content.
     for p in paths:
-        out = p.with_name(p.name.replace("_rover.txt", "_punct.txt"))
-        assert out.exists()
+        assert _punct(p) is not None
 
 
 def test_batch_size_capped_to_micro_batch(tmp_path, fake_model):
-    # An 18-text slab must be fed with batch_size == PUNCT_PIPELINE_BATCH (8),
-    # so length-sorted neighbors share micro-batches padded to their LOCAL max
-    # instead of one slab padded to the longest text.
     paths = [_write_rover(tmp_path, f"f{i}", 5 + i) for i in range(18)]
     punct.make_punct_batch(paths)
 
@@ -113,7 +119,6 @@ def test_batch_size_capped_to_micro_batch(tmp_path, fake_model):
 
 
 def test_batch_size_is_len_pending_when_below_micro_batch(tmp_path, fake_model):
-    # Fewer texts than the micro-batch => no point asking for more.
     paths = [_write_rover(tmp_path, f"g{i}", 5 + i) for i in range(3)]
     punct.make_punct_batch(paths)
 
@@ -125,23 +130,19 @@ def test_oversize_routed_to_per_file_not_batched(tmp_path, fake_model):
     huge = _write_rover(tmp_path, "huge", 1000)  # > 512 tokens
     punct.make_punct_batch([short, huge])
 
-    # The huge text must NOT appear in any batched call.
     assert all(len(t.split()) <= 512 for call in fake_model.batch_calls for t in call)
-    # It must have been processed per-file.
     assert any(len(t.split()) > 512 for t in fake_model.single_calls)
     for p in (short, huge):
-        out = p.with_name(p.name.replace("_rover.txt", "_punct.txt"))
-        assert out.exists()
+        assert _punct(p) is not None
 
 
 def test_existing_outputs_skipped(tmp_path, fake_model):
     p = _write_rover(tmp_path, "done", 12)
-    out = p.with_name(p.name.replace("_rover.txt", "_punct.txt"))
-    out.write_text("already", encoding="utf-8")
+    update_chunk_json(p, {"punct": "already"})
     punct.make_punct_batch([p])
     assert fake_model.batch_calls == []
     assert fake_model.single_calls == []
-    assert out.read_text(encoding="utf-8") == "already"
+    assert _punct(p) == "already"
 
 
 def test_output_independent_of_batch_order(tmp_path, fake_model):
@@ -149,37 +150,24 @@ def test_output_independent_of_batch_order(tmp_path, fake_model):
     punct.make_punct_batch(paths)
     # process_token LOWER_O echoes the word, so each output == its input text.
     for p in paths:
-        out = p.with_name(p.name.replace("_rover.txt", "_punct.txt"))
-        assert out.read_text(encoding="utf-8") == p.read_text(encoding="utf-8")
+        assert _punct(p) == _rover(p)
 
 
 # ---------------------------------------------------------------------------
-# produced-count via DirNameCache == naive scan
+# produced-count via ChunkJsonCache == naive scan
 # ---------------------------------------------------------------------------
 
 def test_produced_count_matches_naive_scan(tmp_path):
-    from src.utils.sidecars import DirNameCache
-
-    rover_paths = []
+    audios = []
     for i in range(20):
-        p = tmp_path / f"file{i}_rover.txt"
-        p.write_text("x", encoding="utf-8")
-        rover_paths.append(p)
-        # Produce a punct sidecar for even indices only.
-        if i % 2 == 0:
-            p.with_name(p.name.replace("_rover.txt", "_punct.txt")).write_text(
-                "y", encoding="utf-8"
-            )
+        a = tmp_path / f"file{i}.wav"
+        a.write_bytes(b"x")
+        update_chunk_json(a, {"rover": "x"})
+        if i % 2 == 0:  # produce a punct key for even indices only
+            update_chunk_json(a, {"punct": "y"})
+        audios.append(a)
 
-    naive = sum(
-        1
-        for rp in rover_paths
-        if rp.with_name(rp.name.replace("_rover.txt", "_punct.txt")).exists()
-    )
-    cache = DirNameCache()
-    cached = sum(
-        1
-        for rp in rover_paths
-        if cache.exists(rp.with_name(rp.name.replace("_rover.txt", "_punct.txt")))
-    )
+    naive = sum(1 for a in audios if _punct(a) is not None)
+    cache = ChunkJsonCache()
+    cached = sum(1 for a in audios if cache.field_complete(a, "punct"))
     assert cached == naive == 10

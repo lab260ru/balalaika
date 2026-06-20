@@ -11,8 +11,7 @@ The test pins that ``_run_diarization_shard``:
   the stage uses) identical to one built from the same rows in one shot.
 """
 
-import csv as _csv
-
+import pandas as pd
 import torch
 
 import src.preprocess.preprocess as P
@@ -125,12 +124,11 @@ def test_final_csv_identical_to_one_shot(tmp_path, monkeypatch):
         for f in files
         for row in _fake_segments(f, files_to_chunks[f])
     }
-    main_csv = tmp_path / "balalaika.csv"
-    with open(main_csv, newline="") as fh:
-        got = {
-            r["filepath"]: float(r["total_duration"])
-            for r in _csv.DictReader(fh)
-        }
+    got_df = pd.read_parquet(tmp_path / "balalaika.parquet")
+    got = {
+        row.filepath: float(row.total_duration)
+        for row in got_df.itertuples()
+    }
     assert got == expected
 
 

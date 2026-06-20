@@ -292,22 +292,28 @@ For ONNX Runtime stages, build providers through
 `src.utils.gpu.get_onnx_providers(...)` so CUDA/TensorRT cache behavior stays
 consistent across the project.
 
-## CSV State And Resume Logic
+## State And Resume Logic
 
 Long-running stages should be resumable. Use `src.utils.csv_manager` instead of
-hand-writing CSV merge logic.
+hand-writing state merge logic. Pipeline state lives **only** in
+`balalaika.parquet` (CSV state was removed); the per-worker `*_part_*.csv`
+partials are transient and deleted after they are folded in.
 
 Important helpers:
 
 - `discover_audio_paths(podcasts_path)`: scan the audio tree.
-- `ensure_main_csv(podcasts_path, audio_paths=...)`: create/load
-  `balalaika.csv`.
+- `ensure_main_csv(podcasts_path, audio_paths=...)`: create/load the
+  `balalaika.parquet` state.
 - `unprocessed_paths(podcasts_path, column, audio_paths)`: skip already scored
   files.
 - `PartialCsvWriter(...)`: stream worker results to
   `<prefix>_part_<rank>.csv`.
-- `absorb_partial_csvs(...)`: merge partials into `balalaika.csv`.
+- `absorb_partial_csvs(...)`: merge partials into the parquet state and delete them.
 - `upsert_columns(...)`: atomically merge result columns by `filepath`.
+
+For per-chunk **text** outputs (stages 8–11), do not write `.txt` sidecars —
+use `src.utils.chunk_json` (`update_chunk_json` / `pending_chunks` /
+`ChunkJsonCache`) so each chunk has a single `<stem>.json`.
 
 For stages that write one value per file, use this flow:
 
@@ -353,16 +359,17 @@ For filtering stages that delete files, pass `drop_missing_files=True` when
 absorbing or upserting results.
 
 If a filter consumes a score produced by a previous stage, follow
-`src/separation/distillmos_filter.py`: read `balalaika.csv`, preview the effect
-of the threshold, delete in workers, write partial CSV rows with enough metadata
-to audit the decision, then merge/prune the main CSV.
+`src/separation/distillmos_filter.py`: read the `balalaika.parquet` state,
+preview the effect of the threshold, delete in workers, write partial CSV rows
+with enough metadata to audit the decision, then merge/prune the state.
 
 ## Avoid Full Tree Scans When Possible
 
 `get_audio_paths()` is the raw recursive filesystem scan.
-`discover_audio_paths()` follows `runtime.audio_paths_source`: `csv` trusts
-`balalaika.csv`, `rglob` forces a scan, and `auto` prefers CSV with a scan
-fallback. On very large datasets, prefer `csv` after `balalaika.csv` exists.
+`discover_audio_paths()` follows `runtime.audio_paths_source`: `csv` trusts the
+`balalaika.parquet` state (the option name is historical), `rglob` forces a scan,
+and `auto` prefers the state with a scan fallback. On very large datasets, prefer
+`csv` once the state file exists.
 
 Do not pass multi-million-item path lists into `mp.spawn` / `mp.Process`. Use
 `src.utils.work_shards.prepare_work_shards()` in the parent, pass only the
@@ -425,7 +432,8 @@ record_stage_summary(
 2. Add a config section or subsection in `configs/config.yaml`.
 3. Put Dataset/DataLoader code in `src/utils/datasets/<area>.py`.
 4. Use `setup_logging(...)` and `load_config(...)`.
-5. Use `csv_manager` helpers for `balalaika.csv` state.
+5. Use `csv_manager` helpers for `balalaika.parquet` state (and `chunk_json` for
+   per-chunk text outputs).
 6. Use one process per GPU for GPU-heavy models.
 7. Add the stage to `base.sh` if it should be part of the main pipeline.
 8. Add or update a `*_yaml.sh` wrapper if users need a direct stage script.
@@ -449,8 +457,9 @@ record_stage_summary(
 - Do not share global model objects across GPU threads.
 - Do not assume CPU-only execution is supported for GPU stages.
 - Do not silently skip model path errors.
-- Do not rewrite `balalaika.csv` manually; use `csv_manager`.
-- Do not force full filesystem scans when `balalaika.csv` already contains the
+- Do not rewrite `balalaika.parquet` manually; use `csv_manager`.
+- Do not write `.txt` text sidecars; use `chunk_json` (`<stem>.json`).
+- Do not force full filesystem scans when `balalaika.parquet` already contains the
   file list.
 
 ## Current Audio Stack

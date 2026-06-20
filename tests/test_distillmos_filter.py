@@ -63,7 +63,7 @@ def make_dataset(tmp_path, rows, *, real_wavs=False):
         csv_rows.append(
             {"filepath": str(p.resolve()), "DistillMOS": mos, "total_duration": csv_dur}
         )
-    pd.DataFrame(csv_rows).to_csv(tmp_path / "balalaika.csv", index=False)
+    pd.DataFrame(csv_rows).to_parquet(tmp_path / "balalaika.parquet", index=False)
     return paths
 
 
@@ -256,7 +256,7 @@ def test_end_to_end_matches_old_all_durations_present(tmp_path):
     assert audit["hours_in"] == ref_audit["hours_in"]
     assert audit["hours_out"] == ref_audit["hours_out"]
 
-    final = pd.read_csv(tmp_path / "balalaika.csv").set_index("filepath")
+    final = pd.read_parquet(tmp_path / "balalaika.parquet").set_index("filepath")
     # Deleted rows are pruned; kept/unscored rows survive with values intact.
     assert paths[0] not in final.index
     assert paths[3] not in final.index
@@ -290,7 +290,7 @@ def test_end_to_end_missing_on_disk_pruned_not_deleted_count(tmp_path):
     assert audit["files_deleted"] == ref_audit["files_deleted"] == 1
     assert audit["files_out"] == ref_audit["files_out"] == 1
 
-    final = set(pd.read_csv(tmp_path / "balalaika.csv")["filepath"])
+    final = set(pd.read_parquet(tmp_path / "balalaika.parquet")["filepath"])
     assert paths[0] not in final  # deleted candidate pruned
     assert paths[2] not in final  # missing-on-disk pruned
     assert paths[1] in final       # kept survives
@@ -317,7 +317,7 @@ def test_end_to_end_missing_duration_kept_file_not_probed(tmp_path):
     assert audit["files_deleted"] == 1
     assert audit["files_out"] == 1
 
-    final = pd.read_csv(tmp_path / "balalaika.csv").set_index("filepath")
+    final = pd.read_parquet(tmp_path / "balalaika.parquet").set_index("filepath")
     # Kept file's duration stays missing (no re-probe).
     assert pd.isna(final.loc[paths[1], "total_duration"])
 
@@ -354,7 +354,7 @@ def make_symlinked_dataset(tmp_path, rows):
         csv_rows.append(
             {"filepath": link_path, "DistillMOS": mos, "total_duration": csv_dur}
         )
-    pd.DataFrame(csv_rows).to_csv(link_root / "balalaika.csv", index=False)
+    pd.DataFrame(csv_rows).to_parquet(link_root / "balalaika.parquet", index=False)
     return link_root, link_paths
 
 

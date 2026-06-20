@@ -1,19 +1,24 @@
-"""Stage 10 — TryIParu G2P phonemization on ``*_rover.txt`` sidecars."""
+"""Stage 11 — TryIParu G2P phonemization on the ``rover`` text of each chunk's
+``<stem>.json`` (writes the ``rover_phonemes`` key)."""
 import argparse
 import multiprocessing
-import os
-import tempfile
 from pathlib import Path
 
 from loguru import logger
 
 from src.phonemizer.fast_g2p import FastG2P
+from src.utils.chunk_json import (
+    chunk_json_path,
+    get_field,
+    pending_chunks,
+    read_chunk_json,
+    update_chunk_json,
+)
 from src.utils.gpu import apply_torch_perf_defaults
 from src.utils.logging_setup import setup_logging
 from src.utils.parallel import run_per_gpu_pool_chunked
-from src.utils.sidecars import pending_sidecar_chain
 from src.utils.stage_status import last_line, write_stage_status
-from src.utils.utils import load_config, read_file_content
+from src.utils.utils import load_config
 
 apply_torch_perf_defaults()
 
@@ -29,29 +34,23 @@ def init_process(device_str: str, batch_size: int, oov_cache_path: str | None) -
     )
 
 
-def _process_one(text_path: Path) -> None:
-    text_path = Path(text_path)
-    output_path = text_path.with_name(f"{text_path.stem}_phonemes.txt")
-    if output_path.exists():
+def _process_one(audio_path: Path) -> None:
+    audio_path = Path(audio_path)
+    data = read_chunk_json(chunk_json_path(audio_path))
+    if get_field(data, "rover_phonemes") is not None:
         return
 
-    text = read_file_content(text_path)
+    text = get_field(data, "rover")
+    if not text:
+        return
     phonemes = g2p_model(text)
-    # Atomic: a worker killed mid-write must not leave a truncated sidecar
-    # that the bare-existence resume check would then skip forever.
-    fd, tmp = tempfile.mkstemp(dir=output_path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(" ".join(phonemes))
-        os.replace(tmp, output_path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+    # update_chunk_json is an atomic read-modify-write, so a worker killed
+    # mid-write never leaves a partial JSON the resume check would skip forever.
+    update_chunk_json(audio_path, {"rover_phonemes": " ".join(phonemes)})
 
 
 def process_chunk(chunk) -> list:
-    """Run G2P over a slab of ``*_rover.txt`` paths.
+    """Run G2P over a slab of audio paths (reads ``rover`` from each chunk JSON).
 
     The per-file G2P call (``FastG2P.__call__``) already batches OOV decode
     across each text's unique words and shares its dict/OOV caches across the
@@ -60,12 +59,12 @@ def process_chunk(chunk) -> list:
     files collapse to O(N/chunk_size).  Per-file fault isolation is preserved:
     one bad file is reported, its slab-mates still complete."""
     failures = []
-    for text_path in chunk:
+    for audio_path in chunk:
         try:
-            _process_one(text_path)
+            _process_one(audio_path)
         except Exception as exc:
-            logger.error(f"Error processing {Path(text_path).name}: {exc}")
-            failures.append({"item": str(text_path), "reason": last_line(exc)})
+            logger.error(f"Error processing {Path(audio_path).name}: {exc}")
+            failures.append({"item": str(audio_path), "reason": last_line(exc)})
     return failures
 
 
@@ -81,19 +80,19 @@ def main(args):
     # Files per work-shard slab (submit-loop chunking; does not change G2P math).
     chunk_size = int(config.get("submit_chunk_size", 256))
 
-    pending_files = pending_sidecar_chain(
+    pending_files = pending_chunks(
         src_path,
-        in_suffix="_rover.txt",
-        out_derive=lambda p: p.with_name(f"{p.stem}_phonemes.txt"),
+        out_field="rover_phonemes",
+        in_field="rover",
         config_path=args.config_path,
     )
     if not pending_files:
-        logger.success("No pending _rover.txt files; phonemes already up to date.")
+        logger.success("No chunks with rover text need phonemes; up to date.")
         return
-    # Path order keeps sidecar reads directory-clustered on HDD datasets.
+    # Path order keeps chunk-JSON reads directory-clustered on HDD datasets.
     pending_files.sort()
 
-    logger.info(f"Found {len(pending_files)} text files to process.")
+    logger.info(f"Found {len(pending_files)} chunks to process.")
 
     pool_kwargs = {}
     if device == "cpu":

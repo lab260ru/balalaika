@@ -19,10 +19,41 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from src.utils import audio_durations as ad
 from src.utils import csv_manager as cm
+
+
+class TestCudfPandasDetection:
+    def test_modern_proxy_predicate(self, monkeypatch):
+        import sys
+        import types
+
+        cudf_pkg = types.ModuleType("cudf")
+        cudf_pkg.__path__ = []
+        cudf_pandas = types.ModuleType("cudf.pandas")
+        cudf_pandas.is_proxy_object = lambda obj: True
+        cudf_pkg.pandas = cudf_pandas
+        monkeypatch.setitem(sys.modules, "cudf", cudf_pkg)
+        monkeypatch.setitem(sys.modules, "cudf.pandas", cudf_pandas)
+
+        assert cm._pandas_is_cudf_proxy()
+
+    def test_fast_read_csv_does_not_force_pyarrow_for_cudf_proxy(
+        self, monkeypatch, tmp_path
+    ):
+        captured = {}
+
+        def fake_read_csv(path, **kwargs):
+            captured.update(kwargs)
+            return pd.DataFrame({"filepath": []})
+
+        monkeypatch.setattr(cm, "_pandas_is_cudf_proxy", lambda: True)
+        monkeypatch.setattr(cm.pd, "read_csv", fake_read_csv)
+
+        cm.fast_read_csv(tmp_path / "balalaika.csv")
+
+        assert captured == {"low_memory": False}
 
 
 # ---------------------------------------------------------------------------
@@ -75,12 +106,15 @@ class TestDurationCacheEquivalence:
                 "DistillMOS": [1.0] * 9,
             }
         )
-        df.to_csv(root / "balalaika.csv", index=False)
+        # parquet state (read by ad._csv_duration_cache) + a CSV reference for
+        # the verbatim original loop below.
+        df.to_parquet(root / "balalaika.parquet", index=False)
+        df.to_csv(root / "reference.csv", index=False)
         return {cm.normalize_path_string(p) for p in df["filepath"]}
 
     def test_matches_original_loop(self, tmp_path):
         requested = self._fixture(tmp_path)
-        old = _old_csv_duration_cache(tmp_path / "balalaika.csv", requested)
+        old = _old_csv_duration_cache(tmp_path / "reference.csv", requested)
         new = ad._csv_duration_cache(tmp_path, requested)
         assert new == old
         # spot-check the semantics the loop encoded
@@ -90,8 +124,8 @@ class TestDurationCacheEquivalence:
         assert new["/d/dup.wav"] == 2.0   # last wins
 
     def test_missing_duration_column(self, tmp_path):
-        pd.DataFrame({"filepath": ["/d/a.wav"]}).to_csv(
-            tmp_path / "balalaika.csv", index=False
+        pd.DataFrame({"filepath": ["/d/a.wav"]}).to_parquet(
+            tmp_path / "balalaika.parquet", index=False
         )
         assert ad._csv_duration_cache(tmp_path, {"/d/a.wav"}) == {}
 
@@ -100,32 +134,6 @@ class TestDurationCacheEquivalence:
         new = ad._csv_duration_cache(tmp_path, {"/d/a.wav"})
         assert set(new) == {"/d/a.wav"}
         assert new["/d/a.wav"] == 8.6645
-
-    def test_parquet_mode_duration_cache_matches_csv(self, tmp_path):
-        import os
-
-        prev = os.environ.get("BALALAIKA_STATE_FORMAT")
-        try:
-            root_csv = tmp_path / "csv"
-            root_csv.mkdir()
-            req = self._fixture(root_csv)
-            os.environ.pop("BALALAIKA_STATE_FORMAT", None)
-            csv_cache = ad._csv_duration_cache(root_csv, req)
-
-            root_pq = tmp_path / "pq"
-            root_pq.mkdir()
-            self._fixture(root_pq)
-            os.environ["BALALAIKA_STATE_FORMAT"] = "parquet"
-            from src.utils import csv_manager as _cm
-
-            _cm.load_main_csv(root_pq)  # migrate to parquet
-            pq_cache = ad._csv_duration_cache(root_pq, req)
-            assert csv_cache == pq_cache
-        finally:
-            if prev is None:
-                os.environ.pop("BALALAIKA_STATE_FORMAT", None)
-            else:
-                os.environ["BALALAIKA_STATE_FORMAT"] = prev
 
 
 class TestCanonicalGuard:
@@ -164,8 +172,8 @@ class TestCanonicalGuard:
 
 class TestUpsertDoesNotMutateCaller:
     def test_results_df_untouched_relative_paths(self, tmp_path):
-        pd.DataFrame({"filepath": ["/d/a.wav"], "crest_factor": [1.0]}).to_csv(
-            tmp_path / "balalaika.csv", index=False
+        pd.DataFrame({"filepath": ["/d/a.wav"], "crest_factor": [1.0]}).to_parquet(
+            tmp_path / "balalaika.parquet", index=False
         )
         incoming = pd.DataFrame(
             {"filepath": ["rel/x.wav", "/d/a.wav"], "crest_factor": [3.0, 4.0]}
@@ -223,9 +231,9 @@ class TestFlushSkip:
         assert skipped  # no new bytes -> the loop would skip the full flush
 
     def test_final_absorb_identical_regardless_of_skips(self, tmp_path):
-        # Whatever the merger does mid-stage, the final absorb yields the same CSV.
-        pd.DataFrame({"filepath": ["/d/a.wav"], "crest_factor": [1.0]}).to_csv(
-            tmp_path / "balalaika.csv", index=False
+        # Whatever the merger does mid-stage, the final absorb yields the same state.
+        pd.DataFrame({"filepath": ["/d/a.wav"], "crest_factor": [1.0]}).to_parquet(
+            tmp_path / "balalaika.parquet", index=False
         )
         pd.DataFrame(
             {"filepath": ["/d/a.wav", "/d/b.wav"], "crest_factor": [9.0, 8.0]}

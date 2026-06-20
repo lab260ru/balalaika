@@ -11,9 +11,10 @@ from src.utils.csv_manager import (
     read_state_dataframe,
     state_path,
 )
+from src.utils.chunk_json import JSON_SUFFIX, get_field, read_chunk_json
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import last_line, write_stage_status
-from src.utils.utils import load_config, read_file_content
+from src.utils.utils import load_config
 
 SUPPORTED_TIMESTAMP_MODELS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
 ASR_CONSISTENCY_COLUMN = "asr_consistency_percent"
@@ -59,7 +60,7 @@ def transcription_sidecar_columns(model_names: Iterable[str]) -> set[str]:
 
 
 def drop_csv_text_columns(df: pd.DataFrame, extra_columns: Optional[set[str]] = None) -> pd.DataFrame:
-    """Keep balalaika.csv as metadata-only; sidecars feed final parquet text."""
+    """Keep the parquet state metadata-only; chunk JSONs feed final text columns."""
     extra_columns = extra_columns or set()
     drop_cols = [
         col
@@ -79,14 +80,12 @@ def read_state_for_collate(
     sidecar_columns: set[str],
     config_path: str | None,
 ) -> pd.DataFrame:
-    """Load the pipeline-state frame collate folds sidecars into.
+    """Load the pipeline-state frame collate folds chunk JSONs into.
 
-    Reads the active state (``balalaika.parquet`` in parquet mode, else
-    ``balalaika.csv``) so direct upserters — e.g. stage-7's duration cache —
-    that write only the parquet state are reflected even though the CSV export
-    may be stale. Falls back to bootstrapping from the audio tree when no state
-    file exists yet. Drops duplicate filepaths and the text/sidecar columns
-    (those are re-sourced from the sidecar files).
+    Reads the parquet state (``balalaika.parquet``) so direct upserters — e.g.
+    stage-7's duration cache — are reflected. Falls back to bootstrapping from
+    the audio tree when no state file exists yet. Drops duplicate filepaths and
+    the text columns (those are re-sourced from each chunk's ``<stem>.json``).
     """
     if state_path(base_path).exists():
         logger.info(f"Loading existing dataframe from {state_path(base_path)}")
@@ -101,11 +100,17 @@ def read_state_for_collate(
 
 
 def sidecar_specs(model_names: Iterable[str]) -> Dict[str, str]:
+    """Map each output column to its dotted key inside the chunk ``<stem>.json``.
+
+    The four text stages and ROVER write a single JSON per chunk
+    (see :mod:`src.utils.chunk_json`); collate reads that one file and projects
+    its keys into the final parquet columns.
+    """
     specs = {
-        'accent': '_accent.txt',
-        'rover': '_rover.txt',
-        'punct': '_punct.txt',
-        'phonemes': '_rover_phonemes.txt',
+        'accent': 'accent',
+        'rover': 'rover',
+        'punct': 'punct',
+        'phonemes': 'rover_phonemes',
     }
 
     seen_suffixes = set()
@@ -114,8 +119,8 @@ def sidecar_specs(model_names: Iterable[str]) -> Dict[str, str]:
         if suffix in seen_suffixes:
             continue
         seen_suffixes.add(suffix)
-        specs[suffix] = f"_{suffix}.txt"
-        specs[f"{suffix}_timestamps"] = f"_{suffix}.tst"
+        specs[suffix] = f"asr.{suffix}"
+        specs[f"{suffix}_timestamps"] = f"asr_ts.{suffix}"
 
     return specs
 
@@ -223,6 +228,7 @@ def process_audio_file(
     # os.path.join mirrors the original Path join: an absolute dirname wins
     # over base_path, a relative one is anchored under it.
     target_dir = os.path.join(str(base_path), dirname)
+    json_name = f"{base_name}{JSON_SUFFIX}"
 
     names = None
     if _dir_names is not None:
@@ -232,23 +238,26 @@ def process_audio_file(
                 names = {entry.name for entry in os.scandir(target_dir)}
             except OSError:
                 # Transient failure (EMFILE, concurrent rename, ...): never
-                # cache the error. Fall through to the direct per-file read
-                # path for THIS call (names=None) so the file is read loudly
-                # instead of every later file in this dir silently reading ''.
-                # The next call for the same dir retries scandir.
+                # cache the error. Fall through to the direct read path for THIS
+                # call (names=None) so the file is read loudly instead of every
+                # later file in this dir silently reading ''. The next call for
+                # the same dir retries scandir.
                 names = None
             else:
                 _dir_names[target_dir] = names
 
     results: Dict[str, Optional[str]] = {'filepath': audio_path_str}
-    for key, suffix in file_types.items():
-        name = f"{base_name}{suffix}"
-        if names is not None and name not in names:
-            # directory listing says the sidecar doesn't exist -> same result
-            # as read_file_content's FileNotFoundError path, without the open
+    if names is not None and json_name not in names:
+        # directory listing says the chunk JSON doesn't exist -> every column
+        # is empty, same as the old missing-sidecar path, without the open.
+        for key in file_types:
             results[key] = ''
-        else:
-            results[key] = read_file_content(os.path.join(target_dir, name))
+        return results
+
+    data = read_chunk_json(os.path.join(target_dir, json_name))
+    for key, dotted in file_types.items():
+        value = get_field(data, dotted)
+        results[key] = '' if value is None else value
 
     return results
 
