@@ -11,6 +11,7 @@ import webdataset as wds
 from tqdm import tqdm
 from loguru import logger
 
+from src.utils.chunk_json import chunk_json_path, read_chunk_json
 from src.utils.csv_manager import discover_audio_paths
 from src.utils.logging_setup import setup_logging
 from src.utils.utils import load_config
@@ -54,12 +55,11 @@ def resolve_output_dir(podcasts_path: Path, output_path: str | None) -> Path:
 
 
 def load_metadata(podcasts_path: Path) -> Dict[str, dict]:
-    """Загружает состояние пайплайна и делает словарь с ключом по базовому имени файла.
+    """Load legacy parquet metadata keyed by audio stem.
 
-    Reads the active pipeline state (``balalaika.parquet`` in parquet mode, else
-    ``balalaika.csv``) so the metadata reflects direct upserters — e.g. stage-7's
-    duration cache — that write only the parquet state without refreshing the CSV
-    export.
+    New pipeline runs write metadata into each chunk's ``<stem>.json`` sidecar,
+    so the main export path no longer needs this full-state read. This remains
+    as a fallback for older datasets that do not have metadata sidecars yet.
     """
     import os
 
@@ -67,8 +67,13 @@ def load_metadata(podcasts_path: Path) -> Dict[str, dict]:
 
     df = read_state_dataframe(podcasts_path)
     if df.empty:
-        logger.warning(f"No pipeline state found under {podcasts_path}!")
-        return {}
+        legacy_csv = podcasts_path / "balalaika.csv"
+        if legacy_csv.exists():
+            logger.info(f"Loading legacy CSV metadata from {legacy_csv}")
+            df = pd.read_csv(legacy_csv, low_memory=False)
+        else:
+            logger.warning(f"No pipeline state found under {podcasts_path}!")
+            return {}
 
     drop_cols = [
         col
@@ -89,6 +94,26 @@ def load_metadata(podcasts_path: Path) -> Dict[str, dict]:
 
     logger.info(f"Loaded metadata for {len(metadata_dict)} files.")
     return metadata_dict
+
+
+TEXT_SIDECAR_KEYS = TEXT_COLUMNS | {"asr", "asr_ts", "asr_consistency"}
+
+
+def has_metadata_sidecars(audio_paths: List[str]) -> bool:
+    """Return True when chunk JSONs contain flat state metadata, not only text."""
+    for path in audio_paths:
+        json_path = chunk_json_path(path)
+        if not json_path.exists():
+            continue
+        data = read_chunk_json(json_path)
+        if any(str(key) not in TEXT_SIDECAR_KEYS for key in data):
+            return True
+    return False
+
+
+def load_sidecar_metadata(audio_path: Path) -> dict:
+    data = read_chunk_json(chunk_json_path(audio_path))
+    return dict(data) if isinstance(data, dict) else {}
 
 
 def _sanitize_record_value(v):
@@ -211,6 +236,7 @@ def worker_fn(
             # isinstance / hasattr dispatch in the hot loop.
             meta = metadata_dict.get(key)
             json_data = dict(meta) if meta is not None else {}
+            json_data.update(load_sidecar_metadata(audio_path))
 
             # One cached scandir per directory instead of two globs per FILE:
             # directories hold hundreds of chunks, so the old pattern rescanned
@@ -235,6 +261,7 @@ def worker_fn(
                 for n in dir_files
                 if (n.startswith(prefix_us) or n.startswith(prefix_dot))
                 and n != audio_path.name
+                and n != f"{key}.json"
             ]
 
             for sibling_name in sibling_names:
@@ -298,7 +325,12 @@ def main(config, config_path: str | None = None):
         logger.warning("No audio data to process.")
         return
 
-    metadata_dict = load_metadata(podcasts_path)
+    if has_metadata_sidecars(all_audio_paths):
+        logger.info("Using per-audio JSON sidecars for WebDataset metadata.")
+        metadata_dict = {}
+    else:
+        logger.info("No metadata sidecars found; falling back to full parquet metadata read.")
+        metadata_dict = load_metadata(podcasts_path)
 
     chunk_size = len(all_audio_paths) // num_workers + 1
     chunks = [all_audio_paths[i:i + chunk_size] for i in range(0, len(all_audio_paths), chunk_size)]

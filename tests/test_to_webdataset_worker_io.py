@@ -10,7 +10,7 @@ import tarfile
 
 import pytest
 
-from src.to_webdataset import worker_fn
+from src.to_webdataset import has_metadata_sidecars, worker_fn
 
 
 def _read_shard_keys(output_dir):
@@ -146,6 +146,50 @@ def test_metadata_and_sibling_packed(tmp_path):
     assert meta["speaker"] == "s1"
     assert meta["dur"] == 1.5
     assert meta["transcript"] == "hello world"
+
+
+def test_has_metadata_sidecars_ignores_text_only_json(tmp_path):
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFFdata")
+    (tmp_path / "clip.json").write_text(
+        json.dumps({"asr": {"m": "hello"}, "rover": "hello"}),
+        encoding="utf-8",
+    )
+    assert not has_metadata_sidecars([str(audio)])
+
+    (tmp_path / "clip.json").write_text(
+        json.dumps({"asr": {"m": "hello"}, "total_duration": 1.2}),
+        encoding="utf-8",
+    )
+    assert has_metadata_sidecars([str(audio)])
+
+
+def test_chunk_json_metadata_is_packed_and_overrides_legacy_dict(tmp_path):
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFFdata")
+    (tmp_path / "clip.json").write_text(
+        json.dumps({"speaker": "json", "p_tts": 0.91}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+
+    processed, errors = worker_fn(
+        worker_id=0,
+        audio_paths=[str(audio)],
+        output_dir=out,
+        metadata_dict={"clip": {"speaker": "legacy", "DistillMOS": 4.0}},
+        max_shard_size=10 * 1024 * 1024,
+        max_shard_count=1000,
+    )
+
+    assert (processed, errors) == (1, 0)
+    samples = _read_shard_keys(out)
+    meta = json.loads(samples["clip"]["json"].decode("utf-8"))
+    assert meta["speaker"] == "json"
+    assert meta["p_tts"] == 0.91
+    assert meta["DistillMOS"] == 4.0
+    assert "json" not in meta
 
 
 def test_shard_start_index_preserves_worker_name_format(tmp_path):

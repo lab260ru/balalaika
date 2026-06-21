@@ -76,7 +76,8 @@ per chunk), never in-process, which is what makes arbitrary `--stage` resume wor
 | 1 | `src.preprocess.preprocess` | Sortformer diarization + Smart Turn chunking |
 | 2 | `src.preprocess.crest_factor_remover` | Crest-factor filter |
 | 3 | `src.preprocess.preprocess_audio` | Loudness normalization (BS.1770-4) |
-| 4 | `src.separation.music_detect` | Music probability scoring + filter |
+| 4 | `src.separation.music_detect` | Music probability scoring |
+| 4.5 | `src.separation.music_detect_filter` | Music-prob threshold filter (deletes files) |
 | 5 | `src.separation.distillmos_process` | DistillMOS quality scoring |
 | 5.5 | `src.separation.distillmos_filter` | DistillMOS threshold filter (deletes files) |
 | 6 | `src.separation.antispoofing` | Spectra-0 anti-spoofing scores |
@@ -96,7 +97,10 @@ Stages 12–14 use top-level modules (`src/collate.py`, `src/to_webdataset.py`,
 `src/report.py`) rather than the `src/<area>/` subdirectory pattern used by
 earlier stages. `src/preprocess/preprocess_existing_chunks.py` is an alternate
 stage-1 path for datasets that arrive pre-chunked (skips diarization, still runs
-Sortformer for metadata).
+Sortformer for metadata). `src/recovery_from_meta.py` is a standalone CLI (own
+`argparse` main, not a numbered stage) that re-exports chunk audio segments from
+the metadata state when the chunk files are lost but the metadata survives; it
+short-circuits when all segments already exist.
 
 **Stage-1 chunk-length output.** Every later stage operates on the chunks this
 stage emits, so its length distribution is load-bearing. `apply_eos_classification`
@@ -112,11 +116,21 @@ columns to the `balalaika.parquet` state (`filepath`, `speaker_id`,
 `start`, `end`, `total_duration`, `playlist_id`, `podcast_id`, `silence_percent`,
 `max_silence_duration`, `is_single_speaker`, `crest_factor`, `loudness_normalized`,
 `DistillMOS`). Later scoring stages (4, 5, 6, 7) `upsert_columns` their own score
-onto these rows, while the dedicated `.5` filter stages (5.5, 6.5, 7.5 — and the
-filter half of stage 4) prune by **removing files from the tree**, so a row's
-presence already encodes "passed every filter that has run". Which score columns
-actually exist in `balalaika.parquet` therefore depends on how far the pipeline
-has been run — verify with the schema rather than assuming.
+onto these rows, while the dedicated `.5` filter stages (4.5, 5.5, 6.5, 7.5) prune
+by **removing files from the tree**, so a row's presence already encodes "passed
+every filter that has run". Which score columns actually exist in
+`balalaika.parquet` therefore depends on how far the pipeline has been run —
+verify with the schema rather than assuming.
+
+**Score/filter split + `inline_filter`.** All four separation scorers follow one
+shape: a score-only stage (4/5/6/7) writes its column, and a paired `.5` filter
+stage deletes files by a per-stage predicate (music_prob > t; DistillMOS < t;
+spoof−bonafide > t; not_tts−tts > t — see `src/separation/inline_filter.py`).
+Each scorer also takes `inline_filter: true` (config), which applies that same
+predicate and deletes **in the scoring pass** (pruning rows + recording the
+filter row itself), so the `.5` stage can be skipped — saving a second walk over
+the tree. Default is off (clean split). The threshold always lives in the `.5`
+stage's `*_filter` subsection (one source of truth, read by both paths).
 
 **State + per-chunk text storage.** Pipeline state lives **only** in
 `balalaika.parquet` — CSV state was removed as a redundant, inefficient copy, so

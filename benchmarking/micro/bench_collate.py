@@ -125,7 +125,6 @@ def _run_old_path(base: Path) -> None:
     results = [collate.process_audio_file(p, base, file_types, {}) for p in audio_paths]
     extracted_df = pd.DataFrame(results)
     final_df = pd.merge(df, extracted_df, on="filepath", how="left")
-    final_df = collate.add_asr_consistency_column(final_df, MODEL_NAMES)
     final_df.to_parquet(base / "balalaika_old.parquet", engine="pyarrow", index=False)
 
 
@@ -226,34 +225,12 @@ def main() -> None:
         _run_ram_bench(args)
         return
 
-    from src.collate import add_asr_consistency_column
-
-    model_names = MODEL_NAMES
-    times = []
-    for _ in range(args.repeats):
-        df = synth_df(args.rows)
-        t0 = time.perf_counter()
-        out = add_asr_consistency_column(df, model_names)
-        times.append(time.perf_counter() - t0)
-    print(
-        f"asr_consistency rows={args.rows} avg={statistics.mean(times):.3f}s "
-        f"min={min(times):.3f}s  (non-nan: {out['asr_consistency_percent'].notna().sum()})"
+    raise SystemExit(
+        "ASR consistency is computed during ROVER now; "
+        "collate only reads asr_consistency from chunk JSON. Use --mode ram "
+        "to benchmark collate sidecar assembly."
     )
 
-    out_path = REPO_ROOT / "benchmarking" / "reports" / "micro" / "collate.jsonl"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("a", encoding="utf-8") as f:
-        f.write(
-            json.dumps(
-                {
-                    "label": args.label,
-                    "at": datetime.now(timezone.utc).isoformat(),
-                    "rows": args.rows,
-                    "asr_consistency_s": times,
-                }
-            )
-            + "\n"
-        )
 
 
 if __name__ == "__main__":

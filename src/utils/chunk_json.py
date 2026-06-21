@@ -13,13 +13,17 @@ Schema (all keys optional, written by their producing stage):
       "asr":    {"<model>": "<text>", ...},      # stage 8 per-model ASR
       "asr_ts": {"<model>": "<timestamps>", ...},# stage 8, when with_timestamps
       "rover":  "<text>",                         # stage 8 ROVER consensus
+      "asr_consistency": 98.5,                      # stage 8 agreement vs ROVER, percent
       "punct":  "<text>",                         # stage 9
       "accent": "<text>",                         # stage 10
-      "rover_phonemes": "<text>"                  # stage 11
+      "rover_phonemes": "<text>",                 # stage 11
+      "total_duration": 12.3,                       # flat pipeline state metadata
+      "DistillMOS": 4.2,
+      "p_tts": 0.97
     }
 
-Chunk *metadata* (start/end/duration/scores) lives in the parquet state, not
-here — no duplication.
+Flat chunk metadata from the pipeline state (start/end/duration/scores/etc.) is
+merged into this same document as stages produce it.
 
 **Concurrency.** Stages run sequentially and each stage's workers process
 disjoint work shards, so no two processes ever write the same chunk JSON at the
@@ -29,12 +33,14 @@ a re-run simply re-reads the last complete version.
 """
 from __future__ import annotations
 
+import copy
 import errno
 import json
 import os
 import tempfile
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 
@@ -110,6 +116,72 @@ def update_chunk_json(audio_path: Path | str, updates: Dict[str, Any]) -> None:
     data = read_chunk_json(path)
     _deep_merge(data, updates)
     _atomic_write_json(path, data)
+
+
+def update_chunk_jsons(
+    items: Iterable[Tuple[Path | str, Dict[str, Any]]],
+    *,
+    require_audio_exists: bool = True,
+) -> Tuple[int, int, int]:
+    """Batched flat-metadata mirror into many ``<stem>.json`` files.
+
+    The per-stage state→JSON mirror used to RMW one JSON per row with an
+    ``os.path.exists`` stat each (``write_metadata_sidecar`` in a loop). This
+    groups ``items`` by parent directory so each directory is ``scandir``'d
+    **once** — answering both "does the audio still exist" and "does the JSON
+    already exist" from a single listing — then reads + deep-merges each JSON and
+    **skips writes that would not change the document** (idempotent re-runs no
+    longer re-touch every file). Rows whose audio file is gone are skipped when
+    ``require_audio_exists`` is set, so a filter stage that deleted the chunk
+    does not resurrect an orphan JSON.
+
+    Returns ``(written, skipped, failed)``.
+    """
+    grouped: Dict[str, List[Tuple[str, Path, Dict[str, Any]]]] = defaultdict(list)
+    for audio_path, updates in items:
+        if not updates:
+            continue
+        ap = audio_path if isinstance(audio_path, Path) else Path(audio_path)
+        jp = chunk_json_path(ap)
+        grouped[str(jp.parent)].append((ap.name, jp, updates))
+
+    written = skipped = failed = 0
+    for directory, rows in grouped.items():
+        # One scandir per directory; None means the listing failed and we fall
+        # back to a per-row stat (rare — a transient EMFILE / concurrent rename).
+        names: Optional[set] = None
+        try:
+            with os.scandir(directory) as it:
+                names = {entry.name for entry in it}
+        except OSError:
+            names = None
+
+        for audio_name, jp, updates in rows:
+            try:
+                if require_audio_exists:
+                    if names is not None:
+                        if audio_name not in names:
+                            skipped += 1
+                            continue
+                    elif not os.path.exists(os.path.join(directory, audio_name)):
+                        skipped += 1
+                        continue
+                json_present = names is not None and jp.name in names
+                # Skip the read when the listing already proves the JSON absent.
+                data = (
+                    read_chunk_json(jp) if (names is None or json_present) else {}
+                )
+                merged = copy.deepcopy(data)
+                _deep_merge(merged, updates)
+                if json_present and merged == data:
+                    skipped += 1
+                    continue
+                _atomic_write_json(jp, merged)
+                written += 1
+            except Exception as exc:  # noqa: BLE001 — mirror is best-effort
+                failed += 1
+                logger.warning(f"Failed to write chunk JSON for {jp}: {exc}")
+    return written, skipped, failed
 
 
 def get_field(data: Dict[str, Any], dotted_key: str) -> Any:

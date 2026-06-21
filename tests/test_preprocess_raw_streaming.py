@@ -140,3 +140,56 @@ def test_empty_shard_returns_zero(tmp_path, monkeypatch):
     )
     assert result["rows"] == 0
     assert result["duration_sum_s"] == 0.0
+
+def test_single_speaker_only_drops_short_multispeaker_source(tmp_path, monkeypatch):
+    source = tmp_path / "short.flac"
+    source.write_bytes(b"x")
+    monkeypatch.setattr(
+        P,
+        "diarize_audio",
+        lambda audio, sr, chunk_duration: [(0.0, 0.5, 0), (0.5, 1.0, 1)],
+    )
+
+    result = P.process_audio_file(
+        str(source),
+        torch.zeros((1, 16000), dtype=torch.float32),
+        16000,
+        {"duration": 15, "single_speaker_only": True, "fuse_audio_preprocessing": False},
+    )
+
+    assert result["segments"] == []
+    assert not source.exists()
+    assert result["crest_audit"]["single_speaker_rejections"] == 1
+
+
+def test_cut_audio_single_speaker_only_skips_multispeaker_window_before_decode(tmp_path, monkeypatch):
+    class Metadata:
+        sample_rate = 16000
+        duration_seconds = 2.0
+
+    class FakeDecoder:
+        metadata = Metadata()
+
+        def __init__(self, path):
+            self.path = path
+
+        def get_samples_played_in_range(self, **kwargs):
+            raise AssertionError("multi-speaker window should be skipped before decode")
+
+    monkeypatch.setattr(P, "AudioDecoder", FakeDecoder)
+    audit = P._new_crest_audit()
+
+    rows = P.cut_audio(
+        str(tmp_path / "src.flac"),
+        [(0.0, 2.0, 0)],
+        [(0.0, 1.0, 0), (1.0, 2.0, 1)],
+        str(tmp_path / "out"),
+        "album",
+        "episode",
+        config={"single_speaker_only": True},
+        crest_audit=audit,
+    )
+
+    assert rows == []
+    assert audit["single_speaker_rejections"] == 1
+

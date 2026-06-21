@@ -257,3 +257,65 @@ def test_open_count_halves(chunk_file):
 
     assert opens_legacy == 2, f"expected 2 read opens in legacy path, got {opens_legacy}"
     assert opens_reuse == 1, f"expected 1 read open in byte-reuse path, got {opens_reuse}"
+
+def test_existing_chunks_single_speaker_only_deletes_multispeaker_chunk(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from src.utils.csv_manager import PartialCsvWriter, read_partial_csvs
+
+    chunk = tmp_path / "0.00_1.00_album_episode.flac"
+    chunk.write_bytes(b"x")
+
+    def fake_loader(file_paths, **kwargs):
+        return [[(str(chunk), torch.zeros((1, 16000), dtype=torch.float32), 16000, "", None)]]
+
+    def fake_metadata(path_audio, audio, sr, podcasts_path, config):
+        return {
+            "filepath": str(chunk),
+            "speaker_id": 0,
+            "start": 0.0,
+            "end": 1.0,
+            "total_duration": 1.0,
+            "playlist_id": "album",
+            "podcast_id": "episode",
+            "silence_percent": 0.0,
+            "max_silence_duration": 0.0,
+            "is_single_speaker": False,
+        }
+
+    monkeypatch.setattr(pec, "create_diarization_dataloader", fake_loader)
+    monkeypatch.setattr(pec, "metadata_for_chunk", fake_metadata)
+
+    processed = SimpleNamespace(value=0)
+    skipped = SimpleNamespace(value=0)
+    errors = SimpleNamespace(value=0)
+    dropped = SimpleNamespace(value=0)
+    crest_files_in = SimpleNamespace(value=0)
+    crest_files_out = SimpleNamespace(value=0)
+    crest_duration_in = SimpleNamespace(value=0.0)
+    crest_duration_out = SimpleNamespace(value=0.0)
+
+    with PartialCsvWriter(tmp_path, pec.PARTIAL_PREFIX, 0, fieldnames=pec.PARTIAL_FIELDS) as writer:
+        pec._process_files(
+            0,
+            [str(chunk)],
+            {"single_speaker_only": True, "fuse_audio_preprocessing": False},
+            tmp_path,
+            writer,
+            set(),
+            processed,
+            skipped,
+            errors,
+            dropped,
+            crest_files_in,
+            crest_files_out,
+            crest_duration_in,
+            crest_duration_out,
+        )
+
+    assert not chunk.exists()
+    assert processed.value == 1
+    assert dropped.value == 1
+    assert errors.value == 0
+    assert read_partial_csvs(tmp_path, pec.PARTIAL_PREFIX).empty
+

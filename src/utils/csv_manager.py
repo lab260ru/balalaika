@@ -35,7 +35,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from loguru import logger
@@ -71,6 +71,8 @@ BASE_COLUMNS: Tuple[str, ...] = (
     "DistillMOS",
     "score_bonafide",
     "score_spoof",
+    "p_not_tts",
+    "p_tts",
     "denoised",
 )
 
@@ -549,6 +551,78 @@ def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[base + extras]
 
 
+def _json_ready_value(value: Any) -> Any:
+    """Convert pandas/numpy scalar values to JSON-safe Python values."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+        return str(value)
+    if hasattr(value, "item"):
+        try:
+            return _json_ready_value(value.item())
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, Mapping):
+        return {str(k): _json_ready_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready_value(v) for v in value]
+    return value
+
+
+def _sidecar_updates_from_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+    updates: Dict[str, Any] = {}
+    for key, value in row.items():
+        if key == "filepath":
+            continue
+        ready = _json_ready_value(value)
+        if ready is None or ready == "":
+            continue
+        updates[str(key)] = ready
+    return updates
+
+
+def write_metadata_sidecar(audio_path: os.PathLike | str, row: Mapping[str, Any]) -> None:
+    """Merge flat state metadata into the chunk's ``<stem>.json`` sidecar."""
+    updates = _sidecar_updates_from_row(row)
+    if not updates:
+        return
+    from src.utils.chunk_json import update_chunk_jsons
+
+    update_chunk_jsons([(Path(audio_path), updates)])
+
+
+def write_metadata_sidecars_from_frame(df: pd.DataFrame) -> int:
+    """Mirror flat state metadata into one chunk JSON per row; return rows written.
+
+    Batches the whole frame through :func:`update_chunk_jsons` so each directory
+    is scandir'd once (no per-row ``exists`` stat) and unchanged JSONs are not
+    rewritten.
+    """
+    if df is None or df.empty or "filepath" not in df.columns:
+        return 0
+    from src.utils.chunk_json import update_chunk_jsons
+
+    items = []
+    for row in df.to_dict("records"):
+        filepath = row.get("filepath")
+        if not filepath:
+            continue
+        updates = _sidecar_updates_from_row(row)
+        if updates:
+            items.append((filepath, updates))
+    if not items:
+        return 0
+    written, _skipped, failed = update_chunk_jsons(items)
+    if failed:
+        logger.warning(f"Metadata JSON sidecars failed to write: {failed}")
+    return written
+
+
 # ---------------------------------------------------------------------------
 # State-format interop (parquet mode)
 # ---------------------------------------------------------------------------
@@ -798,6 +872,10 @@ def upsert_columns(
 
         df = _reorder_columns(df)
         _atomic_write_csv_unlocked(df, target)
+        if results_df is not None and not results_df.empty:
+            written = write_metadata_sidecars_from_frame(results)
+            if written:
+                logger.info(f"Metadata JSON sidecars updated: {written}")
         return df
 
 
@@ -1038,6 +1116,13 @@ class PartialCsvWriter:
         clean = {k: row.get(k, "") for k in self._fields}
         self._writer.writerow(clean)
         self._file.flush()
+        # The state→JSON mirror is NOT done here: a per-row read-modify-write in
+        # the worker hot loop is the dominant IO cost of the scoring stages and
+        # is redundant with the batched mirror that runs when these partials are
+        # folded into the state (``absorb_partial_csvs`` -> ``upsert_columns`` ->
+        # ``write_metadata_sidecars_from_frame``). The partial CSV is flushed
+        # per-row, so a kill before absorb loses no scores; the JSON is brought
+        # up to date on the next absorb (the periodic merger or stage end).
 
     def already_done(self, key_column: str = "filepath") -> Set[str]:
         """Return the values of ``key_column`` already present in the partial."""

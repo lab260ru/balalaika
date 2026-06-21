@@ -1,98 +1,83 @@
-"""Equivalence tests: vectorised ASR consistency vs the row-wise reference."""
+"""Collate reads ASR consistency from chunk JSON, not from exact ASR matches."""
 from __future__ import annotations
 
-import numpy as np
+import math
+from pathlib import Path
+
 import pandas as pd
-import pytest
 
-from src.collate import (
-    ASR_CONSISTENCY_COLUMN,
-    add_asr_consistency_column,
-    asr_consistency_percent,
-)
+from src import collate
+from src.utils.chunk_json import update_chunk_json
 
-MODELS = ["giga_ctc", "giga_rnnt", "vosk", "tone"]
+MODELS = ["m0", "m1"]
 
 
-def reference(df: pd.DataFrame, asr_columns: list[str]) -> pd.Series:
-    return df.apply(asr_consistency_percent, axis=1, asr_columns=asr_columns)
+def _audio(tmp_path: Path, stem: str) -> Path:
+    path = tmp_path / f"{stem}.flac"
+    path.write_bytes(b"x")
+    return path
 
 
-def assert_matches_reference(df: pd.DataFrame):
-    expected = reference(df.copy(), MODELS)
-    got = add_asr_consistency_column(df.copy(), MODELS)[ASR_CONSISTENCY_COLUMN]
-    np.testing.assert_allclose(got.to_numpy(), expected.to_numpy(), equal_nan=True)
+def test_sidecar_specs_include_rover_consistency_field():
+    specs = collate.sidecar_specs(MODELS)
+    assert specs[collate.ASR_CONSISTENCY_COLUMN] == "asr_consistency"
 
 
-def test_edge_cases():
-    df = pd.DataFrame(
+def test_old_exact_match_calculator_removed_from_collate_hot_path():
+    assert not hasattr(collate, "add_asr_consistency_column")
+    assert not hasattr(collate, "asr_consistency_percent")
+
+
+def test_process_audio_file_reads_numeric_consistency(tmp_path):
+    audio = _audio(tmp_path, "a")
+    update_chunk_json(
+        audio,
         {
-            "giga_ctc": ["привет мир", "a", np.nan, "", "x", "  Привет   МИР ", None],
-            "giga_rnnt": ["привет мир", "b", np.nan, "", "x", "привет мир", ""],
-            "vosk": ["привет мир", "c", np.nan, "", "x", "другое", np.nan],
-            "tone": ["другой текст", np.nan, np.nan, "", "x", "привет мир", ""],
-        }
+            "rover": "a b c",
+            "asr_consistency": 88.5,
+            "asr": {"m0": "a b c", "m1": "a b x"},
+        },
     )
-    assert_matches_reference(df)
+
+    row = collate.process_audio_file(str(audio), tmp_path, collate.sidecar_specs(MODELS), {})
+
+    assert row["rover"] == "a b c"
+    assert row[collate.ASR_CONSISTENCY_COLUMN] == 88.5
 
 
-def test_single_nonempty_is_nan():
-    df = pd.DataFrame(
+def test_process_audio_file_missing_or_empty_consistency_is_nan(tmp_path):
+    missing = _audio(tmp_path, "missing")
+    empty = _audio(tmp_path, "empty")
+    update_chunk_json(empty, {"asr_consistency": ""})
+
+    specs = collate.sidecar_specs(MODELS)
+    missing_row = collate.process_audio_file(str(missing), tmp_path, specs, {})
+    empty_row = collate.process_audio_file(str(empty), tmp_path, specs, {})
+
+    assert math.isnan(missing_row[collate.ASR_CONSISTENCY_COLUMN])
+    assert math.isnan(empty_row[collate.ASR_CONSISTENCY_COLUMN])
+
+
+def test_build_slab_preserves_json_consistency_even_when_asr_texts_match(tmp_path):
+    audio = _audio(tmp_path, "slab")
+    update_chunk_json(
+        audio,
         {
-            "giga_ctc": ["только один"],
-            "giga_rnnt": [""],
-            "vosk": [np.nan],
-            "tone": [None],
-        }
+            "asr_consistency": 42.0,
+            "asr": {"m0": "identical", "m1": "identical"},
+        },
     )
-    out = add_asr_consistency_column(df, MODELS)
-    assert np.isnan(out[ASR_CONSISTENCY_COLUMN].iloc[0])
+    df = pd.DataFrame({"filepath": [str(audio)]})
+    specs = collate.sidecar_specs(MODELS)
 
+    class InlineExecutor:
+        def map(self, fn, items):
+            return [fn(item) for item in items]
 
-def test_full_agreement_is_100():
-    df = pd.DataFrame({m: ["одно и то же"] for m in MODELS})
-    out = add_asr_consistency_column(df, MODELS)
-    assert out[ASR_CONSISTENCY_COLUMN].iloc[0] == pytest.approx(100.0)
-
-
-def test_numeric_cells_match_reference():
-    # all-NaN float columns / stray numeric cells go through str() in both paths
-    df = pd.DataFrame(
-        {
-            "giga_ctc": [1.5, np.nan],
-            "giga_rnnt": ["1.5", "y"],
-            "vosk": [np.nan, "y"],
-            "tone": ["1.5", np.nan],
-        }
+    slab, errors = collate.build_slab_frame(
+        df, specs, MODELS, tmp_path, {}, 1, InlineExecutor()
     )
-    assert_matches_reference(df)
 
+    assert errors == []
+    assert slab[collate.ASR_CONSISTENCY_COLUMN].iloc[0] == 42.0
 
-def test_fewer_than_two_columns():
-    df = pd.DataFrame({"giga_ctc": ["a"], "other": ["b"]})
-    out = add_asr_consistency_column(df, ["giga_ctc"])
-    assert np.isnan(out[ASR_CONSISTENCY_COLUMN].iloc[0])
-
-
-def test_vosk_suffix_dedup():
-    # vosk and vosk_small share the 'vosk' sidecar suffix -> counted once
-    df = pd.DataFrame(
-        {
-            "vosk": ["a", "b"],
-            "giga_ctc": ["a", "b"],
-        }
-    )
-    out = add_asr_consistency_column(df, ["vosk", "vosk_small", "giga_ctc"])
-    assert out[ASR_CONSISTENCY_COLUMN].tolist() == [100.0, 100.0]
-
-
-def test_random_matches_reference():
-    rng = np.random.default_rng(7)
-    phrases = ["раз два", "три", "", "четыре пять шесть", "раз  ДВА "]
-    data = {}
-    for m in MODELS:
-        vals = [phrases[i] for i in rng.integers(0, len(phrases), size=500)]
-        s = pd.Series(vals).mask(rng.random(500) < 0.15)
-        data[m] = s
-    df = pd.DataFrame(data)
-    assert_matches_reference(df)

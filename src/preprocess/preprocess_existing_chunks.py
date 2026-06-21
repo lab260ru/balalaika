@@ -43,6 +43,7 @@ from src.preprocess.preprocess import (
     diarize_audio,
     get_chunk_metrics,
     init_models,
+    single_speaker_only_enabled,
 )
 from src.utils.audit import record_stage_summary
 from src.utils.csv_manager import (
@@ -86,6 +87,11 @@ def _truthy(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _falsey(value: object) -> bool:
+    return str(value).strip().lower() in {"0", "false", "no", "n", "off"}
+
+
+
 def _metadata_complete_mask(df: pd.DataFrame, required_columns: Sequence[str]) -> pd.Series:
     if df.empty or "filepath" not in df.columns:
         return pd.Series(False, index=df.index)
@@ -109,6 +115,7 @@ def pending_metadata_paths(
     *,
     overwrite: bool = False,
     required_columns: Sequence[str] = METADATA_VALUE_COLUMNS,
+    single_speaker_only: bool = False,
 ) -> List[str]:
     paths = [normalize_path_string(path) for path in audio_paths if str(path).strip()]
     if overwrite:
@@ -120,7 +127,12 @@ def pending_metadata_paths(
 
     done_mask = _metadata_complete_mask(df, required_columns)
     done = set(df.loc[done_mask, "filepath"].astype(str).map(normalize_path_string))
-    pending = [path for path in paths if path not in done]
+    known_multi_speaker = set()
+    if single_speaker_only and "is_single_speaker" in df.columns:
+        normalized_paths = df["filepath"].astype(str).map(normalize_path_string)
+        false_mask = df["is_single_speaker"].map(_falsey)
+        known_multi_speaker = set(normalized_paths[false_mask])
+    pending = [path for path in paths if path not in done or path in known_multi_speaker]
     logger.info(
         f"Existing-chunk metadata: {len(done)} complete row(s), "
         f"{len(pending)} pending out of {len(paths)} audio file(s)."
@@ -306,12 +318,14 @@ def _process_files(
     processed_counter,
     skipped_counter,
     errors_counter,
+    single_speaker_dropped,
     crest_files_in,
     crest_files_out,
     crest_duration_in,
     crest_duration_out,
 ) -> None:
     fuse_audio = fused_audio_preprocessing_enabled(config)
+    single_speaker_only = single_speaker_only_enabled(config)
     partial_fields = FUSED_PARTIAL_FIELDS if fuse_audio else PARTIAL_FIELDS
     pending_files = []
     for path in files:
@@ -365,6 +379,19 @@ def _process_files(
 
             try:
                 row = metadata_for_chunk(str(path_audio), audio, sr, podcasts_path, config)
+                if single_speaker_only and not _truthy(row.get("is_single_speaker")):
+                    try:
+                        Path(path_audio).unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.error(f"Failed to delete multi-speaker chunk {path_audio}: {exc}")
+                        _increment(errors_counter)
+                        continue
+                    already_done.add(resolved)
+                    _increment(processed_counter)
+                    _increment(single_speaker_dropped)
+                    logger.debug(f"Deleted multi-speaker chunk due to single_speaker_only: {path_audio}")
+                    continue
+
                 if fuse_audio:
                     keep, crest_factor, normalized, duration_s, postprocess_error = (
                         _postprocess_existing_chunk(str(path_audio), config, raw_bytes)
@@ -401,6 +428,7 @@ def run_worker(
     processed_counter,
     skipped_counter,
     errors_counter,
+    single_speaker_dropped,
     crest_files_in,
     crest_files_out,
     crest_duration_in,
@@ -444,6 +472,7 @@ def run_worker(
                 processed_counter,
                 skipped_counter,
                 errors_counter,
+                single_speaker_dropped,
                 crest_files_in,
                 crest_files_out,
                 crest_duration_in,
@@ -463,6 +492,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
     overwrite = _truthy(config.get("existing_chunks_overwrite", False))
     source = str(config.get("existing_chunks_audio_paths_source", DEFAULT_AUDIO_PATHS_SOURCE))
     fuse_audio = fused_audio_preprocessing_enabled(config)
+    single_speaker_only = single_speaker_only_enabled(config)
     logger.info(f"Fused crest/loudness preprocessing: {fuse_audio}")
 
     audio_paths = discover_audio_paths(
@@ -488,7 +518,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
         PARTIAL_PREFIX,
         value_columns=VALUE_COLUMNS,
         bootstrap_audio_paths=audio_paths,
-        drop_missing_files=fuse_audio,
+        drop_missing_files=(fuse_audio or single_speaker_only),
         preserve_existing=not overwrite,
     )
     if absorbed:
@@ -502,6 +532,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
         audio_paths,
         overwrite=overwrite,
         required_columns=(VALUE_COLUMNS if fuse_audio else METADATA_VALUE_COLUMNS),
+        single_speaker_only=single_speaker_only,
     )
     skipped_initial = len(audio_paths) - len(pending)
     if not pending:
@@ -542,6 +573,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
     processed = mp.Value("i", 0)
     skipped = mp.Value("i", skipped_initial)
     errors = mp.Value("i", 0)
+    single_speaker_dropped = mp.Value("i", 0)
     crest_files_in = mp.Value("i", 0)
     crest_files_out = mp.Value("i", 0)
     crest_duration_in = mp.Value("d", 0.0)
@@ -554,7 +586,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
             prefix=PARTIAL_PREFIX,
             value_columns=VALUE_COLUMNS,
             bootstrap_audio_paths=audio_paths,
-            drop_missing_files=fuse_audio,
+            drop_missing_files=(fuse_audio or single_speaker_only),
             preserve_existing=not overwrite,
             **csv_settings,
         ):
@@ -569,6 +601,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
                     processed,
                     skipped,
                     errors,
+                    single_speaker_dropped,
                     crest_files_in,
                     crest_files_out,
                     crest_duration_in,
@@ -585,7 +618,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
         PARTIAL_PREFIX,
         value_columns=VALUE_COLUMNS,
         bootstrap_audio_paths=audio_paths,
-        drop_missing_files=fuse_audio,
+        drop_missing_files=(fuse_audio or single_speaker_only),
         preserve_existing=not overwrite,
     )
 
@@ -603,7 +636,7 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
         podcasts_path=podcasts_path,
         stage="preprocess",
         files_in=work_plan.total_items,
-        files_out=(int(crest_files_out.value) if fuse_audio else int(processed.value)),
+        files_out=(int(crest_files_out.value) if fuse_audio else max(0, int(processed.value) - int(single_speaker_dropped.value))),
         hours_in=(crest_duration_in.value / 3600.0 if fuse_audio else hours),
         hours_out=hours,
         params={
@@ -611,6 +644,8 @@ def main(args, *, config: Mapping[str, object] | None = None, logging_configured
             "overwrite": overwrite,
             "audio_paths_source": source,
             "fuse_audio_preprocessing": fuse_audio,
+            "single_speaker_only": single_speaker_only,
+            "single_speaker_dropped": int(single_speaker_dropped.value),
         },
     )
 

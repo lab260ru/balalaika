@@ -32,7 +32,7 @@ from src.utils.parallel import run_per_gpu_processes
 from src.utils.csv_manager import discover_audio_paths
 from src.utils.chunk_json import ChunkJsonCache, get_field, update_chunk_json
 from src.utils.stage_status import last_line, write_stage_status
-from src.utils.utils import load_config
+from src.utils.utils import load_config, model_key
 from src.utils.work_shards import (
     claim_work_shard,
     load_work_shard_size,
@@ -42,22 +42,6 @@ from src.utils.work_shards import (
     read_work_shard,
 )
 
-MODEL_MAP = {
-    'giga_rnnt': 'gigaam-v3-rnnt',
-    'giga_ctc': 'gigaam-v3-ctc',
-    'giga_ctc_lm': 'gigaam-v3-ctc',
-    'tone': 't-tech/t-one',
-    'vosk': 'alphacep/vosk-model-ru',
-    'vosk_small': 'alphacep/vosk-model-small-ru',
-    'parakeet_v2': 'nemo-parakeet-tdt-0.6b-v2',
-    'parakeet_v3': 'nemo-parakeet-tdt-0.6b-v3',
-    'canary': 'nemo-canary-1b-v2',
-    'whisper_base': 'whisper-base',
-    'whisper_turbo': 'onnx-community/whisper-large-v3-turbo',
-    'gigaam-v3-e2e-ctc': 'gigaam-v3-e2e-ctc'
-}
-
-SUPPORTED_TIMESTAMPS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
 TARGET_SAMPLE_RATE = 16_000
 
 # Per-worker count of fast_rnnt patch skips (fast path -> stock decode). Each
@@ -269,9 +253,9 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
     use_trt = config.get('use_tensorrt', False)
     quantization = config.get('quantization')
 
-    onnx_name = MODEL_MAP.get(model_name, model_name)
-    output_suffix = 'vosk' if 'vosk' in model_name else model_name
-    do_timestamps = config.get('with_timestamps', False) and model_name in SUPPORTED_TIMESTAMPS
+    onnx_name = model_name
+    output_suffix = model_key(model_name)
+    do_timestamps = bool(config.get('with_timestamps', False))
 
     local_path = config.get('vosk_path') if 'vosk' in model_name else config.get('model_path')
 
@@ -294,7 +278,18 @@ def run_worker(cuda_id: int, world_size: int, model_name: str,
         model = onnx_asr.load_model(*load_args, **load_kwargs)
 
         if do_timestamps:
-            model = model.with_timestamps()
+            # Every onnx-asr model exposes with_timestamps(); models that can't
+            # produce token-level indices simply return timestamps=None (then
+            # format_timestamps yields '' and nothing is stored). Guard anyway so
+            # an unsupported adapter degrades to plain text instead of crashing.
+            try:
+                model = model.with_timestamps()
+            except Exception as exc:
+                logger.warning(
+                    f"{model_name}: with_timestamps() unavailable ({exc}); "
+                    f"continuing without timestamps."
+                )
+                do_timestamps = False
 
         if config.get('use_vad', False):
             vad_params = config.get('vad_params', {})
@@ -381,7 +376,7 @@ class _GroupModelSpec:
 def _load_group_model(
     model_name: str, config: dict, providers, config_path: Optional[str] = None
 ) -> _GroupModelSpec:
-    onnx_name = MODEL_MAP.get(model_name, model_name)
+    onnx_name = model_name
     local_path = config.get('vosk_path') if 'vosk' in model_name else config.get('model_path')
     load_args = [onnx_name] + ([local_path] if local_path else [])
     load_kwargs = {"providers": providers}
@@ -392,9 +387,16 @@ def _load_group_model(
 
     model = onnx_asr.load_model(*load_args, **load_kwargs)
 
-    do_timestamps = config.get('with_timestamps', False) and model_name in SUPPORTED_TIMESTAMPS
+    do_timestamps = bool(config.get('with_timestamps', False))
     if do_timestamps:
-        model = model.with_timestamps()
+        try:
+            model = model.with_timestamps()
+        except Exception as exc:
+            logger.warning(
+                f"{model_name}: with_timestamps() unavailable ({exc}); "
+                f"continuing without timestamps."
+            )
+            do_timestamps = False
     if config.get('use_vad', False):
         vad = onnx_asr.load_vad("silero", **config.get('vad_params', {}))
         model = model.with_vad(vad)
@@ -405,7 +407,7 @@ def _load_group_model(
     return _GroupModelSpec(
         name=model_name,
         model=model,
-        suffix='vosk' if 'vosk' in model_name else model_name,
+        suffix=model_key(model_name),
         do_timestamps=do_timestamps,
         batch_size=resolve_batch_size(
             f"transcription.{model_name}", config.get('batch_size'), 16
@@ -621,7 +623,7 @@ def check_consensus(audio_path: Path, model_names: List[str], consensus_num: int
         from src.utils.chunk_json import read_chunk_json, chunk_json_path
         data = read_chunk_json(chunk_json_path(audio_path))
     for mn in model_names:
-        suffix = 'vosk' if 'vosk' in mn else mn
+        suffix = model_key(mn)
         t = get_field(data, f"asr.{suffix}")
         if t:
             normalized = normalize_consensus_text(t)
@@ -738,7 +740,7 @@ def main(args):
             desc="Preparing shared-decode models",
             unit="model",
         ):
-            output_suffix = 'vosk' if 'vosk' in model_name else model_name
+            output_suffix = model_key(model_name)
             for p in get_valid_paths(src_path, output_suffix, [], consensus_num, retry_empty_outputs, args.config_path, cache=group_cache):
                 needed.setdefault(p, []).append(model_name)
 
@@ -760,7 +762,7 @@ def main(args):
                 num_workers=duration_workers,
             )
             annotations = {p: ",".join(models) for p, models in needed.items()}
-            group_tag = "_".join('vosk' if 'vosk' in m else m for m in grouped_models)
+            group_tag = "_".join(model_key(m) for m in grouped_models)
             work_plan = prepare_length_bucketed_work_shards(
                 src_path,
                 f"transcription_group_{group_tag}",
@@ -807,7 +809,7 @@ def main(args):
             continue
         logger.info(f"=== [{idx + 1}/{len(model_names)}] {model_name} ===")
 
-        output_suffix = 'vosk' if 'vosk' in model_name else model_name
+        output_suffix = model_key(model_name)
         processed_names = model_names[:idx] if consensus_num > 0 else []
         paths = get_valid_paths(src_path, output_suffix, processed_names, consensus_num, retry_empty_outputs, args.config_path)
 

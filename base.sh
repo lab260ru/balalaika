@@ -10,7 +10,8 @@
 #   1  Preprocess: chunking         (src.preprocess.preprocess)
 #   2  Preprocess: crest filter     (src.preprocess.crest_factor_remover)
 #   3  Preprocess: loudness         (src.preprocess.preprocess_audio)
-#   4  Separation: music detection  (src.separation.music_detect)
+#   4  Separation: music scoring    (src.separation.music_detect)
+#   4.5 Music filter                 (src.separation.music_detect_filter)
 #   5  Separation: DistillMOS       (src.separation.distillmos_process)
 #   5.5 DistillMOS filter            (src.separation.distillmos_filter)
 #   6  Anti-spoofing scoring        (src.separation.antispoofing)
@@ -91,7 +92,12 @@ activate_venv() {
     python_version=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     local nvidia_base="$venv_path/lib/python$python_version/site-packages/nvidia"
     if [ -d "$nvidia_base" ]; then
-        export LD_LIBRARY_PATH="${nvidia_base}/cublas/lib:${nvidia_base}/cudnn/lib:${nvidia_base}/cuda_runtime/lib:${nvidia_base}/cuda_nvrtc/lib:${nvidia_base}/cufft/lib:${nvidia_base}/nvjitlink/lib:${nvidia_base}/cusolver/lib:${nvidia_base}/cusparse/lib:${LD_LIBRARY_PATH:-}"
+        # CUDA 13 wheels (torch *+cu130) ship every lib in one consolidated
+        # ``nvidia/cu13/lib`` dir (libnvrtc.so.13, libcublas.so.13, …); older
+        # CUDA 12 wheels use the per-component dirs that follow. Put cu13/lib
+        # first so it wins when present; a non-existent path is ignored by the
+        # loader, so listing both layouts is safe on either toolkit.
+        export LD_LIBRARY_PATH="${nvidia_base}/cu13/lib:${nvidia_base}/cublas/lib:${nvidia_base}/cudnn/lib:${nvidia_base}/cuda_runtime/lib:${nvidia_base}/cuda_nvrtc/lib:${nvidia_base}/cufft/lib:${nvidia_base}/nvjitlink/lib:${nvidia_base}/cusolver/lib:${nvidia_base}/cusparse/lib:${LD_LIBRARY_PATH:-}"
     fi
     local trt_libs="$venv_path/lib/python$python_version/site-packages/tensorrt_libs"
     if [ -d "$trt_libs" ]; then
@@ -270,9 +276,15 @@ if stage_active 3; then
 fi
 
 if stage_active 4; then
-    echo "Stage 4: Separation — music detection"
+    echo "Stage 4: Separation — music detection (scoring)"
     run_python src.separation.music_detect
     check_stage_status 4
+fi
+
+if stage_active 4.5; then
+    echo "Stage 4.5: Music filter — music_prob threshold deletion"
+    run_python src.separation.music_detect_filter
+    check_stage_status 4.5
 fi
 
 if stage_active 5; then
@@ -300,13 +312,13 @@ if stage_active 6.5; then
 fi
 
 if stage_active 7; then
-    echo "Stage 7: TTS-suitability — raw classifier scoring"
+    echo "Stage 7: TTS-suitability — probability scoring"
     run_python src.separation.tts_suitability
     check_stage_status 7
 fi
 
 if stage_active 7.5; then
-    echo "Stage 7.5: TTS-suitability filter — not_tts-margin deletion"
+    echo "Stage 7.5: TTS-suitability filter — p_tts threshold deletion"
     run_python src.separation.tts_suitability_filter
     check_stage_status 7.5
 fi

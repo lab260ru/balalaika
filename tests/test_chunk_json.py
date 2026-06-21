@@ -133,3 +133,81 @@ def test_pending_chunks_no_in_field(tmp_path):
     cj.update_chunk_json(a, {"rover": "r"})
     pending = cj.pending_chunks(tmp_path, out_field="rover")
     assert sorted(p.name for p in pending) == ["b.flac"]
+
+
+def test_partial_csv_writer_defers_metadata_sidecar_to_absorb(tmp_path):
+    from src.utils.csv_manager import PartialCsvWriter, absorb_partial_csvs
+
+    audio = _audio(tmp_path, "meta")
+    with PartialCsvWriter(
+        tmp_path,
+        "meta_stage",
+        0,
+        fieldnames=("filepath", "DistillMOS", "p_tts"),
+    ) as writer:
+        writer.write({"filepath": str(audio), "DistillMOS": 4.2, "p_tts": 0.97})
+
+    # Streaming a partial row no longer mirrors to JSON inline (that per-row RMW
+    # in the worker hot loop was the dominant IO cost); the mirror happens when
+    # the partials are absorbed into the state.
+    assert not cj.chunk_json_path(audio).exists()
+
+    absorb_partial_csvs(tmp_path, "meta_stage", ["DistillMOS", "p_tts"])
+
+    data = cj.read_chunk_json(cj.chunk_json_path(audio))
+    assert data["DistillMOS"] == 4.2
+    assert data["p_tts"] == 0.97
+
+
+def test_upsert_columns_updates_metadata_sidecar(tmp_path):
+    import pandas as pd
+
+    from src.utils.csv_manager import upsert_columns
+
+    audio = _audio(tmp_path, "upsert")
+    upsert_columns(
+        tmp_path,
+        pd.DataFrame({"filepath": [str(audio)], "total_duration": [12.5]}),
+        ["total_duration"],
+    )
+
+    data = cj.read_chunk_json(cj.chunk_json_path(audio))
+    assert data["total_duration"] == 12.5
+
+
+def test_update_chunk_jsons_batch_merges_and_counts(tmp_path):
+    a = _audio(tmp_path, "a")
+    b = _audio(tmp_path, "b")
+    cj.update_chunk_json(a, {"rover": "text"})  # pre-existing text key
+
+    written, skipped, failed = cj.update_chunk_jsons(
+        [(a, {"DistillMOS": 4.2}), (b, {"p_tts": 0.9})]
+    )
+    assert (written, skipped, failed) == (2, 0, 0)
+    # Deep-merge preserves the existing text key alongside the new score.
+    assert cj.read_chunk_json(cj.chunk_json_path(a)) == {
+        "rover": "text",
+        "DistillMOS": 4.2,
+    }
+    assert cj.read_chunk_json(cj.chunk_json_path(b)) == {"p_tts": 0.9}
+
+
+def test_update_chunk_jsons_skips_noop_rewrite(tmp_path):
+    a = _audio(tmp_path, "a")
+    cj.update_chunk_jsons([(a, {"DistillMOS": 4.2})])
+    jp = cj.chunk_json_path(a)
+    mtime = jp.stat().st_mtime_ns
+
+    # Identical update must not re-touch the file (no wasted atomic rewrite).
+    written, skipped, failed = cj.update_chunk_jsons([(a, {"DistillMOS": 4.2})])
+    assert (written, skipped, failed) == (0, 1, 0)
+    assert jp.stat().st_mtime_ns == mtime
+
+
+def test_update_chunk_jsons_skips_missing_audio(tmp_path):
+    # Audio was deleted (e.g. by a filter stage); no orphan JSON is created.
+    gone = tmp_path / "gone.flac"
+    written, skipped, failed = cj.update_chunk_jsons([(gone, {"DistillMOS": 4.2})])
+    assert (written, skipped, failed) == (0, 1, 0)
+    assert not cj.chunk_json_path(gone).exists()
+

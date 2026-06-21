@@ -15,7 +15,8 @@ The main entrypoint is `base.sh`. It runs numbered stages from
 | 1 | `src.preprocess.preprocess` | Sortformer diarization, Smart Turn refinement, chunk export. |
 | 2 | `src.preprocess.crest_factor_remover` | Crest-factor filtering. |
 | 3 | `src.preprocess.preprocess_audio` | Loudness normalization. |
-| 4 | `src.separation.music_detect` | Music probability filtering. |
+| 4 | `src.separation.music_detect` | Music probability scoring. |
+| 4.5 | `src.separation.music_detect_filter` | Music-prob threshold filtering. |
 | 5 | `src.separation.distillmos_process` | DistillMOS quality scoring. |
 | 5.5 | `src.separation.distillmos_filter` | DistillMOS threshold filtering. |
 | 6 | `src.separation.antispoofing` | Store raw Spectra-0 class scores. |
@@ -408,8 +409,10 @@ Use it when a stage changes:
 - filtering decisions,
 - quality thresholds.
 
-Current audit-producing stages include `preprocess`, `crest_factor`,
-`music_detect`, and `distillmos_filter`.
+Current audit-producing stages include `preprocess`, `crest_factor`, and the
+filter stages `music_detect_filter`, `distillmos_filter`, `antispoofing_filter`,
+`tts_suitability_filter` (a scoring stage with `inline_filter: true` records the
+matching filter row itself, in its scoring pass).
 
 Example:
 

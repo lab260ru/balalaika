@@ -1,5 +1,5 @@
 """Read-back equivalence: the chunked collate stream vs. the old single-shot
-``merge -> add_asr_consistency_column -> to_parquet`` path.
+``merge -> to_parquet`` path.
 
 The bar (per project discipline) is read-back equality: identical DataFrame
 (columns, dtypes, values, row order) — parquet row-group layout/bytes may
@@ -59,7 +59,6 @@ def _old_path(df: pd.DataFrame, base_path: Path, file_types, model_names) -> pd.
         results.append(collate.process_audio_file(path, base_path, file_types, {}))
     extracted_df = pd.DataFrame(results)
     final_df = pd.merge(df, extracted_df, on="filepath", how="left")
-    final_df = collate.add_asr_consistency_column(final_df, model_names)
     return final_df.reset_index(drop=True)
 
 

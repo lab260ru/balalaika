@@ -2,15 +2,24 @@
 
 Quality filtering and quality annotation on chunked clips. Speaker diarization
 is handled in **preprocess** (Sortformer), not here. The separation package
-currently contains seven model/filter stages:
+pairs each **scoring** stage with a **filter** stage. A scoring stage only
+writes its column to `balalaika.parquet`; the paired filter stage shows the
+distribution, picks a threshold, deletes the matching clips, and appends the
+kept/dropped totals to `filter_summary.csv`. Each scoring stage also accepts
+`inline_filter: true` (config), which applies the same delete predicate **in the
+scoring pass** (reading the threshold from the paired `*_filter` subsection) so
+the separate filter stage can be skipped — see `inline_filter.py`. The package
+contains these model/filter stages:
 
-1. **Music detection** — WavLM backbone + fine-tuned head at
-   `separation.music_detect.music_detect_model`. For every processed clip the
-   model's music probability is written to `balalaika.csv` as `music_prob`.
-   Clips above the threshold are deleted from disk, their rows removed from the
-   CSV, and the kept/dropped totals are appended to `filter_summary.csv`.
-2. **DistillMOS scoring** — speech quality score written to `balalaika.csv` as
-   `DistillMOS`. Annotation only; no deletion.
+1. **Music detection (scoring)** — WavLM backbone + fine-tuned head. For every
+   processed clip the model's music probability is written to
+   `balalaika.parquet` as `music_prob`. Annotation only; no deletion (unless
+   `music_detect.inline_filter` is set).
+1.5. **Music filter** — deletes clips with `music_prob` **above**
+   `separation.music_detect_filter.threshold` and records a `music_detect_filter`
+   audit row in `filter_summary.csv`.
+2. **DistillMOS scoring** — speech quality score written to `balalaika.parquet`
+   as `DistillMOS`. Annotation only; no deletion.
 3. **DistillMOS filter** — deletes clips below
    `separation.distillmos_filter.threshold` after scoring and records an audit
    row in `filter_summary.csv`.
@@ -24,13 +33,12 @@ currently contains seven model/filter stages:
 6. **TTS-suitability scoring** —
    [TTS-Suitability-Classifier](https://huggingface.co/lab260/TTS-Suitability-Classifier)
    ONNX classifier (wav2vec2-300M head). Each clip is layer-normalized, split
-   into 10 s chunks, and the per-chunk logits are averaged; the raw mean logits
-   are written to `balalaika.csv` as `not_tts_score` (output index 0) and
-   `tts_score` (output index 1). No deletion occurs.
+   into 10 s chunks, and the per-chunk logits are averaged; a simple softmax is
+   applied and the probabilities are written to `balalaika.csv` as `p_not_tts`
+   and `p_tts`. No deletion occurs.
 7. **TTS-suitability filter** — computes
-   `not_tts_score - tts_score`, deletes clips above
-   `separation.tts_suitability_filter.threshold` (model leans "not suitable for
-   TTS"; threshold 0.0 == `p_tts < 0.5`), and records a `tts_suitability_filter`
+   `p_tts`, deletes clips below
+   `separation.tts_suitability_filter.threshold`, and records a `tts_suitability_filter`
    audit row.
 
 Every script writes a rotating, timestamped log file under `BALALAIKA_LOG_DIR`
@@ -43,7 +51,7 @@ Every script writes a rotating, timestamped log file under `BALALAIKA_LOG_DIR`
 | Music detection | WavLM + fine-tuned head | PyTorch | Local safetensors head configured by `music_detect_model`. |
 | DistillMOS | DistillMOS | PyTorch | Adds MOS estimate only. |
 | Anti-spoofing | [Spectra-0](https://huggingface.co/lab260/spectra_0) | ONNX Runtime | Binary bonafide/spoof classifier on raw waveforms; downloads `model.onnx` if missing. |
-| TTS-suitability | [TTS-Suitability-Classifier](https://huggingface.co/lab260/TTS-Suitability-Classifier) | ONNX Runtime | wav2vec2-300M binary not_tts/tts classifier; per-file 10 s chunking + mean logits; downloads `model.onnx` if missing. |
+| TTS-suitability | [TTS-Suitability-Classifier](https://huggingface.co/lab260/TTS-Suitability-Classifier) | ONNX Runtime | wav2vec2-300M binary not_tts/tts classifier; per-file 10 s chunking + mean logits + simple softmax; downloads `model.onnx` if missing. |
 
 ## Run
 
@@ -56,6 +64,7 @@ bash src/separation/separation_yaml.sh configs/config.yaml
 
 # Individual stages:
 python -m src.separation.music_detect          --config_path configs/config.yaml
+python -m src.separation.music_detect_filter   --config_path configs/config.yaml
 python -m src.separation.distillmos_process    --config_path configs/config.yaml
 python -m src.separation.distillmos_filter     --config_path configs/config.yaml
 python -m src.separation.antispoofing          --config_path configs/config.yaml
@@ -71,8 +80,9 @@ Documented under **`separation`** in `configs/config.yaml`:
 | Config key | Purpose |
 |------------|---------|
 | `podcasts_path` | Dataset root containing audio files and `balalaika.csv`. |
-| `music_detect.*` | WavLM classifier batch/DataLoader settings, model path, threshold, optional cache/base model. |
-| `distillmos.*` | DistillMOS batch/DataLoader settings. |
+| `music_detect.*` | WavLM classifier batch/DataLoader settings, model path, `inline_filter`. |
+| `music_detect_filter.*` | Music-prob threshold (delete above) and deletion worker count. |
+| `distillmos.*` | DistillMOS batch/DataLoader settings, `inline_filter`. |
 | `distillmos_filter.*` | Threshold and deletion worker count. |
 | `antispoofing.onnx_path` | Local Spectra-0 ONNX path. Missing file is downloaded from HF. |
 | `antispoofing.batch_size`, `num_workers`, `prefetch_factor` | Spectra-0 batching and DataLoader settings. |
@@ -82,7 +92,7 @@ Documented under **`separation`** in `configs/config.yaml`:
 | `tts_suitability.onnx_path` | Local TTS-suitability ONNX path. Missing file is downloaded from HF. |
 | `tts_suitability.batch_size`, `num_workers`, `prefetch_factor` | DataLoader grouping/prefetch (inference is per file). |
 | `tts_suitability.use_tensorrt` | Enable TensorRT EP (off by default; inputs are variable-length). |
-| `tts_suitability_filter.threshold` | Delete when `not_tts_score - tts_score` exceeds this raw-logit margin. |
+| `tts_suitability_filter.threshold` | Delete when `p_tts` is below this threshold. |
 | `tts_suitability_filter.num_workers` | Parallel CPU deletion workers. |
 
 ## `balalaika.csv` columns added here
@@ -93,8 +103,8 @@ Documented under **`separation`** in `configs/config.yaml`:
 | `DistillMOS` | Predicted MOS score. |
 | `score_bonafide` | Raw Spectra-0 output at class index 1. |
 | `score_spoof` | Raw Spectra-0 output at class index 0. |
-| `not_tts_score` | Raw TTS-suitability mean logit at class index 0 (not_tts). |
-| `tts_score` | Raw TTS-suitability mean logit at class index 1 (tts). |
+| `p_not_tts` | TTS-suitability probability for class `not_tts`. |
+| `p_tts` | TTS-suitability probability for class `tts`. |
 
 ## Filter summary rows emitted here
 
@@ -103,7 +113,7 @@ Documented under **`separation`** in `configs/config.yaml`:
 | `music_detect` | Files / hours kept vs. dropped at `music_detect.threshold`. |
 | `distillmos_filter` | Files / hours kept vs. dropped at `distillmos_filter.threshold`. |
 | `antispoofing_filter` | Files / hours kept vs. dropped at the configured raw-score margin. |
-| `tts_suitability_filter` | Files / hours kept vs. dropped at the configured raw-logit margin. |
+| `tts_suitability_filter` | Files / hours kept vs. dropped at the configured `p_tts` threshold. |
 
 ## Resume / Interrupt Safety
 

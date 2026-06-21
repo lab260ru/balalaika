@@ -32,10 +32,18 @@ from src.utils.audio_durations import (
     duration_probe_workers,
     ensure_audio_durations,
 )
+from src.separation.inline_filter import (
+    DISTILLMOS,
+    INLINE_PARTIAL_FIELDS,
+    resolve_inline,
+    write_score_row,
+)
+from src.utils.audit import record_stage_summary
 from src.utils.csv_manager import (
     PartialCsvWriter,
     PeriodicCsvMerger,
     absorb_partial_csvs,
+    audit_from_filter_partials,
     discover_audio_paths,
     ensure_main_csv,
     load_csv_settings,
@@ -53,7 +61,7 @@ from src.utils.work_shards import (
     load_work_shard_size,
     mark_work_shard_done,
     prepare_length_bucketed_work_shards,
-    read_work_shard,
+    read_annotated_work_shard,
 )
 
 apply_torch_perf_defaults(disable_math_sdp=False)
@@ -62,6 +70,14 @@ apply_torch_perf_defaults(disable_math_sdp=False)
 PARTIAL_PREFIX = "distillmos"
 PARTIAL_FIELDS = ("filepath", "DistillMOS")
 COLUMN = "DistillMOS"
+VALUE_COLUMNS = [COLUMN]
+
+
+def _inline_threshold(config: dict):
+    """Inline-delete threshold for stage 5, or ``None`` when score-only."""
+    return resolve_inline(
+        config.get("distillmos", {}), config.get("distillmos_filter", {})
+    )
 
 
 def _process_files(
@@ -76,6 +92,8 @@ def _process_files(
     processed_counter,
     skipped_counter,
     errors_counter,
+    inline_threshold=None,
+    audio_lengths=None,
 ) -> None:
     batch_size = resolve_batch_size(
         "distillmos", config.get("distillmos", {}).get("batch_size"), 16
@@ -137,11 +155,15 @@ def _process_files(
                         skipped_counter.value += 1
                         continue
                     write_started_at = time.perf_counter()
-                    writer.write(
-                        {
-                            "filepath": resolved,
-                            COLUMN: float(mos_val),
-                        }
+                    write_score_row(
+                        writer,
+                        stage=DISTILLMOS,
+                        resolved_path=resolved,
+                        audio_path=path_str,
+                        scores={COLUMN: float(mos_val)},
+                        inline_threshold=inline_threshold,
+                        audio_lengths=audio_lengths,
+                        errors_counter=errors_counter,
                     )
                     logger.debug(
                         f"perf partial_write stage=distillmos rank={rank} "
@@ -194,9 +216,16 @@ def run_inference_worker(
     )
     started_at = time.perf_counter()
 
+    inline_threshold = _inline_threshold(config)
+    fieldnames = (
+        PARTIAL_FIELDS + INLINE_PARTIAL_FIELDS
+        if inline_threshold is not None
+        else PARTIAL_FIELDS
+    )
+
     claimed = 0
     with PartialCsvWriter(
-        podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
+        podcasts_path, PARTIAL_PREFIX, rank, fieldnames=fieldnames
     ) as writer:
         already_done: Set[str] = writer.already_done()
         if already_done:
@@ -208,7 +237,16 @@ def run_inference_worker(
             shard_path = claim_work_shard(work_dir, rank)
             if shard_path is None:
                 break
-            shard_files = read_work_shard(shard_path)
+            # Annotated shards carry the precomputed duration (empty note when
+            # not inline); kept inline rows record hours without a probe.
+            items = read_annotated_work_shard(shard_path)
+            shard_files = [p for p, _ in items]
+            audio_lengths = None
+            if inline_threshold is not None and items and all(n for _, n in items):
+                try:
+                    audio_lengths = {p: float(n) for p, n in items}
+                except ValueError:
+                    audio_lengths = None
             claimed += 1
             logger.info(f"[cuda:{rank}] Processing {len(shard_files)} files from {shard_path.name}.")
             _process_files(
@@ -223,6 +261,8 @@ def run_inference_worker(
                 processed_counter,
                 skipped_counter,
                 errors_counter,
+                inline_threshold=inline_threshold,
+                audio_lengths=audio_lengths,
             )
             mark_work_shard_done(shard_path)
 
@@ -249,6 +289,19 @@ def main():
     config = load_config(args.config_path, "separation")
     podcasts_path = Path(config.get("podcasts_path", "."))
 
+    # Score-only unless inline_filter is on; when on, delete low-MOS files in
+    # this pass, prune their rows, and emit a filter row (stage 5.5 then no-ops).
+    inline_threshold = _inline_threshold(config)
+    drop_missing = inline_threshold is not None
+    value_columns = (
+        VALUE_COLUMNS + ["total_duration"] if drop_missing else VALUE_COLUMNS
+    )
+    if inline_threshold is not None:
+        logger.info(
+            f"inline_filter active: deleting files with DistillMOS < {inline_threshold} "
+            "during scoring."
+        )
+
     available_gpus = torch.cuda.device_count()
     if available_gpus == 0:
         logger.error("No GPU detected.")
@@ -263,10 +316,11 @@ def main():
     ensure_main_csv(podcasts_path, audio_paths=audio_paths)
 
     # 2) Absorb leftover partials from a previous interrupted run.
-    _, absorbed = absorb_partial_csvs(
+    leftover_partials, absorbed = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[COLUMN],
+        value_columns=value_columns,
+        drop_missing_files=drop_missing,
         preserve_existing=True,
     )
     if absorbed:
@@ -297,6 +351,13 @@ def main():
         distillmos_cfg,
         config,
     )
+    # In inline mode carry each file's (already computed) duration into the
+    # shard so kept rows record their hours without a re-probe.
+    annotations = (
+        {p: str(float(durations.get(p, 0.0) or 0.0)) for p in unprocessed}
+        if drop_missing
+        else None
+    )
     work_plan = prepare_length_bucketed_work_shards(
         podcasts_path,
         PARTIAL_PREFIX,
@@ -305,9 +366,11 @@ def main():
         shard_size=shard_size,
         bucket_seconds=bucket_seconds,
         max_duration=max_bucket_duration,
+        annotations=annotations,
     )
     del unprocessed
     del durations
+    del annotations
 
     logger.info(
         f"Processing {work_plan.total_items} files on {available_gpus} GPUs "
@@ -324,7 +387,8 @@ def main():
         with PeriodicCsvMerger(
             podcasts_path,
             prefix=PARTIAL_PREFIX,
-            value_columns=[COLUMN],
+            value_columns=value_columns,
+            drop_missing_files=drop_missing,
             preserve_existing=True,
             **csv_settings,
         ):
@@ -340,12 +404,36 @@ def main():
         logger.critical(f"Multiprocessing failed: {exc}")
 
     # 4) Merge whatever the workers managed to produce (always; even on Ctrl+C).
-    absorb_partial_csvs(
+    new_partials, _ = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=[COLUMN],
+        value_columns=value_columns,
+        drop_missing_files=drop_missing,
         preserve_existing=True,
     )
+
+    # Inline mode emits the filter row (stages 5.5 otherwise owns it).
+    if inline_threshold is not None:
+        partial_frames = [
+            df
+            for df in (leftover_partials, new_partials)
+            if df is not None and not df.empty
+        ]
+        combined = (
+            pd.concat(partial_frames, ignore_index=True)
+            if partial_frames
+            else pd.DataFrame()
+        )
+        audit = audit_from_filter_partials(combined)
+        record_stage_summary(
+            podcasts_path=podcasts_path,
+            stage="distillmos_filter",
+            files_in=audit["files_in"],
+            files_out=audit["files_out"],
+            hours_in=audit["hours_in"],
+            hours_out=audit["hours_out"],
+            params={"threshold": inline_threshold, "deleted": audit["files_deleted"]},
+        )
 
     write_stage_status(
         stage=5,

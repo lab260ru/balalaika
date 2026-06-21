@@ -5,6 +5,19 @@ import re
 import yaml
 from loguru import logger
 
+
+def model_key(model_name: str) -> str:
+    """Deterministic short key for an onnx-asr model name (no lookup table).
+
+    Model names are passed straight to ``onnx_asr.load_model`` (e.g.
+    ``gigaam-v3-ctc``, ``t-tech/t-one``, ``alphacep/vosk-model-ru``); this is the
+    name used as the JSON/parquet key for that model's outputs. We take the last
+    ``/``-segment so HF-style ``org/model`` names yield a clean column
+    (``t-tech/t-one`` -> ``t-one``, ``alphacep/vosk-model-ru`` -> ``vosk-model-ru``).
+    """
+    return str(model_name).split("/")[-1]
+
+
 def load_config(config_path: str, process_name: str):
     config = {}
     if config_path is None or process_name is None:

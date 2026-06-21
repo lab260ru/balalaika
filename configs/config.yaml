@@ -113,7 +113,7 @@ runtime:
   # Source for stage audio file lists: auto prefers balalaika.csv and falls back
   # to rglob when the CSV is missing/empty; csv never scans and requires an
   # existing balalaika.csv; rglob always scans.
-  audio_paths_source: csv
+  audio_paths_source: rglob
   # Number of file paths per on-disk work shard for multiprocessing stages.
   # Keep this small enough that a worker only materializes a bounded list.
   work_shard_size: 10000
@@ -155,7 +155,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /home/nikita/test_data
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -175,7 +175,7 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /home/nikita/test_data
   # raw: diarize long-form audio, cut chunks, and write metadata.
   # existing_chunks: do not cut or rewrite audio; diarize every existing audio
   #   file and backfill the same metadata columns that raw preprocess writes
@@ -189,6 +189,9 @@ preprocess:
   # Used only with input_mode: existing_chunks. false skips rows that already
   # have all preprocess metadata columns; true recomputes and overwrites them.
   existing_chunks_overwrite: false
+  # When true, stage 1 keeps only chunks whose diarization window contains exactly one speaker.
+  # Raw mode skips such output windows; existing_chunks mode deletes rejected files.
+  single_speaker_only: True
   # Fuse chunk export, crest filtering, and LUFS normalization into stage 1.
   # Raw mode processes each native-rate chunk before its first/only write.
   # existing_chunks mode combines crest + LUFS in one native-rate read/write.
@@ -314,7 +317,17 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /home/nikita/test_data
+
+  # SCORE vs FILTER split. Every scoring stage (4 music, 5 DistillMOS,
+  # 6 anti-spoof, 7 TTS) writes its score column to balalaika.parquet and leaves
+  # deletion to a separate ".5" filter stage (4.5/5.5/6.5/7.5) that shows the
+  # score distribution, picks a threshold, and removes files. Set a stage's
+  # ``inline_filter: true`` to instead delete in the SAME scoring pass (reading
+  # the threshold from that stage's ``*_filter`` subsection) — this skips the
+  # extra full walk over the dataset tree the ".5" stage would do. When inline
+  # is on you can leave the ".5" stage in the pipeline; it simply finds no
+  # remaining candidates and exits.
 
   music_detect:
     # WavLM music detector exported to ONNX. If missing, the stage downloads it
@@ -327,8 +340,13 @@ separation:
     # DataLoader worker processes / prefetched batches per GPU worker.
     num_workers: 8
     prefetch_factor: 2
-    # If P(music) > threshold, the file is deleted and its CSV row removed.
-    # music_prob is saved to balalaika.csv for all processed files.
+    # Score-only by default (deletion is stage 4.5, music_detect_filter). Set
+    # true to delete files with music_prob > music_detect_filter.threshold in
+    # this scoring pass instead. See the SCORE vs FILTER note above.
+    inline_filter: False
+    # Deprecated fallback threshold — prefer music_detect_filter.threshold below.
+    # Only consulted (for inline deletion) when that key is absent, for
+    # backward-compatibility with old configs.
     threshold: 0.6
     # TensorRT EP. Off by default: this model scores variable-length audio, so
     # TRT spans a wide dynamic-shape profile and FP16 is force-disabled here (it
@@ -340,6 +358,14 @@ separation:
     # trt_opt_seconds: 15.0
     # trt_max_seconds: 30.0
 
+  music_detect_filter:
+    # Stage 4.5. Files with music_prob ABOVE this threshold are deleted (likely
+    # music). Set to null → manual interactive mode; a float → automatic mode.
+    # Shared with stage 4's inline_filter path.
+    threshold: 0.6
+    # Parallel worker processes for deletion + state updates.
+    num_workers: 8
+
   distillmos:
     # DistillMOS inference batch size per GPU worker.
     batch_size: 8
@@ -347,6 +373,9 @@ separation:
     num_workers: 8
     # Number of prefetched batches per DataLoader worker.
     prefetch_factor: 4
+    # Delete files with DistillMOS < distillmos_filter.threshold in this pass
+    # (instead of via stage 5.5). See the SCORE vs FILTER note above.
+    inline_filter: False
 
   distillmos_filter:
     # DistillMOS threshold. Files with DistillMOS below this are deleted.
@@ -374,12 +403,15 @@ separation:
     # run builds an engine (~8 min, cached under runtime.trt_cache_path; one
     # dynamic-batch profile covers batches 1..batch_size). Set False on nodes
     # without TensorRT or to reproduce fp32 scores exactly.
-    use_tensorrt: True
+    use_tensorrt: False
+    # Delete files with score_spoof - score_bonafide > antispoofing_filter.threshold
+    # in this pass (instead of via stage 6.5). See the SCORE vs FILTER note above.
+    inline_filter: False
 
   antispoofing_filter:
     # Delete when score_spoof - score_bonafide > threshold.
     # 0.0 is the raw model argmax decision; null enables interactive selection.
-    threshold: 0.0
+    threshold: -1.0625009
     # Parallel CPU workers used only for deleting selected files.
     num_workers: 8
 
@@ -399,23 +431,30 @@ separation:
     # single dynamic-shape profile cannot cover the range and each new shape
     # would rebuild the engine. The CUDA EP handles variable shapes directly.
     use_tensorrt: False
+    # Delete files with p_not_tts - p_tts > tts_suitability_filter.threshold in
+    # this pass (instead of via stage 7.5). This stage does not otherwise probe
+    # durations; inline mode adds one cached duration pass. See the note above.
+    inline_filter: False
 
   tts_suitability_filter:
     # Delete when not_tts_score - tts_score > threshold (model leans "not TTS").
-    # 0.0 is the raw argmax decision (equivalently p_tts < 0.5); null enables
     # interactive selection.
-    threshold: 0.0
+    threshold: 0.000361
     # Parallel CPU workers used only for deleting selected files.
     num_workers: 8
 
 transcription:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /home/nikita/test_data
+  # Canonical onnx-asr model names (passed straight to onnx_asr.load_model — see
+  # https://github.com/istupakov/onnx-asr). The JSON/parquet key for each model
+  # is the last '/'-segment of the name (t-tech/t-one -> t-one,
+  # alphacep/vosk-model-ru -> vosk-model-ru).
   model_names:
     - gigaam-v3-e2e-ctc
-    - giga_ctc
-    - giga_rnnt
-    - vosk
-    - tone
+    - gigaam-v3-ctc
+    - gigaam-v3-rnnt
+    - alphacep/vosk-model-ru
+    - t-tech/t-one
   consensus_num: 3
   with_timestamps: True
   use_tensorrt: False
@@ -475,14 +514,14 @@ transcription:
   retry_empty_outputs: False
 
 punctuation:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /home/nikita/test_data
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /home/nikita/test_data
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -519,7 +558,7 @@ accent:
   lazy_rule_engine: True  # skip the unused koziev/rulemma rule engine load
 
 phonemizer:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /home/nikita/test_data
   num_workers: 1
   # "cpu" runs G2P on CPU instead of cuda:N. The model is tiny (d=128);
   # batched CPU decode (~8 ms/word) is close to a busy GPU and uses no VRAM.
@@ -540,7 +579,7 @@ phonemizer:
 
 denoising:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /home/nikita/test_data
   # MossFormer2_SE_48K dynamic ONNX. If missing, it is downloaded from Hugging Face.
   onnx_path: ./models/MossFormer2_SE_48K_dynamic_fp32.onnx
   # Fill after uploading the ONNX model.
@@ -569,13 +608,13 @@ denoising:
   async_save_queue: 8
 
 export:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /home/nikita/test_data
   # Exact directory where shard_*.tar files are written. This may be on a
   # different disk from podcasts_path. Empty keeps the legacy location:
   # <podcasts_path parent>/<podcasts_path name>_webdataset/train.
-  output_path: /mnt/hdd_6tb_1/yandex_data_webdataset/train
+  output_path: /home/nikita/test_data_webdataset/train
   # Parallel processes writing WebDataset shards.
-  num_workers: 1
+  num_workers: 32
   # Local shard number each worker starts from. For a partial export, set this
   # to one greater than the last uploaded shard index. Example: after
   # shard_000_0049.tar, use 50; worker 0 then starts at shard_000_0050.tar.
@@ -584,4 +623,4 @@ export:
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.
   max_shard_size: 536870912
   # Max samples per shard file.
-  max_shard_count: 10000
+  max_shard_count: 50000

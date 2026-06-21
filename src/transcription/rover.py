@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import queue
+import unicodedata
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -12,6 +13,7 @@ from tqdm import tqdm
 
 from src.utils.csv_manager import discover_audio_paths
 from src.utils.chunk_json import ChunkJsonCache, get_field, update_chunk_json
+from src.utils.utils import model_key
 from src.utils.work_shards import (
     claim_work_shard,
     load_work_shard_size,
@@ -19,6 +21,57 @@ from src.utils.work_shards import (
     prepare_work_shards,
     read_work_shard,
 )
+
+
+def _word_tokens(text: object) -> List[str]:
+    if text is None:
+        return []
+    chars = []
+    for char in str(text).lower().replace("е", "ё"):
+        if unicodedata.category(char).startswith("P"):
+            chars.append(" ")
+        else:
+            chars.append(char)
+    return "".join(chars).split()
+
+
+def _word_edit_distance(left: List[str], right: List[str]) -> int:
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+
+    previous = list(range(len(right) + 1))
+    for i, token_left in enumerate(left, start=1):
+        current = [i]
+        for j, token_right in enumerate(right, start=1):
+            substitution = previous[j - 1] + (token_left != token_right)
+            insertion = current[j - 1] + 1
+            deletion = previous[j] + 1
+            current.append(min(substitution, insertion, deletion))
+        previous = current
+    return previous[-1]
+
+
+def asr_consistency_from_transcripts(
+    transcripts: Iterable[object],
+    consensus: object,
+) -> Optional[float]:
+    consensus_words = _word_tokens(consensus)
+    if not consensus_words:
+        return None
+
+    model_words = [_word_tokens(text) for text in transcripts]
+    if len(model_words) < 2:
+        return None
+
+    denom = float(len(consensus_words))
+    scores = [
+        max(0.0, 1.0 - (_word_edit_distance(words, consensus_words) / denom))
+        for words in model_words
+    ]
+    return (sum(scores) / len(scores)) * 100.0
+
 
 
 class ROVERWrapper:
@@ -66,7 +119,7 @@ class ROVERWrapper:
         logger.info(f"ROVER {prefix}fast-path fallbacks: {self.fast_path_fallbacks}")
 
     def _model_suffix(self, model_name: str) -> str:
-        return 'vosk' if 'vosk' in model_name else model_name
+        return model_key(model_name)
 
     def _pending_audio_paths(self, audio_paths: Iterable[str]) -> List[str]:
         pending: List[str] = []
@@ -80,15 +133,23 @@ class ROVERWrapper:
             audio_path = Path(raw_path)
             if any(pattern in audio_path.stem for pattern in self.excluded_patterns):
                 continue
-            if cache.field_complete(
+            rover_complete = cache.field_complete(
                 audio_path, "rover", retry_empty=self.retry_empty_outputs
-            ):
+            )
+            consistency_complete = cache.field_complete(
+                audio_path, "asr_consistency", retry_empty=False
+            )
+            if rover_complete and consistency_complete:
                 continue
             pending.append(str(audio_path))
         return pending
 
-    def _records_for_audio_paths(self, audio_paths: Iterable[str]) -> pd.DataFrame:
+    def _records_for_audio_paths(
+        self,
+        audio_paths: Iterable[str],
+    ) -> tuple[pd.DataFrame, dict[str, List[str]]]:
         records = []
+        transcripts_by_task: dict[str, List[str]] = {}
         total = len(audio_paths) if hasattr(audio_paths, "__len__") else None
         # Per-shard cache: built fresh in whatever (possibly spawned) worker
         # process owns this shard. A shard's files cluster in a handful of
@@ -101,25 +162,47 @@ class ROVERWrapper:
                 continue
 
             data = cache.get(audio_path)
+            task = str(audio_path)
+            model_texts: List[str] = []
             for model_name in self.model_names:
                 suffix = self._model_suffix(model_name)
                 text = get_field(data, f"asr.{suffix}")
-                if not text:
+                if text is None:
+                    continue
+                text_str = str(text).lower()
+                model_texts.append(text_str)
+                if not text_str:
                     continue
                 records.append({
-                    'task': str(audio_path),
-                    'worker': model_name,
-                    'text': str(text).lower()
+                    "task": task,
+                    "worker": model_name,
+                    "text": text_str,
                 })
+            if model_texts:
+                transcripts_by_task[task] = model_texts
 
-        return pd.DataFrame.from_records(records, columns=['task', 'worker', 'text'])
+        df = pd.DataFrame.from_records(records, columns=["task", "worker", "text"])
+        return df, transcripts_by_task
 
-    def _save_results(self, result) -> int:
+    def _save_results(
+        self,
+        result,
+        transcripts_by_task: dict[str, List[str]],
+    ) -> int:
         saved = 0
         for task_path, agg_text in tqdm(result.items(), desc="save_rover_results"):
             try:
+                consensus = "" if agg_text is None else str(agg_text)
+                consistency = asr_consistency_from_transcripts(
+                    transcripts_by_task.get(str(task_path), []),
+                    consensus,
+                )
                 update_chunk_json(
-                    task_path, {"rover": "" if agg_text is None else str(agg_text)}
+                    task_path,
+                    {
+                        "rover": consensus,
+                        "asr_consistency": "" if consistency is None else consistency,
+                    },
                 )
                 saved += 1
             except OSError as e:
@@ -131,7 +214,7 @@ class ROVERWrapper:
         if not audio_paths:
             return 0, 0, 0
 
-        df = self._records_for_audio_paths(audio_paths)
+        df, transcripts_by_task = self._records_for_audio_paths(audio_paths)
         if df.empty:
             logger.warning(f"No transcriptions found in ROVER shard {label}.")
             return len(audio_paths), 0, 0
@@ -142,7 +225,7 @@ class ROVERWrapper:
             f"{task_count} audio file(s), {len(df)} transcript(s)."
         )
         result = self._make_aggregator().fit_predict(df)
-        saved = self._save_results(result)
+        saved = self._save_results(result, transcripts_by_task)
         return len(audio_paths), task_count, saved
 
     def _aggregate_with_fallback(self, audio_paths: List[str], label: str) -> tuple[int, int, int]:

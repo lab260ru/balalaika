@@ -5,21 +5,27 @@ ASR via **[onnx-asr](https://github.com/istupakov/onnx-asr)** on **ONNX Runtime*
 ### Features
 
 - Run multiple models sequentially with **early skip** when `consensus_num` earlier models agree on normalized text.
-- **ROVER** → `{stem}_rover.txt` when `use_rover: True`.
-- **Word-level timestamps** → `{stem}_{model}.tst` (TSV) when `with_timestamps: True` and the model is in the supported set.
+- **ROVER** → the `rover` consensus key plus `asr_consistency` percent in each chunk's `{stem}.json` when `use_rover: True`.
+- **Word-level timestamps** → `asr_ts.<model>` in `{stem}.json` (TSV) when `with_timestamps: True`; emitted for whichever models onnx-asr produces token timestamps for, empty otherwise (no hard-coded whitelist).
 - **Multi-GPU** via `src.utils.parallel.run_per_gpu_processes` (one process per GPU; the model is loaded once per process).
 - **TensorRT providers** built by `src.utils.gpu.get_onnx_providers`, sharing the engine cache root with every other ONNX-RT stage.
 
 ### Typical `model_names` (Russian)
 
-| Config name | Backend (onnx-asr / HF id) |
-|-------------|----------------------------|
-| `giga_ctc` | GigaAM v3 CTC |
-| `giga_rnnt` | GigaAM v3 RNN-T |
-| `vosk` | Vosk Russian |
-| `tone` | T-one |
+`model_names` are **canonical onnx-asr names** passed straight to
+`onnx_asr.load_model` (no alias/lookup table). The JSON/parquet key for a model
+is the last `/`-segment of its name (`utils.model_key`).
 
-Others: `parakeet_v2`, `parakeet_v3`, `canary`, `whisper_base`, `whisper_turbo`, … — see `MODEL_MAP` in `transcription.py` and comments in `configs/config.yaml`.
+| `model_names` entry | JSON/parquet key |
+|---------------------|------------------|
+| `gigaam-v3-ctc` | `gigaam-v3-ctc` |
+| `gigaam-v3-rnnt` | `gigaam-v3-rnnt` |
+| `gigaam-v3-e2e-ctc` | `gigaam-v3-e2e-ctc` |
+| `alphacep/vosk-model-ru` | `vosk-model-ru` |
+| `t-tech/t-one` | `t-one` |
+
+Other supported names (`nemo-parakeet-tdt-0.6b-v2`, `nemo-canary-1b-v2`,
+`whisper-base`, …) — see the onnx-asr README: https://github.com/istupakov/onnx-asr
 
 ## Run
 

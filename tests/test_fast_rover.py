@@ -123,3 +123,59 @@ def test_wrapper_uses_fast_path_and_falls_back(monkeypatch) -> None:
         podcasts_path=".", model_names=["m0"], use_fast_rover=False
     )
     assert isinstance(wrapper_slow._make_aggregator(), ROVER)
+
+def test_asr_consistency_word_wer_formula() -> None:
+    from src.transcription.rover import asr_consistency_from_transcripts
+
+    score = asr_consistency_from_transcripts(
+        ["a b c", "a b x", "a b c"],
+        "a b c",
+    )
+
+    assert score == pytest.approx(((1.0 + (2.0 / 3.0) + 1.0) / 3.0) * 100.0)
+    assert asr_consistency_from_transcripts(["a b", ""], "a b") == pytest.approx(50.0)
+    assert asr_consistency_from_transcripts(["Елка, привет!", "ёлка привет"], "ёлка привет") == pytest.approx(100.0)
+    assert asr_consistency_from_transcripts(["a b c"], "a b c") is None
+    assert asr_consistency_from_transcripts(["a", "b"], "") is None
+
+
+def test_wrapper_saves_asr_consistency(tmp_path, monkeypatch) -> None:
+    from src.transcription.rover import ROVERWrapper
+    from src.utils.chunk_json import chunk_json_path, read_chunk_json, update_chunk_json
+
+    audio = tmp_path / "a.flac"
+    audio.write_bytes(b"x")
+    update_chunk_json(
+        audio,
+        {"asr": {"m0": "a b c", "m1": "a b x", "m2": "a b c"}},
+    )
+
+    class FakeAggregator:
+        def fit_predict(self, df):
+            return pd.Series({str(audio): "a b c"})
+
+    wrapper = ROVERWrapper(str(tmp_path), ["m0", "m1", "m2"])
+    monkeypatch.setattr(wrapper, "_make_aggregator", lambda: FakeAggregator())
+
+    seen, tasks, saved = wrapper._aggregate_audio_paths([str(audio)], "unit")
+
+    assert (seen, tasks, saved) == (1, 1, 1)
+    data = read_chunk_json(chunk_json_path(audio))
+    assert data["rover"] == "a b c"
+    assert data["asr_consistency"] == pytest.approx(88.8888888889)
+
+
+def test_rover_pending_requires_asr_consistency_key(tmp_path) -> None:
+    from src.transcription.rover import ROVERWrapper
+    from src.utils.chunk_json import update_chunk_json
+
+    audio = tmp_path / "pending.flac"
+    audio.write_bytes(b"x")
+    wrapper = ROVERWrapper(str(tmp_path), ["m0", "m1"])
+
+    update_chunk_json(audio, {"rover": "a b"})
+    assert wrapper._pending_audio_paths([str(audio)]) == [str(audio)]
+
+    update_chunk_json(audio, {"asr_consistency": ""})
+    assert wrapper._pending_audio_paths([str(audio)]) == []
+

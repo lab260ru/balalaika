@@ -93,6 +93,19 @@ sortformer_model = None
 smart_vad = None
 
 
+def _config_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def single_speaker_only_enabled(config) -> bool:
+    return _config_bool((config or {}).get("single_speaker_only", False))
+
+
+
 def init_models(gpu_id: int, config: Dict[str, Any], config_path: Optional[str] = None):
     global sortformer_model, smart_vad
     device = f"cuda:{gpu_id}"
@@ -495,6 +508,8 @@ def _new_crest_audit() -> Dict[str, float]:
         "duration_out_s": 0.0,
         "write_errors": 0.0,
         "postprocess_errors": 0.0,
+        "single_speaker_rejections": 0.0,
+        "single_speaker_duration_s": 0.0,
     }
 
 
@@ -553,6 +568,7 @@ def cut_audio(
     results: List[Dict] = []
     config = config or {}
     fuse_audio = fused_audio_preprocessing_enabled(config)
+    single_speaker_only = single_speaker_only_enabled(config)
     crest_audit = crest_audit if crest_audit is not None else _new_crest_audit()
 
     try:
@@ -586,6 +602,15 @@ def cut_audio(
         sil_pct, max_sil, unique_spk = get_chunk_metrics(
             start, end, raw_segments, seg_index=seg_index
         )
+        if single_speaker_only and unique_spk != 1:
+            crest_audit["single_speaker_rejections"] += 1
+            crest_audit["single_speaker_duration_s"] += max(0.0, float(dur))
+            logger.debug(
+                f"Rejected {source_path} {start:.2f}-{end:.2f}s: "
+                f"single_speaker_only requires 1 speaker, got {unique_spk}."
+            )
+            continue
+
 
         try:
             samples = decoder.get_samples_played_in_range(
@@ -686,6 +711,7 @@ def process_audio_file(
         config.get('preferred_chunk_duration', DEFAULT_PREFERRED_CHUNK_DURATION_S)
     )
     fuse_audio = fused_audio_preprocessing_enabled(config)
+    single_speaker_only = single_speaker_only_enabled(config)
     crest_audit = _new_crest_audit()
 
     p_audio = Path(path_audio)
@@ -710,6 +736,21 @@ def process_audio_file(
 
         if total_audio_duration <= limit_dur:
             sil_pct, max_sil, unique_spk = get_chunk_metrics(0.0, total_audio_duration, raw_segments)
+            if single_speaker_only and unique_spk != 1:
+                crest_audit["single_speaker_rejections"] += 1
+                crest_audit["single_speaker_duration_s"] += max(0.0, float(total_audio_duration))
+                logger.debug(
+                    f"Rejected {path_audio}: single_speaker_only requires 1 speaker, "
+                    f"got {unique_spk}."
+                )
+                if p_audio.exists():
+                    os.remove(p_audio)
+                return {
+                    "segments": [],
+                    "source_duration_s": total_audio_duration,
+                    "crest_audit": crest_audit,
+                }
+
             main_spk = raw_segments[0][2] if raw_segments else -1
 
             row = {
@@ -815,10 +856,20 @@ def process_audio_file(
             and crest_audit["files_out"] == 0
             and crest_audit["write_errors"] == 0
         )
+        completed_with_only_single_speaker_rejections = (
+            single_speaker_only
+            and crest_audit["single_speaker_rejections"] > 0
+            and not seg_results
+            and crest_audit["write_errors"] == 0
+        )
         source_processed = (
-            bool(seg_results)
-            and (not fuse_audio or crest_audit["write_errors"] == 0)
-        ) or completed_with_only_crest_rejections
+            (
+                bool(seg_results)
+                and (not fuse_audio or crest_audit["write_errors"] == 0)
+            )
+            or completed_with_only_crest_rejections
+            or completed_with_only_single_speaker_rejections
+        )
         if source_processed:
             if p_audio.exists():
                 os.remove(p_audio)
@@ -1004,6 +1055,7 @@ def main(args):
     chunk_format_cfg = config.get('chunk_format', 'auto')
     logger.info(f"Chunk format policy: '{chunk_format_cfg}' (lossless input stays lossless).")
     fuse_audio = fused_audio_preprocessing_enabled(config)
+    single_speaker_only = single_speaker_only_enabled(config)
     logger.info(f"Fused crest/loudness preprocessing: {fuse_audio}")
 
     num_gpus = torch.cuda.device_count()
@@ -1146,6 +1198,7 @@ def main(args):
                 "preferred_chunk_duration", DEFAULT_PREFERRED_CHUNK_DURATION_S
             ),
             "fuse_audio_preprocessing": fuse_audio,
+            "single_speaker_only": single_speaker_only,
         },
     )
 

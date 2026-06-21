@@ -1,9 +1,8 @@
-"""Filter audio using raw TTS-suitability class logits from balalaika.csv.
+"""Filter audio using TTS-suitability probabilities from balalaika.csv.
 
-The filter computes ``not_tts_margin = not_tts_score - tts_score`` and deletes
-files whose margin is greater than the selected threshold (i.e. the model leans
-toward "not suitable for TTS"). A threshold of zero implements the model's raw
-argmax decision (equivalently ``p_tts < 0.5``) without applying softmax.
+The filter deletes files whose ``p_tts`` is below the selected threshold.
+For backward compatibility, if only legacy raw logits are present, it derives
+``p_tts``/``p_not_tts`` from them via a simple softmax.
 """
 
 import argparse
@@ -13,6 +12,7 @@ from multiprocessing import Process, Value
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -36,27 +36,39 @@ from src.utils.work_shards import (
 )
 
 PARTIAL_PREFIX = "tts_suit_filter"
+P_NOT_TTS_COLUMN = "p_not_tts"
+P_TTS_COLUMN = "p_tts"
 NOT_TTS_SCORE_COLUMN = "not_tts_score"
 TTS_SCORE_COLUMN = "tts_score"
-MARGIN_COLUMN = "not_tts_margin"
 PARTIAL_FIELDS = ("filepath", "duration_s", "deleted")
 
 
 def scored_rows(df: pd.DataFrame) -> pd.DataFrame:
-    required = (NOT_TTS_SCORE_COLUMN, TTS_SCORE_COLUMN)
-    if any(column not in df.columns for column in required):
-        return pd.DataFrame(columns=[*df.columns, MARGIN_COLUMN])
+    out = df.copy()
+    if P_TTS_COLUMN in out.columns and P_NOT_TTS_COLUMN in out.columns:
+        required = (P_NOT_TTS_COLUMN, P_TTS_COLUMN)
+        for column in required:
+            out[column] = pd.to_numeric(out[column], errors="coerce")
+        return out.dropna(subset=list(required))
 
-    out = df.dropna(subset=list(required)).copy()
+    required = (NOT_TTS_SCORE_COLUMN, TTS_SCORE_COLUMN)
+    if any(column not in out.columns for column in required):
+        return pd.DataFrame(columns=[*df.columns, P_NOT_TTS_COLUMN, P_TTS_COLUMN])
+
     for column in required:
         out[column] = pd.to_numeric(out[column], errors="coerce")
     out = out.dropna(subset=list(required))
-    out[MARGIN_COLUMN] = out[NOT_TTS_SCORE_COLUMN] - out[TTS_SCORE_COLUMN]
+    logits = out[[NOT_TTS_SCORE_COLUMN, TTS_SCORE_COLUMN]].to_numpy(dtype=np.float64)
+    logits -= logits.max(axis=1, keepdims=True)
+    probs = np.exp(logits)
+    probs /= probs.sum(axis=1, keepdims=True)
+    out[P_NOT_TTS_COLUMN] = probs[:, 0]
+    out[P_TTS_COLUMN] = probs[:, 1]
     return out
 
 
 def compute_statistics(df: pd.DataFrame) -> dict:
-    values = df[MARGIN_COLUMN].dropna()
+    values = df[P_TTS_COLUMN].dropna()
     if values.empty:
         return {"count": 0}
     percentiles = [5, 10, 25, 50, 75, 90, 95]
@@ -76,11 +88,11 @@ def compute_statistics(df: pd.DataFrame) -> dict:
 
 def print_distribution(stats: dict) -> None:
     if stats["count"] == 0:
-        logger.warning("No complete TTS-suitability score pairs found.")
+        logger.warning("No complete TTS-suitability probabilities found.")
         return
     print("\n" + "=" * 60)
-    print("  TTS-Suitability not_tts Margin Distribution")
-    print("  margin = not_tts_score - tts_score")
+    print("  TTS-Suitability p_tts Distribution")
+    print("  delete when p_tts < threshold")
     print("=" * 60)
     print(f"  Count:  {stats['count']:>10,}")
     print(f"  Min:    {stats['min']:>10.6f}")
@@ -95,18 +107,18 @@ def print_distribution(stats: dict) -> None:
 
 
 def print_histogram(df: pd.DataFrame, bins: int = 10) -> None:
-    values = df[MARGIN_COLUMN].dropna()
+    values = df[P_TTS_COLUMN].dropna()
     if values.empty:
         return
     low = float(values.min())
     high = float(values.max())
     if low == high:
-        print(f"\n  All {len(values)} margins = {low:.6f}")
+        print(f"\n  All {len(values)} p_tts values = {low:.6f}")
         return
 
     width = (high - low) / bins
     print(f"\n  Histogram ({bins} bins):")
-    print(f"  {'Margin range':>24}  {'Files':>10}")
+    print(f"  {'p_tts range':>24}  {'Files':>10}")
     for index in range(bins):
         lower = low + index * width
         upper = high + 1e-9 if index == bins - 1 else low + (index + 1) * width
@@ -117,22 +129,22 @@ def print_histogram(df: pd.DataFrame, bins: int = 10) -> None:
 def determine_threshold(config: dict, args: argparse.Namespace) -> Optional[float]:
     if args.threshold is not None:
         threshold = float(args.threshold)
-        logger.info(f"Auto mode: using CLI not_tts-margin threshold={threshold}")
+        logger.info(f"Auto mode: using CLI p_tts threshold={threshold}")
         return threshold
 
     cfg = config.get("tts_suitability_filter", {})
     configured = cfg.get("threshold")
     if configured is not None and not args.manual:
         threshold = float(configured)
-        logger.info(f"Auto mode: using config not_tts-margin threshold={threshold}")
+        logger.info(f"Auto mode: using config p_tts threshold={threshold}")
         return threshold
 
-    logger.info("Manual mode: interactive not_tts-margin threshold selection")
+    logger.info("Manual mode: interactive p_tts threshold selection")
     while True:
         try:
             raw = input(
-                "\nEnter not_tts-margin threshold "
-                "(delete when not_tts_score - tts_score > threshold): "
+                "\nEnter p_tts threshold "
+                "(delete when p_tts < threshold): "
             ).strip()
             if not raw:
                 return None
@@ -145,7 +157,7 @@ def determine_threshold(config: dict, args: argparse.Namespace) -> Optional[floa
 
 
 def deletion_candidates(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    return df[df[MARGIN_COLUMN] > float(threshold)].copy()
+    return df[df[P_TTS_COLUMN] < float(threshold)].copy()
 
 
 def print_preview(
@@ -163,13 +175,13 @@ def print_preview(
     save_hours = float(durations.sum() / 3600.0 - delete_hours)
 
     print("\n" + "-" * 72)
-    print(f"  not_tts-margin threshold: {threshold:.6f}")
+    print(f"  p_tts threshold: {threshold:.6f}")
     print(
-        f"  DELETE margin > {threshold:.6f}: "
+        f"  DELETE p_tts < {threshold:.6f}: "
         f"{delete_count:>10,} files ({delete_hours:.2f}h)"
     )
     print(
-        f"  SAVE   margin <= {threshold:.6f}: "
+        f"  SAVE   p_tts >= {threshold:.6f}: "
         f"{save_count:>10,} files ({save_hours:.2f}h)"
     )
     print("-" * 72)
@@ -295,7 +307,7 @@ def main(args):
     baseline = scored_rows(load_main_csv(podcasts_path))
     if baseline.empty:
         logger.error(
-            "No complete not_tts_score/tts_score pairs in balalaika.csv. "
+            "No complete p_tts/p_not_tts values or legacy TTS logits in balalaika.csv. "
             "Run stage 7 first."
         )
         write_status(args, processed=0, skipped=0, errors=1)
@@ -322,7 +334,7 @@ def main(args):
     candidates = deletion_candidates(current, threshold)
     print_preview(current, threshold)
     if candidates.empty:
-        logger.info("No files exceed the not_tts-margin threshold.")
+        logger.info("No files fall below the p_tts threshold.")
         write_status(args, processed=0, skipped=len(current), errors=0)
         return
 
@@ -402,7 +414,7 @@ def main(args):
         hours_in=hours_in,
         hours_out=hours_in - hours_deleted,
         params={
-            "score": "not_tts_score-tts_score",
+            "score": "p_tts",
             "threshold": threshold,
             "deleted": files_deleted,
         },
@@ -421,7 +433,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Filter audio using raw TTS-suitability not_tts/tts logits"
+        description="Filter audio using TTS-suitability probability threshold"
     )
     parser.add_argument("--config_path", type=str, required=True)
     parser.add_argument("--log_dir", type=str, default=None)
@@ -434,6 +446,6 @@ if __name__ == "__main__":
         "--threshold",
         type=float,
         default=None,
-        help="Override not_tts-margin threshold; delete when margin is greater",
+        help="Override p_tts threshold; delete when p_tts is lower",
     )
     main(parser.parse_args())

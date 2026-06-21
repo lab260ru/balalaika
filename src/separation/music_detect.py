@@ -30,7 +30,6 @@ A per-stage log file is initialised at startup for offline debugging.
 """
 
 import argparse
-import os
 import shutil
 import time
 from pathlib import Path
@@ -62,6 +61,12 @@ from src.utils.csv_manager import (
     resolve_path,
     unprocessed_paths,
 )
+from src.separation.inline_filter import (
+    MUSIC,
+    delete_and_measure,
+    resolve_inline,
+    should_delete,
+)
 from src.utils.datasets.separation import (
     MUSICDETECT_SAMPLE_RATE,
     create_music_detect_dataloader,
@@ -86,6 +91,21 @@ VALUE_COLUMNS = [COLUMN, "total_duration"]
 MODEL_SAMPLE_RATE = MUSICDETECT_SAMPLE_RATE
 MODEL_REPO_ID = "NikiPshg/music_detection_onnx"
 MODEL_REPO_FILENAME = "music_detection.onnx"
+
+
+def resolve_inline_threshold(config: dict) -> Optional[float]:
+    """Inline-delete threshold for stage 4, or ``None`` when score-only.
+
+    Active only when ``music_detect.inline_filter`` is on. The threshold lives in
+    the ``music_detect_filter`` subsection (shared with stage 4.5); for
+    backward-compatibility it falls back to the legacy ``music_detect.threshold``
+    when the filter subsection has none.
+    """
+    cfg = config.get("music_detect", {})
+    filter_cfg = dict(config.get("music_detect_filter", {}))
+    if filter_cfg.get("threshold") is None and cfg.get("threshold") is not None:
+        filter_cfg["threshold"] = cfg.get("threshold")
+    return resolve_inline(cfg, filter_cfg)
 
 
 def ensure_model(model_path: Path, cfg: dict | None = None) -> Path:
@@ -215,9 +235,9 @@ def _process_files(
     skipped_counter,
     errors_counter,
     audio_lengths: Optional[Dict[str, float]] = None,
+    inline_threshold: Optional[float] = None,
 ) -> int:
     cfg = config.get("music_detect", {})
-    threshold = cfg.get("threshold", 0.5)
     batch_size = resolve_batch_size("music_detect", cfg.get("bs"), 8)
     num_workers = int(cfg.get("num_workers", 4))
     prefetch_factor = int(cfg.get("prefetch_factor", 2))
@@ -304,14 +324,16 @@ def _process_files(
             if duration_s <= 0:
                 duration_s = safe_audio_duration(path_str)
 
+            # Score-only by default; when inline_filter is on, delete files above
+            # the threshold in this same pass (no second tree walk).
             deleted = False
-            if prob_val > threshold:
-                try:
-                    os.remove(path_str)
+            if inline_threshold is not None and should_delete(
+                MUSIC, {"music_prob": prob_val}, inline_threshold
+            ):
+                deleted, duration_s = delete_and_measure(path_str, duration_s)
+                if deleted:
                     deleted_count += 1
-                    deleted = True
-                except OSError as exc:
-                    logger.warning(f"Could not delete {path_str}: {exc}")
+                else:
                     errors_counter.value += 1
 
             writer.write(
@@ -345,6 +367,7 @@ def run_worker(
     cfg = config.get("music_detect", {})
     podcasts_path = Path(config.get("podcasts_path", "."))
     model_path = Path(cfg.get("onnx_path", "./models/music_detection.onnx"))
+    inline_threshold = resolve_inline_threshold(config)
 
     try:
         session, waveform_input, mask_input, output_name = create_session(
@@ -392,6 +415,7 @@ def run_worker(
                     skipped_counter,
                     errors_counter,
                     audio_lengths=shard_lengths,
+                    inline_threshold=inline_threshold,
                 )
                 mark_work_shard_done(shard_path)
 
@@ -416,6 +440,15 @@ def main(args):
 
     podcasts_path = Path(podcasts_path)
     cfg = config.get("music_detect", {})
+    # Score-only unless inline_filter is on; when on, the scoring workers delete
+    # music files in this pass and we prune their rows + record a filter row.
+    inline_threshold = resolve_inline_threshold(config)
+    drop_missing = inline_threshold is not None
+    if inline_threshold is not None:
+        logger.info(
+            f"inline_filter active: deleting files with music_prob > {inline_threshold} "
+            "during scoring (stage 4.5 will then find no candidates)."
+        )
     audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     n_gpus = torch.cuda.device_count()
 
@@ -439,7 +472,7 @@ def main(args):
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=VALUE_COLUMNS,
-        drop_missing_files=True,
+        drop_missing_files=drop_missing,
         bootstrap_audio_paths=audio_paths,
         preserve_existing=True,
     )
@@ -455,22 +488,23 @@ def main(args):
         logger.success(
             "All audio files already have a music_prob entry. Skipping computation."
         )
-        audit = audit_from_filter_partials(leftover_partials)
-        if audit["files_in"] == 0:
-            audit["files_in"] = len(audio_paths)
-            audit["files_out"] = len(audio_paths)
-        record_stage_summary(
-            podcasts_path=podcasts_path,
-            stage="music_detect",
-            files_in=audit["files_in"],
-            files_out=audit["files_out"],
-            hours_in=audit["hours_in"],
-            hours_out=audit["hours_out"],
-            params={
-                "threshold": cfg.get("threshold", 0.5),
-                "deleted": audit["files_deleted"],
-            },
-        )
+        if inline_threshold is not None:
+            audit = audit_from_filter_partials(leftover_partials)
+            if audit["files_in"] == 0:
+                audit["files_in"] = len(audio_paths)
+                audit["files_out"] = len(audio_paths)
+            record_stage_summary(
+                podcasts_path=podcasts_path,
+                stage="music_detect",
+                files_in=audit["files_in"],
+                files_out=audit["files_out"],
+                hours_in=audit["hours_in"],
+                hours_out=audit["hours_out"],
+                params={
+                    "threshold": inline_threshold,
+                    "deleted": audit["files_deleted"],
+                },
+            )
         return
 
     # One duration pass for the whole stage: durations feed both the
@@ -515,7 +549,7 @@ def main(args):
             podcasts_path,
             prefix=PARTIAL_PREFIX,
             value_columns=VALUE_COLUMNS,
-            drop_missing_files=True,
+            drop_missing_files=drop_missing,
             preserve_existing=True,
             **csv_settings,
         ):
@@ -543,35 +577,38 @@ def main(args):
         podcasts_path,
         PARTIAL_PREFIX,
         value_columns=VALUE_COLUMNS,
-        drop_missing_files=True,
+        drop_missing_files=drop_missing,
         preserve_existing=True,
     )
 
-    partial_frames = [
-        df
-        for df in (leftover_partials, new_partials)
-        if df is not None and not df.empty
-    ]
-    combined = (
-        pd.concat(partial_frames, ignore_index=True)
-        if partial_frames
-        else pd.DataFrame()
-    )
+    # Only inline deletion produces a filter row; score-only mode (the default)
+    # leaves deletion + its audit to stage 4.5, matching stages 5/6/7.
+    if inline_threshold is not None:
+        partial_frames = [
+            df
+            for df in (leftover_partials, new_partials)
+            if df is not None and not df.empty
+        ]
+        combined = (
+            pd.concat(partial_frames, ignore_index=True)
+            if partial_frames
+            else pd.DataFrame()
+        )
 
-    audit = audit_from_filter_partials(combined)
+        audit = audit_from_filter_partials(combined)
 
-    record_stage_summary(
-        podcasts_path=podcasts_path,
-        stage="music_detect",
-        files_in=audit["files_in"],
-        files_out=audit["files_out"],
-        hours_in=audit["hours_in"],
-        hours_out=audit["hours_out"],
-        params={
-            "threshold": cfg.get("threshold", 0.5),
-            "deleted": audit["files_deleted"],
-        },
-    )
+        record_stage_summary(
+            podcasts_path=podcasts_path,
+            stage="music_detect",
+            files_in=audit["files_in"],
+            files_out=audit["files_out"],
+            hours_in=audit["hours_in"],
+            hours_out=audit["hours_out"],
+            params={
+                "threshold": inline_threshold,
+                "deleted": audit["files_deleted"],
+            },
+        )
 
     write_stage_status(
         stage=4,

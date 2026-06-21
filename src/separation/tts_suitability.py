@@ -1,10 +1,10 @@
 """TTS-suitability scoring with crash-safe CSV state.
 
 The stage runs the lab260/TTS-Suitability-Classifier ONNX model over 16 kHz
-audio and stores the model's two raw output logits in ``balalaika.csv``. The
-model is a wav2vec2-300M classifier: each file is layer-normalized, chunked into
-10 s windows, and the per-chunk logits are averaged before being written. It
-does not apply softmax and does not delete audio; filtering is handled by
+audio and stores simple softmax probabilities in ``balalaika.csv``. The model
+is a wav2vec2-300M classifier: each file is layer-normalized, chunked into
+10 s windows, and the per-chunk logits are averaged before probabilities are
+computed and written. It does not delete audio; filtering is handled by
 ``src.separation.tts_suitability_filter``.
 
 Inference is per file rather than batched across files: each file yields a
@@ -21,15 +21,25 @@ from typing import List, Set
 import huggingface_hub
 import numpy as np
 import onnxruntime as ort
+import pandas as pd
 import torch
 import torch.multiprocessing as mp
 from loguru import logger
 from tqdm import tqdm
 
+from src.separation.inline_filter import (
+    INLINE_PARTIAL_FIELDS,
+    TTS,
+    resolve_inline,
+    write_score_row,
+)
+from src.utils.audit import record_stage_summary
+from src.utils.audio_durations import duration_probe_workers, ensure_audio_durations
 from src.utils.csv_manager import (
     PartialCsvWriter,
     PeriodicCsvMerger,
     absorb_partial_csvs,
+    audit_from_filter_partials,
     discover_audio_paths,
     ensure_main_csv,
     load_csv_settings,
@@ -53,14 +63,21 @@ from src.utils.work_shards import (
     load_work_shard_size,
     mark_work_shard_done,
     prepare_work_shards,
-    read_work_shard,
+    read_annotated_work_shard,
 )
 
 PARTIAL_PREFIX = "tts_suit"
-TTS_SCORE_COLUMN = "tts_score"
-NOT_TTS_SCORE_COLUMN = "not_tts_score"
-PARTIAL_FIELDS = ("filepath", NOT_TTS_SCORE_COLUMN, TTS_SCORE_COLUMN)
-VALUE_COLUMNS = [NOT_TTS_SCORE_COLUMN, TTS_SCORE_COLUMN]
+P_TTS_COLUMN = "p_tts"
+P_NOT_TTS_COLUMN = "p_not_tts"
+PARTIAL_FIELDS = ("filepath", P_NOT_TTS_COLUMN, P_TTS_COLUMN)
+VALUE_COLUMNS = [P_NOT_TTS_COLUMN, P_TTS_COLUMN]
+
+
+def _inline_threshold(config: dict):
+    """Inline-delete threshold for stage 7, or ``None`` when score-only."""
+    return resolve_inline(
+        config.get("tts_suitability", {}), config.get("tts_suitability_filter", {})
+    )
 MODEL_SAMPLE_RATE = TTS_SUITABILITY_SAMPLE_RATE
 MODEL_CHUNK_FRAMES = TTS_SUITABILITY_CHUNK_FRAMES
 NOT_TTS_CLASS_INDEX = 0
@@ -83,6 +100,14 @@ def mean_class_logits(outputs: np.ndarray) -> tuple[float, float]:
         float(mean_logits[NOT_TTS_CLASS_INDEX]),
         float(mean_logits[TTS_CLASS_INDEX]),
     )
+
+
+def softmax_pair(not_tts_logit: float, tts_logit: float) -> tuple[float, float]:
+    logits = np.asarray([not_tts_logit, tts_logit], dtype=np.float64)
+    logits -= logits.max()
+    probs = np.exp(logits)
+    probs /= probs.sum()
+    return float(probs[NOT_TTS_CLASS_INDEX]), float(probs[TTS_CLASS_INDEX])
 
 
 def ensure_model(model_path: Path, cfg: dict | None = None) -> Path:
@@ -152,6 +177,8 @@ def _process_files(
     processed_counter,
     skipped_counter,
     errors_counter,
+    inline_threshold=None,
+    audio_lengths=None,
 ) -> None:
     batch_size = int(cfg.get("batch_size", 8))
     num_workers = int(cfg.get("num_workers", 4))
@@ -210,7 +237,8 @@ def _process_files(
                     [output_name],
                     {input_name: chunks.numpy().astype(np.float32, copy=False)},
                 )[0]
-                not_tts_score, tts_score = mean_class_logits(outputs)
+                not_tts_logit, tts_logit = mean_class_logits(outputs)
+                p_not_tts, p_tts = softmax_pair(not_tts_logit, tts_logit)
                 logger.debug(
                     f"perf model=tts_suitability event=inference rank={rank} "
                     f"batch={batch_idx} seconds={time.perf_counter() - started_at:.6f} "
@@ -221,12 +249,18 @@ def _process_files(
                 errors_counter.value += 1
                 continue
 
-            writer.write(
-                {
-                    "filepath": resolved,
-                    NOT_TTS_SCORE_COLUMN: float(not_tts_score),
-                    TTS_SCORE_COLUMN: float(tts_score),
-                }
+            write_score_row(
+                writer,
+                stage=TTS,
+                resolved_path=resolved,
+                audio_path=path_str,
+                scores={
+                    P_NOT_TTS_COLUMN: float(p_not_tts),
+                    P_TTS_COLUMN: float(p_tts),
+                },
+                inline_threshold=inline_threshold,
+                audio_lengths=audio_lengths,
+                errors_counter=errors_counter,
             )
             already_done.add(resolved)
             processed_counter.value += 1
@@ -257,16 +291,29 @@ def run_worker(
         session, input_name, output_name = create_session(
             model_path, rank, cfg, config_path
         )
+        inline_threshold = _inline_threshold(config)
+        fieldnames = (
+            PARTIAL_FIELDS + INLINE_PARTIAL_FIELDS
+            if inline_threshold is not None
+            else PARTIAL_FIELDS
+        )
         claimed = 0
         with PartialCsvWriter(
-            podcasts_path, PARTIAL_PREFIX, rank, fieldnames=PARTIAL_FIELDS
+            podcasts_path, PARTIAL_PREFIX, rank, fieldnames=fieldnames
         ) as writer:
             already_done: Set[str] = writer.already_done()
             while True:
                 shard_path = claim_work_shard(work_dir, rank)
                 if shard_path is None:
                     break
-                shard_files = read_work_shard(shard_path)
+                items = read_annotated_work_shard(shard_path)
+                shard_files = [p for p, _ in items]
+                audio_lengths = None
+                if inline_threshold is not None and items and all(n for _, n in items):
+                    try:
+                        audio_lengths = {p: float(n) for p, n in items}
+                    except ValueError:
+                        audio_lengths = None
                 claimed += 1
                 logger.info(
                     f"[cuda:{rank}] Processing {len(shard_files)} files "
@@ -284,6 +331,8 @@ def run_worker(
                     processed_counter,
                     skipped_counter,
                     errors_counter,
+                    inline_threshold=inline_threshold,
+                    audio_lengths=audio_lengths,
                 )
                 mark_work_shard_done(shard_path)
         logger.info(f"Worker {rank} done after {claimed} claimed shard(s).")
@@ -309,6 +358,18 @@ def main(args):
     config = load_config(args.config_path, "separation")
     podcasts_path = Path(config.get("podcasts_path", "."))
     cfg = config.get("tts_suitability", {})
+    # Score-only unless inline_filter is on; when on, delete not-TTS-margin files
+    # in this pass, prune their rows, and emit a filter row (stage 7.5 no-ops).
+    inline_threshold = _inline_threshold(config)
+    drop_missing = inline_threshold is not None
+    value_columns = (
+        VALUE_COLUMNS + ["total_duration"] if drop_missing else VALUE_COLUMNS
+    )
+    if inline_threshold is not None:
+        logger.info(
+            f"inline_filter active: deleting files with p_not_tts - p_tts > "
+            f"{inline_threshold} during scoring."
+        )
     audio_paths = discover_audio_paths(podcasts_path, config_path=args.config_path)
     n_gpus = torch.cuda.device_count()
 
@@ -323,17 +384,18 @@ def main(args):
 
     ensure_main_csv(podcasts_path, audio_paths=audio_paths)
     ensure_model(Path(cfg.get("onnx_path", "./models/tts_suitability.onnx")), cfg)
-    _, absorbed = absorb_partial_csvs(
+    leftover_partials, absorbed = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=VALUE_COLUMNS,
+        value_columns=value_columns,
+        drop_missing_files=drop_missing,
         bootstrap_audio_paths=audio_paths,
         preserve_existing=True,
     )
     if absorbed:
         logger.info(f"Absorbed {absorbed} leftover TTS-suitability rows.")
 
-    pending = unprocessed_paths(podcasts_path, TTS_SCORE_COLUMN, audio_paths)
+    pending = unprocessed_paths(podcasts_path, P_TTS_COLUMN, audio_paths)
     if args.limit is not None:
         pending = pending[: args.limit]
     if not pending:
@@ -341,13 +403,27 @@ def main(args):
         _write_status(args, 0, len(audio_paths), 0)
         return
 
+    # This stage does not bucket by length, so it normally needs no durations.
+    # In inline mode probe them once (cached in the state) and carry them into
+    # the shard so kept rows record hours without a re-probe at delete time.
+    annotations = None
+    if drop_missing:
+        durations = ensure_audio_durations(
+            podcasts_path,
+            pending,
+            num_workers=duration_probe_workers(cfg, config),
+        )
+        annotations = {p: str(float(durations.get(p, 0.0) or 0.0)) for p in pending}
+        del durations
     work_plan = prepare_work_shards(
         podcasts_path,
         PARTIAL_PREFIX,
         pending,
         shard_size=load_work_shard_size(args.config_path),
+        annotations=annotations,
     )
     del pending
+    del annotations
 
     logger.info(
         f"{work_plan.total_items} files need TTS-suitability scoring; "
@@ -360,7 +436,8 @@ def main(args):
         with PeriodicCsvMerger(
             podcasts_path,
             prefix=PARTIAL_PREFIX,
-            value_columns=VALUE_COLUMNS,
+            value_columns=value_columns,
+            drop_missing_files=drop_missing,
             preserve_existing=True,
             **load_csv_settings(args.config_path),
         ):
@@ -386,12 +463,36 @@ def main(args):
         logger.critical(f"TTS-suitability multiprocessing failed: {exc}")
         errors.value += 1
 
-    absorb_partial_csvs(
+    new_partials, _ = absorb_partial_csvs(
         podcasts_path,
         PARTIAL_PREFIX,
-        value_columns=VALUE_COLUMNS,
+        value_columns=value_columns,
+        drop_missing_files=drop_missing,
         preserve_existing=True,
     )
+
+    if inline_threshold is not None:
+        partial_frames = [
+            df
+            for df in (leftover_partials, new_partials)
+            if df is not None and not df.empty
+        ]
+        combined = (
+            pd.concat(partial_frames, ignore_index=True)
+            if partial_frames
+            else pd.DataFrame()
+        )
+        audit = audit_from_filter_partials(combined)
+        record_stage_summary(
+            podcasts_path=podcasts_path,
+            stage="tts_suitability_filter",
+            files_in=audit["files_in"],
+            files_out=audit["files_out"],
+            hours_in=audit["hours_in"],
+            hours_out=audit["hours_out"],
+            params={"threshold": inline_threshold, "deleted": audit["files_deleted"]},
+        )
+
     _write_status(args, processed.value, skipped.value, errors.value)
 
 

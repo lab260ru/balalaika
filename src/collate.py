@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 import concurrent.futures
 from loguru import logger
 
@@ -14,9 +14,8 @@ from src.utils.csv_manager import (
 from src.utils.chunk_json import JSON_SUFFIX, get_field, read_chunk_json
 from src.utils.logging_setup import setup_logging
 from src.utils.stage_status import last_line, write_stage_status
-from src.utils.utils import load_config
+from src.utils.utils import load_config, model_key
 
-SUPPORTED_TIMESTAMP_MODELS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
 ASR_CONSISTENCY_COLUMN = "asr_consistency_percent"
 
 TEXT_COLUMNS = {
@@ -45,8 +44,8 @@ TEXT_COLUMNS = {
 
 
 def output_suffix_for_model(model_name: str) -> str:
-    """Match transcription.py sidecar naming."""
-    return "vosk" if "vosk" in str(model_name) else str(model_name)
+    """Match transcription.py JSON-key naming (last ``/``-segment of the name)."""
+    return model_key(model_name)
 
 
 def transcription_sidecar_columns(model_names: Iterable[str]) -> set[str]:
@@ -111,6 +110,7 @@ def sidecar_specs(model_names: Iterable[str]) -> Dict[str, str]:
         'rover': 'rover',
         'punct': 'punct',
         'phonemes': 'rover_phonemes',
+        ASR_CONSISTENCY_COLUMN: 'asr_consistency',
     }
 
     seen_suffixes = set()
@@ -125,94 +125,20 @@ def sidecar_specs(model_names: Iterable[str]) -> Dict[str, str]:
     return specs
 
 
-def normalize_transcript(text: object) -> str:
-    if text is None:
-        return ""
-    if pd.isna(text):
-        return ""
-    return " ".join(str(text).lower().split())
-
-
-def asr_consistency_percent(row: pd.Series, asr_columns: list[str]) -> float:
-    transcripts = [
-        normalized
-        for col in asr_columns
-        if col in row.index
-        for normalized in [normalize_transcript(row[col])]
-        if normalized
-    ]
-    if len(transcripts) < 2:
+def _coerce_asr_consistency(value: Any) -> float:
+    if value is None or value == "":
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid asr_consistency value in chunk JSON: {value!r}")
         return float("nan")
 
-    best_matching_others = max(
-        transcripts.count(transcript) - 1
-        for transcript in set(transcripts)
-    )
-    return best_matching_others / (len(transcripts) - 1) * 100.0
 
-
-def add_asr_consistency_column(df: pd.DataFrame, model_names: Iterable[str]) -> pd.DataFrame:
-    """Vectorised equivalent of applying :func:`asr_consistency_percent` per row.
-
-    Transcripts are normalised column-wise, factorised to integer codes, and
-    agreement is computed from pairwise code comparisons — same semantics as
-    the row-wise reference implementation (kept above for tests), orders of
-    magnitude faster on multi-million-row frames.
-    """
-    import numpy as np
-
-    asr_columns = []
-    seen = set()
-    for model_name in model_names:
-        suffix = output_suffix_for_model(model_name)
-        if suffix in seen:
-            continue
-        seen.add(suffix)
-        if suffix in df.columns:
-            asr_columns.append(suffix)
-
-    out = df
-    if len(asr_columns) < 2:
-        out[ASR_CONSISTENCY_COLUMN] = float("nan")
-        logger.info("ASR consistency skipped: fewer than two ASR text columns found.")
-        return out
-
-    normalized = [
-        out[col].fillna("").astype(str).str.lower().str.split().str.join(" ")
-        for col in asr_columns
-    ]
-    # One shared factorisation so equal transcripts share an integer code.
-    stacked = pd.concat(normalized, ignore_index=True)
-    codes_flat, uniques = pd.factorize(stacked)
-    empty_code = -1
-    for idx, value in enumerate(uniques):
-        if value == "":
-            empty_code = idx
-            break
-
-    n = len(out)
-    k_cols = len(asr_columns)
-    codes = codes_flat.reshape(k_cols, n)
-    nonempty = codes != empty_code
-
-    matches = np.zeros((k_cols, n), dtype=np.int16)
-    for i in range(k_cols):
-        for j in range(i + 1, k_cols):
-            eq = (codes[i] == codes[j]) & nonempty[i] & nonempty[j]
-            matches[i] += eq
-            matches[j] += eq
-
-    k = nonempty.sum(axis=0)
-    best = np.where(nonempty, matches, -1).max(axis=0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        consistency = np.where(
-            k >= 2, best / np.maximum(k - 1, 1) * 100.0, np.nan
-        )
-    out[ASR_CONSISTENCY_COLUMN] = consistency.astype(float)
-    logger.info(
-        f"Added {ASR_CONSISTENCY_COLUMN} from ASR columns: {asr_columns}"
-    )
-    return out
+def _field_default(key: str, value: Any) -> Any:
+    if key == ASR_CONSISTENCY_COLUMN:
+        return _coerce_asr_consistency(value)
+    return '' if value is None else value
 
 
 def process_audio_file(
@@ -220,7 +146,7 @@ def process_audio_file(
     base_path: Path,
     file_types: Dict[str, str],
     _dir_names: Optional[Dict[str, set]] = None,
-) -> Dict[str, Optional[str]]:
+) -> Dict[str, Any]:
     import os
 
     dirname, filename = os.path.split(audio_path_str)
@@ -251,13 +177,13 @@ def process_audio_file(
         # directory listing says the chunk JSON doesn't exist -> every column
         # is empty, same as the old missing-sidecar path, without the open.
         for key in file_types:
-            results[key] = ''
+            results[key] = _field_default(key, None)
         return results
 
     data = read_chunk_json(os.path.join(target_dir, json_name))
     for key, dotted in file_types.items():
         value = get_field(data, dotted)
-        results[key] = '' if value is None else value
+        results[key] = _field_default(key, value)
 
     return results
 
@@ -324,7 +250,6 @@ def build_slab_frame(
     kept_meta = metadata_slab.reset_index(drop=True)
     sidecar_df = pd.DataFrame(columns, index=kept_meta.index)
     slab = pd.concat([kept_meta, sidecar_df], axis=1)
-    slab = add_asr_consistency_column(slab, model_names)
     return slab, errors
 
 
@@ -340,9 +265,6 @@ def main(args):
     config = load_config(args.config_path, 'download')
     transcription_config = load_config(args.config_path, 'transcription')
     model_names = transcription_config.get('model_names', [])
-    configured_timestamp_models = [
-        name for name in model_names if name in SUPPORTED_TIMESTAMP_MODELS
-    ]
     base_path = Path(config.get('podcasts_path', '../../balalaika'))
     num_workers = config.get('num_workers', 32)
     # Rows per streamed slab. Caps peak RAM at ~O(slab) instead of O(dataset):
@@ -356,7 +278,8 @@ def main(args):
     sidecar_columns = set(file_types.keys()) | transcription_sidecar_columns(model_names)
     logger.info(
         f"Collating {len(file_types)} sidecar columns "
-        f"({len(model_names)} ASR model(s), {len(configured_timestamp_models)} timestamp-capable)."
+        f"({len(model_names)} ASR model(s); timestamp columns are populated for "
+        f"whichever models onnx-asr emits timestamps for, empty otherwise)."
     )
 
     df = read_state_for_collate(base_path, sidecar_columns, args.config_path)
