@@ -93,6 +93,85 @@ def create_crest_factor_dataloader(
     return DataLoader(dataset, **loader_kwargs)
 
 
+class TailSignalDataset(Dataset):
+    """Per-chunk tail-clipping signals (SPEC_drop_criteria.md) for stage 3.5.
+
+    The signals are computed inside the loader worker so only four scalars per
+    file cross the process boundary, mirroring ``CrestFactorDataset``'s
+    stats-in-worker pattern. Audio shorter than the spec's 100 ms floor cannot
+    be measured; such a fragment is by definition unusable for TTS, so it is
+    reported as fully clipped (``0.0 / 0.0``) rather than left null (a null
+    column would keep the file permanently "pending" on every resume).
+    """
+
+    def __init__(self, file_paths: List[str]):
+        self.file_paths = file_paths
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+    def __getitem__(self, idx: int):
+        from src.utils.tail_signals import tail_signals
+
+        path = self.file_paths[idx]
+        started_at = time.perf_counter()
+        try:
+            waveform, sample_rate = torchaudio.load_with_torchcodec(path)
+            waveform = waveform.to(dtype=torch.float32)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0)
+            else:
+                waveform = waveform.squeeze(0)
+            duration_s = waveform.numel() / float(sample_rate)
+            sig = tail_signals(waveform.numpy(), int(sample_rate))
+            tail_db, trailing_ms = (0.0, 0.0) if sig is None else sig
+            logger.debug(
+                f"dataloader_audio_load dataset=tail_signal path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} "
+                f"sample_rate={int(sample_rate)} frames={waveform.numel()}"
+            )
+            return path, float(tail_db), float(trailing_ms), duration_s, ""
+        except Exception as exc:
+            logger.debug(
+                f"dataloader_audio_load dataset=tail_signal path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
+            )
+            return path, 0.0, 0.0, 0.0, str(exc)
+
+
+def tail_signal_collate(batch):
+    paths, tail_dbs, trailing_mss, durations, errors = zip(*batch)
+    return (
+        list(paths),
+        list(tail_dbs),
+        list(trailing_mss),
+        list(durations),
+        list(errors),
+    )
+
+
+def create_tail_signal_dataloader(
+    file_paths: List[str],
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+) -> DataLoader:
+    dataset = TailSignalDataset(file_paths)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": False,
+        "collate_fn": tail_signal_collate,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["worker_init_fn"] = crest_factor_worker_init
+    return DataLoader(dataset, **loader_kwargs)
+
+
 class LoudnessNormalizeDataset(Dataset):
     def __init__(self, file_paths: List[str]):
         self.file_paths = file_paths
@@ -110,7 +189,12 @@ class LoudnessNormalizeDataset(Dataset):
                 f"seconds={time.perf_counter() - started_at:.6f} "
                 f"sample_rate={int(sample_rate)} frames={int(waveform.shape[-1])}"
             )
-            return path, waveform.to(dtype=torch.float32).contiguous(), int(sample_rate), ""
+            return (
+                path,
+                waveform.to(dtype=torch.float32).contiguous(),
+                int(sample_rate),
+                "",
+            )
         except Exception as exc:
             logger.debug(
                 f"dataloader_audio_load dataset=loudness path={path} "

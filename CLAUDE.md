@@ -76,6 +76,7 @@ per chunk), never in-process, which is what makes arbitrary `--stage` resume wor
 | 1 | `src.preprocess.preprocess` | Sortformer diarization + Smart Turn chunking |
 | 2 | `src.preprocess.crest_factor_remover` | Crest-factor filter |
 | 3 | `src.preprocess.preprocess_audio` | Loudness normalization (BS.1770-4) |
+| 3.5 | `src.preprocess.tail_score` | Tail-clipping signal scoring (backfill) |
 | 4 | `src.separation.music_detect` | Music probability scoring |
 | 4.5 | `src.separation.music_detect_filter` | Music-prob threshold filter (deletes files) |
 | 5 | `src.separation.distillmos_process` | DistillMOS quality scoring |
@@ -93,14 +94,27 @@ per chunk), never in-process, which is what makes arbitrary `--stage` resume wor
 | 14 | `src.to_webdataset` | Export WebDataset tar shards |
 | 15 | `src.report` | Build `filter_report.md` |
 
-Stages 12–14 use top-level modules (`src/collate.py`, `src/to_webdataset.py`,
+Stages 13–15 use top-level modules (`src/collate.py`, `src/to_webdataset.py`,
 `src/report.py`) rather than the `src/<area>/` subdirectory pattern used by
 earlier stages. `src/preprocess/preprocess_existing_chunks.py` is an alternate
-stage-1 path for datasets that arrive pre-chunked (skips diarization, still runs
-Sortformer for metadata). `src/recovery_from_meta.py` is a standalone CLI (own
+stage-1 path for datasets that arrive pre-chunked (skips cutting, still runs
+Sortformer to backfill the same metadata columns); it is selected by setting
+`preprocess.input_mode: existing_chunks` in the config — stage 1's module
+dispatches to it internally, so `base.sh --stage 1` covers both modes.
+`src/recovery_from_meta.py` is a standalone CLI (own
 `argparse` main, not a numbered stage) that re-exports chunk audio segments from
 the metadata state when the chunk files are lost but the metadata survives; it
 short-circuits when all segments already exist.
+
+`scripts/` holds standalone one-shot utilities outside the stage system, run
+directly with the venv python: `filter_by_asr_match.py` (keep only rows where
+two ASR models' transcriptions agree after normalization — reads the chunk
+sidecars one directory at a time to stay HDD-friendly),
+`export_music_detect_onnx.py` (export the fine-tuned WavLM music detector to
+the ONNX file stage 4 consumes), `merge_preprocess_partials_once.py` (legacy:
+folds `preprocess_part_*.csv` worker partials into a `balalaika.csv` — predates
+the parquet-only state, so it doesn't apply to current runs), and
+`analyze_balalaika_dataset.py` (EDA plots/tables over the metadata).
 
 **Stage-1 chunk-length output.** Every later stage operates on the chunks this
 stage emits, so its length distribution is load-bearing. `apply_eos_classification`
@@ -111,7 +125,17 @@ window and discarded the leading speech, which both lost audio and piled ~15 % o
 chunks up exactly at the cap. Pieces shorter than `min_segment_duration` (default
 2 s, the floor for usable utterances) are dropped. Net output is a smooth,
 roughly bell-shaped duration distribution centred near `preferred_chunk_duration`
-with no spike at the cap and no sub-2 s fragments. Stage 1 writes 13 metadata
+with no spike at the cap and no sub-2 s fragments. **Smart cutting**
+(SPEC_drop_criteria.md): interior split points additionally snap to the
+quietest 20 ms frame within ±`split_snap_window` (default 0.5 s) instead of
+cutting arithmetically mid-word, and every chunk end gets up to `tail_pad`
+(default 0.2 s) of trailing audio — bounded by the next diarization
+segment/chunk, the `duration` cap and end-of-source — so natural endings keep
+their acoustic decay. Set both to 0 for the legacy zero-margin arithmetic
+boundaries. Stage 3.5 (`src.preprocess.tail_score`) backfills the two
+clipped-tail signals (`tail_db`, `trailing_silence_ms`,
+`src/utils/tail_signals.py`) into `balalaika.parquet` for trees cut before
+this change; it is score-only — no filter stage exists for them yet. Stage 1 writes 13 metadata
 columns to the `balalaika.parquet` state (`filepath`, `speaker_id`,
 `start`, `end`, `total_duration`, `playlist_id`, `podcast_id`, `silence_percent`,
 `max_silence_duration`, `is_single_speaker`, `crest_factor`, `loudness_normalized`,
@@ -222,7 +246,7 @@ See `src/utils/README.md` and `docs/dev.md` for the authoritative API.
   retained for its `DirNameCache`/NAME_MAX semantics and tests.
 
 - **`audit.py`** + **`stage_status.py`** — filter stages append `{files_in/out,
-  hours_in/out}` rows to `<podcasts_path>/filter_summary.csv` (consumed by stage 14
+  hours_in/out}` rows to `<podcasts_path>/filter_summary.csv` (consumed by stage 15
   `src.report` → `filter_report.md`); every stage writes
   `<log_dir>/stage_<id>_status.json` for `--strict`.
 
@@ -233,6 +257,11 @@ See `src/utils/README.md` and `docs/dev.md` for the authoritative API.
   sysfs rotational flag, overridable via `runtime.io_profile` or
   `$BALALAIKA_IO_PROFILE`). Stages clamp DataLoader worker counts on HDD because
   multiple concurrent readers multiply seek distance rather than throughput.
+  Stage 14 export takes the complementary approach: instead of many workers, a
+  small worker count plus a `posix_fadvise WILLNEED` sliding window
+  (`export.readahead`) keeps the HDD's IO queue deep so the elevator can sort
+  reads by on-disk location — measured 1.7× over the old 32-worker default on
+  small chunk files.
 
 - **`node_profile.py`** — resolves `batch_size: auto` in config against
   `cache/node_profile.json` (generated by `benchmarking/warmup.py`). Stages call

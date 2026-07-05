@@ -15,6 +15,7 @@ The main entrypoint is `base.sh`. It runs numbered stages from
 | 1 | `src.preprocess.preprocess` | Sortformer diarization, Smart Turn refinement, chunk export. |
 | 2 | `src.preprocess.crest_factor_remover` | Crest-factor filtering. |
 | 3 | `src.preprocess.preprocess_audio` | Loudness normalization. |
+| 3.5 | `src.preprocess.tail_score` | Tail-clipping signal scoring (`tail_db`, `trailing_silence_ms` — SPEC_drop_criteria.md; score-only backfill for trees not cut by the smart stage-1 path). |
 | 4 | `src.separation.music_detect` | Music probability scoring. |
 | 4.5 | `src.separation.music_detect_filter` | Music-prob threshold filtering. |
 | 5 | `src.separation.distillmos_process` | DistillMOS quality scoring. |

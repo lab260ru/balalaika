@@ -71,6 +71,7 @@ bash base.sh --config_path configs/config.yaml --stage 15 --stop_stage 15
 | 1 | Preprocess: diarization + chunking | `src.preprocess.preprocess` |
 | 2 | Preprocess: crest-factor filter | `src.preprocess.crest_factor_remover` |
 | 3 | Preprocess: loudness normalization | `src.preprocess.preprocess_audio` |
+| 3.5 | Tail-signal scoring (clipped-tail meta) | `src.preprocess.tail_score` |
 | 4 | Separation: music scoring | `src.separation.music_detect` |
 | 4.5 | Separation: music filter | `src.separation.music_detect_filter` |
 | 5 | Separation: DistillMOS scoring | `src.separation.distillmos_process` |

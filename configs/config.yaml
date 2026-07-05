@@ -155,7 +155,7 @@ runtime:
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /home/nikita/test_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
@@ -175,7 +175,7 @@ download:
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /home/nikita/test_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # raw: diarize long-form audio, cut chunks, and write metadata.
   # existing_chunks: do not cut or rewrite audio; diarize every existing audio
   #   file and backfill the same metadata columns that raw preprocess writes
@@ -204,7 +204,7 @@ preprocess:
   # existing_chunks_raw_bytes_max_s: 60
   # Maximum duration of each output segment in seconds.
   
-  duration: 15
+  duration: 20
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
   num_workers: 1
   # DataLoader batch size for Sortformer diarization source loading.
@@ -236,6 +236,21 @@ preprocess:
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
   # crest_factor is saved to balalaika.csv for all files; deleted files also have their CSV row removed.
   crest_treshold: 10
+  # --- Stage 3.5: tail-signal scoring (src.preprocess.tail_score) -----------
+  # Backfills tail_db + trailing_silence_ms (SPEC_drop_criteria.md) to
+  # balalaika.parquet for chunks that were NOT cut by the smart stage-1 path
+  # (pre-existing trees, existing_chunks mode). Score-only: nothing is deleted;
+  # inspect the column distribution before choosing any drop threshold.
+  # Chunks already scored (tail_db present) are skipped on resume.
+  # Worker processes for tail-signal scoring (pure CPU, IO-bound).
+  tail_score_workers: 4
+  # Tail-score DataLoader batch size per worker (signals are computed inside
+  # the loader workers; only four scalars per file cross the batch boundary).
+  tail_score_batch_size: 256
+  # Tail-score DataLoader workers inside each process (decode parallelism).
+  tail_score_loader_workers: 2
+  # Number of prefetched batches per tail-score DataLoader worker.
+  tail_score_prefetch_factor: 2
   # True peak ceiling in dBFS before/after loudness step (see preprocess_audio).
   peak: -1.0
   # Target integrated loudness in LUFS (ITU-R BS.1770-4 meter in code).
@@ -273,6 +288,22 @@ preprocess:
   # smooths the length distribution (the old path piled ~15% of chunks exactly
   # at the cap). E.g. a 15s span becomes 2x7.5s rather than 1x15s.
   preferred_chunk_duration: 8.0
+  # Smart cutting (SPEC_drop_criteria.md). Balanced-split cut points are
+  # arithmetic, i.e. they land mid-speech and usually mid-word — such clipped
+  # tails showed x4.6 the last-word ASR error of natural endings. Each interior
+  # cut may move up to this many seconds either way to the quietest 20 ms frame
+  # nearby (constrained so every piece stays inside
+  # [min_segment_duration, duration]). 0 restores the exact arithmetic splits.
+  # NOT bit-exact vs pre-change chunk trees: boundaries (and thus chunk
+  # filenames) move for any span longer than `duration`.
+  split_snap_window: 0.5
+  # Trailing margin (seconds) appended after each chunk's end so a natural
+  # ending keeps its acoustic decay instead of stopping at the last voiced
+  # sample (a <40 ms margin registers as an "abrupt tail" and gives a TTS
+  # model no end-of-sentence cue). Bounded by the next diarization segment,
+  # the next chunk, the `duration` cap and end-of-source. 0 restores the
+  # legacy zero-margin ends.
+  tail_pad: 0.1
   # Maximum silence gap allowed when merging same-speaker pieces before an EOS
   # boundary is reached. Low EOU is buffered, but only chunks ending with good
   # EOU are saved; overflow before the final good EOU is discarded.
@@ -302,7 +333,7 @@ preprocess:
     # Smart Turn end-of-turn ONNX model path.
     smart_vad_model: ./models/smart-turn-v3.2-gpu.onnx
     # Smart Turn probability threshold for cutting/refining segment ends.
-    smart_vad_threshold: 0.4
+    smart_vad_threshold: 0.8
     # Audio sample rate expected by Smart Turn / Whisper feature extraction.
     smart_vad_sample_rate: 16000
   # SmartVAD (end-of-turn) batch size in RAW mode. Default 1 = one
@@ -317,7 +348,7 @@ preprocess:
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /home/nikita/test_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
 
   # SCORE vs FILTER split. Every scoring stage (4 music, 5 DistillMOS,
   # 6 anti-spoof, 7 TTS) writes its score column to balalaika.parquet and leaves
@@ -444,7 +475,7 @@ separation:
     num_workers: 8
 
 transcription:
-  podcasts_path: /home/nikita/test_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # Canonical onnx-asr model names (passed straight to onnx_asr.load_model — see
   # https://github.com/istupakov/onnx-asr). The JSON/parquet key for each model
   # is the last '/'-segment of the name (t-tech/t-one -> t-one,
@@ -497,10 +528,10 @@ transcription:
   # each order is itself fully deterministic. Recommended "path" on HDD.
   shard_order: path
   # CPU processes for ROVER shard aggregation.
-  rover_workers: 4
-  batch_size: 8
-  num_workers: 1
-  prefetch_factor: 1
+  rover_workers: 16
+  batch_size: 4
+  num_workers: 8
+  prefetch_factor: 4
   # Keep DataLoader workers alive across work shards. Each GPU worker claims
   # 10k-file shards in a loop; the old flow built a fresh DataLoader (spawning
   # up to num_workers loader processes + refilling prefetch) per shard, idling
@@ -514,14 +545,14 @@ transcription:
   retry_empty_outputs: False
 
 punctuation:
-  podcasts_path: /home/nikita/test_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /home/nikita/test_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
@@ -558,7 +589,7 @@ accent:
   lazy_rule_engine: True  # skip the unused koziev/rulemma rule engine load
 
 phonemizer:
-  podcasts_path: /home/nikita/test_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   num_workers: 1
   # "cpu" runs G2P on CPU instead of cuda:N. The model is tiny (d=128);
   # batched CPU decode (~8 ms/word) is close to a busy GPU and uses no VRAM.
@@ -579,14 +610,14 @@ phonemizer:
 
 denoising:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /home/nikita/test_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # MossFormer2_SE_48K dynamic ONNX. If missing, it is downloaded from Hugging Face.
   onnx_path: ./models/MossFormer2_SE_48K_dynamic_fp32.onnx
   # Fill after uploading the ONNX model.
   # Batch and DataLoader settings per GPU worker.
   batch_size: 2
-  num_workers: 4
-  prefetch_factor: 2
+  num_workers: 1
+  prefetch_factor: 1
   # Number of stage worker processes. 0 = one process per visible GPU.
   processes: 0
   # TensorRT EP uses the shared runtime.trt_cache_path cache.
@@ -608,13 +639,24 @@ denoising:
   async_save_queue: 8
 
 export:
-  podcasts_path: /home/nikita/test_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # Exact directory where shard_*.tar files are written. This may be on a
   # different disk from podcasts_path. Empty keeps the legacy location:
   # <podcasts_path parent>/<podcasts_path name>_webdataset/train.
-  output_path: /home/nikita/test_data_webdataset/train
-  # Parallel processes writing WebDataset shards.
-  num_workers: 32
+  output_path: /mnt/ssd_1tb_1/04072026_webdataset/train
+  # Parallel processes writing WebDataset shards. With readahead > 0 a few
+  # processes saturate an HDD: 8 workers + readahead 128 measured 1.7x faster
+  # than 32 workers without readahead, and beat even 128 stock workers
+  # (10k-chunk cold-cache bench on one spindle). Without readahead, throughput
+  # keeps growing with worker count (queue depth), at 16x the process cost.
+  num_workers: 8
+  # Per-worker sliding window of files queued for async kernel readahead
+  # (posix_fadvise WILLNEED on the next N audio+json files). Many outstanding
+  # requests let the disk elevator sort reads by on-disk location — the whole
+  # win on HDD for ~0.5 MB chunk files. Measured optimum is broad (64..256);
+  # 512 already regresses (page-cache churn). 0 disables (bit-identical
+  # output either way; readahead only warms the page cache).
+  readahead: 128
   # Local shard number each worker starts from. For a partial export, set this
   # to one greater than the last uploaded shard index. Example: after
   # shard_000_0049.tar, use 50; worker 0 then starts at shard_000_0050.tar.

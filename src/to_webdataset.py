@@ -180,10 +180,28 @@ def _sanitize_records(df: pd.DataFrame) -> List[dict]:
         per_col_values[str(col)] = vals
 
     str_cols = [str(c) for c in columns]
-    return [
-        {c: per_col_values[c][i] for c in str_cols}
-        for i in range(n)
-    ]
+    return [{c: per_col_values[c][i] for c in str_cols} for i in range(n)]
+
+
+def _prefetch_paths(paths) -> None:
+    """Queue async kernel readahead for the given files.
+
+    open + POSIX_FADV_WILLNEED + close: the readahead survives the close and
+    lands in the page cache. Many outstanding readahead requests let the disk
+    elevator sort them by on-disk location, which is what makes an HDD fast on
+    thousands of ~0.5 MB files — a strictly serial read pays full seek +
+    rotational latency per file with a queue depth of 1.
+    """
+    for p in paths:
+        try:
+            fd = os.open(p, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_WILLNEED)
+        finally:
+            os.close(fd)
+
 
 def worker_fn(
     worker_id: int,
@@ -193,6 +211,7 @@ def worker_fn(
     max_shard_size: int,
     max_shard_count: int,
     shard_start_index: int = 0,
+    readahead: int = 0,
 ):
     if not audio_paths:
         return 0, 0
@@ -201,6 +220,7 @@ def worker_fn(
     samples_processed = 0
     errors_count = 0
     dir_cache: Dict[str, set] = {}
+    prefetched_upto = 0  # index into audio_paths already queued for readahead
 
     with wds.ShardWriter(
         pattern,
@@ -209,13 +229,22 @@ def worker_fn(
         start_shard=shard_start_index,
         opener=_open_shard_exclusive,
     ) as sink:
-        for audio_str in tqdm(audio_paths, desc=f"Worker {worker_id}", position=worker_id):
-            audio_path = Path(audio_str)
-            
-            key = audio_path.stem
-            ext = audio_path.suffix.lstrip('.')
+        for index, audio_str in enumerate(
+            tqdm(audio_paths, desc=f"Worker {worker_id}", position=worker_id)
+        ):
+            if readahead > 0 and prefetched_upto < min(
+                index + readahead, len(audio_paths)
+            ):
+                window = audio_paths[prefetched_upto : index + readahead]
+                _prefetch_paths(p for a in window for p in (a, str(chunk_json_path(a))))
+                prefetched_upto = index + readahead
 
-            safe_key = key.replace('.', '_')
+            audio_path = Path(audio_str)
+
+            key = audio_path.stem
+            ext = audio_path.suffix.lstrip(".")
+
+            safe_key = key.replace(".", "_")
 
             # Read directly and let the exception path handle a missing file,
             # avoiding a redundant exists() stat right before the open. A
@@ -266,10 +295,10 @@ def worker_fn(
 
             for sibling_name in sibling_names:
                 sibling = parent_dir / sibling_name
-                postfix_name = sibling_name[len(key):].lstrip('_.')
+                postfix_name = sibling_name[len(key) :].lstrip("_.")
 
                 try:
-                    text_content = sibling.read_text(encoding='utf-8').strip()
+                    text_content = sibling.read_text(encoding="utf-8").strip()
                     json_data[str(postfix_name)] = text_content
                 except UnicodeDecodeError:
                     pass
@@ -278,18 +307,14 @@ def worker_fn(
                     errors_count += 1
 
             try:
-                json_bytes = json.dumps(json_data, ensure_ascii=False).encode('utf-8')
+                json_bytes = json.dumps(json_data, ensure_ascii=False).encode("utf-8")
             except Exception as e:
                 logger.error(f"Failed to serialize JSON for {key}: {e}")
                 errors_count += 1
                 continue
 
-            sample = {
-                "__key__": safe_key,
-                ext: audio_bytes,
-                "json": json_bytes
-            }
-            
+            sample = {"__key__": safe_key, ext: audio_bytes, "json": json_bytes}
+
             try:
                 sink.write(sample)
                 samples_processed += 1
@@ -299,26 +324,28 @@ def worker_fn(
 
     return samples_processed, errors_count
 
+
 def main(config, config_path: str | None = None):
-    podcasts_path_str = config.get('podcasts_path')
+    podcasts_path_str = config.get("podcasts_path")
     if not podcasts_path_str:
         logger.error("podcasts_path is not defined in the config!")
         return
 
-    max_shard_size = config.get('max_shard_size', 512 * 1024 * 1024)
-    max_shard_count = config.get('max_shard_count', 10000)
-    shard_start_index = int(config.get('shard_start_index', 0))
+    max_shard_size = config.get("max_shard_size", 512 * 1024 * 1024)
+    max_shard_count = config.get("max_shard_count", 10000)
+    shard_start_index = int(config.get("shard_start_index", 0))
     if shard_start_index < 0:
         raise ValueError("export.shard_start_index must be >= 0")
-        
+
     podcasts_path = Path(podcasts_path_str)
 
-    wds_output_dir = resolve_output_dir(podcasts_path, config.get('output_path'))
+    wds_output_dir = resolve_output_dir(podcasts_path, config.get("output_path"))
     wds_output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"WebDataset shards will be saved to: {wds_output_dir}")
 
-    num_workers = config.get('num_workers', 4)
+    num_workers = config.get("num_workers", 4)
     num_workers = max(1, num_workers)
+    readahead = max(0, int(config.get("readahead", 0)))
 
     all_audio_paths = discover_audio_paths(podcasts_path_str, config_path=config_path)
     if not all_audio_paths:
@@ -329,13 +356,20 @@ def main(config, config_path: str | None = None):
         logger.info("Using per-audio JSON sidecars for WebDataset metadata.")
         metadata_dict = {}
     else:
-        logger.info("No metadata sidecars found; falling back to full parquet metadata read.")
+        logger.info(
+            "No metadata sidecars found; falling back to full parquet metadata read."
+        )
         metadata_dict = load_metadata(podcasts_path)
 
     chunk_size = len(all_audio_paths) // num_workers + 1
-    chunks = [all_audio_paths[i:i + chunk_size] for i in range(0, len(all_audio_paths), chunk_size)]
+    chunks = [
+        all_audio_paths[i : i + chunk_size]
+        for i in range(0, len(all_audio_paths), chunk_size)
+    ]
 
-    logger.info(f"Starting {len(chunks)} workers to build WebDataset from {len(all_audio_paths)} audio files...")
+    logger.info(
+        f"Starting {len(chunks)} workers to build WebDataset from {len(all_audio_paths)} audio files..."
+    )
     logger.info(
         f"Shard numbering starts at {shard_start_index}; existing shard files will not be overwritten."
     )
@@ -359,6 +393,7 @@ def main(config, config_path: str | None = None):
                 max_shard_size,
                 max_shard_count,
                 shard_start_index,
+                readahead,
             )
             for worker_id, chunk in enumerate(chunks)
         ]
@@ -372,7 +407,9 @@ def main(config, config_path: str | None = None):
                 logger.error(f"Worker failed with error: {e}")
                 total_errors += 1
 
-    logger.success(f"WebDataset creation completed! Total samples packed: {total_processed}")
+    logger.success(
+        f"WebDataset creation completed! Total samples packed: {total_processed}"
+    )
     logger.success(f"Output directory: {wds_output_dir}")
 
     write_stage_status(
@@ -384,12 +421,17 @@ def main(config, config_path: str | None = None):
         errors=total_errors,
     )
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_path", type=str, required=True, help="Path to YAML config")
-    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
+    parser.add_argument(
+        "--config_path", type=str, required=True, help="Path to YAML config"
+    )
+    parser.add_argument(
+        "--log_dir", type=str, default=None, help="Override log directory"
+    )
     args = parser.parse_args()
 
     setup_logging("to_webdataset", log_dir=args.log_dir)
-    config = load_config(args.config_path, process_name='export')
+    config = load_config(args.config_path, process_name="export")
     main(config, args.config_path)

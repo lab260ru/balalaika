@@ -10,6 +10,7 @@
 #   1  Preprocess: chunking         (src.preprocess.preprocess)
 #   2  Preprocess: crest filter     (src.preprocess.crest_factor_remover)
 #   3  Preprocess: loudness         (src.preprocess.preprocess_audio)
+#   3.5 Tail-signal scoring          (src.preprocess.tail_score)
 #   4  Separation: music scoring    (src.separation.music_detect)
 #   4.5 Music filter                 (src.separation.music_detect_filter)
 #   5  Separation: DistillMOS       (src.separation.distillmos_process)
@@ -49,7 +50,7 @@ while [[ $# -gt 0 ]]; do
         --strict)
             strict_mode=1; shift ;;
         --help|-h)
-            sed -n '2,30p' "$0"
+            sed -n '2,32p' "$0"
             exit 0 ;;
         *)
             # Backwards-compat: accept positional config path as before.
@@ -273,6 +274,12 @@ if stage_active 3; then
     echo "Stage 3: Preprocess — loudness normalization (BS.1770-4)"
     run_python src.preprocess.preprocess_audio
     check_stage_status 3
+fi
+
+if stage_active 3.5; then
+    echo "Stage 3.5: Tail-signal scoring — tail_db / trailing_silence_ms"
+    run_python src.preprocess.tail_score
+    check_stage_status 3.5
 fi
 
 if stage_active 4; then
