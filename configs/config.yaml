@@ -398,7 +398,11 @@ separation:
     num_workers: 8
 
   distillmos:
-    # DistillMOS inference batch size per GPU worker.
+    # DistillMOS inference batch size per GPU worker, counted in FILES; each
+    # file contributes ceil(max(dur-7.68s, 0)/1s)+1 fixed 7.68 s segments to
+    # the GPU batch. Scores are batch-size independent: segmentation happens
+    # per file in the dataloader (no zero-padding ever reaches the model), so
+    # any batch_size gives the same MOS as batch_size=1.
     batch_size: 8
     # DataLoader workers per GPU worker for decoding/resampling audio.
     num_workers: 8

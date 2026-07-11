@@ -16,6 +16,7 @@ Resume behaviour:
 * Files already scored (non-null ``DistillMOS`` in ``balalaika.csv``) are
   skipped automatically.
 """
+
 import argparse
 import time
 from pathlib import Path
@@ -123,7 +124,9 @@ def _process_files(
         cache_dir=str(podcasts_path),
         assume_sorted=not sort_in_loader,
     )
-    prefetch_batches = num_loader_workers * prefetch_factor if num_loader_workers > 0 else 0
+    prefetch_batches = (
+        num_loader_workers * prefetch_factor if num_loader_workers > 0 else 0
+    )
     logger.debug(
         f"perf dataloader_config stage=distillmos rank={rank} "
         f"batch_size={batch_size} workers={num_loader_workers} "
@@ -133,7 +136,9 @@ def _process_files(
 
     with torch.inference_mode():
         batch_wait_started_at = time.perf_counter()
-        for batch_idx, (paths, batch) in enumerate(tqdm(dataloader, desc=f"DistillMOS-{rank}", position=rank)):
+        for batch_idx, (paths, batch, seg_counts) in enumerate(
+            tqdm(dataloader, desc=f"DistillMOS-{rank}", position=rank)
+        ):
             batch_received_at = time.perf_counter()
             logger.debug(
                 f"perf dataloader_wait stage=distillmos rank={rank} "
@@ -143,13 +148,23 @@ def _process_files(
             try:
                 batch = batch.to(device, non_blocking=True)
                 inference_started_at = time.perf_counter()
-                mos = sqa_model(batch).detach().flatten().cpu()
+                # ``batch`` is fixed-size per-file segments (see
+                # distillmos_segments); average the segment scores per file —
+                # the model's own per-file mean, done here because the model
+                # runs with segmenting_in_forward=False.
+                seg_mos = sqa_model(batch).detach().flatten().cpu()
                 logger.debug(
                     f"perf model=distillmos event=inference rank={rank} "
                     f"batch={batch_idx} seconds={time.perf_counter() - inference_started_at:.6f} "
-                    f"items={len(paths)} frames={int(batch.shape[-1])}"
+                    f"items={len(paths)} segments={int(batch.shape[0])} "
+                    f"frames={int(batch.shape[-1])}"
                 )
-                for path_str, mos_val in zip(paths, mos.tolist()):
+                mos = []
+                offset = 0
+                for count in seg_counts:
+                    mos.append(seg_mos[offset : offset + count].mean().item())
+                    offset += count
+                for path_str, mos_val in zip(paths, mos):
                     resolved = resolve_path(path_str)
                     if resolved in already_done:
                         skipped_counter.value += 1
@@ -198,9 +213,14 @@ def run_inference_worker(
     logger.info(f"[cuda:{rank}] Loading DistillMOS model...")
     try:
         import distillmos
+
         sqa_model = distillmos.ConvTransformerSQAModel()
         sqa_model.to(device)
         sqa_model.eval()
+        # Segmentation happens per file in the dataloader (distillmos_segments)
+        # so scores cannot depend on batch composition; the model receives
+        # fixed 122880-sample crops directly.
+        sqa_model.segmenting_in_forward = False
     except Exception as exc:
         logger.error(f"Failed to load distillmos model on worker {rank}: {exc}")
         errors_counter.value += 1
@@ -248,7 +268,9 @@ def run_inference_worker(
                 except ValueError:
                     audio_lengths = None
             claimed += 1
-            logger.info(f"[cuda:{rank}] Processing {len(shard_files)} files from {shard_path.name}.")
+            logger.info(
+                f"[cuda:{rank}] Processing {len(shard_files)} files from {shard_path.name}."
+            )
             _process_files(
                 rank,
                 shard_files,
@@ -267,15 +289,16 @@ def run_inference_worker(
             mark_work_shard_done(shard_path)
 
     elapsed = time.perf_counter() - started_at
-    logger.success(
-        f"[cuda:{rank}] Finished {claimed} shard(s) in {elapsed:.2f}s."
-    )
+    logger.success(f"[cuda:{rank}] Finished {claimed} shard(s) in {elapsed:.2f}s.")
+
 
 def main():
     mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, required=True)
-    parser.add_argument("--log_dir", type=str, default=None, help="Override log directory")
+    parser.add_argument(
+        "--log_dir", type=str, default=None, help="Override log directory"
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -377,9 +400,9 @@ def main():
         f"over {work_plan.shard_count} shard(s)."
     )
 
-    processed = mp.Value('i', 0)
-    skipped = mp.Value('i', 0)
-    errors = mp.Value('i', 0)
+    processed = mp.Value("i", 0)
+    skipped = mp.Value("i", 0)
+    errors = mp.Value("i", 0)
 
     csv_settings = load_csv_settings(args.config_path)
 
@@ -394,7 +417,15 @@ def main():
         ):
             mp.spawn(
                 run_inference_worker,
-                args=(available_gpus, str(work_plan.work_dir), config, podcasts_path, processed, skipped, errors),
+                args=(
+                    available_gpus,
+                    str(work_plan.work_dir),
+                    config,
+                    podcasts_path,
+                    processed,
+                    skipped,
+                    errors,
+                ),
                 nprocs=available_gpus,
                 join=True,
             )
