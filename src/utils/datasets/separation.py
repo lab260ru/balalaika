@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 DISTILLMOS_SAMPLE_RATE = 16_000
+# DistillMOS internal segmentation constants (mirror distillmos.sqa SEQ_LEN /
+# MAX_HOP_LEN): fixed 122880-sample (7.68 s) crops on a <=1 s hop grid, scores
+# averaged per file.
+DISTILLMOS_SEQ_LEN = 122_880
+DISTILLMOS_MAX_HOP_LEN = 16_000
 ANTISPOOF_SAMPLE_RATE = 16_000
 ANTISPOOF_NUM_SAMPLES = 64_600
 MUSICDETECT_SAMPLE_RATE = 16_000
@@ -36,6 +41,33 @@ TTS_SUITABILITY_CHUNK_FRAMES = 160_000
 # to identical float32 via libsndfile and torchcodec (verified on fixtures).
 _RANGED_DECODE_FORMATS = frozenset({"WAV", "WAVEX", "FLAC"})
 _RANGED_DECODE_SUBTYPES = frozenset({"PCM_16", "PCM_24", "PCM_32", "FLOAT", "DOUBLE"})
+
+
+def distillmos_segments(waveform: torch.Tensor) -> torch.Tensor:
+    """Replicate DistillMOS's in-forward segmentation for ONE waveform.
+
+    Returns a ``(num_hops, DISTILLMOS_SEQ_LEN)`` tensor of fixed-size crops
+    computed from the file's *true* length (short files are zero-padded to one
+    segment, exactly like ``segmenting_in_forward=True`` does for a single
+    file). Segmenting per file here — instead of letting the model segment a
+    zero-padded batch — is what makes the score independent of batch
+    composition: with the old ``pad_sequence`` collate the model derived its
+    crop grid from the LONGEST file in the batch, so every other file was
+    scored on shifted windows plus windows of pure padding (measured mean
+    |ΔMOS| ≈ 0.03, max 0.35 vs batch_size=1 at the production batch_size=8).
+    """
+    length = int(waveform.shape[-1])
+    overlength = length - DISTILLMOS_SEQ_LEN
+    if overlength < 0:
+        waveform = torch.nn.functional.pad(waveform, (0, -overlength))
+        overlength = 0
+    num_hops = int(np.ceil(overlength / DISTILLMOS_MAX_HOP_LEN)) + 1
+    return torch.stack(
+        [
+            waveform[int(c * overlength) : int(c * overlength) + DISTILLMOS_SEQ_LEN]
+            for c in np.linspace(0, 1, num_hops)
+        ]
+    )
 
 
 class DistillMOSDataset(Dataset):
@@ -57,7 +89,9 @@ class DistillMOSDataset(Dataset):
                 f"seconds={time.perf_counter() - started_at:.6f} error=load_failed"
             )
             logger.warning("Failed to load %s, returning silence", path_str)
-            return path_str, torch.zeros(DISTILLMOS_SAMPLE_RATE // 100)
+            return path_str, distillmos_segments(
+                torch.zeros(DISTILLMOS_SAMPLE_RATE // 100)
+            )
         if waveform.shape[0] > 1:
             waveform = waveform[:1]
         if sample_rate != DISTILLMOS_SAMPLE_RATE:
@@ -71,15 +105,22 @@ class DistillMOSDataset(Dataset):
             f"seconds={time.perf_counter() - started_at:.6f} "
             f"sample_rate={DISTILLMOS_SAMPLE_RATE} frames={int(waveform.shape[-1])}"
         )
-        return path_str, waveform.squeeze(0).contiguous()
+        return path_str, distillmos_segments(waveform.squeeze(0).contiguous())
 
 
 def distillmos_collate(
     batch: List[Tuple[str, torch.Tensor]],
-) -> Tuple[List[str], torch.Tensor]:
-    paths, waves = zip(*batch)
-    padded = pad_sequence(waves, batch_first=True)
-    return list(paths), padded
+) -> Tuple[List[str], torch.Tensor, List[int]]:
+    """Concatenate per-file segment stacks; no padding is ever introduced.
+
+    Returns ``(paths, segments, counts)`` where ``segments`` has shape
+    ``(sum(counts), DISTILLMOS_SEQ_LEN)`` and the first ``counts[0]`` rows
+    belong to ``paths[0]`` etc. The stage runs the model with
+    ``segmenting_in_forward=False`` and averages the segment scores per file.
+    """
+    paths, seg_stacks = zip(*batch)
+    counts = [int(s.shape[0]) for s in seg_stacks]
+    return list(paths), torch.cat(seg_stacks, dim=0), counts
 
 
 def estimate_audio_lengths(file_paths: List[str]) -> Dict[str, float]:

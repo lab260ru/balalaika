@@ -11,6 +11,7 @@
   an ORT ``SessionOptions`` with optional intra-op thread caps, gated on
   ``runtime.threads_per_worker`` (no-op by default).
 """
+
 from __future__ import annotations
 
 import os
@@ -41,7 +42,11 @@ def apply_torch_perf_defaults(*, disable_math_sdp: bool = True) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
-    torch.backends.cuda.enable_math_sdp(False)
+    # ``disable_math_sdp=False`` callers (DistillMOS) need the math backend:
+    # its transformer encoder has no flash/mem-efficient kernel for this
+    # config and raises ``RuntimeError: Invalid backend`` without it.
+    torch.backends.cuda.enable_math_sdp(not disable_math_sdp)
+
 
 def configured_threads_per_worker(
     config_path: str | os.PathLike | None = None,
@@ -106,9 +111,7 @@ def make_session_options(
 
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    return apply_ort_thread_caps(
-        opts, config_path=config_path, for_gpu_ep=for_gpu_ep
-    )
+    return apply_ort_thread_caps(opts, config_path=config_path, for_gpu_ep=for_gpu_ep)
 
 
 def onnx_first_input_name(model_path: os.PathLike | str) -> str:
