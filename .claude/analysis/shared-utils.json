@@ -1,0 +1,253 @@
+{
+  "area": "shared-utils (src/utils/: csv_manager.py, work_shards.py, parallel.py, utils.py, audio_durations.py, sidecars.py, audit.py)",
+  "data_flow": "These modules form the cross-stage bookkeeping spine. Every heavy stage (preprocess, crest, loudness, music, DistillMOS, antispoofing) follows the same lifecycle, all implemented in csv_manager.py and work_shards.py:\n\n1. discover_audio_paths(podcasts_path, config_path) (csv_manager.py:1054) resolves the universe of audio either from balalaika.csv (usecols=filepath, _audio_paths_from_csv:1027) or via filesystem rglob (_audio_paths_from_rglob:1046 -> utils.get_audio_paths:36 which does FIVE separate rglob passes). Both feed _dedupe_paths (1008) which strips, suffix-checks, normalizes, dedupes through a Python set with a per-item tqdm.\n2. ensure_main_csv (275) reads balalaika.csv under an flock+RLock, restoring from .bak if corrupt.\n3. absorb_partial_csvs (556) reads any leftover <prefix>_part_*.csv (read_partial_csvs:509 -> pd.concat + drop_duplicates), then calls upsert_columns (333) which does a full outer pandas merge on filepath and a full-CSV atomic rewrite (atomic_write_csv:229 -> backup copy of the whole CSV + chunked rewrite + fsync + os.replace).\n4. unprocessed_paths (444) reloads the WHOLE main CSV (load_main_csv:265 which re-normalizes the entire filepath column via _normalize_filepath_column:245), builds a done-set, and filters the audio list with a Python loop+tqdm.\n5. ensure_audio_durations (audio_durations.py:121) reads the CSV again (usecols filepath+total_duration), probes missing durations via ProcessPoolExecutor of safe_audio_duration (audit.py:89, torchaudio.info per file), then calls upsert_columns AGAIN (another full-CSV rewrite).\n6. prepare_work_shards / prepare_length_bucketed_work_shards (work_shards.py:97/152) wipe and rewrite the on-disk shard dir, writing newline-delimited path files of shard_size.\n7. Workers claim shards by atomic rename (claim_work_shard:224 -> sorted glob of all pending shards EACH claim), read them (read_work_shard:240), process, and stream rows into a per-rank PartialCsvWriter (604) that flush()es after EVERY row.\n8. A PeriodicCsvMerger (789) daemon thread polls every poll_interval (>=5s), byte-counts partial rows (_count_partial_rows:770), and when threshold crossed calls _flush_once -> read_partial_csvs + upsert_columns (yet another full-CSV rewrite).\n9. Final absorb_partial_csvs again, then audit_from_filter_partials (722) + record_stage_summary (audit.py:42) append one row to filter_summary.csv.\n\nparallel.py (run_per_gpu_pool/run_per_gpu_processes) is the alternate orchestration path for the text/light-model stages (punctuation, accents, phonemizer, transcription, denoising), round-robin sharding items across GPUs.\n\nThe dominating cost is the repeated full-CSV read+merge+rewrite cycle: for a multi-million-row balalaika.csv, every stage rewrites the entire CSV at least 3-4 times (absorb-in, durations-upsert, periodic flushes every flush_every_rows=10k, absorb-out), each rewrite preceded by a full-file backup copy and full filepath-column re-normalization.",
+  "operations": [
+    {
+      "name": "get_audio_paths 5x rglob",
+      "what": "utils.py:36-44 runs five independent Path.rglob passes over the whole tree (.mp3/.wav/.flac/.ogg/.opus). Each rglob is a full recursive directory walk = 5 stat storms over the entire dataset.",
+      "cost": "heavy"
+    },
+    {
+      "name": "_dedupe_paths per-item loop",
+      "what": "csv_manager.py:1008-1024 GIL-bound Python loop with tqdm over every path: str/strip/Path(suffix)/normalize_path_string/set-membership. Runs on every discover_audio_paths call.",
+      "cost": "moderate"
+    },
+    {
+      "name": "normalize_path_string",
+      "what": "csv_manager.py:87-98 builds a Path object and calls is_absolute per value; cheap individually but called millions of times via _normalize_filepath_column and normalize_path_values.",
+      "cost": "light"
+    },
+    {
+      "name": "_normalize_filepath_column",
+      "what": "csv_manager.py:245-254 df.copy() + tolist() + normalize_path_values over the ENTIRE filepath column on EVERY load_main_csv / upsert read. Full materialization to Python list + rebuild.",
+      "cost": "heavy"
+    },
+    {
+      "name": "_read_csv_safe",
+      "what": "csv_manager.py:128-160 pd.read_csv(low_memory=False) of the full multi-GB CSV. Called by load_main_csv, ensure_main_csv, upsert_columns, _flush_once — multiple times per stage.",
+      "cost": "dominant"
+    },
+    {
+      "name": "atomic_write_csv full rewrite + backup",
+      "what": "csv_manager.py:210-238 copies the ENTIRE existing CSV to .bak with a byte-loop (_copy_file_with_progress:177) THEN rewrites the whole CSV chunked (_write_csv_with_progress:190) + fsync. Happens on every upsert/flush.",
+      "cost": "dominant"
+    },
+    {
+      "name": "upsert_columns outer merge",
+      "what": "csv_manager.py:400-420 pandas outer merge of full CSV with incoming, per-column combine_first/loc assignment, drop of incoming cols. O(N) memory spike (two copies of the frame).",
+      "cost": "heavy"
+    },
+    {
+      "name": "drop_missing_files existence check",
+      "what": "csv_manager.py:422-432 Python loop with Path(p).exists() per row over the whole CSV + tqdm — a stat storm proportional to total dataset size on every filter-stage merge.",
+      "cost": "heavy"
+    },
+    {
+      "name": "unprocessed_paths",
+      "what": "csv_manager.py:444-491 full load_main_csv (re-normalizes whole column) + builds done set via tolist() + two Python tqdm loops over audio_resolved.",
+      "cost": "heavy"
+    },
+    {
+      "name": "PeriodicCsvMerger poll + flush",
+      "what": "csv_manager.py:864-900 every poll_interval re-byte-counts all partials (_count_partial_rows:770 opens+iterates every partial), and on threshold does a FULL read_partial_csvs + upsert_columns (full-CSV rewrite). Repeats many times per stage.",
+      "cost": "dominant"
+    },
+    {
+      "name": "_count_partial_rows newline count",
+      "what": "csv_manager.py:770-786 opens each partial and sums newlines (sum(1 for _ in f)) every poll. Re-reads growing files repeatedly; cost grows with partial size.",
+      "cost": "moderate"
+    },
+    {
+      "name": "PartialCsvWriter.write flush-per-row",
+      "what": "csv_manager.py:652-663 csv.DictWriter.writerow + self._file.flush() after EVERY row. flush() forces a write() syscall per row (no fsync, but still a syscall + libc buffer flush per item).",
+      "cost": "moderate"
+    },
+    {
+      "name": "PartialCsvWriter.already_done",
+      "what": "csv_manager.py:665-684 pd.read_csv(usecols=[key]) of the worker's own partial + normalize_path_values with tqdm. Once per worker startup.",
+      "cost": "light"
+    },
+    {
+      "name": "claim_work_shard sorted glob",
+      "what": "work_shards.py:224-237 sorted(glob('shard_*.pending')) on EVERY claim. With many shards and many workers this is O(shards) glob+sort per claimed shard = O(shards^2) total directory scans.",
+      "cost": "moderate"
+    },
+    {
+      "name": "prepare_length_bucketed_work_shards sort",
+      "what": "work_shards.py:201-214 sorts each bucket by durations.get(p) with a per-element dict lookup in the key fn; fine but builds full in-memory bucket dict of all paths.",
+      "cost": "light"
+    },
+    {
+      "name": "ensure_audio_durations double CSV touch",
+      "what": "audio_durations.py:138 reads CSV (usecols) for cache, then 152-166 upsert_columns writes the WHOLE CSV again just to persist durations. Two more full-CSV passes per duration-using stage.",
+      "cost": "heavy"
+    },
+    {
+      "name": "_csv_duration_cache per-row loop",
+      "what": "audio_durations.py:71-82 Python tqdm loop zipping filepath+duration, normalize each, dict insert. O(N) GIL-bound over full CSV.",
+      "cost": "moderate"
+    },
+    {
+      "name": "safe_audio_duration probe",
+      "what": "audit.py:89-114 imports torchaudio (or soundfile) and calls .info per file. Run via ProcessPoolExecutor in _probe_missing_durations; torchaudio import cost paid per worker process.",
+      "cost": "moderate"
+    },
+    {
+      "name": "run_per_gpu_pool submit+gather",
+      "what": "parallel.py:80-114 builds one ProcessPoolExecutor per GPU, submits one future PER ITEM (no chunking), gathers via as_completed.",
+      "cost": "moderate"
+    },
+    {
+      "name": "record_stage_summary append",
+      "what": "audit.py:75-79 single-row append to filter_summary.csv. Cheap.",
+      "cost": "trivial"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Collapse get_audio_paths from 5 rglob passes to 1 os.scandir/os.walk",
+      "location": "src/utils/utils.py:36-44",
+      "description": "Replace the five separate Path.rglob('*.ext') calls with a single os.walk/os.scandir traversal that checks the extension set once per entry. Currently the whole tree is walked 5 times. Use a single pass and filter on suffix in AUDIO_EXTENSIONS. Path.rglob also returns Path objects (slow); os.scandir with entry.name is much faster.",
+      "expected_gain": "~4-5x faster audio discovery; on a cold cache / network-ish SSD it is the difference between minutes and tens of seconds for large trees",
+      "risk": "low",
+      "low_resource_note": "Pure win on weak nodes — fewer syscalls and less Path object churn means less CPU and RAM. No knob needed."
+    },
+    {
+      "title": "Avoid full-CSV re-normalization of the filepath column on every read",
+      "location": "src/utils/csv_manager.py:245-254 (_normalize_filepath_column) and 265-272 (load_main_csv)",
+      "description": "normalize_path_values is run over the ENTIRE filepath column on every load_main_csv, upsert_columns, ensure_main_csv, read_partial_csvs. Since pipeline CSVs already store absolute paths (the docstring at 88-98 says so), this is almost always a no-op that still costs a df.copy() + tolist() + per-row Path()+is_absolute() + tqdm over millions of rows. Add a fast vectorized pre-check: df['filepath'].str.startswith('/') (or os.sep) — if all True, skip normalization entirely. Or normalize once at write time and mark the CSV as canonical.",
+      "expected_gain": "Removes one O(N) Python pass + a full df copy per CSV touch; with 3-4 touches per stage and millions of rows this is a large fraction of stage-setup wall time and a big RAM spike avoided",
+      "risk": "medium",
+      "low_resource_note": "Critical on the 31GB node: the df.copy() doubles peak RAM for the frame. Skipping it is essential to avoid OOM on large CSVs."
+    },
+    {
+      "title": "Stop rewriting the entire CSV (plus full .bak copy) on every periodic flush",
+      "location": "src/utils/csv_manager.py:210-238 (_atomic_write_csv_unlocked) + 789-900 (PeriodicCsvMerger)",
+      "description": "Each PeriodicCsvMerger flush, each absorb, and the durations upsert performs: full-file backup copy (16MB-chunk byte loop, _copy_file_with_progress:177) + full chunked rewrite + fsync + replace. For a multi-GB CSV flushed every 10k rows this rewrites the whole file dozens of times per stage — pure I/O amplification. Options: (a) raise flush_every_rows / disable periodic flush by default since absorb at end already persists; (b) write the periodic merge to a parquet/feather snapshot instead of CSV; (c) skip the .bak copy on periodic flushes (keep it only for the final write) — the .bak doubles every write's I/O. (d) keep the merged frame in memory across flushes instead of re-reading the whole CSV each time (the docstring at 806-810 explicitly traded this away — revisit for large datasets).",
+      "expected_gain": "Each avoided rewrite saves a full-CSV write+copy. Eliminating the per-flush .bak copy alone halves periodic-flush I/O; raising the threshold or snapshotting can cut total stage I/O by an order of magnitude on big datasets",
+      "risk": "medium",
+      "low_resource_note": "On low-RAM nodes prefer the I/O-reduction options (skip .bak on periodic flush, raise flush_every_rows) over the in-memory mirror — the in-memory frame is exactly what the current design avoided to save RAM. Make flush_every_rows a config knob (it already is via load_csv_settings:931) and document a high default for large CSVs."
+    },
+    {
+      "title": "Vectorize unprocessed_paths and done-set construction",
+      "location": "src/utils/csv_manager.py:444-491",
+      "description": "Currently: full load_main_csv (re-normalizes whole column), then df.loc[mask,'filepath'].tolist() into a set, then a Python tqdm loop over audio_resolved doing set membership. Replace with pandas: read only usecols=['filepath', column] (not the whole CSV), build done set vectorized, then compute pending via np.isin / set difference on arrays rather than an explicit Python loop+tqdm. Also the audio_resolved building loop (459-463) is a second Python pass that could be vectorized.",
+      "expected_gain": "Reading 2 columns instead of all (~10-50 columns) cuts read time and RAM proportionally; vectorized membership removes a multi-million-iteration GIL loop",
+      "risk": "low",
+      "low_resource_note": "usecols read is a major RAM saver on the 31GB node — the full CSV with all stage columns is the memory hog. Strong win."
+    },
+    {
+      "title": "Read partials with usecols + dtype and avoid re-normalization",
+      "location": "src/utils/csv_manager.py:509-540 (read_partial_csvs) and 770-786 (_count_partial_rows)",
+      "description": "read_partial_csvs concats all partials then re-normalizes the filepath column (538). Partials are written by our own PartialCsvWriter with absolute paths, so normalization is redundant — skip it. _count_partial_rows re-counts newlines of growing files every poll; cache last byte-size per file and only re-count files whose mtime/size grew (stat is cheaper than full read).",
+      "expected_gain": "Removes redundant O(N) normalize on every flush; _count cache turns repeated full-file scans into stat() calls",
+      "risk": "low",
+      "low_resource_note": "Helps everywhere; the stat-based count is especially good on slow disks / weak CPUs."
+    },
+    {
+      "title": "Batch PartialCsvWriter flushes instead of flush-per-row",
+      "location": "src/utils/csv_manager.py:652-663",
+      "description": "self._file.flush() after every writerow forces a libc buffer flush (write syscall) per row. For high-throughput stages (millions of short rows) this is a syscall storm. Flush every N rows or every T seconds instead; the crash-resilience guarantee can be kept loose (a few unflushed rows are re-derived on resume because already_done skips them). Expose flush cadence as a knob.",
+      "expected_gain": "Reduces write syscalls by Nx (e.g. 100x at N=100); meaningful for the fast filter stages where per-row work is tiny",
+      "risk": "medium",
+      "low_resource_note": "On weak CPUs the syscall overhead is a larger fraction of per-row cost, so this helps more there. Keep a time-based flush so a stalled worker still persists; default N small (e.g. 50) to keep resume cheap."
+    },
+    {
+      "title": "Make claim_work_shard O(1)-ish instead of sorted-glob-per-claim",
+      "location": "src/utils/work_shards.py:224-237",
+      "description": "Every shard claim does sorted(work_dir.glob('shard_*.pending')) — a full directory listing + sort, then tries to rename the first. With S shards and W workers this is O(S) per claim and O(S^2/W) directory scans overall, plus heavy contention (all workers glob+sort the same dir and race on the same first entry). Use os.scandir without sorting (claim any pending, order doesn't matter except for the length-bucketing which only needs coarse ordering), or hand each worker a disjoint shard-index stride to avoid the shared-first-entry thundering herd.",
+      "expected_gain": "Removes O(S^2) directory scans; with thousands of shards this is a real chunk of worker idle time and FS load at startup/steady-state",
+      "risk": "medium",
+      "low_resource_note": "Strong win on weak CPU/single-disk nodes where directory scans + rename contention serialize workers. Note: dropping the sort changes shard processing order — verify length-bucketing locality (it only matters for batch homogeneity, not correctness)."
+    },
+    {
+      "title": "Chunk work in run_per_gpu_pool instead of one future per item",
+      "location": "src/utils/parallel.py:95-107",
+      "description": "ex.submit(work_fn, item) is called once per item, so the pool's task queue holds one IPC message per item and pickles each item individually. For the text stages (phonemizer/punct/accents) with many short files this is pure IPC/scheduling overhead. Submit batches (chunks of items) per future, or use ex.map with chunksize.",
+      "expected_gain": "Cuts pickling + scheduling overhead proportional to chunk size; for many tiny items this can be 2-5x on the orchestration overhead",
+      "risk": "medium",
+      "low_resource_note": "Helps on weak CPU (less inter-process churn). Requires work_fn to accept a batch — a signature change in the consuming stages, so medium risk."
+    },
+    {
+      "title": "Cache torchaudio import / use a lighter probe in safe_audio_duration",
+      "location": "src/utils/audit.py:89-114 and src/utils/audio_durations.py:91-118",
+      "description": "safe_audio_duration imports torchaudio inside the function; under ProcessPoolExecutor(map) each worker process pays the torchaudio import once but the per-call import lookup still runs. More importantly torchaudio.info pulls in the full torchaudio/torch stack per probe worker. For duration-only probing, soundfile (libsndfile) or a tiny header parser (mutagen for mp3, or reading WAV/FLAC headers directly) is far lighter and avoids loading torch in pure-probe workers. Also raise chunksize (already 128) and consider threads instead of processes since .info releases the GIL in C.",
+      "expected_gain": "Avoids loading the torch stack in N probe processes (seconds + ~hundreds of MB RAM each); meaningful when probing many missing durations",
+      "risk": "low",
+      "low_resource_note": "Big RAM win on the 31GB node — torch in 4+ probe processes can be several GB. Prefer soundfile-first or thread pool here."
+    },
+    {
+      "title": "Persist canonical absolute paths once so downstream normalization is skippable",
+      "location": "src/utils/csv_manager.py:82-98, 245-254",
+      "description": "If filepaths are guaranteed absolute at write time (they are produced by resolve), all the repeated normalize passes (load, upsert, partials, durations, files_in_csv:1078, already_done) become redundant. Introduce a module-level flag / cheap vectorized startswith('/') guard so the whole normalize machinery short-circuits. This compounds across every function that calls normalize_path_values.",
+      "expected_gain": "Removes ~6 distinct O(N) Python normalization passes across a stage's lifecycle",
+      "risk": "medium",
+      "low_resource_note": "Compounding CPU+RAM win; gate behind a guard so a stray relative path still gets fixed (don't blindly trust)."
+    },
+    {
+      "title": "Skip the full-CSV backup copy when the CSV is large and unchanged-by-this-write is rare",
+      "location": "src/utils/csv_manager.py:217-218",
+      "description": "_atomic_write_csv_unlocked always copies the existing CSV to .bak before writing the new tmp. Since the write is already atomic (tmp+fsync+os.replace), the .bak only protects against a corrupt-source-frame bug, not crash. For multi-GB CSVs this doubles every write's I/O. Consider keeping .bak only on the final absorb (not periodic flushes), or hardlink instead of byte-copy when on the same filesystem (os.link is near-instant), restoring copy semantics only if needed.",
+      "expected_gain": "Halves write-path I/O on every flush; hardlink makes the backup essentially free",
+      "risk": "medium",
+      "low_resource_note": "I/O win independent of RAM. Hardlink is safe on same-FS SSD work disk; falls back to copy across FS. Verify .bak recovery path (ensure_main_csv:292-303) still works with a hardlinked backup (it does — it's read-only there)."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "run_per_gpu_pool early return has wrong arity (3-tuple vs 2-tuple)",
+      "location": "src/utils/parallel.py:71",
+      "description": "When items is empty the function returns `0, [], []` (a 3-tuple) but the documented/normal return at line 114 is `error_count, error_details` (2-tuple), and all callers unpack exactly two values, e.g. phonemizer.py:56 `error_count, error_details = run_per_gpu_pool(...)`, punctuation.py:74, accents.py:70. If any of those stages is ever invoked with an empty item list AFTER passing the earlier `if not pending_files: return` guard (e.g. items becomes empty due to a race or a caller that doesn't pre-guard), this raises `ValueError: too many values to unpack`. The docstring also says it returns just the count. Dead/inconsistent contract.",
+      "severity": "medium"
+    },
+    {
+      "title": "error_details records the wrong item on task failure (closure over loop variable)",
+      "location": "src/utils/parallel.py:106",
+      "description": "In the as_completed loop, `error_details.append({'item': str(item), 'reason': str(exc)})` references `item`, but `item` is the loop variable from the SUBMISSION loop (lines 95-96) and is now bound to the LAST item submitted, not the item whose future failed. Every failed task is reported with the same wrong item string. Futures are not mapped back to their item. This makes error reporting / debugging on failures misleading.",
+      "severity": "medium"
+    },
+    {
+      "title": "PartialCsvWriter.write crashes if _fields is None after _open_for fallback",
+      "location": "src/utils/csv_manager.py:656-661",
+      "description": "write() calls _open_for which on the exception path (line 643 `except Exception: pass`) can leave _fields set from the passed-in default, but if both fieldnames and row.keys() produce an empty/odd header and the header-read fails, `self._fields` could be a non-list. More concretely, line 656 `[k for k in row.keys() if k not in self._fields]` and 661 `{k: row.get(k,'') for k in self._fields}` assume _fields is a non-None iterable; _open_for always sets it (line 645) so this is mostly safe, but if fieldnames was passed as empty sequence the header is empty and every key is dropped silently producing empty rows. Low-severity data-quality footgun masked by the silent `unknown` drop + debug-only log.",
+      "severity": "low"
+    },
+    {
+      "title": "drop_missing_files existence check is a stat storm over the WHOLE CSV, not just incoming files",
+      "location": "src/utils/csv_manager.py:422-432",
+      "description": "When a filter stage merges with drop_missing_files=True, it Path.exists() every row of the entire merged CSV (all prior stages' files), not just the files this stage touched. On a multi-million-row CSV merged repeatedly (periodic + final), this re-stats the entire dataset every merge. Not a correctness bug but a severe performance trap that scales with total dataset size each call; effectively O(N * num_merges).",
+      "severity": "medium"
+    },
+    {
+      "title": "Backup .bak written before every periodic flush can leave a stale/inconsistent recovery copy",
+      "location": "src/utils/csv_manager.py:215-218",
+      "description": "_atomic_write_csv_unlocked always overwrites .bak with the CURRENT (pre-write) CSV. During a long stage the .bak is constantly churned. If the process is killed during the _copy_file_with_progress byte loop (before the new tmp is written), .bak is a partial/truncated file (copystat happens after the loop at line 187, but the bytes are written incrementally). ensure_main_csv:296 then reads this partial .bak via pd.read_csv which may succeed-with-truncation, silently restoring an incomplete CSV. The atomic guarantee covers the main CSV but NOT the .bak copy.",
+      "severity": "medium"
+    },
+    {
+      "title": "claim_work_shard thundering-herd race wastes work, no correctness loss but throughput bug",
+      "location": "src/utils/work_shards.py:227-233",
+      "description": "All workers sort+glob the same dir and all try to rename the SAME first pending shard. Only one wins (rename); the losers catch FileNotFoundError and re-glob from scratch. Under high worker counts this is repeated wasted globbing/renaming contention. Functionally correct but a scalability bug (workers serialize on the shared first entry).",
+      "severity": "low"
+    },
+    {
+      "title": "duration_bucket_settings ignores config_path argument",
+      "location": "src/utils/audio_durations.py:201-207",
+      "description": "The function takes config_path but immediately discards it (`_ = config_path` at 206) and only reads from *configs mappings. Callers passing a config_path expecting bucket settings to be read from the YAML file get the defaults unless they ALSO pass the parsed config dict. This is a silent dead-parameter that lies about its contract (the docstring implies it uses config). Bucketing may silently fall back to defaults (1.0s / 15.0s).",
+      "severity": "low"
+    },
+    {
+      "title": "audit_from_filter_partials deleted-mask double-counts/ORs string and bool incorrectly for numeric columns",
+      "location": "src/utils/csv_manager.py:749-753",
+      "description": "deleted_mask ORs `astype(str).str.lower().isin({'true','1','yes'})` with `(partials_df[deleted_column] == True)`. If the column is float/int (e.g. 1.0), astype(str) gives '1.0' which is NOT in the set, and `== True` is False for 1.0 in pandas object comparison in some dtypes — so a deleted flag stored as numeric 1.0 may be missed, undercounting files_deleted and inflating files_out/hours_out in the audit report. Unit/type fragility in reported metrics.",
+      "severity": "low"
+    },
+    {
+      "title": "PeriodicCsvMerger time-based flush can never fire if row count never grows past last flush but seconds elapse with equal count",
+      "location": "src/utils/csv_manager.py:880-884",
+      "description": "The seconds branch requires `current_rows > self._last_flushed_rows`. After a row-threshold flush sets _last_flushed_rows=current_rows, if workers stop producing (stage tail) the time-based flush will never fire even though there could be unmerged rows that arrived between the count snapshot and the flush (read_partial_csvs at flush time may include more rows than the count used to gate). Minor: the final absorb covers it, but periodic freshness silently stalls at the tail. Logic slightly inconsistent (gates on a count taken before the flush read).",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "Reusable timing/logging hooks already present: (1) distillmos_process.py:186/220 uses time.perf_counter() around the per-worker shard loop and logs 'Finished N shard(s) in Xs' (logger.success) — a ready per-worker throughput probe; the same pattern exists in the other worker stages. (2) csv_manager._read_csv_safe logs 'Reading CSV ...' / 'Read N rows' (132-134) and read_partial_csvs/_write_csv_with_progress wrap work in named tqdm bars (desc='write_<name>', 'read_<prefix>_partials', 'normalize_filepath', 'check_existing_files', 'resolve_<col>_paths', 'filter_pending_<col>') — these tqdm descs give free per-phase wall-clock and rate readouts you can scrape from logs to attribute time. (3) PeriodicCsvMerger logs 'balalaika.csv refreshed: N rows ... folded in' (897) and announces its cadence at __enter__ (910) — use these to count how many full-CSV rewrites a stage triggers. (4) prepare_work_shards / prepare_length_bucketed_work_shards log shard counts + item counts (145, 216) for work-distribution sanity. (5) unprocessed_paths logs 'N done, M pending out of K' (487) — good for verifying resume/skip accounting. (6) record_stage_summary (audit.py:81) emits '[audit] stage: in->out files, Xh->Yh' per stage into filter_summary.csv, which is the canonical place to read end-to-end stage retention. There is no PYTHONPROFILE / cProfile harness and no DEBUG env-gated timing; the loguru DEBUG level (BALALAIKA_LOG_LEVEL via runtime_env) can be lowered to surface PartialCsvWriter header-drift debug logs but adds no timing. Recommend wrapping atomic_write_csv and upsert_columns with perf_counter logging at INFO to directly measure the dominant CSV-rewrite cost during benchmarking."
+}

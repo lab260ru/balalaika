@@ -31,6 +31,143 @@ def path_exists(path: Path, *, missing_on_too_long: bool, label: str = "Sidecar"
         raise
 
 
+class DirNameCache:
+    """Existence checks backed by one scandir per directory.
+
+    Equivalent to ``os.path.exists`` per path but O(#directories) syscalls
+    instead of O(#paths) — pending-work scans over millions of sidecars do
+    two existence probes per audio file, which this collapses to dictionary
+    lookups. Dangling symlinks are verified with a real ``exists`` so they
+    still read as missing. A name whose byte length exceeds the directory's
+    ``NAME_MAX`` can never appear in a directory listing, so — matching the
+    old per-file helpers that caught the ``ENAMETOOLONG`` ``OSError`` —
+    :meth:`exists` / :meth:`sidecar_complete` treat such outputs as already
+    complete (skip once, forever) and warn once per offending name, instead
+    of marking the file pending every run and looping on the even-longer
+    ``.tmp`` write.
+
+    Sizes (for the ``retry_empty`` zero-byte rule of stage 7) are available
+    via :meth:`sidecar_complete` / :meth:`size`. A size is fetched with one
+    targeted ``os.stat`` the first time it is asked for and then memoised — a
+    *targeted* stat rather than a second whole-directory scandir, because only
+    the handful of sidecars that actually exist (and are ``.txt``) ever need a
+    size, so a full scandir-stat pass would stat far more entries than the old
+    per-file logic did. ``os.stat`` follows symlinks, so a 0-byte symlink
+    target still reads as empty, matching ``Path.stat().st_size``.
+
+    Not picklable/shareable across processes — every process (e.g. a spawned
+    ROVER worker) must build its own; the per-directory scandir still
+    amortizes across all the files a shard touches in that directory.
+    """
+
+    _MISSING = object()
+    _DEFAULT_NAME_MAX = 255
+
+    def __init__(self) -> None:
+        self._names: dict[str, set[str]] = {}
+        # path -> st_size (or _MISSING sentinel); memoised on first size() ask
+        self._sizes: dict[str, object] = {}
+        # dir -> PC_NAME_MAX byte budget; memoised on first too-long check
+        self._name_max: dict[str, int] = {}
+        # offending names already warned about, so each is logged only once
+        self._warned_too_long: set[str] = set()
+
+    def _dir_names(self, d: str) -> set[str]:
+        import os
+
+        cached = self._names.get(d)
+        if cached is not None:
+            return cached
+        present: set[str] = set()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            if os.path.exists(entry.path):
+                                present.add(entry.name)
+                        else:
+                            present.add(entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        self._names[d] = present
+        return present
+
+    def _name_too_long(self, d: str, name: str) -> bool:
+        """Whether ``name``'s byte length exceeds directory ``d``'s NAME_MAX.
+
+        Such a name can never appear in ``d``'s listing, so an existence
+        probe would always read as missing; the caller treats it as complete
+        (skip) instead, matching the old ENAMETOOLONG handling. Warns once
+        per offending name.
+        """
+        import os
+
+        limit = self._name_max.get(d)
+        if limit is None:
+            try:
+                limit = os.pathconf(d, "PC_NAME_MAX")
+            except (OSError, ValueError, AttributeError):
+                limit = self._DEFAULT_NAME_MAX
+            self._name_max[d] = limit
+        if len(os.fsencode(name)) <= limit:
+            return False
+        full = os.path.join(d, name)
+        if full not in self._warned_too_long:
+            self._warned_too_long.add(full)
+            logger.warning(f"Sidecar name exceeds NAME_MAX; treating as complete / skipping: {full}")
+        return True
+
+    def exists(self, path: Path | str) -> bool:
+        import os
+
+        d, name = os.path.split(str(path))
+        if self._name_too_long(d, name):
+            return True
+        return name in self._dir_names(d)
+
+    def size(self, path: Path | str) -> int | None:
+        """Cached ``st_size`` for ``path``, or ``None`` if it does not exist.
+
+        Uses one targeted, memoised ``os.stat`` per distinct path.
+        """
+        import os
+
+        key = str(path)
+        cached = self._sizes.get(key, self._MISSING)
+        if cached is not self._MISSING:
+            return cached  # type: ignore[return-value]
+        try:
+            value: int | None = os.stat(key).st_size
+        except OSError:
+            value = None
+        self._sizes[key] = value
+        return value
+
+    def sidecar_complete(self, path: Path | str, *, retry_empty: bool = False) -> bool:
+        """Cache-backed equivalent of :func:`text_sidecar_complete`.
+
+        A sidecar is "complete" (already done, skip it) iff it exists AND
+        (``retry_empty`` is off, or its suffix isn't ``.txt``, or its size is
+        non-zero). Only consults sizes when ``retry_empty`` would otherwise
+        apply, so the size pass is skipped entirely for callers that never
+        retry empties.
+        """
+        import os
+
+        p = path if isinstance(path, Path) else Path(path)
+        d, name = os.path.split(str(p))
+        if self._name_too_long(d, name):
+            return True
+        if not self.exists(p):
+            return False
+        if retry_empty and p.suffix == ".txt":
+            return (self.size(p) or 0) != 0
+        return True
+
+
 def text_sidecar_complete(path: Path, *, retry_empty: bool = False, label: str = "Sidecar") -> bool:
     """Return whether a text sidecar should be treated as already complete.
 
@@ -72,12 +209,13 @@ def pending(
     on disk are excluded too — useful for stages chained off a previous
     stage's sidecar (so a deleted upstream file doesn't reappear as work).
     """
+    cache = DirNameCache()
     out: List[Path] = []
     for raw in inputs:
         p = Path(raw)
-        if require_input_exists and not path_exists(p, missing_on_too_long=True):
+        if require_input_exists and not cache.exists(p):
             continue
-        if not path_exists(derive_output(p), missing_on_too_long=False):
+        if not cache.exists(derive_output(p)):
             out.append(p)
     return out
 
@@ -99,13 +237,14 @@ def pending_audio_to_sidecar(
         if config_path
         else get_audio_paths(str(podcasts_path))
     )
+    cache = DirNameCache()
     pendings: List[Path] = []
     for a in audio:
         a = Path(a)
         in_path = with_suffix_at_stem(a, in_suffix)
-        if not path_exists(in_path, missing_on_too_long=True):
+        if not cache.exists(in_path):
             continue
-        if path_exists(with_suffix_at_stem(a, out_suffix), missing_on_too_long=False):
+        if cache.exists(with_suffix_at_stem(a, out_suffix)):
             continue
         pendings.append(in_path)
     return pendings

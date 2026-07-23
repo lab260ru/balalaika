@@ -15,19 +15,23 @@ The main entrypoint is `base.sh`. It runs numbered stages from
 | 1 | `src.preprocess.preprocess` | Sortformer diarization, Smart Turn refinement, chunk export. |
 | 2 | `src.preprocess.crest_factor_remover` | Crest-factor filtering. |
 | 3 | `src.preprocess.preprocess_audio` | Loudness normalization. |
-| 4 | `src.separation.music_detect` | Music probability filtering. |
+| 3.5 | `src.preprocess.tail_score` | Tail-clipping signal scoring (`tail_db`, `trailing_silence_ms` — SPEC_drop_criteria.md; score-only backfill for trees not cut by the smart stage-1 path). |
+| 4 | `src.separation.music_detect` | Music probability scoring. |
+| 4.5 | `src.separation.music_detect_filter` | Music-prob threshold filtering. |
 | 5 | `src.separation.distillmos_process` | DistillMOS quality scoring. |
 | 5.5 | `src.separation.distillmos_filter` | DistillMOS threshold filtering. |
 | 6 | `src.separation.antispoofing` | Store raw Spectra-0 class scores. |
 | 6.5 | `src.separation.antispoofing_filter` | Filter by spoof-vs-bonafide score margin. |
-| 7 | `src.transcription.transcription` | ASR with `onnx-asr` and optional ROVER. |
-| 8 | `src.punctuation.punctuation` | Punctuation restoration. |
-| 9 | `src.accents.accents` | Accent restoration. |
-| 10 | `src.phonemizer.phonemizer` | G2P / phonemization. |
-| 11 | `src.denoising.denoising` | ONNX Runtime / TensorRT denoising / speech enhancement. |
-| 12 | `src.collate` | Merge sidecars into parquet. |
-| 13 | `src.to_webdataset` | Export WebDataset shards. |
-| 14 | `src.report` | Build filter report. |
+| 7 | `src.separation.tts_suitability` | Store raw TTS-suitability not_tts/tts logits. |
+| 7.5 | `src.separation.tts_suitability_filter` | Filter by not_tts-vs-tts logit margin. |
+| 8 | `src.transcription.transcription` | ASR with `onnx-asr` and optional ROVER. |
+| 9 | `src.punctuation.punctuation` | Punctuation restoration. |
+| 10 | `src.accents.accents` | Accent restoration. |
+| 11 | `src.phonemizer.phonemizer` | G2P / phonemization. |
+| 12 | `src.denoising.denoising` | ONNX Runtime / TensorRT denoising / speech enhancement. |
+| 13 | `src.collate` | Merge sidecars into parquet. |
+| 14 | `src.to_webdataset` | Export WebDataset shards. |
+| 15 | `src.report` | Build filter report. |
 
 Run a single stage:
 
@@ -41,7 +45,7 @@ Run from a checkpoint:
 bash base.sh --config_path configs/config.yaml --stage 4
 ```
 
-By default, `base.sh` runs stages 11..14. Use `--stage 1 --stop_stage 14`
+By default, `base.sh` runs stages 12..15. Use `--stage 1 --stop_stage 15`
 to run the full local pipeline from preprocessing through the final report. Use
 `--strict` when the orchestrator should abort after any stage writes a status
 file with non-zero errors.
@@ -290,22 +294,28 @@ For ONNX Runtime stages, build providers through
 `src.utils.gpu.get_onnx_providers(...)` so CUDA/TensorRT cache behavior stays
 consistent across the project.
 
-## CSV State And Resume Logic
+## State And Resume Logic
 
 Long-running stages should be resumable. Use `src.utils.csv_manager` instead of
-hand-writing CSV merge logic.
+hand-writing state merge logic. Pipeline state lives **only** in
+`balalaika.parquet` (CSV state was removed); the per-worker `*_part_*.csv`
+partials are transient and deleted after they are folded in.
 
 Important helpers:
 
 - `discover_audio_paths(podcasts_path)`: scan the audio tree.
-- `ensure_main_csv(podcasts_path, audio_paths=...)`: create/load
-  `balalaika.csv`.
+- `ensure_main_csv(podcasts_path, audio_paths=...)`: create/load the
+  `balalaika.parquet` state.
 - `unprocessed_paths(podcasts_path, column, audio_paths)`: skip already scored
   files.
 - `PartialCsvWriter(...)`: stream worker results to
   `<prefix>_part_<rank>.csv`.
-- `absorb_partial_csvs(...)`: merge partials into `balalaika.csv`.
+- `absorb_partial_csvs(...)`: merge partials into the parquet state and delete them.
 - `upsert_columns(...)`: atomically merge result columns by `filepath`.
+
+For per-chunk **text** outputs (stages 8–11), do not write `.txt` sidecars —
+use `src.utils.chunk_json` (`update_chunk_json` / `pending_chunks` /
+`ChunkJsonCache`) so each chunk has a single `<stem>.json`.
 
 For stages that write one value per file, use this flow:
 
@@ -351,16 +361,17 @@ For filtering stages that delete files, pass `drop_missing_files=True` when
 absorbing or upserting results.
 
 If a filter consumes a score produced by a previous stage, follow
-`src/separation/distillmos_filter.py`: read `balalaika.csv`, preview the effect
-of the threshold, delete in workers, write partial CSV rows with enough metadata
-to audit the decision, then merge/prune the main CSV.
+`src/separation/distillmos_filter.py`: read the `balalaika.parquet` state,
+preview the effect of the threshold, delete in workers, write partial CSV rows
+with enough metadata to audit the decision, then merge/prune the state.
 
 ## Avoid Full Tree Scans When Possible
 
 `get_audio_paths()` is the raw recursive filesystem scan.
-`discover_audio_paths()` follows `runtime.audio_paths_source`: `csv` trusts
-`balalaika.csv`, `rglob` forces a scan, and `auto` prefers CSV with a scan
-fallback. On very large datasets, prefer `csv` after `balalaika.csv` exists.
+`discover_audio_paths()` follows `runtime.audio_paths_source`: `csv` trusts the
+`balalaika.parquet` state (the option name is historical), `rglob` forces a scan,
+and `auto` prefers the state with a scan fallback. On very large datasets, prefer
+`csv` once the state file exists.
 
 Do not pass multi-million-item path lists into `mp.spawn` / `mp.Process`. Use
 `src.utils.work_shards.prepare_work_shards()` in the parent, pass only the
@@ -399,8 +410,10 @@ Use it when a stage changes:
 - filtering decisions,
 - quality thresholds.
 
-Current audit-producing stages include `preprocess`, `crest_factor`,
-`music_detect`, and `distillmos_filter`.
+Current audit-producing stages include `preprocess`, `crest_factor`, and the
+filter stages `music_detect_filter`, `distillmos_filter`, `antispoofing_filter`,
+`tts_suitability_filter` (a scoring stage with `inline_filter: true` records the
+matching filter row itself, in its scoring pass).
 
 Example:
 
@@ -423,7 +436,8 @@ record_stage_summary(
 2. Add a config section or subsection in `configs/config.yaml`.
 3. Put Dataset/DataLoader code in `src/utils/datasets/<area>.py`.
 4. Use `setup_logging(...)` and `load_config(...)`.
-5. Use `csv_manager` helpers for `balalaika.csv` state.
+5. Use `csv_manager` helpers for `balalaika.parquet` state (and `chunk_json` for
+   per-chunk text outputs).
 6. Use one process per GPU for GPU-heavy models.
 7. Add the stage to `base.sh` if it should be part of the main pipeline.
 8. Add or update a `*_yaml.sh` wrapper if users need a direct stage script.
@@ -447,8 +461,9 @@ record_stage_summary(
 - Do not share global model objects across GPU threads.
 - Do not assume CPU-only execution is supported for GPU stages.
 - Do not silently skip model path errors.
-- Do not rewrite `balalaika.csv` manually; use `csv_manager`.
-- Do not force full filesystem scans when `balalaika.csv` already contains the
+- Do not rewrite `balalaika.parquet` manually; use `csv_manager`.
+- Do not write `.txt` text sidecars; use `chunk_json` (`<stem>.json`).
+- Do not force full filesystem scans when `balalaika.parquet` already contains the
   file list.
 
 ## Current Audio Stack

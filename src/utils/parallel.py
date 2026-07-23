@@ -17,12 +17,15 @@ stage can finalize state (merge partials, etc.).
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 import torch
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from loguru import logger
 from tqdm import tqdm
+
+from src.utils.stage_status import last_line
 
 
 
@@ -60,7 +63,9 @@ def run_per_gpu_pool(
         desc: Tqdm description.
 
     Returns:
-        Number of items that completed successfully.
+        A ``(error_count, error_details)`` tuple: the number of items whose
+        ``work_fn`` raised, and a list of ``{"item", "reason"}`` dicts (one per
+        failure).
     """
     if gpu_ids is None:
         gpu_ids = list(range(torch.cuda.device_count()))
@@ -68,12 +73,11 @@ def run_per_gpu_pool(
     if not gpu_ids:
         raise RuntimeError("No GPUs available; refusing to run a per-GPU pool.")
     if not items:
-        return 0, [], []
+        return 0, []
 
     shards = shard_round_robin(items, len(gpu_ids))
     executors: List[ProcessPoolExecutor] = []
-    futures: List = []
-    completed = 0
+    future_to_item: dict = {}
     error_count = 0
     error_details: list[dict] = []
 
@@ -93,18 +97,116 @@ def run_per_gpu_pool(
             )
             executors.append(ex)
             for item in chunk:
-                futures.append(ex.submit(work_fn, item))
+                future_to_item[ex.submit(work_fn, item)] = item
 
-        with tqdm(total=len(futures), desc=desc) as bar:
-            for fut in as_completed(futures):
+        with tqdm(total=len(future_to_item), desc=desc) as bar:
+            for fut in as_completed(future_to_item):
                 try:
                     fut.result()
-                    completed += 1
                 except Exception as exc:
-                    logger.error(f"{desc}: task failed: {exc}")
+                    item = future_to_item[fut]
+                    logger.error(f"{desc}: task failed for {item}: {exc}")
                     error_count += 1
-                    error_details.append({"item": str(item), "reason": str(exc)})
+                    error_details.append({"item": str(item), "reason": last_line(exc)})
                 bar.update(1)
+    except KeyboardInterrupt:
+        logger.warning(f"{desc}: interrupted by user; shutting down workers...")
+    finally:
+        for ex in executors:
+            ex.shutdown(wait=True, cancel_futures=True)
+
+    return error_count, error_details
+
+
+def _chunk_list(items: Sequence[Any], chunk_size: int) -> List[List[Any]]:
+    """Split ``items`` into consecutive chunks of at most ``chunk_size``."""
+    n = max(1, int(chunk_size))
+    return [list(items[i : i + n]) for i in range(0, len(items), n)]
+
+
+def run_per_gpu_pool_chunked(
+    items: Sequence[Any],
+    *,
+    work_fn: Callable[[List[Any]], Sequence[dict]],
+    initializer: Callable[..., None],
+    init_args_factory: Callable[[int], Tuple[Any, ...]],
+    chunk_size: int,
+    num_workers_per_gpu: int = 1,
+    gpu_ids: Optional[Sequence[int]] = None,
+    desc: str = "Progress",
+) -> tuple[int, list[dict]]:
+    """Like :func:`run_per_gpu_pool`, but submit work in **chunks** (slabs).
+
+    Instead of one :class:`~concurrent.futures.Future` per item (O(N) Futures
+    and one IPC pickle per item — real RAM/CPU at millions of files), this
+    round-robins ``items`` across GPUs, splits each GPU's shard into
+    ``chunk_size`` slabs, and submits ONE future per slab.  ``work_fn`` receives
+    the whole slab (a ``list``) so the worker can batch model calls across it.
+
+    ``work_fn`` must return a sequence of ``{"item", "reason"}`` dicts, one per
+    item in the slab that FAILED (empty when all succeeded).  Keeping fault
+    isolation inside the worker means a single bad file never fails its
+    slab-mates, matching the per-file ``try/except`` of the old stages.
+
+    Returns the same ``(error_count, error_details)`` 2-tuple as
+    :func:`run_per_gpu_pool`.
+    """
+    if gpu_ids is None:
+        gpu_ids = list(range(torch.cuda.device_count()))
+    gpu_ids = list(gpu_ids)
+    if not gpu_ids:
+        raise RuntimeError("No GPUs available; refusing to run a per-GPU pool.")
+    if not items:
+        return 0, []
+
+    shards = shard_round_robin(items, len(gpu_ids))
+    executors: List[ProcessPoolExecutor] = []
+    future_to_chunk: dict = {}
+    error_count = 0
+    error_details: list[dict] = []
+    total_items = len(items)
+
+    try:
+        for slot, gpu_id in enumerate(gpu_ids):
+            shard = shards[slot]
+            if not shard:
+                continue
+            chunks = _chunk_list(shard, chunk_size)
+            logger.info(
+                f"{desc}: launching {num_workers_per_gpu} workers on GPU {gpu_id} "
+                f"for {len(shard)} items in {len(chunks)} chunk(s)."
+            )
+            ex = ProcessPoolExecutor(
+                max_workers=num_workers_per_gpu,
+                initializer=initializer,
+                initargs=init_args_factory(gpu_id),
+            )
+            executors.append(ex)
+            for chunk in chunks:
+                future_to_chunk[ex.submit(work_fn, chunk)] = chunk
+
+        with tqdm(total=total_items, desc=desc) as bar:
+            for fut in as_completed(future_to_chunk):
+                chunk = future_to_chunk[fut]
+                try:
+                    failures = fut.result() or []
+                    for fail in failures:
+                        error_count += 1
+                        error_details.append(
+                            {
+                                "item": str(fail.get("item")),
+                                "reason": last_line(fail.get("reason")),
+                            }
+                        )
+                except Exception as exc:
+                    # The whole slab crashed (e.g. the worker process died):
+                    # attribute the failure to every item in the slab so the
+                    # count is honest rather than silently dropping work.
+                    logger.error(f"{desc}: chunk of {len(chunk)} failed: {exc}")
+                    for item in chunk:
+                        error_count += 1
+                        error_details.append({"item": str(item), "reason": last_line(exc)})
+                bar.update(len(chunk))
     except KeyboardInterrupt:
         logger.warning(f"{desc}: interrupted by user; shutting down workers...")
     finally:
@@ -119,6 +221,10 @@ def run_per_gpu_processes(
     num_gpus: int,
     args: tuple = (),
     join: bool = True,
+    *,
+    progress_counter=None,
+    progress_total: Optional[int] = None,
+    progress_desc: str = "GPU workers",
 ) -> tuple[int, list[dict]]:
     """Spawn exactly one :class:`multiprocessing.Process` per GPU.
 
@@ -136,6 +242,11 @@ def run_per_gpu_processes(
     processes: List[mp.Process] = []
     error_count = 0
     error_details: list[dict] = []
+    progress_start = (
+        int(progress_counter.value)
+        if progress_counter is not None and progress_total is not None
+        else 0
+    )
 
     try:
         for gpu_id in range(num_gpus):
@@ -151,8 +262,27 @@ def run_per_gpu_processes(
         if not join:
             return 0, []
 
+        progress_bar = (
+            tqdm(total=progress_total, desc=progress_desc, unit="result")
+            if progress_counter is not None and progress_total is not None
+            else None
+        )
+        while any(proc.is_alive() for proc in processes):
+            if progress_bar is not None:
+                completed = max(0, int(progress_counter.value) - progress_start)
+                progress_bar.n = min(completed, progress_total)
+                progress_bar.refresh()
+            for proc in processes:
+                proc.join(timeout=0.2)
+            time.sleep(0.05)
+
+        if progress_bar is not None:
+            completed = max(0, int(progress_counter.value) - progress_start)
+            progress_bar.n = min(completed, progress_total)
+            progress_bar.refresh()
+            progress_bar.close()
+
         for proc in processes:
-            proc.join()
             if proc.exitcode not in (0, None):
                 logger.error(f"{proc.name} exited with code {proc.exitcode}")
                 error_count += 1
@@ -173,4 +303,3 @@ def run_per_gpu_processes(
         raise
 
     return error_count, error_details
-

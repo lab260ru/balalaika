@@ -17,20 +17,31 @@ def build_runtime_library_paths() -> List[str]:
     nvidia_root = site_packages / "nvidia"
 
     library_dirs: List[Path] = []
-    for candidate in [
+    # The CUDA 12 wheels (e.g. torch 2.8 cu128) lay each component out under
+    # nvidia/<component>/lib. Older single-tree wheels used nvidia/cuXX/lib
+    # instead. Probe both layouts and keep whatever exists so the harness works
+    # regardless of which packaging the active venv uses. base.sh's
+    # activate_venv exports the same per-component dirs.
+    candidates = [
         nvidia_root / "cu13" / "lib",
+        nvidia_root / "cu12" / "lib",
         nvidia_root / "cublas" / "lib",
         nvidia_root / "cudnn" / "lib",
         nvidia_root / "cuda_runtime" / "lib",
+        nvidia_root / "cuda_cupti" / "lib",
         nvidia_root / "cuda_nvrtc" / "lib",
         nvidia_root / "cufft" / "lib",
+        nvidia_root / "cufile" / "lib",
+        nvidia_root / "curand" / "lib",
         nvidia_root / "nvjitlink" / "lib",
+        nvidia_root / "nvtx" / "lib",
         nvidia_root / "cusolver" / "lib",
         nvidia_root / "cusparse" / "lib",
         nvidia_root / "cusparselt" / "lib",
         nvidia_root / "nccl" / "lib",
         site_packages / "tensorrt_libs",
-    ]:
+    ]
+    for candidate in candidates:
         if candidate.exists():
             library_dirs.append(candidate)
 

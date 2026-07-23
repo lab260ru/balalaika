@@ -1,0 +1,281 @@
+{
+  "area": "denoising-export",
+  "data_flow": "DENOISING (src/denoising/denoising.py): main() resolves podcasts_path, picks num_processes = min(configured, visible GPUs) (or GPU count). It calls discover_audio_paths (reads filepath column from balalaika.csv, or rglob), ensure_main_csv, absorb_partial_csvs (folds leftover denoising_part_*.csv into the main CSV via a full read+merge+atomic rewrite), then unprocessed_paths (loads the WHOLE main CSV to find rows where 'denoised' is null). It probes durations (ensure_audio_durations -> cached total_duration column, missing ones probed with torchaudio.info), then prepare_length_bucketed_work_shards writes on-disk shard files grouped by duration bucket. run_per_gpu_processes spawns one process per GPU; a PeriodicCsvMerger daemon thread folds partials into balalaika.csv every flush_every_rows/seconds. Each worker (run_worker) builds an ORT session (TensorRT-first), then loops: claim_work_shard (rename), read_work_shard (list of paths), _process_files. A DataLoader (DenoisingDataset) decodes each file with torchaudio.load_with_torchcodec, downmixes to mono, resamples to 48k if needed, PEAK-normalizes to int16 (normalize_to_int16), returns int16 tensor + length. denoising_collate pads the batch to next multiple of 384 with RMS-matched gaussian noise, stacks to (B,1,T) int16. Worker converts to float32 (still in int16 numeric range ±32767), runs ORT, clips to ±32767, trims to original length, divides by 32768 to get float waveform, writes back in place with torchaudio.save_with_torchcodec (48k), and writes one partial-CSV row (flush after every row). Shard marked done on completion. COLLATE (src/collate.py): loads balalaika.csv, drops text columns, then a ThreadPoolExecutor(num_workers) reads per-file sidecar .txt/.tst files (read_file_content) for every audio row, builds a results DataFrame, pd.merge with main df, computes asr_consistency via df.apply(axis=1), writes balalaika.parquet. TO_WEBDATASET (src/to_webdataset.py): load_metadata reads balalaika.csv into a per-stem dict (df.iterrows()), discover_audio_paths, splits into num_workers contiguous chunks, ProcessPoolExecutor runs worker_fn per chunk; each worker reads each audio file bytes, globs sibling sidecars (parent_dir.glob twice per file), serializes JSON, writes to wds.ShardWriter tar. REPORT (src/report.py): reads filter_summary.csv, streams balalaika.parquet (iter_batches) or balalaika.csv to compute per-column missing counts, renders Markdown.",
+  "operations": [
+    {
+      "name": "discover_audio_paths (denoising main)",
+      "what": "Reads filepath column from balalaika.csv or rglob; _dedupe_paths normalizes every path (Path.is_absolute fast path) and rglobs by extension. denoising.py:404 -> csv_manager.py:1054/1027/1046",
+      "cost": "moderate"
+    },
+    {
+      "name": "ensure_main_csv",
+      "what": "Full read of balalaika.csv under fcntl lock; on corruption restores from .bak; may atomic-rewrite. denoising.py:409 -> csv_manager.py:275",
+      "cost": "moderate"
+    },
+    {
+      "name": "absorb_partial_csvs (pre-run + post-run)",
+      "what": "read_partial_csvs (concat all denoising_part_*.csv) then upsert_columns: full read of main CSV, outer merge, backup-copy + chunked rewrite + fsync of the ENTIRE main CSV. Run twice per stage invocation. denoising.py:411,487 -> csv_manager.py:556,333",
+      "cost": "heavy"
+    },
+    {
+      "name": "unprocessed_paths",
+      "what": "load_main_csv (full CSV read + normalize_filepath_column over all rows with tqdm), builds done-set, filters pending list. denoising.py:423 -> csv_manager.py:444",
+      "cost": "heavy"
+    },
+    {
+      "name": "ensure_audio_durations",
+      "what": "Reads filepath+total_duration cols from CSV; missing durations probed via ProcessPoolExecutor(torchaudio.info). If any probed, upsert_columns rewrites whole CSV again. denoising.py:433 -> audio_durations.py:121",
+      "cost": "moderate"
+    },
+    {
+      "name": "prepare_length_bucketed_work_shards",
+      "what": "Buckets pending paths by duration, sorts each bucket, writes shard files to disk. denoising.py:442 -> work_shards.py:152",
+      "cost": "light"
+    },
+    {
+      "name": "PeriodicCsvMerger background thread",
+      "what": "Every poll_interval counts partial rows (byte newline count) and on threshold does a full _flush_once = read all partials + full-CSV upsert rewrite. denoising.py:467 -> csv_manager.py:789",
+      "cost": "moderate"
+    },
+    {
+      "name": "create_session (per worker)",
+      "what": "Builds a CPU probe InferenceSession JUST to read the input name, deletes it, then builds the real TRT/CUDA session. Two session constructions; TRT engine build on first run is very slow (minutes) unless cached. denoising.py:144-173",
+      "cost": "heavy"
+    },
+    {
+      "name": "DataLoader decode per file",
+      "what": "torchaudio.load_with_torchcodec full decode, mono downmix, conditional resample to 48k, peak-normalize to int16, numpy round-trip. datasets/denoising.py:47-69",
+      "cost": "heavy"
+    },
+    {
+      "name": "denoising_collate",
+      "what": "Pads each item to batch max rounded to multiple of 384; for noise pad mode computes RMS of tail and fills with torch.randn per item (Python loop over batch). datasets/denoising.py:78-104",
+      "cost": "moderate"
+    },
+    {
+      "name": "ORT inference",
+      "what": "session.run on (B,1,T) float32; batch_size default 2, padded to bucket max. Timed via perf debug log. denoising.py:255",
+      "cost": "dominant"
+    },
+    {
+      "name": "per-item save",
+      "what": "clip + /32768 + torch.from_numpy + torchaudio.save_with_torchcodec per file (re-encode 48k), individually. denoising.py:276-290",
+      "cost": "heavy"
+    },
+    {
+      "name": "PartialCsvWriter.write + flush",
+      "what": "csv.DictWriter.writerow + file.flush() after EVERY denoised file. denoising.py:297 -> csv_manager.py:652",
+      "cost": "light"
+    },
+    {
+      "name": "collate sidecar read",
+      "what": "ThreadPoolExecutor(num_workers=32 default) submits one task per audio row, each opening N sidecar files (one per ASR model + 4). GIL-bound + open() storms. collate.py:198-211,147-158",
+      "cost": "heavy"
+    },
+    {
+      "name": "collate asr_consistency apply",
+      "what": "df.apply(axis=1) Python row loop computing transcript agreement; O(rows * models). collate.py:136-140,101-116",
+      "cost": "moderate"
+    },
+    {
+      "name": "collate parquet write",
+      "what": "pd.merge then to_parquet single-shot in memory. collate.py:219-223",
+      "cost": "moderate"
+    },
+    {
+      "name": "to_webdataset load_metadata",
+      "what": "Reads whole CSV, df.iterrows() building a python dict keyed by stem; row.to_dict() per row. to_webdataset.py:43-68",
+      "cost": "moderate"
+    },
+    {
+      "name": "to_webdataset metadata_dict pickling",
+      "what": "Entire metadata_dict passed to every ProcessPoolExecutor worker -> pickled and copied once per process (RAM blowup on low-RAM node). to_webdataset.py:184-188",
+      "cost": "heavy"
+    },
+    {
+      "name": "to_webdataset per-file sibling glob",
+      "what": "Two parent_dir.glob() calls PER audio file to find sidecars, plus read_bytes of audio + read_text of each sibling, then tar write. to_webdataset.py:111-147",
+      "cost": "heavy"
+    },
+    {
+      "name": "report missing summary",
+      "what": "Streams parquet via iter_batches (good) or full CSV row loop; light relative to pipeline. report.py:81-119",
+      "cost": "light"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Eliminate the throwaway CPU probe InferenceSession used only to read the input name",
+      "location": "src/denoising/denoising.py:160-166",
+      "description": "create_session builds a full CPUExecutionProvider InferenceSession (graph optimization ORT_ENABLE_ALL) purely to call get_inputs()[0].name, then deletes it and builds the real session. The input name can be obtained from the real session after construction, or with onnx.load + cheap graph inspection, or hardcoded from the model. This duplicates session init per worker (per GPU process), wasting CPU and memory and running full ORT graph optimization on CPU. Reorder: build the real session first, read input_name from it, then patch is not needed because TRT profile shapes need the name before building. Alternative: load model proto with onnx.load(model_path).graph.input[0].name (no session). On low-resource nodes this matters more (CPU/RAM contention with the other training job).",
+      "expected_gain": "Saves one full ORT session init + graph optimization per worker process (hundreds of ms to seconds, and transient RAM).",
+      "risk": "low",
+      "low_resource_note": "Bigger relative win on weak CPU/low-RAM nodes; no knob needed."
+    },
+    {
+      "title": "Batch all CSV partial writes / flush less often in denoising",
+      "location": "src/denoising/denoising.py:296-307; src/utils/csv_manager.py:652-663",
+      "description": "PartialCsvWriter.write does file.flush() after EVERY denoised file (one fsync-free flush, but still a syscall + python overhead per item). With small batches and many files this adds per-item IO latency on the SSD work disk. Buffer rows and flush every K rows or every batch (crash-tolerance is already coarse-grained by shards). Even simpler: flush once per batch in _process_files instead of per row.",
+      "expected_gain": "Removes one flush() syscall per processed file; small but compounds over millions of files.",
+      "risk": "low",
+      "low_resource_note": "Helps everywhere; the crash-resume guarantee weakens slightly (lose a partial batch on SIGKILL) — gate behind a config knob to keep per-row safety when desired."
+    },
+    {
+      "title": "Save denoised audio asynchronously / overlap save+encode with next-batch inference",
+      "location": "src/denoising/denoising.py:270-308",
+      "description": "After ORT returns, the worker loops over each output, builds a tensor, and calls torchaudio.save_with_torchcodec synchronously (re-encode + write to disk) for each file before fetching the next batch. The GPU sits idle during this CPU/IO-bound save loop. Offload saves to a ThreadPoolExecutor (encode+write releases the GIL in torchcodec/ffmpeg) so the main thread can pull the next DataLoader batch and launch the next inference. Same idea for the partial-CSV write.",
+      "expected_gain": "Can overlap heavy per-file re-encode/write with GPU inference; potentially 1.3-2x throughput when save dominates between small batches.",
+      "risk": "medium",
+      "low_resource_note": "On low-CPU nodes the save threads compete with DataLoader workers; expose a save_workers knob (default small, e.g. 2) and keep it 0/synchronous as fallback."
+    },
+    {
+      "title": "Increase denoising batch_size beyond 2 and right-size DataLoader prefetch",
+      "location": "src/denoising/denoising.py:189; configs/config.yaml:308-310",
+      "description": "batch_size default is 2 with num_workers 4 / prefetch 2. Length-bucketed shards already keep batch padding tight, so larger batches amortize the fixed ORT/TRT launch and Python overhead. The dynamic TRT opt profile is set to batch_size x 1 x 48000 (denoising.py:134) — so the engine is only optimal for the configured batch; bumping batch_size and rebuilding the engine should improve GPU utilization. Add an autotune step to pick the largest batch that fits the (shared, ~2-4GB free) VRAM.",
+      "expected_gain": "Higher GPU occupancy; 1.5-3x on the inference-dominant path for short clips.",
+      "risk": "medium",
+      "low_resource_note": "VRAM is shared with another job (~12-14GB used of 16GB) so batch must be tuned conservatively; needs a per-node batch_size knob (already exists) plus an autotuner."
+    },
+    {
+      "title": "Enable TRT fp16 / verify it is actually on for denoising",
+      "location": "src/denoising/denoising.py:117-141; src/utils/gpu.py:52-63; src/utils/runtime_env.py:39",
+      "description": "runtime.trt_fp16 defaults True and is passed via get_onnx_providers, but the model file configured is MossFormer2_SE_48K_dynamic_fp32.onnx (config.yaml:305) and add_denoising_trt_profile_options does NOT set trt_fp16_enable (only profile shapes + timing cache) — it relies on the base provider dict. Confirm fp16 is in effect (log the provider options) and consider an fp16 ONNX export to halve memory/bandwidth. Haswell host has no AVX-512 so CPU fallback would be slow; keep everything on GPU.",
+      "expected_gain": "fp16 TRT typically 1.5-2x vs fp32 and halves VRAM (critical given shared GPU).",
+      "risk": "medium",
+      "low_resource_note": "fp16 lowers VRAM pressure on the shared GPU — strongly beneficial; validate output SNR doesn't regress (denoising quality)."
+    },
+    {
+      "title": "Avoid two full balalaika.csv rewrites per denoising invocation (pre + post absorb)",
+      "location": "src/denoising/denoising.py:411-421,487-493; src/utils/csv_manager.py:333-441,210-226",
+      "description": "absorb_partial_csvs is called at start AND end, each doing upsert_columns which: reads the entire CSV, does a backup file COPY of the whole CSV (_copy_file_with_progress), does an outer merge, then chunked-writes the whole CSV + fsync. On a multi-million-row CSV this is the dominant non-GPU cost and pure IO. The pre-run absorb is only needed if leftover partials exist — guard it with a cheap list_partial_csvs() check before doing any CSV read/merge (read_partial_csvs already returns empty, but upsert still runs when bootstrap_audio_paths is passed). Also: the .bak full-file copy on every write is redundant given tmp+rename atomicity; make it opt-in.",
+      "expected_gain": "Removes one or two full-CSV read+copy+rewrite cycles per stage run; can save minutes and several GB of transient IO on large datasets.",
+      "risk": "medium",
+      "low_resource_note": "On low-RAM nodes the full-CSV pandas load is the OOM risk; skipping unneeded merges directly reduces peak RAM. Keep .bak behind a knob."
+    },
+    {
+      "title": "unprocessed_paths re-loads and re-normalizes the entire CSV every stage",
+      "location": "src/utils/csv_manager.py:444-491,245-254",
+      "description": "load_main_csv normalizes the filepath column for ALL rows (normalize_path_values with a tqdm loop and per-row Path() construction) even though CSV paths are already absolute. The is_absolute fast path helps, but constructing a Path object per row over millions of rows is still GIL-bound Python. Vectorize: use a pandas str.startswith('/') mask and only resolve the small set of non-absolute paths; skip building Path objects for the common case.",
+      "expected_gain": "Cuts a multi-million-iteration Python loop to a vectorized pandas op; seconds-to-minutes saved per stage start.",
+      "risk": "low",
+      "low_resource_note": "Pure CPU win; helps weak-CPU nodes most. No knob needed."
+    },
+    {
+      "title": "collate: replace per-file ThreadPool sidecar reads with bulk directory scan",
+      "location": "src/collate.py:147-158,198-211",
+      "description": "For every audio row, process_audio_file builds and open()s N sidecar paths (one per ASR model + accent/rover/punct/phonemes). With 32 threads this is GIL-bound and an open() storm (each read_file_content opens, reads, closes). Many sidecars won't exist (FileNotFoundError caught silently returns ''), so you pay a failed stat/open per missing sidecar. Better: scandir each unique parent directory once, build a set of existing sidecar names, then only open files that exist. Use a ProcessPool for true parallel IO+parse, or read sidecars with os.scandir + direct open keyed by stem.",
+      "expected_gain": "Eliminates millions of failed open() syscalls; 2-5x faster collate on datasets with sparse sidecars.",
+      "risk": "low",
+      "low_resource_note": "Lower syscall + thread overhead helps weak nodes; cap num_workers (default 32 is high for a low-CPU node) — add/respect a knob."
+    },
+    {
+      "title": "collate: vectorize asr_consistency instead of df.apply(axis=1)",
+      "location": "src/collate.py:119-144,101-116",
+      "description": "asr_consistency_percent runs per row via df.apply(axis=1), normalizing each transcript string and counting matches in Python for every row. This is O(rows*models) pure Python. Pre-normalize each ASR column once with vectorized pandas str ops (lower/split/join via .str), then compute row agreement with numpy/pandas (e.g. compare normalized columns pairwise or use mode counts). ",
+      "expected_gain": "Removes a full-DataFrame python row loop; 5-20x on the consistency computation.",
+      "risk": "medium",
+      "low_resource_note": "Vectorized version uses more transient memory for the normalized columns; on low-RAM nodes process in chunks. Validate identical output (NaN when <2 transcripts)."
+    },
+    {
+      "title": "to_webdataset: do not pickle the full metadata_dict to every worker",
+      "location": "src/to_webdataset.py:175,184-188,70",
+      "description": "metadata_dict (one entry per audio file, full row dict) is built in the parent then passed as an argument to every ProcessPoolExecutor worker, so it is pickled and copied into each of N processes. On the 31GB node this multiplies a large dict by num_workers and can OOM. Instead, have each worker read only the slice of the CSV it needs (chunk-local stems), or store metadata as a parquet/feather the workers memory-map, or use a shared read-only structure. Also load_metadata uses df.iterrows()+row.to_dict() (slowest pandas iteration) — use df.to_dict('records') or itertuples.",
+      "expected_gain": "Avoids N-way RAM duplication and large pickle/IPC cost at pool startup; prevents OOM and speeds worker spawn.",
+      "risk": "medium",
+      "low_resource_note": "Critical on the 31GB node — this is a likely OOM source; the fix directly reduces peak RAM. Default num_workers is 1 in config which sidesteps it, but any increase reintroduces the blowup."
+    },
+    {
+      "title": "to_webdataset: collapse the two per-file globs into one scandir",
+      "location": "src/to_webdataset.py:111-128",
+      "description": "For each audio file, worker_fn does parent_dir.glob(f'{key}_*') UNION parent_dir.glob(f'{key}.*') — two directory scans per file. In a directory with many files this is O(files_per_dir) per file => O(N^2) within a directory. Scan each parent directory once (os.scandir), group siblings by stem, and look them up. Also read_bytes of the audio plus read_text of each sibling are sync; could overlap with tar writes.",
+      "expected_gain": "Turns per-file directory rescans into one scan per directory; large win when many files share a directory.",
+      "risk": "low",
+      "low_resource_note": "Fewer syscalls helps weak nodes; no extra RAM. No knob needed."
+    },
+    {
+      "title": "DataLoader pin_memory=False and persistent_workers=False forfeit overlap",
+      "location": "src/utils/datasets/denoising.py:118-133",
+      "description": "pin_memory is False (input goes to ORT via numpy on CPU anyway, so pinning is moot for ORT CPU->GPU copy — but if you move to IOBinding/CUDA tensors it would matter). persistent_workers=False means the 4 DataLoader workers are re-spawned for EVERY shard (each _process_files call creates a fresh DataLoader). With many small shards this repeatedly pays worker fork + torchcodec/ffmpeg import cost. Reuse one DataLoader across shards within a worker, or set persistent_workers=True with a dataset that can be re-pointed, or process all claimed shards through one loader.",
+      "expected_gain": "Removes repeated worker process startup (import torch/torchaudio/torchcodec) per shard — seconds per shard saved with default 10k-row shards.",
+      "risk": "medium",
+      "low_resource_note": "persistent workers hold RAM between shards; on low-RAM nodes keep workers low (knob exists). Bigger win when shard count is high."
+    },
+    {
+      "title": "Use ORT IOBinding to keep input on GPU and avoid host->device copy per batch",
+      "location": "src/denoising/denoising.py:252-261",
+      "description": "input_np is a numpy float32 array copied to the device by ORT each run; output copied back to host. For a streaming pipeline you can pre-upload via IOBinding and bind output to a device buffer, reducing PCIe transfer overhead, especially with larger batches. Combined with feeding torch CUDA tensors (DLPack) avoids the numpy host round-trip done in the collate/worker.",
+      "expected_gain": "Reduces per-batch H2D/D2H copy overhead; 10-25% on transfer-bound short clips.",
+      "risk": "medium",
+      "low_resource_note": "IOBinding uses device memory for buffers — on the shared GPU keep buffers sized to the tuned batch; needs care, gate behind a knob."
+    },
+    {
+      "title": "Avoid int16 quantization round-trip in the denoising data path",
+      "location": "src/utils/datasets/denoising.py:16-19,61; src/denoising/denoising.py:253,281-284",
+      "description": "The dataset peak-normalizes float audio to int16 (lossy 16-bit quantization), the collate stacks int16, then the worker casts back to float32 in the ±32767 range and finally divides by 32768. The float->int16->float trip both loses precision and does extra casts/copies. If the model expects float waveforms (most SE models do), feed float32 directly (scaled to [-1,1]) and skip the int16 quantization and the /32768. This removes two dtype conversions and a numpy copy per item and improves quality.",
+      "expected_gain": "Removes per-item quantize + cast copies; modest CPU/memory-bandwidth win plus quality improvement.",
+      "risk": "high",
+      "low_resource_note": "Must confirm the ONNX model's expected input scale/dtype — changing it wrong corrupts all output. Validate against a reference before adopting."
+    },
+    {
+      "title": "report: stream CSV missing-summary with pandas/pyarrow instead of csv.DictReader row loop",
+      "location": "src/report.py:107-119",
+      "description": "_read_csv_missing_summary iterates every row with csv.DictReader and per-column str().strip() in Python. For a multi-million-row balalaika.csv this is slow. The parquet path already streams via iter_batches (good). For CSV, read in chunks with pandas and use vectorized isna()/eq('') counts. Report runs once so impact is bounded, but on huge CSVs it can still take minutes.",
+      "expected_gain": "Vectorized counting vs python row loop; minutes -> seconds on large CSV.",
+      "risk": "low",
+      "low_resource_note": "Chunked pandas read keeps RAM bounded on the 31GB node; choose a chunksize knob."
+    },
+    {
+      "title": "Make noise padding vectorized / avoid per-item torch.randn in collate",
+      "location": "src/utils/datasets/denoising.py:28-36,94-104",
+      "description": "denoising_collate loops over the batch in Python, computing tail RMS and calling torch.randn(pad_len) per item, then assigning. For batches with large padding this is per-item Python + RNG. Could vectorize RNG across the batch or precompute padding. Minor since batch_size is small (2), but grows with batch_size. Also make_noise_padding builds a new tensor even when pad_len is the full max.",
+      "expected_gain": "Small; scales with batch_size — relevant if batch_size is raised.",
+      "risk": "low",
+      "low_resource_note": "Negligible RAM; helps only when batches grow. No knob needed."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "max_padded_len default mismatch between caller and collate would silently truncate the TRT max profile",
+      "location": "src/utils/datasets/denoising.py:82,115 vs src/denoising/denoising.py:64,212",
+      "description": "denoising_collate and create_denoising_dataloader default max_padded_len=96_000, but the caller passes MODEL_MAX_PADDED_LEN=960_000 (10x larger) and the TRT max profile is built for 960_000 (denoising.py:135). The defaults are inconsistent (96k vs 960k). It is not a live bug because the caller always passes the value explicitly, but anyone calling create_denoising_dataloader with defaults gets a 96k cap that raises RuntimeError on the first >2s clip while the model/engine supports 20s. Dead/misleading defaults.",
+      "severity": "low"
+    },
+    {
+      "title": "to_webdataset ProcessPoolExecutor max_workers can exceed configured num_workers",
+      "location": "src/to_webdataset.py:177-178,184",
+      "description": "chunk_size = len(paths)//num_workers + 1 then chunks splits paths; ProcessPoolExecutor(max_workers=len(chunks)). When len(paths) is not divisible, len(chunks) can be num_workers OR num_workers (usually equal), but if num_workers > len(paths) the chunking yields len(paths) chunks (more processes than intended is bounded), and if num_workers==0 it was clamped to 1. The real issue: workers are sized to len(chunks) not num_workers, so the configured cap is not authoritative. Minor, but on a low-RAM node spawning len(chunks) processes each receiving the full metadata_dict can OOM unexpectedly.",
+      "severity": "medium"
+    },
+    {
+      "title": "asr_consistency mutates the caller's DataFrame in place via out = df",
+      "location": "src/collate.py:130-132",
+      "description": "add_asr_consistency_column sets out = df (no copy) then writes out[ASR_CONSISTENCY_COLUMN] = nan, mutating final_df directly. Harmless here since final_df is local, but the function signature implies it returns a new frame; the in-place write also triggers a SettingWithCopy-style assignment on a merge result. Low risk, but the 'return a transformed df' contract is misleading.",
+      "severity": "low"
+    },
+    {
+      "title": "Denoising errors_counter double-counts / shard not failed on batch error",
+      "location": "src/denoising/denoising.py:264-268",
+      "description": "On an ORT batch failure the code increments errors_counter by len(valid_indices) and continues to the next batch, but the shard is still marked done (mark_work_shard_done at denoising.py:378) after _process_files returns. Files in a failed batch are never written to the partial CSV (so denoised stays null) AND the shard is consumed/done, so on re-run they ARE picked up again by unprocessed_paths (good) — but the work-shard 'done' marker lies about completion. Not data loss, but the done/error accounting is inconsistent; a partially-failed shard reports done.",
+      "severity": "low"
+    },
+    {
+      "title": "PartialCsvWriter.already_done skips files whose batch failed, but resolves paths twice",
+      "location": "src/denoising/denoising.py:195,271",
+      "description": "_process_files calls resolve_path(path) (Path.resolve(), a filesystem stat) for the pre-skip check at line 195 AND again at line 271 for every successfully denoised file. resolve_path does real FS work (csv_manager.py:82-84) and is called per file twice. Use normalize_path_string (cheap, avoids stat for absolute paths) like the rest of csv_manager does. Performance bug, not correctness.",
+      "severity": "low"
+    },
+    {
+      "title": "normalize_to_int16 can overflow int16 on asymmetric peaks",
+      "location": "src/utils/datasets/denoising.py:16-19",
+      "description": "scale = 32767.0/max_abs maps peak to +32767, but negative samples at -max_abs map to -32767 (fine); however rounding via astype(int16) truncates toward zero, and any sample exactly at the peak after float rounding could reach 32767 — safe. The real subtlety: the model output is divided by 32768 (denoising.py:283) while input was scaled by 32767, an asymmetric scale factor introducing a tiny gain mismatch (32767/32768). Cosmetic, sub-LSB, but technically a unit inconsistency between encode (32767) and decode (32768).",
+      "severity": "low"
+    },
+    {
+      "title": "collate writes parquet but balalaika.csv text columns are dropped only from the CSV-load copy, not validated against sidecars",
+      "location": "src/collate.py:185-219",
+      "description": "If balalaika.csv already contains stale text columns AND sidecar files are missing, drop_csv_text_columns removes them from df, then merge with extracted_df (sidecar contents, possibly empty strings) — so previously-present text in the CSV is silently discarded and replaced by '' from read_file_content's FileNotFoundError path (utils.py:33-34). A missing sidecar becomes an empty string rather than NaN, which downstream missing-value reporting (report.py counts '' as missing — consistent) but the parquet stores '' not null. Behavioral, low severity.",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "Denoising has rich perf logging at logger.debug level that benchmarks can reuse directly (set BALALAIKA_LOG_LEVEL=DEBUG): 'perf dataloader_config' (denoising.py:215), 'perf dataloader_wait' per batch with seconds+items (denoising.py:227), 'perf model=denoising event=inference' with seconds/items/frames (denoising.py:256), 'perf audio_save' per file with seconds+frames (denoising.py:291), 'perf partial_write' per row (denoising.py:303). The dataset logs 'dataloader_audio_load dataset=denoising' with per-file decode seconds + frames (datasets/denoising.py:64,71). These cover the full per-batch breakdown (decode wait vs inference vs save vs csv-write) so you can attribute time without adding hooks. csv_manager logs read/write row counts and 'balalaika.csv refreshed: N rows' on each periodic flush (csv_manager.py:132-134,897). work_shards logs shard counts (work_shards.py:145,216). write_stage_status emits processed/skipped/errors per stage (denoising stage=11, collate=12, to_webdataset=13, report=14). collate and to_webdataset have only tqdm progress bars (no fine timing) — add timing around the ThreadPool/ProcessPool sections and the per-file glob in to_webdataset for those stages. report has no timing instrumentation."
+}

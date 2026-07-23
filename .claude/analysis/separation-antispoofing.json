@@ -1,0 +1,228 @@
+{
+  "area": "separation-antispoofing",
+  "data_flow": "Stage 6 (antispoofing.py) and stage 6.5 (antispoofing_filter.py) operate on the chunked/normalized 16kHz audio referenced in balalaika.csv.\n\nStage 6 main() flow: setup_logging -> mp.set_start_method(\"spawn\", force=True) -> load_config -> discover_audio_paths (reads balalaika.csv 'filepath' column or rglob) -> ensure_main_csv -> ensure_model (HF download once) -> absorb_partial_csvs (read+merge any antispoof_part_*.csv into balalaika.csv with full-CSV rewrite) -> unprocessed_paths(score_spoof) which does a FULL pd.read_csv of balalaika.csv, builds a done-set, then per-path membership check -> ensure_audio_durations (reads balalaika.csv total_duration column, probes missing via ProcessPoolExecutor torchaudio.info, then upsert -> ANOTHER full-CSV rewrite) -> prepare_length_bucketed_work_shards (writes on-disk shard files grouped by duration bucket, sorted within bucket) -> spawn n_gpus workers + a PeriodicCsvMerger daemon thread that every poll re-reads all partials and rewrites the entire balalaika.csv.\n\nEach worker (run_worker): set cuda device -> create_session (ORT InferenceSession with ORT_ENABLE_ALL, CUDA or TRT provider) -> open PartialCsvWriter (reads its own partial to build already_done set) -> loop: claim_work_shard (rename), read_work_shard (read lines), _process_files. _process_files builds a DataLoader (AntiSpoofingDataset) per shard: each __getitem__ decodes via torchaudio.load_with_torchcodec, mono-mixes, resamples to 16k, preemphasis, random crop/repeat to fixed 64600 samples; collate stacks into (B, 64600) tensor. Per batch: tensor.numpy().astype(float32) -> session.run -> raw_class_scores slices columns -> writer.write per row (flush after every row). After all shards, final absorb_partial_csvs does another full-CSV rewrite.\n\nStage 6.5 filter main() flow: load_config -> ensure_main_csv -> scored_rows (full load_main_csv + dropna + to_numeric + margin compute) -> absorb_partial_csvs (full rewrite) -> scored_rows AGAIN (second full load_main_csv) -> print_distribution/histogram -> determine_threshold -> deletion_candidates -> prepare_work_shards over candidate filepaths -> run_deletion_workers (plain multiprocessing.Process, NOT spawn). Each filter worker: per file calls safe_audio_duration (torchaudio.info, a SECOND probe of the same file durations already cached in CSV), os.remove, writes partial row. Then absorb_partial_csvs again, concat partials, compute deleted set, record_stage_summary, write_status.",
+  "operations": [
+    {
+      "name": "spawn start method (stage 6)",
+      "what": "mp.set_start_method('spawn', force=True) at antispoofing.py:293 forces full interpreter re-import per worker; combined with create_antispoofing_dataloader spawning its own DataLoader worker procs this is nested process startup",
+      "cost": "moderate"
+    },
+    {
+      "name": "discover_audio_paths",
+      "what": "antispoofing.py:297 -> csv_manager:_audio_paths_from_csv reads entire balalaika.csv usecols=['filepath'] then _dedupe_paths normalizes every path with a tqdm loop and per-path Path().suffix check",
+      "cost": "moderate"
+    },
+    {
+      "name": "ensure_main_csv",
+      "what": "antispoofing.py:309 reads+rewrites the full CSV under flock (csv_manager:275)",
+      "cost": "moderate"
+    },
+    {
+      "name": "absorb_partial_csvs x2",
+      "what": "antispoofing.py:311 and :384 each read all partials + full balalaika.csv merge + atomic full rewrite + .bak copy (csv_manager:556,210). Final one runs even when nothing new.",
+      "cost": "heavy"
+    },
+    {
+      "name": "unprocessed_paths",
+      "what": "antispoofing.py:321 does full pd.read_csv of balalaika.csv (csv_manager:455), builds done-set, two tqdm Python loops over all audio paths",
+      "cost": "moderate"
+    },
+    {
+      "name": "ensure_audio_durations",
+      "what": "antispoofing.py:329 reads total_duration column (full CSV pass, tqdm zip loop audio_durations:72), probes missing via ProcessPoolExecutor torchaudio.info, then upsert_columns -> full CSV rewrite (audio_durations:160)",
+      "cost": "moderate"
+    },
+    {
+      "name": "prepare_length_bucketed_work_shards",
+      "what": "work_shards:152 buckets by duration, sorts each bucket by duration again, writes shard files to disk",
+      "cost": "light"
+    },
+    {
+      "name": "PeriodicCsvMerger thread",
+      "what": "csv_manager:789 background thread; every >=300s or 10000 new rows re-reads ALL partials + full balalaika.csv + full atomic rewrite + .bak copy",
+      "cost": "heavy"
+    },
+    {
+      "name": "create_session",
+      "what": "antispoofing.py:103 builds ORT InferenceSession, ORT_ENABLE_ALL graph opt; provider is plain CUDAEP unless use_tensorrt; no fp16, no IOBinding, no intra/inter-op thread tuning",
+      "cost": "light"
+    },
+    {
+      "name": "DataLoader per shard",
+      "what": "_process_files:151 builds a fresh DataLoader for EVERY shard (default 10000 files). persistent_workers=True is wasted since the loader is torn down each shard; workers re-spawn per shard",
+      "cost": "moderate"
+    },
+    {
+      "name": "audio decode+resample+preemphasis (per item)",
+      "what": "AntiSpoofingDataset.__getitem__ separation.py:165 torchaudio.load_with_torchcodec, mono mean, functional.resample, functional.preemphasis, _pad_random random crop",
+      "cost": "heavy"
+    },
+    {
+      "name": "collate stack",
+      "what": "antispoofing_collate separation.py:198 stacks fixed-length (64600) waveforms; all items identical length so padding is free but a .contiguous() copy is made",
+      "cost": "light"
+    },
+    {
+      "name": "batch.numpy().astype(float32)",
+      "what": "antispoofing.py:188 host tensor -> numpy -> ORT copies to GPU each batch (no pinned mem, no IOBinding)",
+      "cost": "moderate"
+    },
+    {
+      "name": "session.run inference",
+      "what": "antispoofing.py:186 Spectra-0 ONNX over (B,64600); fp32, the dominant GPU compute",
+      "cost": "dominant"
+    },
+    {
+      "name": "raw_class_scores + per-row writer.write",
+      "what": "antispoofing.py:190-217 np.asarray copy, .tolist(), then per-row csv.DictWriter.write + flush() after EVERY row (csv_manager:663)",
+      "cost": "moderate"
+    },
+    {
+      "name": "safe_audio_duration in filter worker",
+      "what": "antispoofing_filter.py:200 torchaudio.info probe per deleted file — redundant: total_duration already cached in CSV and re-derived again later from baseline",
+      "cost": "moderate"
+    },
+    {
+      "name": "os.remove per file",
+      "what": "antispoofing_filter.py:203 single unlink syscall per candidate, plus per-row partial write+flush",
+      "cost": "light"
+    },
+    {
+      "name": "scored_rows x2 (filter)",
+      "what": "antispoofing_filter.py:294 and :313 each fully load_main_csv + copy + to_numeric + dropna + margin compute on the entire CSV",
+      "cost": "heavy"
+    },
+    {
+      "name": "run_deletion_workers",
+      "what": "antispoofing_filter.py:226 plain multiprocessing.Process (fork) workers; worker count min(num_workers, shard_count)",
+      "cost": "light"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Eliminate redundant duration probe in filter worker",
+      "location": "src/separation/antispoofing_filter.py:200",
+      "description": "safe_audio_duration(path_str) re-runs torchaudio.info on every file about to be deleted. total_duration is already cached in balalaika.csv (and stage 6 already ensured durations). The value written to the partial duration_s is never actually used for the final audit either — record_stage_summary recomputes hours_in/hours_deleted from baseline['total_duration'] (lines 386-395). So this probe is pure waste. Pass the cached duration from the candidates DataFrame into the shard (or drop duration_s entirely). On a delete-heavy threshold this removes one full file-open+header-parse per deleted file.",
+      "expected_gain": "Removes one I/O+decode-header op per deleted file; can cut filter-stage wall time 30-60% when many files are deleted",
+      "risk": "low",
+      "low_resource_note": "Pure win on low-RAM/low-CPU nodes — fewer syscalls and no torchaudio/soundfile spin-up per file; helps most where IO is the bottleneck."
+    },
+    {
+      "title": "Reuse one DataLoader across all shards in stage 6",
+      "location": "src/separation/antispoofing.py:151",
+      "description": "_process_files creates a brand-new DataLoader (and re-spawns num_workers worker processes) for each claimed shard (default 10000 files). persistent_workers=True is pointless because the loader object is discarded after each shard. Either feed all shard files for a worker through a single DataLoader, or set the dataset's file list per shard while keeping workers alive. Re-spawning N workers per shard on spawn start method is expensive.",
+      "expected_gain": "Removes worker spawn/teardown per shard; a few seconds saved per shard, larger when many small shards",
+      "risk": "medium",
+      "low_resource_note": "On low-CPU nodes worker spawn is comparatively costly, so this helps; but keep num_workers small (config knob) so total processes stay within 48 threads minus the training job."
+    },
+    {
+      "title": "fp16 / TensorRT for Spectra-0 ONNX",
+      "location": "src/separation/antispoofing.py:112 and src/utils/gpu.py:46",
+      "description": "get_onnx_providers returns plain CUDAEP with fp32 unless use_tensorrt is set. Spectra-0 is a 1D-CNN/transformer over 64600 samples — a strong fp16 candidate. Enabling TRT (cfg.use_tensorrt) gives engine-cached fp16; the cache path is already wired (gpu.py:48-61). Input is fixed-length (64600) so TRT static shapes work without rebuilds. Could also try ORT's CUDA fp16 by casting input.",
+      "expected_gain": "1.5-2.5x inference throughput on the 4060 Ti (good fp16)",
+      "risk": "medium",
+      "low_resource_note": "TRT engine build is a one-time VRAM/time spike — risky given only ~2-4GB free VRAM next to the training job. Gate behind a config knob and bound trt_max_workspace_size; on weak nodes prefer plain fp16 CUDAEP cast to avoid build spikes."
+    },
+    {
+      "title": "Avoid per-row flush in PartialCsvWriter for this stage",
+      "location": "src/utils/csv_manager.py:663 (called from antispoofing.py:209)",
+      "description": "writer.write flushes after every single row. For an 8-item batch that is 8 fsync-adjacent flushes per inference. A batched writer.write_many that writes a whole batch and flushes once per batch (or every K rows) keeps crash-safety roughly intact while cutting flush syscalls ~batch_size-fold. The score data is cheaply recomputable so a slightly weaker durability guarantee is acceptable.",
+      "expected_gain": "Reduces write syscalls ~8x; small but real on SSD, larger if writer contends",
+      "risk": "low",
+      "low_resource_note": "Helps on slow disks/low-RAM where flush stalls hurt; add a flush-every-N knob."
+    },
+    {
+      "title": "Batch the spoof-margin slicing / .tolist conversion",
+      "location": "src/separation/antispoofing.py:190-217",
+      "description": "raw_class_scores does np.asarray(copy) then .tolist() and zips Python floats. For tiny batches this is negligible, but writer rows could be built from numpy directly. Minor.",
+      "expected_gain": "Marginal (<2%)",
+      "risk": "low",
+      "low_resource_note": "Trivial; skip unless batch size is large."
+    },
+    {
+      "title": "Increase default batch_size / autotune for fixed-length input",
+      "location": "src/separation/antispoofing.py:138",
+      "description": "Default batch_size=8 with fixed 64600-sample inputs is very small for a 16GB GPU; the model and input shape are static so larger batches greatly improve GPU utilization. Autotune the largest batch that fits remaining VRAM.",
+      "expected_gain": "2-4x throughput from better GPU occupancy at batch 32-128",
+      "risk": "low",
+      "low_resource_note": "Must be a config knob: with only ~2-4GB free VRAM next to training, a large batch can OOM. Provide per-node batch_size and a conservative default."
+    },
+    {
+      "title": "Combine the two scored_rows/load_main_csv passes in filter",
+      "location": "src/separation/antispoofing_filter.py:294 and :313",
+      "description": "main() loads + parses the full balalaika.csv twice (baseline, then current after absorb). If no partials were absorbed (the common fresh run), the second load is identical to the first. Skip the re-load when absorbed==0, or reuse baseline.",
+      "expected_gain": "Halves filter-stage CSV parse cost on large CSVs (tens of millions of rows)",
+      "risk": "low",
+      "low_resource_note": "Big win on low-RAM nodes — avoids holding/parsing a multi-GB CSV twice."
+    },
+    {
+      "title": "ORT session thread tuning",
+      "location": "src/separation/antispoofing.py:110",
+      "description": "SessionOptions only sets graph_optimization_level. On CUDA EP, intra/inter-op threads still spin CPU threads for the few CPU ops/copies; on a shared 48-thread box with a training job, set intra_op_num_threads to a small value and execution_mode appropriately to avoid oversubscription across the 2 GPU workers + DataLoader workers.",
+      "expected_gain": "Avoids CPU thread oversubscription; modest, prevents slowdowns under contention",
+      "risk": "low",
+      "low_resource_note": "Important on the low-core/shared node — without a cap, 2 ORT sessions + dataloaders can spawn dozens of threads and thrash."
+    },
+    {
+      "title": "Skip final absorb_partial_csvs when nothing new",
+      "location": "src/separation/antispoofing.py:384",
+      "description": "The post-stage absorb always runs a full-CSV merge+rewrite+.bak even if PeriodicCsvMerger already folded everything and no partials remain. read_partial_csvs returning empty already short-circuits (csv_manager:574), but ensure no bootstrap forces a rewrite. Confirm it no-ops on empty.",
+      "expected_gain": "Saves one full-CSV rewrite (GBs) on clean completion",
+      "risk": "low",
+      "low_resource_note": "Large win on big CSVs; the rewrite copies the whole file plus a .bak copy."
+    },
+    {
+      "title": "Move preemphasis/mono-mix to batched GPU op",
+      "location": "src/utils/datasets/separation.py:172-182",
+      "description": "Per-item mono mean + functional.resample + functional.preemphasis run on CPU in DataLoader workers (GIL-bound, AVX2-only Haswell). Since all items become identical length 64600, preemphasis and (optionally) resample could run once per batch on GPU after stacking. Resample is the heaviest CPU op here.",
+      "expected_gain": "Offloads CPU-bound DSP to GPU; helps when CPU is the bottleneck (likely on this node)",
+      "risk": "medium",
+      "low_resource_note": "On the weak CPU this is a real win, but moving resample to GPU competes for the scarce VRAM — make it a knob; keep CPU path for low-VRAM nodes."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "Filter worker uses fork, parent forced spawn — inconsistent and fork-after-CUDA risk",
+      "location": "src/separation/antispoofing_filter.py:11,239",
+      "description": "antispoofing_filter uses multiprocessing.Process (default fork on Linux) while antispoofing forces spawn. The filter itself imports pandas/torchaudio in workers; fork is fine here since no CUDA is initialized in the filter parent, so it's not a hard bug — but it is inconsistent with the rest of the pipeline and would break if CUDA were ever touched before fork. Low severity, worth noting.",
+      "severity": "low"
+    },
+    {
+      "title": "duration_s written to partial is dead/misleading data",
+      "location": "src/separation/antispoofing_filter.py:200-217",
+      "description": "Each worker probes and writes duration_s into the partial, but the final audit (lines 386-408) recomputes all hours from baseline['total_duration'], never from the partials. The duration_s column is collected at real I/O cost and then ignored — dead work that 'lies' (the docstring/field implies it matters).",
+      "severity": "medium"
+    },
+    {
+      "title": "FileNotFoundError on delete counted as success but not counted as deleted",
+      "location": "src/separation/antispoofing_filter.py:206-207",
+      "description": "When os.remove raises FileNotFoundError, deleted=True is set (so the partial records deleted) but deleted_counter is NOT incremented (only the try-branch increments it at :205). The final success log 'Deleted: N' therefore undercounts files that were already gone. Minor accounting inconsistency vs. the partial-derived audit.",
+      "severity": "low"
+    },
+    {
+      "title": "skipped count can be wrong/negative-clamped in filter status",
+      "location": "src/separation/antispoofing_filter.py:412",
+      "description": "write_status skipped=max(0,len(current)-processed). 'current' is the count of ALL scored rows, but 'processed' only counts deletion candidates handled by workers. So skipped is reported as (all_scored - deleted_candidates), which conflates 'kept' with 'skipped' and is not a meaningful skip count. Reporting bug, not data loss.",
+      "severity": "low"
+    },
+    {
+      "title": "Random crop makes Spectra-0 scores non-deterministic across re-runs",
+      "location": "src/utils/datasets/separation.py:160",
+      "description": "_pad_random uses random.randint to pick the crop window with no seeding, so the same file scored on a re-run (e.g. after a crash/resume) gets a different bonafide/spoof score. Resume semantics rely on already_done to avoid re-scoring, so usually masked — but any partial loss + re-score yields inconsistent scores for the same file. For a scoring stage this is a correctness/reproducibility concern.",
+      "severity": "medium"
+    },
+    {
+      "title": "errors_counter over-counts on batch failure then per-row already-done",
+      "location": "src/separation/antispoofing.py:198",
+      "description": "On a session.run exception the whole batch is counted as errors (+=len(paths)) and the batch is skipped. Those files remain unprocessed and will be retried next run — fine — but they are also counted as errors in the stage status, inflating the error metric for transient OOM/retryable failures. Cosmetic/metrics only.",
+      "severity": "low"
+    },
+    {
+      "title": "Histogram last-bin upper bound uses absolute epsilon on possibly large/negative range",
+      "location": "src/separation/antispoofing_filter.py:111",
+      "description": "upper = high + 1e-9 for the last bin to make the right edge inclusive. If margins span a large range the 1e-9 nudge can be below float resolution and the max value can be dropped from the final bin count. Display-only, but the histogram counts can be off by the number of exact-max files.",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "Stage 6 already emits structured loguru DEBUG perf lines that benchmarks can grep directly:\n- antispoofing.py:160 'perf dataloader_config stage=antispoofing rank=... batch_size=... workers=... prefetch_factor=... prefetch_batches=... items=...'\n- antispoofing.py:172 'perf dataloader_wait stage=antispoofing rank=... batch=... seconds=... items=...' (measures DataLoader starvation between batches)\n- antispoofing.py:191 'perf model=antispoofing event=inference rank=... batch=... seconds=... items=... frames=...' (pure session.run wall time)\n- separation.py:184 (AntiSpoofingDataset) 'dataloader_audio_load dataset=antispoofing path=... seconds=... sample_rate=... frames=...' per item, and an error variant at :191. These give per-file decode+resample+preemphasis cost.\nComparing dataloader_wait vs inference seconds tells you immediately whether the stage is GPU-bound or input-starved. write_stage_status (stage=6 / 6.5) records processed/skipped/errors to ./logs for end-to-end accounting. The filter stage has NO timing instrumentation — add perf lines around safe_audio_duration and os.remove if benchmarking deletion throughput. Enable these by running with loguru level DEBUG (setup_logging('antispoofing', log_dir=...))."
+}

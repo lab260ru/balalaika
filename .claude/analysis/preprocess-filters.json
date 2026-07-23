@@ -1,0 +1,202 @@
+{
+  "area": "preprocess-filters (src/preprocess/crest_factor_remover.py, src/preprocess/preprocess_audio.py)",
+  "data_flow": "Both stages share an identical scaffold: main() loads config, calls discover_audio_paths() (reads balalaika.csv filepath column via pandas, or rglobs the tree), ensure_main_csv() (bootstrap+atomic write under fcntl lock), absorb_partial_csvs() (read leftover <prefix>_part_*.csv, upsert into balalaika.csv, delete partials), unprocessed_paths() (re-loads the FULL balalaika.csv, builds a done-set, filters pending), then prepare_work_shards() writes pending paths to on-disk shard files (10k/shard) under <podcasts>/.balalaika_work/<stage>. A PeriodicCsvMerger daemon thread is started, then mp.spawn launches N worker processes. Each worker opens a PartialCsvWriter (append CSV, flush per row), claims shards one at a time via atomic rename (claim_work_shard globs+sorts shard_*.pending every claim), reads the shard file, and runs _process_files.\n\nCREST: _process_files builds a torch DataLoader (CrestFactorDataset). Each __getitem__ decodes a whole file via torchaudio.load_with_torchcodec, casts to float32, downmixes to mono, then reduces to scalar peak (abs.amax) + sum_squares (square.sum) + length + sample_rate on the CPU worker — returning only 4 scalars per file (not the waveform). collate stacks scalars into tensors. The main worker then computes crest_factor = peak/rms vectorized over the batch, deletes files above threshold via os.remove, and streams one row per file to the partial CSV (flush each).\n\nLOUDNESS: _process_files builds a DataLoader (LoudnessNormalizeDataset) that decodes the FULL waveform per file and returns it. collate is identity (returns the list of (path, waveform, sr, error)). The main worker loops items serially: audio.numpy() -> normalize_audio_loudness (pyloudnorm Meter.integrated_loudness then pyln.normalize.loudness, both numpy/CPU) -> torchaudio.save_with_torchcodec back to the same path (re-encode, blocking), then writes a row to the partial CSV (flush each). pyln.Meter is cached per (rate, block_size) in audio_postprocessing._METER_CACHE.\n\nAfter workers join, main() absorbs the new partials into balalaika.csv (another full-CSV read/merge/atomic-write under lock), computes an audit summary (crest also has a fallback that probes safe_audio_duration over EVERY audio path if workers wrote nothing), records stage summary and writes stage status.\n\nCRITICAL CONTEXT: config.yaml sets fuse_audio_preprocessing: true, which folds crest+loudness into stage 1 (preprocess_existing_chunks.py). When fused, these two standalone stages are largely redundant in normal runs — but neither early-returns when pending work exists; they will still do a full decode pass over any file lacking the column. Also config defaults are batch_size=1, loader_workers=0 for both stages, so the DataLoader runs entirely in-process with NO prefetch overlap and NO batching benefit.",
+  "operations": [
+    {
+      "name": "config + audio discovery",
+      "what": "main() load_config + discover_audio_paths() reads full balalaika.csv filepath col (or rglob whole tree) then _dedupe_paths normalizes every path with tqdm; crest_factor_remover.py:287, preprocess_audio.py:275",
+      "cost": "moderate"
+    },
+    {
+      "name": "ensure_main_csv",
+      "what": "reads balalaika.csv, possibly backs it up (full file copy) and atomic-writes it; under fcntl + thread lock; csv_manager.py:275-330 invoked at crest_factor_remover.py:303 / preprocess_audio.py:289",
+      "cost": "moderate"
+    },
+    {
+      "name": "absorb leftover partials (startup)",
+      "what": "read_partial_csvs + upsert_columns = full balalaika.csv read, pandas outer-merge, optional per-row Path.exists() existence check (drop_missing_files for crest), reorder, backup-copy, atomic write; crest_factor_remover.py:308 / preprocess_audio.py:293",
+      "cost": "heavy"
+    },
+    {
+      "name": "unprocessed_paths",
+      "what": "RE-LOADS the entire balalaika.csv again (separate from absorb), builds done-set, tqdm-normalizes+filters every audio path; csv_manager.py:444 invoked at crest_factor_remover.py:323 / preprocess_audio.py:307",
+      "cost": "moderate"
+    },
+    {
+      "name": "prepare_work_shards",
+      "what": "rmtree+recreate work dir, write pending paths to shard files 10k each; work_shards.py:97",
+      "cost": "light"
+    },
+    {
+      "name": "PeriodicCsvMerger thread",
+      "what": "every poll_interval (30s) byte-counts partial rows; when grown by flush_every_rows(10k) or 300s, does a FULL read_partial_csvs + upsert_columns (full-CSV read+merge+backup-copy+atomic-write); csv_manager.py:789-900",
+      "cost": "heavy"
+    },
+    {
+      "name": "mp.spawn workers",
+      "what": "spawn start method: each worker re-imports torch/torchaudio/torchcodec + re-runs module-level apply_torch_perf_defaults (loudness); crest_factor_remover.py:381 / preprocess_audio.py:355",
+      "cost": "moderate"
+    },
+    {
+      "name": "claim_work_shard (per shard)",
+      "what": "globs+sorts ALL shard_*.pending in work dir on every claim, attempts atomic rename; work_shards.py:224",
+      "cost": "light"
+    },
+    {
+      "name": "CREST decode per file",
+      "what": "torchaudio.load_with_torchcodec decodes WHOLE file at native rate, float32 cast, mono downmix, abs.amax + square.sum reduction; preprocess.py:20-48",
+      "cost": "heavy"
+    },
+    {
+      "name": "CREST batch compute",
+      "what": "vectorized peak/rms over batch on CPU, index_select on valid mask, durations from lengths/sr; crest_factor_remover.py:153-167",
+      "cost": "trivial"
+    },
+    {
+      "name": "CREST os.remove for over-threshold",
+      "what": "synchronous unlink per deleted file; crest_factor_remover.py:189",
+      "cost": "light"
+    },
+    {
+      "name": "LOUDNESS decode per file",
+      "what": "torchaudio.load_with_torchcodec decodes WHOLE waveform, float32+contiguous, returns full tensor through collate (held in RAM); preprocess.py:99-115",
+      "cost": "heavy"
+    },
+    {
+      "name": "LOUDNESS measure+normalize",
+      "what": "audio.numpy() then pyloudnorm Meter.integrated_loudness (numpy K-weighting filter over whole signal) + pyln.normalize.loudness gain; serial per file on CPU; audio_postprocessing.py:62-73 via process_audio_file preprocess_audio.py:79-109",
+      "cost": "heavy"
+    },
+    {
+      "name": "LOUDNESS save_with_torchcodec",
+      "what": "synchronous re-encode + write back to same path, blocks the worker between decodes; preprocess_audio.py:71",
+      "cost": "dominant"
+    },
+    {
+      "name": "partial CSV write per file",
+      "what": "csv.DictWriter.writerow + file.flush() (fsync-ish) after EVERY row; csv_manager.py:652-663",
+      "cost": "light"
+    },
+    {
+      "name": "final absorb_partial_csvs",
+      "what": "another full read_partial_csvs + upsert (full-CSV merge + backup-copy + atomic-write); crest_factor_remover.py:417 / preprocess_audio.py:394",
+      "cost": "heavy"
+    },
+    {
+      "name": "CREST audit fallback",
+      "what": "if workers wrote nothing, sums safe_audio_duration over EVERY audio path (decodes/probes each file); crest_factor_remover.py:435",
+      "cost": "dominant"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Skip the standalone crest/loudness stages entirely when fuse_audio_preprocessing is true",
+      "location": "src/preprocess/crest_factor_remover.py:268,323; src/preprocess/preprocess_audio.py (no fuse check at all)",
+      "description": "config.yaml defaults fuse_audio_preprocessing:true, which does crest+LUFS inside stage 1 (preprocess_existing_chunks.py). The standalone stages only consult fuse_audio for audit accounting (crest line 326) and never early-return; loudness never even reads the flag. If base.sh still invokes these stages, every file lacking the column triggers a full redundant decode (crest) or a full decode+re-encode (loudness). Add an early return that records the audit summary and writes stage status when fuse is enabled and the column work was already done by stage 1. Verify base.sh stage wiring first.",
+      "expected_gain": "Eliminates an entire redundant full-decode pass (crest) and a full decode+re-encode pass (loudness) over the whole dataset — potentially the largest single win, hours on big corpora.",
+      "risk": "medium",
+      "low_resource_note": "Huge help on weak nodes (avoids re-encoding every file). Gate behind the existing fuse flag so non-fused configs are unaffected."
+    },
+    {
+      "title": "Raise batch_size / loader_workers / enable prefetch from config defaults of 1/0",
+      "location": "configs/config.yaml:160-164 (crest), 177-181 (loudness); consumed at crest_factor_remover.py:278-280, preprocess_audio.py:258-260",
+      "description": "Defaults are crest_factor_batch_size=1, crest_factor_loader_workers=0, loudness_batch_size=1, loudness_loader_workers=0. With loader_workers=0 the DataLoader decodes in the main process with zero compute/IO overlap and persistent_workers/prefetch are dead. Crest especially is embarrassingly parallel and CPU/IO bound — set loader_workers to a few (e.g. 4-8) and batch_size to 32-256 so decode overlaps the (trivial) reduction. Loudness benefits from loader_workers>0 so the next file decodes while the current one is being LUFS-measured and re-encoded.",
+      "expected_gain": "Crest: near-linear speedup up to IO/CPU saturation (2-8x). Loudness: 1.5-3x by overlapping decode with measure+encode.",
+      "risk": "low",
+      "low_resource_note": "On the 31GB/48-thread node this is the cheapest big win, but loudness holds full waveforms in RAM (batch + prefetch * workers copies) — keep loudness_batch_size small (4-8) and loader_workers modest (2-4) to bound RAM; crest returns only scalars so it can use larger batches safely."
+    },
+    {
+      "title": "Batch/parallelize loudness measure+normalize+write instead of strict serial per-file",
+      "location": "src/preprocess/preprocess_audio.py:160-185 (serial loop), :79-109 process_audio_file",
+      "description": "The worker decodes a batch but then processes items strictly serially: measure (pyloudnorm, CPU) -> normalize -> save_with_torchcodec (blocking re-encode). The blocking write stalls the single thread. Use a small ThreadPoolExecutor inside the worker to overlap the GIL-releasing torchcodec encode of file N with the numpy LUFS measurement of file N+1, or move writes to a writer thread. pyloudnorm itself is numpy/scipy and releases the GIL in its FFT/filtering core.",
+      "expected_gain": "1.3-2x on loudness by hiding encode latency behind the next file's measurement.",
+      "risk": "medium",
+      "low_resource_note": "Bounded thread pool (2-3) is fine on low-CPU nodes; gate the pool size by a config knob and keep it small so RAM (full waveforms) does not blow the 31GB budget."
+    },
+    {
+      "title": "Avoid double full-CSV load: reuse the DataFrame from absorb in unprocessed_paths",
+      "location": "src/preprocess/crest_factor_remover.py:308-323; preprocess_audio.py:293-307; csv_manager.py upsert_columns + unprocessed_paths both _read_csv_safe the whole CSV",
+      "description": "absorb_partial_csvs -> upsert_columns reads+writes the full balalaika.csv, then unprocessed_paths immediately RE-READS the same (now just-written) CSV. On a multi-GB CSV that is two full pandas reads back to back. Have absorb return (or cache) the merged DataFrame and pass it to a pending-computation that accepts an in-memory frame, or expose an unprocessed_paths(df=...) overload.",
+      "expected_gain": "Removes one full multi-GB CSV read per stage startup (seconds to minutes at scale).",
+      "risk": "medium",
+      "low_resource_note": "Pure win on low-RAM nodes too (one fewer transient DataFrame), but must ensure the merger thread hasn't rewritten the CSV in between; safe because this runs before workers start."
+    },
+    {
+      "title": "Backup-copy of balalaika.csv on every atomic write is doubling write IO",
+      "location": "src/utils/csv_manager.py:217-218,177-187 (_copy_file_with_progress before each _atomic_write_csv_unlocked)",
+      "description": "Every upsert (startup absorb, each periodic flush, final absorb) copies the entire existing balalaika.csv to .bak with a chunked read+write before writing the new tmp. With flush_every_rows=10k and a multi-GB CSV, the periodic merger copies the whole CSV every ~10k rows of progress — O(progress/10k * CSV_size) of pure backup IO. Replace the pre-copy with a cheap hardlink/rename of the previous good file (the new file is written to tmp anyway), or keep .bak only via rename of the prior committed file after os.replace.",
+      "expected_gain": "Halves CSV write IO; on weak SSD/low-RAM nodes the periodic flush becomes far cheaper.",
+      "risk": "medium",
+      "low_resource_note": "Big help on the SSD/low-RAM node where repeated multi-GB copies dominate; hardlink keeps crash safety without the copy."
+    },
+    {
+      "title": "fp16 / half not applicable here, but skip float32 upcast in crest reduction",
+      "location": "src/utils/datasets/preprocess.py:25-36 (CrestFactorDataset)",
+      "description": "Crest casts the whole decoded waveform to float32 then computes abs.amax and square.sum. torchcodec already returns float; the square.sum in float32 over long signals can also lose precision but more importantly the full-precision mono downmix (mean over channels) allocates a full-length copy. peak and sum_squares can be computed per-channel and combined, or computed in a single fused pass without the intermediate contiguous() mono buffer. Minor.",
+      "expected_gain": "Small (5-15% of the crest decode-side CPU), mostly fewer allocations.",
+      "risk": "low",
+      "low_resource_note": "Reduces transient RAM per file on low-RAM nodes; no knob needed."
+    },
+    {
+      "title": "Reduce per-row flush() on partial CSV writer",
+      "location": "src/utils/csv_manager.py:663 (self._file.flush() after every writerow); called from both stages' writer.write",
+      "description": "PartialCsvWriter flushes after every single row for crash safety. At batch_size>1 and high throughput (crest can do thousands of rows/min) this is a syscall per file. Flush every K rows (configurable) or rely on Python buffering with a periodic flush, accepting at most K rows of replay loss — the resume logic already re-scores anything not in the partial.",
+      "expected_gain": "Small-moderate on crest at high throughput (cuts syscalls); negligible for loudness (encode-bound).",
+      "risk": "low",
+      "low_resource_note": "Helps the crest stage on any node; keep a config knob defaulting to flush-every-row to preserve current crash guarantees on weak nodes if desired."
+    },
+    {
+      "title": "claim_work_shard globs+sorts the whole work dir on every claim",
+      "location": "src/utils/work_shards.py:224-237",
+      "description": "Each shard claim does sorted(work_dir.glob('shard_*.pending')). With many shards and many workers this is O(remaining_shards) per claim = O(N^2/shard_size) directory scans over a stage. For these stages shard_size=10k so it is usually small, but with millions of files (hundreds of shards) it adds up. Could cache the listing per worker and only re-glob on a claim race.",
+      "expected_gain": "Small unless shard count is large (hundreds+).",
+      "risk": "low",
+      "low_resource_note": "Negligible RAM; helps only large-corpus runs."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "CREST audit fallback decodes/probes EVERY audio file when workers wrote nothing",
+      "location": "src/preprocess/crest_factor_remover.py:432-438",
+      "description": "If audit['files_in']==0 (e.g. all reads failed, or everything was already done and partials are empty), it runs sum(safe_audio_duration(p) for p in audio_paths) over the ENTIRE dataset to produce an hours number for the report. On a large corpus this silently triggers a full decode/probe pass purely for reporting. Should be bounded to a sample, or skipped when the run was a no-op.",
+      "severity": "medium"
+    },
+    {
+      "title": "Loudness re-encodes every file through TorchCodec defaults, can change codec/quality and is unconditional",
+      "location": "src/preprocess/preprocess_audio.py:66-76,104",
+      "description": "_write_audio always re-encodes the normalized samples back to the SAME path via save_with_torchcodec at default encoder settings. For lossy inputs (mp3/ogg/opus) this is a lossy re-encode (generation loss); for flac it re-compresses. The module docstring claims this fixed a FLAC->.mp3 mismatch, but writing float32 to a .mp3 path still re-encodes lossily. There is no bitrate/quality control and no skip-if-unchanged. Combined with fuse_audio_preprocessing:true this whole pass is also usually redundant.",
+      "severity": "high"
+    },
+    {
+      "title": "peak parameter is accepted but ignored in loudness normalization",
+      "location": "src/preprocess/audio_postprocessing.py:62-73 (\"_ = peak\"); plumbed from preprocess_audio.py:254 peak=-1.0",
+      "description": "normalize_audio_loudness takes peak and immediately discards it (_ = peak); only integrated loudness normalization is applied, no true-peak limiting/ceiling. The config peak: -1.0 dBFS ceiling documented in config.yaml:168 is never enforced, so normalized output can exceed the intended peak and even clip. Dead parameter that lies about behavior.",
+      "severity": "medium"
+    },
+    {
+      "title": "Loudness collate holds full waveforms for the whole batch in RAM with no length cap",
+      "location": "src/utils/datasets/preprocess.py:118-119 (identity collate) + :99-115 returns full waveform",
+      "description": "LoudnessNormalizeDataset returns full-length native-rate waveforms and the collate just lists them, so batch_size * prefetch_factor * (loader_workers or 1) full waveforms are resident. With chunk_duration up to 900s native 48kHz stereo, a single item can be ~340MB; raising loudness_batch_size or workers on the 31GB node can OOM. No per-item size guard.",
+      "severity": "medium"
+    },
+    {
+      "title": "errors_counter/skipped_counter increments are not atomic across workers",
+      "location": "src/preprocess/crest_factor_remover.py:109,145,174,183,210; preprocess_audio.py:131,163,167,184",
+      "description": "mp.Value('i') .value += 1 is a read-modify-write without holding the value's lock, so concurrent workers can lose increments. Only affects the reported processed/skipped/errors counts in stage_status, not data correctness, but the numbers can undercount under multi-worker runs.",
+      "severity": "low"
+    },
+    {
+      "title": "Loudness skipped counter reused/shadowed; potential miscount",
+      "location": "src/preprocess/preprocess_audio.py:308 (skipped=len(...)) then :341 (skipped=mp.Value('i',0))",
+      "description": "main() computes a local skipped int at line 308 for logging, then rebinds skipped to an mp.Value at line 341. The final write_stage_status uses skipped.value (the mp.Value, counting only per-worker already-done hits), so the large 'already normalized' count computed at startup is never reported. Cosmetic/reporting bug, not data loss.",
+      "severity": "low"
+    },
+    {
+      "title": "os.remove failure on over-threshold file still leaves deleted=False but row may mismatch later prune",
+      "location": "src/preprocess/crest_factor_remover.py:187-204",
+      "description": "If os.remove fails (OSError logged), deleted stays False and the partial row records deleted=False even though the file exceeded threshold. Subsequent absorb with drop_missing_files would not drop it (file still exists), so an over-threshold file can survive in the dataset silently after a transient delete failure. Low impact but the audit will also miscount it as survived.",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "Both files are already richly instrumented with loguru DEBUG 'perf ...' lines that benchmarks can grep directly: crest_factor_remover.py emits perf dataloader_config (:123), perf dataloader_wait per batch (:137), perf model=crest_factor event=batch_compute (:168), perf partial_write (:205). preprocess_audio.py emits perf dataloader_config (:145), perf dataloader_wait (:155), perf model=loudness_normalize event=process_file (:171), perf partial_write (:179), and perf audio_save with frames+sample_rate (:72). The dataloader datasets also emit perf-grade timing: preprocess.py CrestFactorDataset logs dataloader_audio_load dataset=crest with seconds+frames (:37), LoudnessNormalizeDataset logs dataloader_audio_load dataset=loudness (:104). So decode time (dataset side), batch wait, compute/encode, and write are all separately measurable per batch/file. PeriodicCsvMerger logs each flush with row counts (csv_manager.py:897). All gated by loguru level=DEBUG, so a benchmark run needs DEBUG logging enabled (setup_logging) to capture them; otherwise only INFO-level shard/throughput logs appear."
+}

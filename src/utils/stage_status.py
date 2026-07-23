@@ -7,6 +7,23 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def last_line(text: object) -> str:
+    """Compact a (possibly multi-line) error string to its last non-empty line.
+
+    Error reasons are ``str(exc)``; some libraries (torchcodec) return a
+    ~90-line traceback as the exception message. Stored verbatim these reasons
+    accumulate in each stage's ``error_details`` list — and, for transcription,
+    in a cross-worker ``mp.Manager().list()`` held in RAM for the whole run — so
+    thousands of them balloon memory into a real OOM when a systematic failure
+    (e.g. a broken decoder) makes every file error. The full trace is still
+    written to the stage log; the status JSON only needs a one-line summary.
+    Returns "" for empty input.
+    """
+    s = str(text)
+    lines = [ln for ln in s.splitlines() if ln.strip()]
+    return lines[-1] if lines else s.strip()
+
+
 def write_stage_status(
     stage: int,
     stage_name: str,

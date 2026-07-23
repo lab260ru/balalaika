@@ -1,6 +1,8 @@
 """Shared in-memory crest filtering and loudness normalization."""
 from __future__ import annotations
 
+import os
+import warnings
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -9,6 +11,128 @@ import pyloudnorm as pyln
 import torch
 
 _METER_CACHE: dict[tuple[int, float], pyln.Meter] = {}
+
+
+def save_audio_atomic(
+    audio_path: str,
+    tensor: "torch.Tensor",
+    sample_rate: int,
+) -> None:
+    """Atomically (over)write a normalized audio file in place.
+
+    The loudness/crest stages re-encode the *source* file in place. A plain
+    ``torchaudio.save_with_torchcodec`` over the original path leaves a
+    truncated file if the process is killed mid-encode — and since the
+    ``loudness_normalized`` marker is only written after a successful save, a
+    resume then re-decodes the now-corrupt audio and the original is gone with
+    no backup.
+
+    This writes to ``<path>.tmp<pid>`` in the SAME directory (so the final
+    ``os.replace`` is an atomic same-filesystem rename, no extra HDD seeks) and
+    swaps it onto the target only once the encode fully succeeded. The bytes
+    that land at the final path are byte-identical to the direct save (same
+    encoder, same args); only the failure window changes — mirrors the §11.8
+    ``download.py`` tmp+os.replace fix. A leftover ``.tmp<pid>`` from a crashed
+    process is cleaned up here on the next attempt.
+    """
+    import torchaudio
+
+    directory = os.path.dirname(audio_path) or "."
+    base = os.path.basename(audio_path)
+    # Keep the original extension on the temp file: save_with_torchcodec (and
+    # ffmpeg under it) pick the output container from the suffix, so the temp
+    # must end in the same ext (e.g. ".mp3"/".wav") to encode identically.
+    stem, ext = os.path.splitext(base)
+    tmp_path = os.path.join(directory, f"{stem}.tmp{os.getpid()}{ext}")
+    try:
+        torchaudio.save_with_torchcodec(tmp_path, tensor, sample_rate)
+        os.replace(tmp_path, audio_path)
+    except BaseException:
+        # Never leave a half-written temp behind (and never clobber the source
+        # on failure — the original is untouched until the atomic replace).
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _integrated_loudness_fast(meter: pyln.Meter, data: np.ndarray) -> float:
+    """Bit-exact fast reimplementation of ``Meter.integrated_loudness``.
+
+    pyloudnorm's block loop calls ``np.sum(np.square(block))`` on 75%%
+    overlapping slices, squaring every sample ~4x and allocating a fresh
+    block-sized temp each time; the gating passes are per-block Python list
+    comprehensions with scalar ``np.log10``. Here each channel is squared
+    ONCE and every reduction keeps the same element order, length and dtype
+    as the original (numpy's pairwise summation depends only on those), so
+    the returned LUFS — and therefore the normalized audio bytes — are
+    identical. Pinned by tests/test_fast_loudness.py on real audio.
+
+    Block boundaries replicate the original's per-block ``int()`` truncation
+    (a fixed stride would round differently on some sample rates).
+    """
+    from pyloudnorm import util
+
+    input_data = data.copy()
+    util.valid_audio(input_data, meter.rate, meter.block_size)
+
+    if input_data.ndim == 1:
+        input_data = np.reshape(input_data, (input_data.shape[0], 1))
+
+    num_channels = input_data.shape[1]
+    num_samples = input_data.shape[0]
+
+    for _filter_class, filter_stage in meter._filters.items():
+        for ch in range(num_channels):
+            input_data[:, ch] = filter_stage.apply_filter(input_data[:, ch])
+
+    G = np.array([1.0, 1.0, 1.0, 1.41, 1.41])[:num_channels]
+    T_g = meter.block_size
+    Gamma_a = -70.0
+    step = 1.0 - meter.overlap
+
+    T = num_samples / meter.rate
+    num_blocks = int(np.round(((T - T_g) / (T_g * step))) + 1)
+    j_range = np.arange(0, num_blocks)
+    z = np.zeros(shape=(num_channels, num_blocks))
+
+    # Same truncated bounds as the original per-block loop.
+    lower = (T_g * (j_range * step) * meter.rate).astype(np.int64)
+    upper = (T_g * (j_range * step + 1) * meter.rate).astype(np.int64)
+    scale = 1.0 / (T_g * meter.rate)
+    for i in range(num_channels):
+        squared = np.square(input_data[:, i])
+        zi = z[i]
+        for j in j_range:
+            zi[j] = scale * np.sum(squared[lower[j]:upper[j]])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        # weighted per-block power; channel sum order matches np.sum(list)
+        weighted = np.sum(G[:, np.newaxis] * z, axis=0)
+        l = -0.691 + 10.0 * np.log10(weighted)
+
+    J_g = np.flatnonzero(l >= Gamma_a)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        z_first = z[:, J_g]
+        z_avg_gated = np.array([np.mean(z_first[i]) for i in range(num_channels)])
+        Gamma_r = -0.691 + 10.0 * np.log10(np.sum(G * z_avg_gated)) - 10.0
+
+    J_g = np.flatnonzero((l > Gamma_r) & (l > Gamma_a))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        z_second = z[:, J_g]
+        z_avg_gated = np.nan_to_num(
+            np.array([np.mean(z_second[i]) for i in range(num_channels)])
+        )
+
+    with np.errstate(divide="ignore"):
+        LUFS = -0.691 + 10.0 * np.log10(np.sum(G * z_avg_gated))
+
+    return LUFS
 
 
 @dataclass
@@ -69,7 +193,12 @@ def normalize_audio_loudness(
     """Normalize mono or frames-first multichannel audio to target LUFS."""
     _ = peak
     meter = _get_meter(rate, block_size)
-    measured = meter.integrated_loudness(audio)
+    try:
+        measured = _integrated_loudness_fast(meter, audio)
+    except Exception:
+        # Any surprise (e.g. >5 channels) falls back to the stock meter,
+        # which raises/behaves exactly as before this optimization.
+        measured = meter.integrated_loudness(audio)
     return pyln.normalize.loudness(audio, measured, loudness)
 
 

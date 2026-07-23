@@ -1,8 +1,11 @@
 import time
-from typing import List
+from pathlib import Path
+from typing import List, Optional
 
 import torch
 import torchaudio
+
+from src.utils.io_profile import clamp_loader_workers
 from loguru import logger
 from torch.utils.data import DataLoader, Dataset
 from torchcodec.decoders import AudioDecoder
@@ -75,12 +78,92 @@ def create_crest_factor_dataloader(
     prefetch_factor: int,
 ) -> DataLoader:
     dataset = CrestFactorDataset(file_paths)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,
         "num_workers": num_workers,
         "pin_memory": False,
         "collate_fn": crest_factor_collate,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["worker_init_fn"] = crest_factor_worker_init
+    return DataLoader(dataset, **loader_kwargs)
+
+
+class TailSignalDataset(Dataset):
+    """Per-chunk tail-clipping signals (SPEC_drop_criteria.md) for stage 3.5.
+
+    The signals are computed inside the loader worker so only four scalars per
+    file cross the process boundary, mirroring ``CrestFactorDataset``'s
+    stats-in-worker pattern. Audio shorter than the spec's 100 ms floor cannot
+    be measured; such a fragment is by definition unusable for TTS, so it is
+    reported as fully clipped (``0.0 / 0.0``) rather than left null (a null
+    column would keep the file permanently "pending" on every resume).
+    """
+
+    def __init__(self, file_paths: List[str]):
+        self.file_paths = file_paths
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+    def __getitem__(self, idx: int):
+        from src.utils.tail_signals import tail_signals
+
+        path = self.file_paths[idx]
+        started_at = time.perf_counter()
+        try:
+            waveform, sample_rate = torchaudio.load_with_torchcodec(path)
+            waveform = waveform.to(dtype=torch.float32)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0)
+            else:
+                waveform = waveform.squeeze(0)
+            duration_s = waveform.numel() / float(sample_rate)
+            sig = tail_signals(waveform.numpy(), int(sample_rate))
+            tail_db, trailing_ms = (0.0, 0.0) if sig is None else sig
+            logger.debug(
+                f"dataloader_audio_load dataset=tail_signal path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} "
+                f"sample_rate={int(sample_rate)} frames={waveform.numel()}"
+            )
+            return path, float(tail_db), float(trailing_ms), duration_s, ""
+        except Exception as exc:
+            logger.debug(
+                f"dataloader_audio_load dataset=tail_signal path={path} "
+                f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
+            )
+            return path, 0.0, 0.0, 0.0, str(exc)
+
+
+def tail_signal_collate(batch):
+    paths, tail_dbs, trailing_mss, durations, errors = zip(*batch)
+    return (
+        list(paths),
+        list(tail_dbs),
+        list(trailing_mss),
+        list(durations),
+        list(errors),
+    )
+
+
+def create_tail_signal_dataloader(
+    file_paths: List[str],
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+) -> DataLoader:
+    dataset = TailSignalDataset(file_paths)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": False,
+        "collate_fn": tail_signal_collate,
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
@@ -106,7 +189,12 @@ class LoudnessNormalizeDataset(Dataset):
                 f"seconds={time.perf_counter() - started_at:.6f} "
                 f"sample_rate={int(sample_rate)} frames={int(waveform.shape[-1])}"
             )
-            return path, waveform.to(dtype=torch.float32).contiguous(), int(sample_rate), ""
+            return (
+                path,
+                waveform.to(dtype=torch.float32).contiguous(),
+                int(sample_rate),
+                "",
+            )
         except Exception as exc:
             logger.debug(
                 f"dataloader_audio_load dataset=loudness path={path} "
@@ -126,6 +214,7 @@ def create_loudness_normalize_dataloader(
     prefetch_factor: int,
 ) -> DataLoader:
     dataset = LoudnessNormalizeDataset(file_paths)
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,
@@ -144,13 +233,29 @@ class DiarizationDataset(Dataset):
 
     Sortformer and SmartVAD both run at 16 kHz, so we resample inside the
     decoder rather than carrying the native-rate (often 44.1/48 kHz) waveform
-    through VRAM. The native file is *not* touched here — chunk export reads
-    it lazily later via :class:`torchcodec.decoders.AudioDecoder`, so audio
-    cuts keep the source's original quality.
+    through VRAM. The native file is *not* re-read from disk here — the file's
+    raw encoded bytes are read **once** with :meth:`pathlib.Path.read_bytes`
+    and both the 16 kHz decode (here) and the downstream native-rate decode
+    (crest/LUFS postprocessing) consume the *same* bytes. ``torchcodec``
+    decodes identically from a ``bytes`` source and from a path source, so
+    outputs stay bit-identical while halving disk reads on cold-cache HDDs.
+
+    Shipping the raw bytes through the batch costs RAM, so it is gated on
+    ``raw_bytes_max_duration_s``: bytes are only carried back when the decoded
+    audio is no longer than that many seconds (chunks ~0.5-2 MB each). Longer
+    sources (e.g. multi-hour raw podcasts) decode from the path as before and
+    ship ``None`` so prefetch RAM stays bounded. ``None`` disables byte reuse
+    entirely (legacy path-only behavior).
     """
 
-    def __init__(self, file_paths: List[str]):
+    def __init__(
+        self,
+        file_paths: List[str],
+        *,
+        raw_bytes_max_duration_s: Optional[float] = None,
+    ):
         self.file_paths = [str(p) for p in file_paths]
+        self.raw_bytes_max_duration_s = raw_bytes_max_duration_s
 
     def __len__(self) -> int:
         return len(self.file_paths)
@@ -158,30 +263,49 @@ class DiarizationDataset(Dataset):
     def __getitem__(self, idx: int):
         path = self.file_paths[idx]
         started_at = time.perf_counter()
+        ship_bytes = self.raw_bytes_max_duration_s is not None
         try:
-            decoder = AudioDecoder(path, sample_rate=DIARIZATION_SAMPLE_RATE)
+            if ship_bytes:
+                raw_bytes = Path(path).read_bytes()
+                source = raw_bytes
+            else:
+                raw_bytes = None
+                source = path
+            decoder = AudioDecoder(source, sample_rate=DIARIZATION_SAMPLE_RATE)
             samples = decoder.get_all_samples()
             waveform = samples.data.to(dtype=torch.float32)
             if waveform.ndim == 1:
                 waveform = waveform.unsqueeze(0)
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
+            # Only carry bytes back when the decode is short enough to be cheap.
+            if ship_bytes:
+                duration_s = float(waveform.shape[-1]) / float(DIARIZATION_SAMPLE_RATE)
+                if duration_s > float(self.raw_bytes_max_duration_s):
+                    raw_bytes = None
             logger.debug(
                 f"dataloader_audio_load dataset=diarization path={path} "
                 f"seconds={time.perf_counter() - started_at:.6f} "
-                f"sample_rate={DIARIZATION_SAMPLE_RATE} frames={int(waveform.shape[-1])}"
+                f"sample_rate={DIARIZATION_SAMPLE_RATE} frames={int(waveform.shape[-1])} "
+                f"raw_bytes={'yes' if raw_bytes is not None else 'no'}"
             )
-            return path, waveform.contiguous(), DIARIZATION_SAMPLE_RATE, ""
+            return path, waveform.contiguous(), DIARIZATION_SAMPLE_RATE, "", raw_bytes
         except Exception as exc:
             logger.debug(
                 f"dataloader_audio_load dataset=diarization path={path} "
                 f"seconds={time.perf_counter() - started_at:.6f} error={exc}"
             )
-            return path, torch.empty(0, dtype=torch.float32), 0, str(exc)
+            return path, torch.empty(0, dtype=torch.float32), 0, str(exc), None
 
 
 def diarization_collate(batch):
     return batch
+
+
+def diarization_worker_init(_: int) -> None:
+    # Pin each decode worker to a single thread so they don't each grab all
+    # cores (the source decode happens inside loader workers when enabled).
+    torch.set_num_threads(1)
 
 
 def create_diarization_dataloader(
@@ -189,8 +313,12 @@ def create_diarization_dataloader(
     batch_size: int,
     num_workers: int,
     prefetch_factor: int,
+    raw_bytes_max_duration_s: Optional[float] = None,
 ) -> DataLoader:
-    dataset = DiarizationDataset(file_paths)
+    dataset = DiarizationDataset(
+        file_paths, raw_bytes_max_duration_s=raw_bytes_max_duration_s
+    )
+    num_workers = clamp_loader_workers(num_workers, file_paths)
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": False,
@@ -200,5 +328,10 @@ def create_diarization_dataloader(
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = prefetch_factor
+        # torch requires prefetch_factor >= 1 when workers > 0; the config
+        # default of 0 (used only with workers=0) would crash otherwise, so
+        # floor it. Index order is unchanged (shuffle=False), so any worker
+        # count produces the same batch sequence and identical outputs.
+        loader_kwargs["prefetch_factor"] = max(1, prefetch_factor)
+        loader_kwargs["worker_init_fn"] = diarization_worker_init
     return DataLoader(dataset, **loader_kwargs)

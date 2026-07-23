@@ -1,0 +1,231 @@
+{
+  "area": "transcription",
+  "data_flow": "Stage 7 (transcription.py main) runs once per model in config.transcription.model_names SEQUENTIALLY (config has 5 models: gigaam-v3-e2e-ctc, giga_ctc, giga_rnnt, vosk, tone). For each model: (1) get_valid_paths() calls discover_audio_paths() which reads balalaika.csv usecols=[filepath] into pandas, dedupes, then for EVERY path does a Path.exists()/stat() syscall on the model-specific .txt sidecar (and a second stat for retry_empty zero-byte check). With consensus_num=3, once >=3 prior models processed, it ALSO calls check_consensus() per remaining file, which opens+reads up to 3 prior .txt sidecars per file. (2) ensure_audio_durations() reads balalaika.csv total_duration column (full-CSV pandas read + per-row normalize_path_string in a tqdm loop), probes any missing via ProcessPoolExecutor(torchaudio.info), and writes back via upsert_columns (a locked full-CSV read-modify-write). (3) prepare_length_bucketed_work_shards() buckets paths by duration into 1s buckets up to 15s, sorts each bucket by duration, and writes on-disk shard files (default 10k paths each). (4) run_per_gpu_processes spawns one mp.Process per GPU; each worker (run_worker) calls torch.cuda.set_device, builds ONNX providers (TRT-first since use_tensorrt=True), loads the onnx-asr model, optionally .with_timestamps()/.with_vad(), then loops claiming shards via atomic rename. (5) _process_files builds a DataLoader over TranscriptionDataset: each __getitem__ decodes via torchaudio.load_with_torchcodec, casts float32, mono-mixes if multichannel, resamples to 16k if needed; collate pads to longest-in-batch with pad_sequence and computes lengths. (6) recognize_batch does waveforms.numpy() (CPU) and calls model._recognize_batch(np, lengths) — ONNX inference runs on the padded batch. (7) Results -> extract_text/format_timestamps -> save_results writes a .txt (and .tst if timestamps) sidecar per file with one open()/write() each. After all models, optional ROVER (rover.py) re-discovers all audio paths, finds pending _rover.txt, shards, and per shard re-reads every per-model .txt sidecar into a pandas DataFrame, runs crowdkit ROVER token alignment, writes _rover.txt sidecars atomically.",
+  "operations": [
+    {
+      "name": "per-model full audio rediscovery",
+      "what": "get_valid_paths() -> discover_audio_paths() reads balalaika.csv (pandas read_csv usecols=[filepath]) + _dedupe_paths for EVERY model pass; called 5x total",
+      "cost": "moderate"
+    },
+    {
+      "name": "per-file sidecar stat storm",
+      "what": "get_valid_paths loop transcription.py:284-294 does path.exists() + (retry_empty) stat().st_size per candidate per model; on N files x 5 models = up to 10N stat syscalls",
+      "cost": "moderate"
+    },
+    {
+      "name": "consensus sidecar reads",
+      "what": "check_consensus() transcription.py:257-271 opens+reads up to (idx) prior .txt sidecars per remaining file once idx>=consensus_num; for models 4-5 this is up to 3-4 file reads per file",
+      "cost": "heavy"
+    },
+    {
+      "name": "duration CSV cache read",
+      "what": "_csv_duration_cache() audio_durations.py:58-88 full balalaika.csv read + per-row normalize_path_string inside tqdm loop, once per model",
+      "cost": "moderate"
+    },
+    {
+      "name": "duration probe pool",
+      "what": "_probe_missing_durations() audio_durations.py:111-118 ProcessPoolExecutor(torchaudio.info) over missing files; cached in CSV so amortized but first run pays it; spawns extra processes",
+      "cost": "moderate"
+    },
+    {
+      "name": "duration writeback upsert",
+      "what": "ensure_audio_durations -> upsert_columns csv_manager.py:333 locked full-CSV read-modify-write per model when any duration was probed",
+      "cost": "moderate"
+    },
+    {
+      "name": "work-shard write",
+      "what": "prepare_length_bucketed_work_shards writes shard files to disk per model; sorts each bucket by duration (good for padding) work_shards.py:201-214",
+      "cost": "light"
+    },
+    {
+      "name": "shard claim glob",
+      "what": "claim_work_shard work_shards.py:227 does sorted(work_dir.glob('shard_*.pending')) on every claim; O(shards) per claim -> O(shards^2) total per worker as shards drain",
+      "cost": "light"
+    },
+    {
+      "name": "process spawn per GPU per model",
+      "what": "run_per_gpu_processes spawns fresh mp.Process per GPU EACH of the 5 model iterations; each reloads ONNX model + rebuilds/loads TRT engine cache parallel.py:140-149",
+      "cost": "heavy"
+    },
+    {
+      "name": "ONNX/TRT model load",
+      "what": "onnx_asr.load_model + providers; with use_tensorrt=True first run builds TRT engines (very slow), cached per cuda_id in trt_cache dir gpu.py:48-63",
+      "cost": "dominant"
+    },
+    {
+      "name": "audio decode per file",
+      "what": "TranscriptionDataset.__getitem__ datasets/transcription.py:21 torchaudio.load_with_torchcodec full decode of each file, EVERY model pass (no shared decode across models)",
+      "cost": "heavy"
+    },
+    {
+      "name": "resample per file",
+      "what": "torchaudio.functional.resample datasets/transcription.py:26 when sr!=16k, recomputed every model pass",
+      "cost": "moderate"
+    },
+    {
+      "name": "mono mixdown",
+      "what": "waveform.mean(dim=0) if multichannel datasets/transcription.py:24",
+      "cost": "light"
+    },
+    {
+      "name": "collate pad_sequence",
+      "what": "transcription_collate datasets/transcription.py:40 pads batch to longest waveform; padded zeros fed to ONNX (lengths passed but compute still over padded width for many ONNX graphs)",
+      "cost": "moderate"
+    },
+    {
+      "name": "numpy round-trip",
+      "what": "recognize_batch datasets/transcription.py:66-67 np.asarray(waveforms.numpy()) + lengths.numpy(); waveforms.numpy() is zero-copy but np.asarray wrap is redundant",
+      "cost": "trivial"
+    },
+    {
+      "name": "ONNX inference",
+      "what": "model._recognize_batch on padded batch; the actual GPU compute, dominant per-batch cost",
+      "cost": "dominant"
+    },
+    {
+      "name": "sidecar writes",
+      "what": "save_results transcription.py:59-81 one open/write per .txt and per .tst, no batching/buffering",
+      "cost": "light"
+    },
+    {
+      "name": "single-file fallback",
+      "what": "_process_files transcription.py:160-170 on batch failure re-runs each file individually with waveform[:length] slice+unsqueeze+contiguous (extra copies)",
+      "cost": "light"
+    },
+    {
+      "name": "ROVER re-discovery + sidecar re-read",
+      "what": "rover.py _records_for_audio_paths:68-96 re-opens every per-model .txt for every pending audio file into pandas records; plus _pending_audio_paths separate full pass of stat checks",
+      "cost": "heavy"
+    },
+    {
+      "name": "ROVER aggregation",
+      "what": "crowdkit ROVER.fit_predict per shard rover.py:129 token-level alignment over all transcripts; CPU-bound, parallelized across rover_workers=4",
+      "cost": "heavy"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Decode/resample each audio ONCE, share across all models",
+      "location": "src/transcription/transcription.py:334 (per-model loop) and src/utils/datasets/transcription.py:18-29",
+      "description": "The outer loop reruns the entire decode+resample+mono pipeline for every model (5x in the shipped config). Most models share TARGET_SAMPLE_RATE=16k. Restructure so a file is decoded once and fed to all 16k models in that pass (load all 16k-compatible models per worker and run them on the same waveform batch), or cache a decoded/resampled 16k tensor on disk/RAM keyed by path for reuse across model passes. This collapses 5x decode+resample to ~1x.",
+      "expected_gain": "Up to ~4-5x reduction in CPU decode/resample work; large overall wall-clock win on IO/CPU-bound nodes where decode dominates",
+      "risk": "medium",
+      "low_resource_note": "Caching decoded 16k audio to disk costs SSD space (~2x raw 16k PCM) and 31GB RAM is too small to cache in memory; gate behind a config knob (cache_decoded: false default) and prefer the multi-model-per-pass approach which needs no extra storage but more VRAM (problematic when only ~2GB free per 4060 Ti). On low-VRAM nodes keep sequential models but still benefit from a small on-disk 16k cache toggle."
+    },
+    {
+      "title": "Avoid feeding padded zeros to ONNX / tighten batch padding",
+      "location": "src/utils/datasets/transcription.py:40 and src/transcription/transcription.py:152",
+      "description": "pad_sequence pads every batch to the longest clip; lengths are passed to _recognize_batch but many ONNX encoder graphs still compute over the full padded width. Duration bucketing + per-bucket sort already limits this, but cross-bucket shards and the final ragged shard can still pad heavily. Consider sorting within shard and using a length-aware/dynamic batcher (group near-equal lengths) to minimize wasted padded frames, and verify onnx-asr actually masks padded compute.",
+      "expected_gain": "10-40% on batches with high length variance; depends on model graph",
+      "risk": "low",
+      "low_resource_note": "Pure scheduling change, helps everywhere; no extra memory. On weak nodes smaller batch_size already reduces padding waste."
+    },
+    {
+      "title": "Persist ONNX/TRT model across model iterations or skip respawn",
+      "location": "src/transcription/transcription.py:373-377 (run_per_gpu_processes called inside per-model loop)",
+      "description": "A fresh process-per-GPU is spawned for EACH of the 5 models; each respawn reloads the ONNX model and re-initializes the TRT EP (engine build/load). Engines are cached per cuda_id (gpu.py:48-63) so subsequent builds are loads not rebuilds, but process spawn + CUDA context init + ORT session creation is paid 5x per GPU. Keep one long-lived worker per GPU that iterates models internally, or batch all models into a single worker lifecycle.",
+      "expected_gain": "Saves seconds-to-minutes of repeated CUDA/ORT/TRT init per model per GPU (5x); meaningful when per-model file counts are small",
+      "risk": "medium",
+      "low_resource_note": "Holding multiple models resident raises VRAM; on the constrained 16GB-with-12-14GB-used node this can OOM. Make 'keep models resident' a config knob; default to load-one-model-at-a-time but reuse the process (just swap the session) to still skip spawn cost."
+    },
+    {
+      "title": "Cache audio discovery + sidecar-pending computation across models",
+      "location": "src/transcription/transcription.py:278 (discover_audio_paths) and 339 (get_valid_paths per model)",
+      "description": "discover_audio_paths re-reads balalaika.csv and re-dedupes for every model; the full audio universe is identical across models. Read it once in main() and pass the list down. Also the per-file exists()/stat() pending scan is repeated per model — a single batched directory listing (os.scandir of each parent dir once) can resolve all model suffixes at once instead of 2 stats x N files x 5 models.",
+      "expected_gain": "Eliminates 4 redundant full-CSV reads and ~80% of the stat syscalls; large on millions-of-files datasets where the stat storm is minutes",
+      "risk": "low",
+      "low_resource_note": "Strictly fewer syscalls and less pandas work; helps weak nodes most (SSD stat storm + low RAM). Batched scandir uses one listing per directory instead of per-file stat."
+    },
+    {
+      "title": "Replace per-claim glob with cached shard listing",
+      "location": "src/utils/work_shards.py:227 (claim_work_shard sorted glob each call)",
+      "description": "Each claim does sorted(glob('shard_*.pending')) — O(remaining_shards) per claim, O(S^2) over a run. With 10k-path shards this is usually small, but for huge datasets with many shards and few workers it adds up. Workers could cache the sorted shard list and only re-glob on a claim race (FileNotFoundError).",
+      "expected_gain": "Removes O(S^2) glob/sort overhead; minor unless shard count is large",
+      "risk": "low",
+      "low_resource_note": "Pure CPU/syscall saving, helps weak nodes; negligible memory."
+    },
+    {
+      "title": "ROVER: read each per-model sidecar once, avoid double full pass",
+      "location": "src/transcription/rover.py:52-66 (_pending_audio_paths) and 68-96 (_records_for_audio_paths)",
+      "description": "ROVER does one full pass building pending (stat per file) then a second pass opening every per-model .txt per file. The stat for the per-model transcript and the read could be combined, and the pending-vs-records passes merged into one walk so files are visited once. Also path_exists()+read_file_content() do two syscalls where one open with try/except would do.",
+      "expected_gain": "~2x fewer filesystem traversals in ROVER stage; significant on large datasets",
+      "risk": "low",
+      "low_resource_note": "Fewer syscalls, lower IO; helps weak/SSD nodes. crowdkit ROVER itself is the heavy CPU part and is already parallelized via rover_workers."
+    },
+    {
+      "title": "Enable pin_memory for the DataLoader when a GPU is present",
+      "location": "src/utils/datasets/transcription.py:56 (pin_memory: False)",
+      "description": "pin_memory is hardcoded False. recognize_batch goes through numpy on CPU, so pinned host memory only helps if onnx-asr copies to GPU via a path that benefits from pinned buffers — verify the onnx-asr input path. If it does H2D copies, pinned memory overlaps transfer with compute.",
+      "expected_gain": "0-10%; only if onnx-asr does explicit H2D from these buffers",
+      "risk": "low",
+      "low_resource_note": "Pinned memory consumes scarce RAM (31GB) and is page-locked; on the low-RAM node leave it off or gate behind a knob. Likely net-neutral here since data is handed to ORT as numpy."
+    },
+    {
+      "title": "Tune num_workers/prefetch for low-RAM node",
+      "location": "src/transcription/transcription.py:128-138 (reads config num_workers=16, prefetch_factor=4)",
+      "description": "16 loader workers x prefetch 4 x batch 8 means up to ~512 decoded waveforms buffered per GPU worker; with 2 GPU workers that is ~1024 waveforms in RAM. On a 31GB node decoding long clips this risks RAM pressure/OOM and oversubscribes 48 threads across other stages. Provide per-node autotuned defaults and lower them on weak nodes.",
+      "expected_gain": "Prevents OOM/thrash on weak nodes; can also improve throughput by avoiding GIL/thread oversubscription",
+      "risk": "medium",
+      "low_resource_note": "This is THE knob for low-resource nodes: cap num_workers and prefetch_factor; persistent_workers=True (already set) keeps workers warm but also keeps their RAM resident across shards."
+    },
+    {
+      "title": "Buffer/batch sidecar writes",
+      "location": "src/transcription/transcription.py:59-81 (save_results) ",
+      "description": "One open/write per .txt and .tst with no buffering; for many tiny files the syscall + metadata overhead dominates IO. Minor, but writing could use os.open with O_WRONLY|O_CREAT|O_TRUNC and a single write, and skip empty .tst entirely (already does).",
+      "expected_gain": "Small; matters only at very high file counts",
+      "risk": "low",
+      "low_resource_note": "Fewer syscalls helps SSD-bound weak nodes marginally."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "format_timestamps trailing-word end time uses wrong array index",
+      "location": "src/transcription/transcription.py:120",
+      "description": "When the final word has no trailing blank token, the code appends (word_start, timestamps[-1], current_word). But `timestamps` here is the local zip variable name shadowed by the loop? No — it is the outer `timestamps` array, so timestamps[-1] is the last token's timestamp, which is the END of the last character, generally correct. However if the last token IS blank, the branch at :110 already flushed and current_word is empty so this is skipped — fine. The real latent issue: the loop closes a word on a blank using that blank's timestamp `ts` as the word END (line 111), but `ts` is the blank's START time, slightly underestimating word end. Low impact on downstream but worth noting for timestamp accuracy.",
+      "severity": "low"
+    },
+    {
+      "title": "Single-file fallback can desync results/paths order on partial failures",
+      "location": "src/transcription/transcription.py:159-178",
+      "description": "On batch failure the code rebuilds `results` per-file and appends None on failure, then save_results zips paths with texts. This stays aligned, but if recognize_batch returns more/fewer than one result for a single waveform (e.g. VAD splitting), results length can mismatch len(paths), causing texts/ts to misalign with paths in save_results (zip silently truncates). With use_vad enabled a single input may yield multiple segments.",
+      "severity": "medium"
+    },
+    {
+      "title": "errors_counter/error_details mutated cross-process without guaranteed propagation",
+      "location": "src/transcription/transcription.py:143-146, 167-170, 252-255",
+      "description": "Workers are separate mp.Process. processed/errors are mp.Value (atomic-ish but .value += is NOT atomic without a lock — read-modify-write race between two GPU workers) and error_details is a Manager().list (ok). The processed_counter.value += len(paths) at :181 and errors_counter.value += 1 across 2 processes can lose updates due to the non-atomic increment. Final reported processed/errors counts may be undercounted.",
+      "severity": "medium"
+    },
+    {
+      "title": "check_consensus reads sidecars without retry_empty awareness",
+      "location": "src/transcription/transcription.py:262",
+      "description": "check_consensus uses text_sidecar_complete(tp) WITHOUT retry_empty, so a zero-byte (failed) prior transcript counts as complete and contributes an empty string to the consensus Counter. If 3 models produced empty sidecars, consensus 'agrees' on empty and the file is skipped for the current model, losing a real transcription opportunity.",
+      "severity": "medium"
+    },
+    {
+      "title": "ROVER stats_queue drain race: get(timeout=1.0) can drop stats from slow workers",
+      "location": "src/transcription/rover.py:213-222",
+      "description": "After join() all workers have exited and put their stats, but the loop does exactly len(processes) gets with a 1s timeout each and `continue` on Empty — if a worker put two-ish times or ordering causes an early Empty, a real stat sitting in the pipe buffer after a transient Empty is skipped (the loop iteration is consumed). Counts (seen/tasks/saved/failed) can be undercounted; only a logged warning results, not a correctness failure of the saved files.",
+      "severity": "low"
+    },
+    {
+      "title": "np.asarray on waveforms.numpy() is a redundant no-op wrap",
+      "location": "src/utils/datasets/transcription.py:66",
+      "description": "waveforms.numpy() already returns a float32 ndarray (tensor is float32); np.asarray(..., dtype=np.float32) just rewraps. Harmless but dead-ish; if the tensor were ever non-contiguous numpy() would still work. Not a correctness bug, minor.",
+      "severity": "low"
+    },
+    {
+      "title": "output_suffix collision: 'vosk' suffix shared by vosk and vosk_small",
+      "location": "src/transcription/transcription.py:195, 337",
+      "description": "output_suffix is 'vosk' whenever 'vosk' in model_name, so both 'vosk' and 'vosk_small' write to <stem>_vosk.txt. If both appear in model_names they overwrite each other's sidecars and ROVER would only see one as worker='vosk'/'vosk_small' but read the same file (rover.py uses _model_suffix identically), conflating two models. Misleading consensus/ROVER if both configured.",
+      "severity": "medium"
+    },
+    {
+      "title": "do_timestamps silently dropped for unsupported models",
+      "location": "src/transcription/transcription.py:196",
+      "description": "do_timestamps = with_timestamps AND model in SUPPORTED_TIMESTAMPS. With config with_timestamps:True but e.g. giga_rnnt/vosk not in SUPPORTED_TIMESTAMPS, no .tst is written and no warning is logged that timestamps were requested but unavailable — silent feature drop (config lies).",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "No dedicated timing/DEBUG hooks exist in these three files. Reusable signals for benchmarking: (1) tqdm bars per worker desc=f'ASR-{cuda_id}' (transcription.py:140) give per-batch throughput; tqdm in work_shards.py and audio_durations.py (probe_total_duration, load_total_duration, bucket_/write_ work shards) time the prep phases. (2) logger.info lines report shard counts and per-shard file counts (transcription.py:232, 368-371) and ROVER per-shard task/transcript counts (rover.py:125-128, 276-280) — parse these for stage timing. (3) format_length_range (transcription.py:52) already computes min/max seconds per batch and is logged on batch failure — could be logged always for padding-waste analysis. (4) write_stage_status (transcription.py:403) records processed/skipped/errors counts to disk. (5) onnx-asr / ORT can be profiled via ORT session profiling and TRT verbose logging (set via providers in gpu.py) — not currently enabled. No torch.cuda.Event or perf_counter timers anywhere; benchmarks should add perf_counter around recognize_batch (transcription.py:152) and around the dataloader iteration to separate decode/IO time from GPU inference time."
+}

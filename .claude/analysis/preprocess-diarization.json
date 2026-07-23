@@ -1,0 +1,242 @@
+{
+  "area": "preprocess-diarization",
+  "data_flow": "Two entry points share most code. RAW mode (src/preprocess/preprocess.py:main, lines 821-1014): discover_audio_paths (CSV or rglob) -> filter out already-chunked names via regex (855-862) -> ensure_main_csv + absorb leftover partials (876-888) -> round-robin split files across GPUs (896-898) -> a ThreadPoolExecutor with one thread per GPU (913) submits process_gpu_batch (801), which spawns a ProcessPoolExecutor(max_workers=1, initializer=init_models) (803-807). The single child runs _run_diarization_shard (725): builds a DiarizationDataset DataLoader (create_diarization_dataloader, src/utils/datasets/preprocess.py:187) that decodes each source file to 16kHz mono via torchcodec AudioDecoder(sample_rate=16000) (datasets/preprocess.py:162), then per file calls process_audio_file (544). That mean-mixes to mono (570), runs diarize_audio (147) which windows the audio into chunk_duration (900s) blocks and calls Sortformer.diarize per window. For files <= duration (15s) it writes one row and optionally crest/loudness-filters the whole file in place (597-633). For longer files it builds a single-speaker timeline (build_single_speaker_timeline:178), runs SmartVAD per segment (apply_eos_classification:228), then cut_audio (420) re-opens the source at NATIVE sample rate and decodes only each [start,end] window via get_samples_played_in_range (475), optionally crest/loudness-postprocesses (502), and writes each chunk with torchcodec AudioEncoder (_save_audio_chunk:359). Rows are streamed to preprocess_part_<gpu>.csv via PartialCsvWriter (flush() per row, 663). A PeriodicCsvMerger thread (csv_manager.py:789) folds partials into balalaika.csv every flush_every_rows/seconds; absorb_partial_csvs runs at end. EXISTING_CHUNKS mode (preprocess_existing_chunks.py): work split via on-disk shards (work_shards.py), mp.spawn one worker per GPU; each worker claims shards, builds a DataLoader over the chunk files, runs diarize_audio for metadata only (no cutting), and if fuse_audio does a SEPARATE native-rate torchaudio.load_with_torchcodec read + crest/loudness + save (_postprocess_existing_chunk:229). Sortformer itself (sortformer_onnx.py): resample-to-16k if needed -> extract_mel_features on GPU then .cpu().numpy() (133) -> _process_features loops chunks calling session.run per chunk (210) with growing numpy FIFO/spkcache caches and Python-loop cache compression (_compress_spkcache:262) -> _binarize Python loop over every frame x 4 speakers (359).",
+  "operations": [
+    {
+      "name": "audio_paths_source dispatch",
+      "what": "discover_audio_paths reads balalaika.csv usecols=filepath or rglobs the tree, then _dedupe_paths tqdm-loops every path (csv_manager.py:1054, 1008-1024)",
+      "cost": "moderate"
+    },
+    {
+      "name": "already-chunked regex filter",
+      "what": "main loops every discovered path compiling-match chunk_pattern (preprocess.py:856-862); O(N) Python, fine",
+      "cost": "light"
+    },
+    {
+      "name": "ensure_main_csv + absorb leftover partials at startup",
+      "what": "reads full balalaika.csv, normalizes filepath column with a tqdm per-row loop, then upsert_columns does an outer merge + full atomic rewrite of the whole CSV (preprocess.py:876-888 -> csv_manager.py:556,333)",
+      "cost": "heavy"
+    },
+    {
+      "name": "DataLoader source decode to 16kHz mono",
+      "what": "DiarizationDataset.__getitem__ opens torchcodec AudioDecoder(sample_rate=16000), get_all_samples, mean to mono (datasets/preprocess.py:158-174). With diarization_loader_workers=0 (config default) this runs synchronously in the GPU process — no decode/compute overlap",
+      "cost": "heavy"
+    },
+    {
+      "name": "mono mix of already-mono audio",
+      "what": "process_audio_file re-checks audio.shape[0]>1 and mean-mixes (preprocess.py:569-570); dataset already returned mono so this is a no-op copy guard",
+      "cost": "trivial"
+    },
+    {
+      "name": "diarize_audio windowing",
+      "what": "slices audio into 900s windows; per window resets state and runs full Sortformer.diarize (preprocess.py:147-175). Drops first+last segment per window when >2 segs (169-170)",
+      "cost": "moderate"
+    },
+    {
+      "name": "Sortformer resample inside diarize",
+      "what": "diarize re-checks sample_rate!=16000 and resamples (sortformer_onnx.py:142-147); audio is already 16k from loader so this is skipped — but the device transfer audio.to(device) at 137 still copies whole window to GPU",
+      "cost": "light"
+    },
+    {
+      "name": "extract_mel_features GPU->CPU roundtrip",
+      "what": "STFT+MelScale+log computed on GPU then .transpose().unsqueeze().cpu().numpy() per window (sortformer_onnx.py:110-133). Full mel spectrogram copied GPU->host as numpy because ORT session is fed numpy",
+      "cost": "moderate"
+    },
+    {
+      "name": "Sortformer streaming session.run per chunk",
+      "what": "_process_features loops num_chunks (~ window_frames/992) and calls self.session.run per chunk (sortformer_onnx.py:177-195, 210). This is the dominant GPU op; each call is small (124-frame chunk) so kernel-launch / host-sync overhead per call is high",
+      "cost": "dominant"
+    },
+    {
+      "name": "growing numpy cache concatenation",
+      "what": "_streaming_update does np.concatenate on fifo/fifo_preds/spkcache every chunk, reallocating ever-larger arrays (sortformer_onnx.py:223-243)",
+      "cost": "moderate"
+    },
+    {
+      "name": "spkcache compression Python loops",
+      "what": "_compress_spkcache calls _boost_topk_scores (per-speaker np.argsort copy loop, 310-316), _get_topk_indices (Python loop over spkcache_len building lists + .sort(), 318-343), _gather_spkcache (Python per-index assignment loop, 345-357) and _update_silence_profile (Python per-frame running-mean loop, 253-260)",
+      "cost": "moderate"
+    },
+    {
+      "name": "_binarize frame loop",
+      "what": "Python double loop over NUM_SPEAKERS x num_frames reading preds[t,spk] scalar, building/merging/padding intervals, then formats segments into strings (sortformer_onnx.py:359-417). String formatting then re-parsed by parse_diarization_output (preprocess.py:127)",
+      "cost": "moderate"
+    },
+    {
+      "name": "SmartVAD per-segment inference",
+      "what": "apply_eos_classification loops every segment, slices numpy, calls smart_vad.predict_endpoint one segment at a time (preprocess.py:248-259). Each call runs WhisperFeatureExtractor padding to full 8s + one ONNX run (offline_svad.py:72-122)",
+      "cost": "heavy"
+    },
+    {
+      "name": "VAD resample guard",
+      "what": "apply_eos_classification resamples audio sr->vad_sr only if different (preprocess.py:241-243); both are 16k so skipped, then .numpy() on CPU tensor (246)",
+      "cost": "trivial"
+    },
+    {
+      "name": "cut_audio lazy native-rate decode",
+      "what": "re-opens source with AudioDecoder (no resample) and get_samples_played_in_range per kept segment (preprocess.py:449-477); good — avoids materializing full waveform",
+      "cost": "moderate"
+    },
+    {
+      "name": "fused crest/loudness postprocess per chunk",
+      "what": "_postprocess_chunk -> postprocess_audio_tensor moves to CPU, computes crest factor, pyloudnorm integrated_loudness + normalize per chunk (audio_postprocessing.py:76-135). pyln meter cached by (rate,block_size) (audio_postprocessing.py:53-59)",
+      "cost": "moderate"
+    },
+    {
+      "name": "chunk encode/write",
+      "what": "_save_audio_chunk builds torchcodec AudioEncoder and to_file per chunk (preprocess.py:359-377)",
+      "cost": "moderate"
+    },
+    {
+      "name": "per-row partial CSV flush",
+      "what": "writer.write does csv writerow + file.flush() per chunk row (csv_manager.py:652-663); fsync-free but a syscall per row",
+      "cost": "light"
+    },
+    {
+      "name": "PeriodicCsvMerger full-CSV rewrite",
+      "what": "every flush_every_rows(10000)/300s the background thread reads ALL partials with pandas, outer-merges into balalaika.csv, and atomically rewrites the WHOLE file incl. a full .bak copy (csv_manager.py:846-862 -> _atomic_write_csv_unlocked:210-226)",
+      "cost": "heavy"
+    },
+    {
+      "name": "torch.cuda.empty_cache per file",
+      "what": "process_audio_file finally clause calls empty_cache after every source file (preprocess.py:702-704); forces CUDA allocator to release+re-acquire, adds latency",
+      "cost": "light"
+    },
+    {
+      "name": "existing_chunks double audio read",
+      "what": "in fuse mode each chunk is decoded once by the DataLoader for diarization (16k) AND re-read at native rate by _postprocess_existing_chunk via torchaudio.load_with_torchcodec (preprocess_existing_chunks.py:234)",
+      "cost": "heavy"
+    },
+    {
+      "name": "pending_metadata_paths CSV scan",
+      "what": "loads full main CSV, builds completion mask over all required columns with per-column astype(str).str.strip (preprocess_existing_chunks.py:87-126)",
+      "cost": "moderate"
+    },
+    {
+      "name": "_increment shared counters",
+      "what": "existing_chunks increments mp.Value with get_lock() per file for processed/skipped/crest counters (preprocess_existing_chunks.py:219-226, 350-357); lock contention across GPU workers",
+      "cost": "light"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Enable async DataLoader workers + prefetch for diarization decode",
+      "location": "configs/config.yaml:154-156 (diarization_loader_workers=0, prefetch_factor=0); src/utils/datasets/preprocess.py:187-204",
+      "description": "Decode/resample-to-16k currently runs synchronously inside the GPU process between inference calls, so the GPU idles during every torchcodec decode + resample of a multi-minute source. Set diarization_loader_workers>=2 and prefetch_factor>=2 so next-file decode overlaps current-file inference. The loader already supports persistent_workers and prefetch (datasets/preprocess.py:200-203). Note worker_init is missing here (crest loader sets torch.set_num_threads(1) at datasets/preprocess.py:51 but diarization loader does not) so each worker may grab all 48 threads — add a worker_init_fn that pins torch.set_num_threads(1).",
+      "expected_gain": "20-40% wall-clock on decode-bound files; larger for high-SR FLAC",
+      "risk": "low",
+      "low_resource_note": "On 31GB RAM keep workers small (2-4) and prefetch=2; each worker buffers a full decoded 16k window. Expose as the existing config knobs so weak nodes can keep 0/1."
+    },
+    {
+      "title": "Batch SmartVAD across segments instead of one ONNX call per segment",
+      "location": "src/preprocess/preprocess.py:248-259; src/libs/smart_turn/offline_svad.py:72-150",
+      "description": "apply_eos_classification calls predict_endpoint once per segment in a Python loop; each call re-runs WhisperFeatureExtractor padding every segment to a fixed 8s tensor and one ONNX run. Stack all segment features into a (N,80,T) batch and run the session once (the model output is already (B,1) per offline_svad.py:127). This amortizes kernel launches and the per-call torch.cuda.synchronize at offline_svad.py:142. Feature extraction can also be batched since all segments pad to max_length=8s.",
+      "expected_gain": "2-5x on the VAD step for multi-speaker long files; VAD is a heavy per-segment cost",
+      "risk": "medium",
+      "low_resource_note": "Cap batch size (e.g. 16-32 segments) so a long file with hundreds of turns does not spike VRAM on the shared 16GB GPU; expose a smart_vad_batch_size knob."
+    },
+    {
+      "title": "Feed Sortformer mel features as GPU OrtValue (io-binding) to kill the per-window CPU roundtrip",
+      "location": "src/preprocess/sortformer_onnx.py:133, 201-211",
+      "description": "extract_mel_features computes the spectrogram on GPU then .cpu().numpy() and the ORT session is fed numpy dicts (sortformer_onnx.py:201-211), so every window does a GPU->host->GPU bounce and ORT does its own H2D copy per session.run. SmartVAD already demonstrates the io_binding+from_dlpack pattern (offline_svad.py:124-143). Bind the mel tensor and the streaming cache tensors as CUDA OrtValues to keep them resident on-device across the chunk loop.",
+      "expected_gain": "10-25% on Sortformer inference, mostly from removing per-chunk H2D/D2H",
+      "risk": "medium",
+      "low_resource_note": "Pure win on single-GPU; no extra RAM. Keep a numpy fallback (as SmartVAD does at offline_svad.py:144-150) for CPUExecutionProvider nodes."
+    },
+    {
+      "title": "Reconsider TensorRT-first provider for the streaming Sortformer session",
+      "location": "src/preprocess/preprocess.py:95 (use_tensorrt=True); src/utils/gpu.py:45-64",
+      "description": "Sortformer is fed variable-length chunks (last chunk is zero-padded to feed_size but caches grow, sortformer_onnx.py:184-187, 223) and many small dynamic-shape inputs; TRT engine builds for unseen shapes are extremely slow and can rebuild repeatedly, and the first run pays a multi-minute engine compile. Benchmark CUDA EP vs TRT EP; if TRT does not cache a stable engine, force CUDAExecutionProvider for this model. The 12-14GB already used by the other training job also competes with the configured 4GB TRT workspace (runtime_env.py:38).",
+      "expected_gain": "Avoids minutes of per-run engine builds; steady-state may be neutral to slightly slower without TRT",
+      "risk": "medium",
+      "low_resource_note": "On the busy/low-VRAM node TRT workspace allocation can OOM; CUDA EP is safer. Make the provider choice a config knob per model."
+    },
+    {
+      "title": "Vectorize _binarize and skip the string round-trip",
+      "location": "src/preprocess/sortformer_onnx.py:359-417; src/preprocess/preprocess.py:127-144",
+      "description": "_binarize loops every (speaker, frame) reading scalar preds[t,spk] and emits f-strings that parse_diarization_output then splits and re-floats. Replace the inner frame loop with numpy threshold + np.diff edge detection per speaker column, and return tuples directly instead of formatting/parsing strings. Removes Python-level O(frames*speakers) work and the format/parse overhead.",
+      "expected_gain": "5-15% of Sortformer CPU time on long windows; reduces GIL-bound work",
+      "risk": "low",
+      "low_resource_note": "Helps most on weak CPU (Haswell) nodes where this Python loop is relatively costlier; pure CPU win, no VRAM."
+    },
+    {
+      "title": "Vectorize spkcache compression and silence-profile update",
+      "location": "src/preprocess/sortformer_onnx.py:253-260, 310-357",
+      "description": "_update_silence_profile updates a running mean one frame at a time in a Python loop (253-260) — replace with a single vectorized mean over sil_embs. _boost_topk_scores copies a column and argsorts per speaker (310-316); _get_topk_indices builds Python lists and sorts (318-343); _gather_spkcache assigns per index in Python (345-357). These run on every compression trigger for long audio. Use np.argpartition for top-k and vectorized gather/scatter.",
+      "expected_gain": "5-10% of Sortformer CPU time on long files; more when spkcache compresses often",
+      "risk": "medium",
+      "low_resource_note": "CPU-side win, important on the 48-thread Haswell node since this is single-threaded numpy in the GIL; no memory cost."
+    },
+    {
+      "title": "Avoid double native-rate read in existing_chunks fuse mode",
+      "location": "src/preprocess/preprocess_existing_chunks.py:342-360, 229-286; src/utils/datasets/preprocess.py:158-180",
+      "description": "Each chunk is decoded to 16k by the DataLoader for diarization, then _postprocess_existing_chunk re-opens the same file at native rate (torchaudio.load_with_torchcodec) for crest+loudness. For short pre-chunked files (<=15s, the common case) the diarization 16k waveform is enough for crest factor and the native read is only needed for the rewrite. Either have the dataset return both rates in one decode, or compute crest on the already-loaded tensor and only re-read when a rewrite is actually required.",
+      "expected_gain": "~30-50% fewer file decodes in existing_chunks+fuse (the active config) when most chunks pass crest",
+      "risk": "medium",
+      "low_resource_note": "Crest/loudness must stay at native rate for correctness if spec requires it; gate behind a knob. Saves IO on SSD-bound weak nodes."
+    },
+    {
+      "title": "Reduce PeriodicCsvMerger full-file rewrites (incl. .bak copy) on large CSVs",
+      "location": "src/utils/csv_manager.py:846-862, 210-226; src/preprocess/preprocess.py:906-912",
+      "description": "Every flush reads all partials with pandas, outer-merges, and rewrites the ENTIRE balalaika.csv plus a full byte-copy backup (.bak). At tens of millions of rows this is a multi-GB rewrite each flush_every_rows(10000). For an append-mostly stage like preprocess, prefer appending new partial rows to the main CSV (or only rewriting when rows are actually mutated), or raise flush_every_rows substantially for the preprocess stage so rewrites are rarer.",
+      "expected_gain": "Large on big datasets — eliminates repeated O(total_rows) IO; can dominate late-stage wall-clock",
+      "risk": "medium",
+      "low_resource_note": "On 31GB RAM the full-CSV pandas load per flush is also a RAM spike; raising flush_every_rows (csv config block) is a zero-code mitigation for weak nodes."
+    },
+    {
+      "title": "Throttle torch.cuda.empty_cache to not run per source file",
+      "location": "src/preprocess/preprocess.py:702-704",
+      "description": "The finally block calls torch.cuda.empty_cache() after every source file, forcing the CUDA caching allocator to release blocks it will immediately re-acquire for the next file, adding sync latency and fragmentation churn. Only call it on actual OOM recovery or every N files.",
+      "expected_gain": "small but steady per-file latency reduction; a few % on many-small-file runs",
+      "risk": "low",
+      "low_resource_note": "On the shared-VRAM node empty_cache does return memory to the other training job, so keep an occasional call (every N files) rather than removing entirely."
+    },
+    {
+      "title": "Hoist mono-mix and unify decode so process_audio_file does not re-guard",
+      "location": "src/preprocess/preprocess.py:569-570; src/utils/datasets/preprocess.py:166-168",
+      "description": "The dataset already returns mono (datasets/preprocess.py:166-168) yet process_audio_file re-checks shape[0]>1 and mean-mixes again (569-570). Minor, but it's an extra full-window allocation guard on every file. Trust the loader's contract or move the guard into the dataset only.",
+      "expected_gain": "negligible-to-small; removes one branch + potential copy per file",
+      "risk": "low",
+      "low_resource_note": "Trivial; safe everywhere."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "Source pre-flight hours scan disabled; hours_in always 0.0 in raw mode audit",
+      "location": "src/preprocess/preprocess.py:870-872, 967-968",
+      "description": "_measure_source_hours is commented out and hours_in is hard-coded to 0.0, so record_stage_summary for the preprocess stage always reports hours_in=0.0 (lines 967-983). The audit's hours_removed therefore looks like a net GAIN (hours_out>0, hours_in=0) and the report under-attributes removed audio to this stage. The docstring at lines 11-12 still claims hours_in/out are logged. Dead/lying instrumentation.",
+      "severity": "medium"
+    },
+    {
+      "title": "Per-window segment trimming can silently drop real speech",
+      "location": "src/preprocess/preprocess.py:169-170",
+      "description": "diarize_audio drops the first and last segment of every 900s window whenever len(segs)>2 and the file is longer than one window. This is meant to discard boundary artifacts but unconditionally deletes up to 2 genuine segments per window for multi-window files, losing speech near every window boundary. No overlap/handoff between windows is used, so boundary content is just lost.",
+      "severity": "medium"
+    },
+    {
+      "title": "loudness_normalized column written as empty string vs True (mixed dtype)",
+      "location": "src/preprocess/preprocess.py:539, 631-633; src/preprocess/preprocess_existing_chunks.py:359",
+      "description": "row['loudness_normalized'] is set to True (bool) when normalized and '' (empty string) otherwise. This produces a mixed object column in balalaika.csv, which complicates downstream boolean filtering and any _metadata_complete_mask checks that test notna()+non-empty (preprocess_existing_chunks.py:95-101 would treat '' as incomplete). Use a consistent False/0 sentinel.",
+      "severity": "low"
+    },
+    {
+      "title": "crest_audit['files_in'] not incremented in the short-file fused path of cut_audio's sibling",
+      "location": "src/preprocess/preprocess.py:605-606 vs 500-501",
+      "description": "In the short-file branch of process_audio_file files_in/files_out are set by assignment (=1) (605,621) while cut_audio increments (+=1). These are consistent per-call, but the short-file branch decodes the whole file with AudioDecoder.get_all_samples (600) loading the entire native-rate waveform into RAM — for a file just under the 15s limit that's fine, but the limit_dur default is 15s while total_audio_duration uses the 16k-derived duration (566); a file slightly over native length boundary could mis-route. Low risk but worth noting the duration is computed from the resampled 16k tensor, not the native file.",
+      "severity": "low"
+    },
+    {
+      "title": "Swallowed exceptions hide broken-file root causes in dataset getitem",
+      "location": "src/utils/datasets/preprocess.py:175-180",
+      "description": "DiarizationDataset.__getitem__ catches all exceptions and returns an empty tensor + error string at debug level only; the error is later logged once in _run_diarization_shard (preprocess.py:776-777) but the original traceback is lost, making decode-failure debugging hard on weak nodes. Not a correctness bug but obscures resource/codec failures.",
+      "severity": "low"
+    },
+    {
+      "title": "PartialCsvWriter.write flushes per row but never fsyncs; claim of crash-safety overstated for power loss",
+      "location": "src/utils/csv_manager.py:652-663",
+      "description": "write() calls self._file.flush() per row (Python buffer -> OS) but never os.fsync, so the docstrings claiming a SIGKILL/OOM loses at most one row (preprocess.py:18-20) hold for process kill but NOT for OS crash/power loss. Minor doc/behavior mismatch.",
+      "severity": "low"
+    }
+  ],
+  "instrumentation": "Rich loguru DEBUG perf hooks already exist and are reusable for benchmarking (all gated on DEBUG log level): (1) Sortformer inference timing per window — 'perf model=sortformer event=inference seconds=... sample_rate=... frames=...' (preprocess.py:159-163). (2) SmartVAD inference timing per segment — 'perf model=smart_vad event=inference seconds=...' (preprocess.py:254-258). (3) Chunk save timing — 'perf audio_save stage=preprocess path=... seconds=... format=...' (preprocess.py:373-377) and the existing_chunks variant (preprocess_existing_chunks.py:266-270). (4) Audio load timing per file in every dataset — 'dataloader_audio_load dataset=diarization|crest|loudness path=... seconds=... frames=...' (datasets/preprocess.py:37-41, 104-108, 169-173). (5) DataLoader wait/backpressure — 'perf dataloader_wait stage=preprocess rank=... batch=... seconds=... items=...' and a one-shot 'perf dataloader_config ... batch_size=... workers=... prefetch_factor=... prefetch_batches=...' (preprocess.py:757-774, preprocess_existing_chunks.py:327-331). (6) Per-row partial-write timing — 'perf partial_write stage=preprocess rank=... seconds=...' (preprocess.py:786-792). (7) existing_chunks native-rate load timing — 'perf audio_load stage=preprocess_existing_chunks ...' (preprocess_existing_chunks.py:236-240). The __main__ block of sortformer_onnx.py prints RTF = wall/(samples/16k) for a single file (lines 436-441) — a ready-made micro-benchmark harness for the diarizer. Run benchmarks with loguru level=DEBUG to capture all of these into the rotating per-stage log file set up by setup_logging."
+}

@@ -32,6 +32,20 @@ stage_init() {
     # shellcheck disable=SC1090
     source "$venv/bin/activate"
 
+    # Mirror base.sh: prepend the venv's bundled NVIDIA / TensorRT shared
+    # libraries to LD_LIBRARY_PATH so ONNX Runtime's CUDA/TensorRT execution
+    # providers can dlopen them when stages launch via the *_yaml.sh wrappers.
+    local python_version
+    python_version=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    local nvidia_base="$venv/lib/python$python_version/site-packages/nvidia"
+    if [ -d "$nvidia_base" ]; then
+        export LD_LIBRARY_PATH="${nvidia_base}/cublas/lib:${nvidia_base}/cudnn/lib:${nvidia_base}/cuda_runtime/lib:${nvidia_base}/cuda_nvrtc/lib:${nvidia_base}/cufft/lib:${nvidia_base}/nvjitlink/lib:${nvidia_base}/cusolver/lib:${nvidia_base}/cusparse/lib:${LD_LIBRARY_PATH:-}"
+    fi
+    local trt_libs="$venv/lib/python$python_version/site-packages/tensorrt_libs"
+    if [ -d "$trt_libs" ]; then
+        export LD_LIBRARY_PATH="${trt_libs}:${LD_LIBRARY_PATH:-}"
+    fi
+
     mkdir -p "${BALALAIKA_LOG_DIR:-./logs}"
 }
 

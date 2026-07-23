@@ -33,7 +33,10 @@ import torchaudio
 from loguru import logger
 from tqdm import tqdm
 
-from src.preprocess.audio_postprocessing import normalize_audio_loudness
+from src.preprocess.audio_postprocessing import (
+    normalize_audio_loudness,
+    save_audio_atomic,
+)
 from src.utils.csv_manager import (
     PartialCsvWriter,
     PeriodicCsvMerger,
@@ -68,7 +71,9 @@ def _write_audio(audio_path: str, samples: np.ndarray, sample_rate: int) -> None
     array = samples if samples.ndim == 2 else samples[np.newaxis, :]
     tensor = torch.as_tensor(array, dtype=torch.float32)
     save_started_at = time.perf_counter()
-    torchaudio.save_with_torchcodec(audio_path, tensor, sample_rate)
+    # Atomic tmp+os.replace in the same dir: a crash mid-encode can no longer
+    # truncate the source file (bytes identical to the direct save).
+    save_audio_atomic(audio_path, tensor, sample_rate)
     logger.debug(
         f"perf audio_save stage=loudness path={audio_path} "
         f"seconds={time.perf_counter() - save_started_at:.6f} "
@@ -305,10 +310,10 @@ def main(args):
 
     # 3) Determine work: any file whose loudness_normalized cell is empty/false.
     paths_to_process = unprocessed_paths(podcasts_path, NORMALIZED_COLUMN, audio_paths)
-    skipped = len(audio_paths) - len(paths_to_process)
+    skipped_at_discovery = len(audio_paths) - len(paths_to_process)
     logger.info(
         f"Found {len(audio_paths)} audio files; "
-        f"skipping {skipped} already normalized; processing {len(paths_to_process)}."
+        f"skipping {skipped_at_discovery} already normalized; processing {len(paths_to_process)}."
     )
 
     if not paths_to_process:
@@ -403,7 +408,7 @@ def main(args):
         stage_name="preprocess_audio",
         log_dir=args.log_dir or "./logs",
         processed=processed.value,
-        skipped=skipped.value,
+        skipped=skipped_at_discovery + skipped.value,
         errors=errors.value,
     )
 

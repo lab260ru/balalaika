@@ -10,29 +10,33 @@
 #   1  Preprocess: chunking         (src.preprocess.preprocess)
 #   2  Preprocess: crest filter     (src.preprocess.crest_factor_remover)
 #   3  Preprocess: loudness         (src.preprocess.preprocess_audio)
-#   4  Separation: music detection  (src.separation.music_detect)
+#   3.5 Tail-signal scoring          (src.preprocess.tail_score)
+#   4  Separation: music scoring    (src.separation.music_detect)
+#   4.5 Music filter                 (src.separation.music_detect_filter)
 #   5  Separation: DistillMOS       (src.separation.distillmos_process)
 #   5.5 DistillMOS filter            (src.separation.distillmos_filter)
 #   6  Anti-spoofing scoring        (src.separation.antispoofing)
 #   6.5 Anti-spoofing filter         (src.separation.antispoofing_filter)
-#   7  Transcription                (src.transcription.transcription)
-#   8  Punctuation                  (src.punctuation.punctuation)
-#   9  Accents                      (src.accents.accents)
-#   10 Phonemizer                   (src.phonemizer.phonemizer)
-#   11 Denoising / enhancement      (src.denoising.denoising)
-#   12 Collate -> parquet           (src.collate)
-#   13 Export -> WebDataset         (src.to_webdataset)
-#   14 Filter report                (src.report)
+#   7  TTS-suitability scoring      (src.separation.tts_suitability)
+#   7.5 TTS-suitability filter       (src.separation.tts_suitability_filter)
+#   8  Transcription                (src.transcription.transcription)
+#   9  Punctuation                  (src.punctuation.punctuation)
+#   10 Accents                      (src.accents.accents)
+#   11 Phonemizer                   (src.phonemizer.phonemizer)
+#   12 Denoising / enhancement      (src.denoising.denoising)
+#   13 Collate -> parquet           (src.collate)
+#   14 Export -> WebDataset         (src.to_webdataset)
+#   15 Filter report                (src.report)
 #
-# Run a single stage:    bash base.sh --stage 7 --stop_stage 7
+# Run a single stage:    bash base.sh --stage 8 --stop_stage 8
 # Run from a checkpoint: bash base.sh --stage 4
 # =============================================================================
 set -euo pipefail
 
 # ---- defaults ---------------------------------------------------------------
 config_path="configs/config.yaml"
-stage=11
-stop_stage=14
+stage=12
+stop_stage=15
 strict_mode=0
 
 while [[ $# -gt 0 ]]; do
@@ -46,7 +50,7 @@ while [[ $# -gt 0 ]]; do
         --strict)
             strict_mode=1; shift ;;
         --help|-h)
-            sed -n '2,28p' "$0"
+            sed -n '2,32p' "$0"
             exit 0 ;;
         *)
             # Backwards-compat: accept positional config path as before.
@@ -89,7 +93,12 @@ activate_venv() {
     python_version=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     local nvidia_base="$venv_path/lib/python$python_version/site-packages/nvidia"
     if [ -d "$nvidia_base" ]; then
-        export LD_LIBRARY_PATH="${nvidia_base}/cublas/lib:${nvidia_base}/cudnn/lib:${nvidia_base}/cuda_runtime/lib:${nvidia_base}/cuda_nvrtc/lib:${nvidia_base}/cufft/lib:${nvidia_base}/nvjitlink/lib:${nvidia_base}/cusolver/lib:${nvidia_base}/cusparse/lib:${LD_LIBRARY_PATH:-}"
+        # CUDA 13 wheels (torch *+cu130) ship every lib in one consolidated
+        # ``nvidia/cu13/lib`` dir (libnvrtc.so.13, libcublas.so.13, …); older
+        # CUDA 12 wheels use the per-component dirs that follow. Put cu13/lib
+        # first so it wins when present; a non-existent path is ignored by the
+        # loader, so listing both layouts is safe on either toolkit.
+        export LD_LIBRARY_PATH="${nvidia_base}/cu13/lib:${nvidia_base}/cublas/lib:${nvidia_base}/cudnn/lib:${nvidia_base}/cuda_runtime/lib:${nvidia_base}/cuda_nvrtc/lib:${nvidia_base}/cufft/lib:${nvidia_base}/nvjitlink/lib:${nvidia_base}/cusolver/lib:${nvidia_base}/cusparse/lib:${LD_LIBRARY_PATH:-}"
     fi
     local trt_libs="$venv_path/lib/python$python_version/site-packages/tensorrt_libs"
     if [ -d "$trt_libs" ]; then
@@ -101,22 +110,54 @@ activate_venv "${BALALAIKA_VENV:-.dev_venv}"
 
 mkdir -p "${BALALAIKA_LOG_DIR:-./logs}"
 
-# ---- cudf.pandas accelerator ------------------------------------------------
-# Each stage's main process does the heavy CSV work (read_csv -> merge ->
-# atomic write) through pandas in csv_manager. cudf.pandas transparently
-# routes those calls to GPU when available and silently falls back to CPU
-# otherwise. We probe once at startup and toggle a launcher prefix per call.
+# ---- cudf.pandas accelerator (OPT-IN) ---------------------------------------
+# cudf.pandas transparently routes pandas calls to the GPU. It is now OPT-IN
+# (default OFF) for two concrete reasons:
 #
-# Disable explicitly with BALALAIKA_DISABLE_CUDF=1 (handy when debugging a
-# regression that smells like a cuDF/pandas API drift).
+#  1. csv_manager's hot path is the pyarrow CSV engine (report.md §4.1:
+#     3.4x read / 4.1x write). csv_manager deliberately DISABLES both pyarrow
+#     fast paths when it detects the cudf proxy, so enabling cudf.pandas
+#     silently forfeits those measured wins and routes the CSV-heavy path back
+#     through cuDF interception (fcntl-locked read/merge/write cycles full of
+#     ops cudf must D2H-fallback for).
+#  2. The blanket prefix injected cudf.pandas.install() into EVERY stage,
+#     including the GPU multiprocessing stages (ASR, denoising, DistillMOS,
+#     music_detect, antispoofing) whose parents do little parent-side pandas.
+#     Each such process then holds a cuDF CUDA context (hundreds of MB of VRAM)
+#     that contends with ORT/torch — an OOM risk on GPUs shared with a
+#     training job, not merely overhead.
+#
+# Opt back in on a node that genuinely benefits (CSV-bound stages, idle GPU)
+# with BALALAIKA_ENABLE_CUDF=1. BALALAIKA_DISABLE_CUDF=1 still forces it off
+# and wins if both are set.
 cudf_prefix=()
 if [[ "${BALALAIKA_DISABLE_CUDF:-0}" == "1" ]]; then
     echo "cudf.pandas: disabled via BALALAIKA_DISABLE_CUDF=1"
+elif [[ "${BALALAIKA_ENABLE_CUDF:-0}" != "1" ]]; then
+    echo "cudf.pandas: off by default (set BALALAIKA_ENABLE_CUDF=1 to opt in; keeps pyarrow CSV fast paths)"
 elif python3 -c "import cudf.pandas" >/dev/null 2>&1; then
     cudf_prefix=(python3 -m cudf.pandas)
-    echo "cudf.pandas: enabled (Pandas Accelerator Mode)"
+    echo "cudf.pandas: enabled via BALALAIKA_ENABLE_CUDF=1 (Pandas Accelerator Mode)"
 else
-    echo "cudf.pandas: not available, falling back to vanilla pandas"
+    echo "cudf.pandas: requested via BALALAIKA_ENABLE_CUDF=1 but not importable; falling back to vanilla pandas"
+fi
+
+# ---- thread-pool hygiene (OPT-IN) -------------------------------------------
+# This box has 48 logical cores shared with the user's training job. Left
+# uncapped, OpenMP/OpenBLAS/MKL each lazily spawn a full per-process thread
+# team (one per visible core) in every stage process AND every forked child
+# (loader workers, probe pools). With several workers that is hundreds of
+# spinning threads fighting the GPU EPs and the co-resident training job.
+#
+# runtime.threads_per_worker (BALALAIKA_THREADS_PER_WORKER) caps those teams
+# for all stage processes and the children they fork. Empty (the default)
+# exports nothing, so single-worker latency is unchanged (library defaults).
+if [[ -n "${BALALAIKA_THREADS_PER_WORKER:-}" ]]; then
+    export OMP_NUM_THREADS="$BALALAIKA_THREADS_PER_WORKER"
+    export OPENBLAS_NUM_THREADS="$BALALAIKA_THREADS_PER_WORKER"
+    export MKL_NUM_THREADS="$BALALAIKA_THREADS_PER_WORKER"
+    export NUMEXPR_NUM_THREADS="$BALALAIKA_THREADS_PER_WORKER"
+    echo "thread caps: OMP/OPENBLAS/MKL/NUMEXPR = $BALALAIKA_THREADS_PER_WORKER per worker"
 fi
 
 # ---- helpers ----------------------------------------------------------------
@@ -235,10 +276,22 @@ if stage_active 3; then
     check_stage_status 3
 fi
 
+if stage_active 3.5; then
+    echo "Stage 3.5: Tail-signal scoring — tail_db / trailing_silence_ms"
+    run_python src.preprocess.tail_score
+    check_stage_status 3.5
+fi
+
 if stage_active 4; then
-    echo "Stage 4: Separation — music detection"
+    echo "Stage 4: Separation — music detection (scoring)"
     run_python src.separation.music_detect
     check_stage_status 4
+fi
+
+if stage_active 4.5; then
+    echo "Stage 4.5: Music filter — music_prob threshold deletion"
+    run_python src.separation.music_detect_filter
+    check_stage_status 4.5
 fi
 
 if stage_active 5; then
@@ -266,51 +319,63 @@ if stage_active 6.5; then
 fi
 
 if stage_active 7; then
-    echo "Stage 7: Transcription — onnx-asr + ROVER"
-    run_python src.transcription.transcription
+    echo "Stage 7: TTS-suitability — probability scoring"
+    run_python src.separation.tts_suitability
     check_stage_status 7
 fi
 
+if stage_active 7.5; then
+    echo "Stage 7.5: TTS-suitability filter — p_tts threshold deletion"
+    run_python src.separation.tts_suitability_filter
+    check_stage_status 7.5
+fi
+
 if stage_active 8; then
-    echo "Stage 8: Punctuation — RUPunct"
-    run_python src.punctuation.punctuation
+    echo "Stage 8: Transcription — onnx-asr + ROVER"
+    run_python src.transcription.transcription
     check_stage_status 8
 fi
 
 if stage_active 9; then
-    echo "Stage 9: Accents — ruAccent"
-    run_python src.accents.accents
+    echo "Stage 9: Punctuation — RUPunct"
+    run_python src.punctuation.punctuation
     check_stage_status 9
 fi
 
 if stage_active 10; then
-    echo "Stage 10: Phonemizer — TryIParu G2P"
-    run_python src.phonemizer.phonemizer
+    echo "Stage 10: Accents — ruAccent"
+    run_python src.accents.accents
     check_stage_status 10
 fi
 
 if stage_active 11; then
-    echo "Stage 11: Denoising — ClearVoice MossFormer2_SE_48K"
-    run_python src.denoising.denoising
+    echo "Stage 11: Phonemizer — TryIParu G2P"
+    run_python src.phonemizer.phonemizer
     check_stage_status 11
 fi
 
 if stage_active 12; then
-    echo "Stage 12: Collate — balalaika.parquet"
-    run_python src.collate
+    echo "Stage 12: Denoising — ClearVoice MossFormer2_SE_48K"
+    run_python src.denoising.denoising
     check_stage_status 12
 fi
 
 if stage_active 13; then
-    echo "Stage 13: Export — WebDataset shards"
-    run_python src.to_webdataset
+    echo "Stage 13: Collate — balalaika.parquet"
+    run_python src.collate
     check_stage_status 13
 fi
 
 if stage_active 14; then
-    echo "Stage 14: Filter report — filter_report.md"
-    run_python src.report --quiet
+    echo "Stage 14: Export — WebDataset shards"
+    run_python src.to_webdataset
     check_stage_status 14
+fi
+
+if stage_active 15; then
+    echo "Stage 15: Filter report — filter_report.md"
+    run_python src.report --quiet
+    check_stage_status 15
 fi
 
 echo -e "\n\033[1;32mPipeline finished (stages ${stage}..${stop_stage})\033[0m"

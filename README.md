@@ -44,7 +44,7 @@ Edit `configs/config.yaml`:
 - set model paths under `preprocess`, `separation`, etc.;
 - tune `runtime:` (`venv_path`, `cpu_affinity`, `log_dir`, TensorRT cache).
 
-Run the default tail of the pipeline (stages 11..14):
+Run the default tail of the pipeline (stages 12..15):
 
 ```bash
 bash base.sh --config_path configs/config.yaml
@@ -57,10 +57,10 @@ Run only a range of stages:
 bash base.sh --config_path configs/config.yaml --stage 1 --stop_stage 3
 
 # Transcription only
-bash base.sh --config_path configs/config.yaml --stage 7 --stop_stage 7
+bash base.sh --config_path configs/config.yaml --stage 8 --stop_stage 8
 
 # Regenerate the filtering report only
-bash base.sh --config_path configs/config.yaml --stage 14 --stop_stage 14
+bash base.sh --config_path configs/config.yaml --stage 15 --stop_stage 15
 ```
 
 ---
@@ -73,19 +73,23 @@ bash base.sh --config_path configs/config.yaml --stage 14 --stop_stage 14
 | 1 | Preprocess: diarization + chunking | `src.preprocess.preprocess` |
 | 2 | Preprocess: crest-factor filter | `src.preprocess.crest_factor_remover` |
 | 3 | Preprocess: loudness normalization | `src.preprocess.preprocess_audio` |
-| 4 | Separation: music detection | `src.separation.music_detect` |
+| 3.5 | Tail-signal scoring (clipped-tail meta) | `src.preprocess.tail_score` |
+| 4 | Separation: music scoring | `src.separation.music_detect` |
+| 4.5 | Separation: music filter | `src.separation.music_detect_filter` |
 | 5 | Separation: DistillMOS scoring | `src.separation.distillmos_process` |
 | 5.5 | Separation: DistillMOS filter | `src.separation.distillmos_filter` |
 | 6 | Separation: Spectra-0 raw scoring | `src.separation.antispoofing` |
 | 6.5 | Separation: anti-spoofing filter | `src.separation.antispoofing_filter` |
-| 7 | Transcription + ROVER | `src.transcription.transcription` |
-| 8 | Punctuation | `src.punctuation.punctuation` |
-| 9 | Stress marks / accents | `src.accents.accents` |
-| 10 | Phonemization | `src.phonemizer.phonemizer` |
-| 11 | Denoising / enhancement | `src.denoising.denoising` |
-| 12 | Collate to Parquet | `src.collate` |
-| 13 | Export to WebDataset | `src.to_webdataset` |
-| 14 | Filtering report | `src.report` |
+| 7 | Separation: TTS-suitability scoring | `src.separation.tts_suitability` |
+| 7.5 | Separation: TTS-suitability filter | `src.separation.tts_suitability_filter` |
+| 8 | Transcription + ROVER | `src.transcription.transcription` |
+| 9 | Punctuation | `src.punctuation.punctuation` |
+| 10 | Stress marks / accents | `src.accents.accents` |
+| 11 | Phonemization | `src.phonemizer.phonemizer` |
+| 12 | Denoising / enhancement | `src.denoising.denoising` |
+| 13 | Collate to Parquet | `src.collate` |
+| 14 | Export to WebDataset | `src.to_webdataset` |
+| 15 | Filtering report | `src.report` |
 
 `base.sh --help` prints the same map.
 
@@ -114,6 +118,22 @@ values for logging, TensorRT provider setup, CSV-backed file discovery, and
 on-disk work-shard sizing. Heavy stages write work queues under
 `<podcasts_path>/.balalaika_work/<stage>/` so multiprocessing workers claim
 small shard files instead of receiving millions of paths through pickle.
+
+### Per-node batch-size autotuning
+
+Run once on every new machine:
+
+```bash
+python -m benchmarking.warmup --config_path configs/config.yaml
+```
+
+This probes each tunable model with growing batch sizes (respecting free
+VRAM, safe even while other jobs share the GPU) and writes
+`cache/node_profile.json`. Any model `batch_size` in the config can then be
+set to `auto` to use the profiled optimum; plain integers keep working as
+before. Transcription resolves per-model optima (`transcription.<model>`),
+which matters: on one test node `tone` was 29x faster at batch 64 while
+`giga_rnnt` was fastest at batch 1. See `report.md` for measurements.
 
 ---
 

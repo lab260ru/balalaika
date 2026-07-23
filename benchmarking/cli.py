@@ -201,3 +201,7 @@ def main() -> int:
     }
     print(json.dumps(final_summary, ensure_ascii=False))
     return 0 if report["successful"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -98,7 +98,7 @@ def ensure_output_dirs(output_dir: Path) -> dict[str, Path]:
 def read_csv(csv_path: Path) -> pd.DataFrame:
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
-    df = pd.read_csv(csv_path)
+    df = pd.read_parquet(csv_path)
     if "filepath" not in df.columns:
         raise ValueError("Expected a 'filepath' column in balalaika.csv")
     df = df.drop_duplicates(subset=["filepath"]).reset_index(drop=True)

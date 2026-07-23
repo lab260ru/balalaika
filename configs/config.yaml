@@ -73,9 +73,16 @@ cache_path: ./cache
 # until the next run.
 # -----------------------------------------------------------------------------
 csv:
-  # Fold worker partial CSVs into balalaika.csv after every N rows of
+  # Pipeline state lives in balalaika.parquet (snappy) only — CSV state was
+  # removed as a redundant, inefficient copy. All hot ops (load, atomic write
+  # with .bak, periodic flush, absorb, drop_missing, narrow column reads) run on
+  # the parquet file; column projection keeps narrow reads cheap and dtypes are
+  # preserved natively. No balalaika.csv is produced. (The per-worker partials
+  # below are transient .csv files, streamed row-by-row for crash safety and
+  # deleted after they are folded into the parquet state.)
+  # Fold worker partial CSVs into the state file after every N rows of
   # cumulative progress across workers. 0 disables periodic flushing
-  # (only the post-stage merge runs). 10 000 rows ≈ a few seconds of pandas
+  # (only the post-stage merge runs). 100 000 rows ≈ a few seconds of pandas
   # work on a multi-million-row CSV; raise it for very large datasets.
   flush_every_rows: 100000
   # Fallback timer: at least flush every N seconds even if the row threshold
@@ -90,9 +97,14 @@ csv:
 # -----------------------------------------------------------------------------
 runtime:
   # Python virtualenv that base.sh / *_yaml.sh activate.
-  venv_path: .dev_venv
-  # CPU range passed to `taskset -c` for CPU-bound stages. Empty to disable.
-  cpu_affinity: "0-80"
+  venv_path: /home/nikita/balalaika/.dev_venv
+  # CPU range passed to `taskset -c` for CPU-bound stages. Empty ("") disables
+  # pinning entirely, which is the safe default: an explicit range that exceeds
+  # the host's core count (e.g. "0-80" on a 48-core box) is silently clamped by
+  # taskset and a stale range can mis-pin or crash on smaller machines. Set a
+  # NUMA-local range manually (e.g. "0-23") for memory-bound stages where you
+  # want all workers on one socket; leave empty to let the OS scheduler decide.
+  cpu_affinity: ""
   # Default directory for per-stage rotating log files. CLIs accept --log_dir.
   log_dir: ./logs
   # Minimum log level for console and per-stage files. Use DEBUG to include
@@ -101,36 +113,75 @@ runtime:
   # Source for stage audio file lists: auto prefers balalaika.csv and falls back
   # to rglob when the CSV is missing/empty; csv never scans and requires an
   # existing balalaika.csv; rglob always scans.
-  audio_paths_source: csv
+  audio_paths_source: rglob
   # Number of file paths per on-disk work shard for multiprocessing stages.
   # Keep this small enough that a worker only materializes a bounded list.
   work_shard_size: 10000
+  # Disk type the dataset lives on: auto detects the rotational flag of the
+  # device backing podcasts_path (LVM/dm stacks are walked); hdd clamps
+  # DataLoader workers to 4 and probe pools to 2 so concurrent readers stop
+  # seek-thrashing one spindle; ssd keeps configured worker counts as-is.
+  # Env override: BALALAIKA_IO_PROFILE. Shard line order is a separate knob:
+  # BALALAIKA_SHARD_ORDER=path (default; directory-clustered reads on HDD)
+  # or legacy (pre-2026-06 input/duration order).
+  io_profile: auto
   # Root for TensorRT engine cache. Each session appends /trt_cache_<gpu_id>.
-  trt_cache_path: ./cache/trt
+  trt_cache_path: /home/nikita/balalaika/cache/trt
   # Per-session TensorRT workspace size in bytes (4 GiB by default).
   trt_workspace_bytes: 4294967296
   # Enable FP16 for TensorRT sessions when supported.
   trt_fp16: True
+  # Per-worker thread cap. Empty ("" — the default) leaves library defaults
+  # untouched so single-worker latency is unchanged. A positive int caps each
+  # stage process (and its forked children): ORT intra-op pools shrink to this
+  # value with inter-op=1 and no busy-spin on GPU-EP sessions, and base.sh
+  # exports OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS to match. Recommended on this
+  # 48-thread box shared with the training job, where multiple workers x
+  # multiple ORT sessions otherwise oversubscribe the CPU: try 4. Outputs of
+  # GPU-EP sessions are unaffected; CPU-executed ops change reduction order, so
+  # re-verify if a stage runs ops on CPU.
+  threads_per_worker: ""
+  # Per-worker malloc_trim(0) interval, in decoded audio items. torchcodec/ffmpeg
+  # decode churns the glibc heap, so each DataLoader worker's RSS ratchets up to
+  # a multi-GB high-water mark and (with transcription.persistent_loaders: True)
+  # never drops, OOM-killing workers on a RAM-tight box. The transcription
+  # datasets call malloc_trim(0) every N decoded items to hand that memory back
+  # to the OS — measured worker RSS ~4.5 GB -> ~1 GB at 128. Memory-only (never
+  # changes outputs); 0 disables. Exported as BALALAIKA_MALLOC_TRIM_EVERY.
+  malloc_trim_every: 128
+  # cudf.pandas is OFF by default (it disables the pyarrow CSV fast paths and
+  # adds a per-stage cuDF CUDA context that risks OOM on shared GPUs). Opt in
+  # on a cudf node with the env knob BALALAIKA_ENABLE_CUDF=1 (see base.sh).
 
 download:
   # Root directory where downloaded episodes are stored ({podcast_id}/{episode_id}/*.mp3).
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # Max episodes fetched per playlist when using the downloader.
   episodes_limit: 100
   # Parallel download threads.
   num_workers: 4
   # Optional pickle path with podcast / episode URLs (see download module).
   podcasts_urls_file: ''
+  # --- collate (stage 12) reads this section too (see note above) ---
+  # Rows per streamed parquet slab. Collate reads sidecars and writes row-groups
+  # one slab at a time, so peak RAM is ~O(slab) instead of O(whole dataset) —
+  # this is what keeps stage 12 off the OOM line at multi-million-row scale.
+  # Lower on very low-RAM nodes; raise to trade RAM for fewer row-groups.
+  collate_slab_rows: 200000
+  # Compression for balalaika.parquet. snappy is the old default; zstd is
+  # ~2x smaller on the text-heavy sidecar columns (fewer HDD write bytes) —
+  # recommended once downstream parquet readers are confirmed zstd-capable.
+  collate_parquet_compression: snappy
 
 preprocess:
   # Dataset root: long-form audio before chunking; after chunking, same tree holds segments.
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # raw: diarize long-form audio, cut chunks, and write metadata.
   # existing_chunks: do not cut or rewrite audio; diarize every existing audio
   #   file and backfill the same metadata columns that raw preprocess writes
   #   (speaker_id, start/end, total_duration, playlist_id/podcast_id,
   #   silence_percent, max_silence_duration, is_single_speaker).
-  input_mode: existing_chunks
+  input_mode: raw
   # Used only with input_mode: existing_chunks. Defaults to auto so a fresh
   # pre-chunked dataset can be discovered even when runtime.audio_paths_source
   # is set to csv for later stages.
@@ -138,33 +189,68 @@ preprocess:
   # Used only with input_mode: existing_chunks. false skips rows that already
   # have all preprocess metadata columns; true recomputes and overwrites them.
   existing_chunks_overwrite: false
+  # When true, stage 1 keeps only chunks whose diarization window contains exactly one speaker.
+  # Raw mode skips such output windows; existing_chunks mode deletes rejected files.
+  single_speaker_only: True
   # Fuse chunk export, crest filtering, and LUFS normalization into stage 1.
   # Raw mode processes each native-rate chunk before its first/only write.
   # existing_chunks mode combines crest + LUFS in one native-rate read/write.
   # Set false to keep stages 1, 2, and 3 fully independent.
   fuse_audio_preprocessing: true
+  # existing_chunks + fuse: chunks at most this long reuse the loader's raw
+  # bytes for the native-rate pass, so each file leaves the disk once
+  # (bit-identical outputs). Longer files fall back to a second read.
+  # Default: 4 x duration. Lower it on very low-RAM nodes.
+  # existing_chunks_raw_bytes_max_s: 60
   # Maximum duration of each output segment in seconds.
   
-  duration: 15
+  duration: 20
   # Worker processes per GPU for diarization+VAD chunking (Sortformer is heavy — often 1).
   num_workers: 1
   # DataLoader batch size for Sortformer diarization source loading.
   diarization_batch_size: 1
   # DataLoader workers per GPU process for Sortformer diarization source loading.
+  # Default 0 = decode runs synchronously in the GPU process (the GPU idles
+  # during every torchcodec decode/resample). Set 2-4 so the next file's decode
+  # overlaps the current file's inference; the batch sequence is
+  # index-deterministic with shuffle=False, so outputs are identical regardless
+  # of worker count. RECOMMENDED on decode-bound nodes: 2 (with prefetch >= 1
+  # below). RAM note: a long raw podcast decoded to 16 kHz fp32 is ~0.45 GB per
+  # buffered item, so keep workers*prefetch small (2x2) on the 31 GB node; for
+  # existing_chunks the items are ~1 MB so it is free.
   diarization_loader_workers: 0
-  # Number of prefetched batches per diarization DataLoader worker.
+  # Number of prefetched batches per diarization DataLoader worker. Used only
+  # when diarization_loader_workers > 0; floored to 1 in that case (torch
+  # requires >= 1). Default 0 pairs with the workers=0 default. RECOMMENDED 2.
   diarization_prefetch_factor: 0
   # Worker processes per GPU for crest factor removal.
   num_workers_crest_factor: 1
   # Crest-factor DataLoader batch size per worker.
   crest_factor_batch_size: 1
   # Crest-factor DataLoader workers inside each process.
+  # Recommended: 4-8 on an HDD-backed dataset (0 serializes decode on the main
+  # thread, idling the CPU between files). Default kept at 0 for reproducibility.
   crest_factor_loader_workers: 0
   # Number of prefetched batches per crest-factor DataLoader worker.
   crest_factor_prefetch_factor: 2
   # Delete files whose crest factor (peak / RMS) exceeds this value (linear ratio, not dB).
   # crest_factor is saved to balalaika.csv for all files; deleted files also have their CSV row removed.
   crest_treshold: 10
+  # --- Stage 3.5: tail-signal scoring (src.preprocess.tail_score) -----------
+  # Backfills tail_db + trailing_silence_ms (SPEC_drop_criteria.md) to
+  # balalaika.parquet for chunks that were NOT cut by the smart stage-1 path
+  # (pre-existing trees, existing_chunks mode). Score-only: nothing is deleted;
+  # inspect the column distribution before choosing any drop threshold.
+  # Chunks already scored (tail_db present) are skipped on resume.
+  # Worker processes for tail-signal scoring (pure CPU, IO-bound).
+  tail_score_workers: 4
+  # Tail-score DataLoader batch size per worker (signals are computed inside
+  # the loader workers; only four scalars per file cross the batch boundary).
+  tail_score_batch_size: 256
+  # Tail-score DataLoader workers inside each process (decode parallelism).
+  tail_score_loader_workers: 2
+  # Number of prefetched batches per tail-score DataLoader worker.
+  tail_score_prefetch_factor: 2
   # True peak ceiling in dBFS before/after loudness step (see preprocess_audio).
   peak: -1.0
   # Target integrated loudness in LUFS (ITU-R BS.1770-4 meter in code).
@@ -176,6 +262,8 @@ preprocess:
   # Loudness-normalization DataLoader batch size per process.
   loudness_batch_size: 1
   # Loudness-normalization DataLoader workers inside each process.
+  # Recommended: 4-8 on an HDD-backed dataset (0 serializes decode -> LUFS ->
+  # re-encode on the main thread). Default kept at 0 for reproducibility.
   loudness_loader_workers: 0
   # Number of prefetched batches per loudness-normalization DataLoader worker.
   loudness_prefetch_factor: 2
@@ -187,52 +275,142 @@ preprocess:
   chunk_format: auto
   # Minimum acceptable segment length (seconds) when filtering single-speaker
   # diarization output. Below this, the segment is dropped before EOS refinement.
-  min_segment_duration: 1.0
+  # Floor of 2.0s removes the sub-2s over-segmentation mass (1-2s fragments are
+  # mostly noise for ASR/TTS training).
+  min_segment_duration: 2.0
   # Hard floor for a chunk to actually be written to disk (seconds). Below this
   # value the chunk is silently skipped (e.g. 100 ms artefacts from VAD).
   min_save_duration: 0.5
+  # Target chunk length (seconds). A merged span longer than `duration` (the
+  # cap) is split into N balanced pieces of ~this length instead of being
+  # truncated to its trailing `duration` window. This both keeps all the audio
+  # (the old truncation discarded everything before the last window) and
+  # smooths the length distribution (the old path piled ~15% of chunks exactly
+  # at the cap). E.g. a 15s span becomes 2x7.5s rather than 1x15s.
+  preferred_chunk_duration: 8.0
+  # Smart cutting (SPEC_drop_criteria.md). Balanced-split cut points are
+  # arithmetic, i.e. they land mid-speech and usually mid-word — such clipped
+  # tails showed x4.6 the last-word ASR error of natural endings. Each interior
+  # cut may move up to this many seconds either way to the quietest 20 ms frame
+  # nearby (constrained so every piece stays inside
+  # [min_segment_duration, duration]). 0 restores the exact arithmetic splits.
+  # NOT bit-exact vs pre-change chunk trees: boundaries (and thus chunk
+  # filenames) move for any span longer than `duration`.
+  split_snap_window: 0.5
+  # Trailing margin (seconds) appended after each chunk's end so a natural
+  # ending keeps its acoustic decay instead of stopping at the last voiced
+  # sample (a <40 ms margin registers as an "abrupt tail" and gives a TTS
+  # model no end-of-sentence cue). Bounded by the next diarization segment,
+  # the next chunk, the `duration` cap and end-of-source. 0 restores the
+  # legacy zero-margin ends.
+  tail_pad: 0.1
   # Maximum silence gap allowed when merging same-speaker pieces before an EOS
   # boundary is reached. Low EOU is buffered, but only chunks ending with good
   # EOU are saved; overflow before the final good EOU is discarded.
   max_merge_gap: 0.5
   # ONNX Sortformer weights for streaming diarization.
   sortformer_model: ./models/diar_streaming_sortformer_4spk-v2.1.onnx
-  # Use TensorRT execution provider for Sortformer ONNX Runtime session (needs CUDA+TensorRT).
+  # Execution provider for the streaming Sortformer session. True = TensorRT
+  # first (with runtime.trt_fp16 precision), the historical default. The
+  # streaming session has genuinely dynamic input shapes (spkcache/fifo lengths
+  # cycle each chunk) and no pinned TRT profile, so TRT can pay multi-minute
+  # engine builds and fp16 silently shifts every diarization prediction (hence
+  # all chunk boundaries) — a tradeoff that has NOT been measured against
+  # CUDA-fp32 on this node. Set False to run CUDAExecutionProvider fp32 (matches
+  # the module's own commented-out default) when reproducibility or first-run
+  # latency matters more than steady-state TRT throughput.
   use_tensorrt: True
+  # IOBinding for the streaming Sortformer session: keep the per-chunk state
+  # tensors resident on the GPU instead of round-tripping every chunk through
+  # numpy (numpy session.run copies inputs H2D and outputs D2H each of the ~91
+  # calls per 900 s window). Same graph + EP => identical numerics (proven
+  # against the numpy path on a synthetic ONNX model in tests); the numpy path
+  # is the bit-for-bit fallback. Default False; RECOMMENDED True on GPU nodes
+  # once validated with the real model (it cannot be numerically validated here
+  # — the Sortformer ONNX is absent on this node).
+  sortformer_io_binding: False
   vad_args:
     # Smart Turn end-of-turn ONNX model path.
     smart_vad_model: ./models/smart-turn-v3.2-gpu.onnx
     # Smart Turn probability threshold for cutting/refining segment ends.
-    smart_vad_threshold: 0.4
+    smart_vad_threshold: 0.8
     # Audio sample rate expected by Smart Turn / Whisper feature extraction.
     smart_vad_sample_rate: 16000
+  # SmartVAD (end-of-turn) batch size in RAW mode. Default 1 = one
+  # feature-extraction + ONNX call per diarized segment (bit-identical to the
+  # historical flow). Raise (e.g. 16-32) to stack a file's segments into one
+  # feature-extraction + ONNX call — fewer kernel launches/syncs on long
+  # multi-turn files. NOT bit-exact above 1: batched cuBLAS kernels and even the
+  # Whisper feature extraction differ from batch-1 by ~1 float32 ULP, and
+  # probabilities sit against the 0.4 threshold, so a knife-edge segment could
+  # flip. Validate on a node that has smart-turn-v3.2-gpu.onnx before enabling.
+  smart_vad_batch_size: 1
 
 separation:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
+
+  # SCORE vs FILTER split. Every scoring stage (4 music, 5 DistillMOS,
+  # 6 anti-spoof, 7 TTS) writes its score column to balalaika.parquet and leaves
+  # deletion to a separate ".5" filter stage (4.5/5.5/6.5/7.5) that shows the
+  # score distribution, picks a threshold, and removes files. Set a stage's
+  # ``inline_filter: true`` to instead delete in the SAME scoring pass (reading
+  # the threshold from that stage's ``*_filter`` subsection) — this skips the
+  # extra full walk over the dataset tree the ".5" stage would do. When inline
+  # is on you can leave the ".5" stage in the pipeline; it simply finds no
+  # remaining candidates and exits.
 
   music_detect:
+    # WavLM music detector exported to ONNX. If missing, the stage downloads it
+    # from Hugging Face (repo_id/repo_filename below).
+    onnx_path: ./models/music_detection.onnx
+    repo_id: lab260/MusicDetection
+    repo_filename: music_detection.onnx
     # Inference batch size for music classifier.
     bs: 8
-    # DataLoader worker processes per GPU worker.
+    # DataLoader worker processes / prefetched batches per GPU worker.
     num_workers: 8
-    # Fine-tuned WavLM music-detector weights (safetensors).
-    music_detect_model: ./models/music_detection.safetensors
-    # If P(music) > threshold, the file is deleted and its CSV row removed.
-    # music_prob is saved to balalaika.csv for all processed files.
+    prefetch_factor: 2
+    # Score-only by default (deletion is stage 4.5, music_detect_filter). Set
+    # true to delete files with music_prob > music_detect_filter.threshold in
+    # this scoring pass instead. See the SCORE vs FILTER note above.
+    inline_filter: False
+    # Deprecated fallback threshold — prefer music_detect_filter.threshold below.
+    # Only consulted (for inline deletion) when that key is absent, for
+    # backward-compatibility with old configs.
     threshold: 0.6
-    # Optional: HF model id for WavLM backbone (default microsoft/wavlm-base-plus in code).
-    # base_model: microsoft/wavlm-base-plus
-    # Optional: directory for per-worker audio length cache (default ./cache).
-    # cache_path: ./cache
+    # TensorRT EP. Off by default: this model scores variable-length audio, so
+    # TRT spans a wide dynamic-shape profile and FP16 is force-disabled here (it
+    # yields NaNs / class flips for this model regardless of runtime.trt_fp16).
+    # CUDA EP handles variable lengths without per-shape engine rebuilds. When
+    # True, tune trt_opt_seconds / trt_max_seconds to your clip lengths; shapes
+    # beyond the profile fall back to CUDA EP automatically.
+    use_tensorrt: False
+    # trt_opt_seconds: 15.0
+    # trt_max_seconds: 30.0
+
+  music_detect_filter:
+    # Stage 4.5. Files with music_prob ABOVE this threshold are deleted (likely
+    # music). Set to null → manual interactive mode; a float → automatic mode.
+    # Shared with stage 4's inline_filter path.
+    threshold: 0.6
+    # Parallel worker processes for deletion + state updates.
+    num_workers: 8
 
   distillmos:
-    # DistillMOS inference batch size per GPU worker.
+    # DistillMOS inference batch size per GPU worker, counted in FILES; each
+    # file contributes ceil(max(dur-7.68s, 0)/1s)+1 fixed 7.68 s segments to
+    # the GPU batch. Scores are batch-size independent: segmentation happens
+    # per file in the dataloader (no zero-padding ever reaches the model), so
+    # any batch_size gives the same MOS as batch_size=1.
     batch_size: 8
     # DataLoader workers per GPU worker for decoding/resampling audio.
     num_workers: 8
     # Number of prefetched batches per DataLoader worker.
     prefetch_factor: 4
+    # Delete files with DistillMOS < distillmos_filter.threshold in this pass
+    # (instead of via stage 5.5). See the SCORE vs FILTER note above.
+    inline_filter: False
 
   distillmos_filter:
     # DistillMOS threshold. Files with DistillMOS below this are deleted.
@@ -248,76 +426,247 @@ separation:
     batch_size: 8
     num_workers: 4
     prefetch_factor: 2
-    # TensorRT is supported when the exported ONNX has compatible dynamic batch profile.
+    # Read only the random 4.04 s scoring window (+1 sample) from PCM
+    # wav/flac at 16 kHz instead of decoding the whole clip — proven
+    # bit-identical to full-decode-then-crop; ~4x fewer bytes streamed per
+    # 15 s clip. Recommended True for HDD datasets; other containers and
+    # sample rates fall back to the full decode automatically.
+    ranged_decode: False
+    # TensorRT fp16: measured 4.25x faster than CUDA fp32 on RTX 4060 Ti
+    # (224 -> 53 ms per batch of 8). Logits shift by ~0.005 in fp16 — far
+    # below this stage's own run-to-run variation from its random crop. First
+    # run builds an engine (~8 min, cached under runtime.trt_cache_path; one
+    # dynamic-batch profile covers batches 1..batch_size). Set False on nodes
+    # without TensorRT or to reproduce fp32 scores exactly.
     use_tensorrt: False
+    # Delete files with score_spoof - score_bonafide > antispoofing_filter.threshold
+    # in this pass (instead of via stage 6.5). See the SCORE vs FILTER note above.
+    inline_filter: False
 
   antispoofing_filter:
     # Delete when score_spoof - score_bonafide > threshold.
     # 0.0 is the raw model argmax decision; null enables interactive selection.
-    threshold: 0.0
+    threshold: -1.0625009
+    # Parallel CPU workers used only for deleting selected files.
+    num_workers: 8
+
+  tts_suitability:
+    # lab260/TTS-Suitability-Classifier ONNX model (wav2vec2-300M head). If
+    # missing, the stage downloads it from Hugging Face (repo_id/repo_filename).
+    onnx_path: ./models/tts_suitability.onnx
+    repo_id: lab260/TTS-Suitability-Classifier
+    repo_filename: model.onnx
+    # Files per DataLoader batch. Inference is per file (each clip is layer-
+    # normalized, split into 10 s chunks and its per-chunk logits averaged), so
+    # this controls loader grouping/prefetch, not the ONNX batch dimension.
+    batch_size: 8
+    num_workers: 4
+    prefetch_factor: 2
+    # TensorRT off by default: inputs are variable-length / variable-chunk, so a
+    # single dynamic-shape profile cannot cover the range and each new shape
+    # would rebuild the engine. The CUDA EP handles variable shapes directly.
+    use_tensorrt: False
+    # Delete files with p_not_tts - p_tts > tts_suitability_filter.threshold in
+    # this pass (instead of via stage 7.5). This stage does not otherwise probe
+    # durations; inline mode adds one cached duration pass. See the note above.
+    inline_filter: False
+
+  tts_suitability_filter:
+    # Delete when not_tts_score - tts_score > threshold (model leans "not TTS").
+    # interactive selection.
+    threshold: 0.000361
     # Parallel CPU workers used only for deleting selected files.
     num_workers: 8
 
 transcription:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
+  # Canonical onnx-asr model names (passed straight to onnx_asr.load_model — see
+  # https://github.com/istupakov/onnx-asr). The JSON/parquet key for each model
+  # is the last '/'-segment of the name (t-tech/t-one -> t-one,
+  # alphacep/vosk-model-ru -> vosk-model-ru).
   model_names:
     - gigaam-v3-e2e-ctc
-    - giga_ctc
-    - giga_rnnt
-    - vosk
-    - tone
+    - gigaam-v3-ctc
+    - gigaam-v3-rnnt
+    - alphacep/vosk-model-ru
+    - t-tech/t-one
   consensus_num: 3
   with_timestamps: True
-  use_tensorrt: True
+  use_tensorrt: False
   use_vad: False
   use_rover: True
+  # Decode/resample each audio file ONCE for the first consensus_num models
+  # (they always process every pending file) instead of once per model —
+  # saves N-1 disk reads + decodes per file. Each model keeps its own batch
+  # size via sub-batching. Costs the summed VRAM of the grouped models on
+  # each GPU; set False on very tight VRAM or to reproduce the old
+  # one-model-at-a-time flow exactly.
+  share_decode: True
+  # Numba-accelerated ROVER aggregation (identical outputs, ~12x faster;
+  # pinned by tests/test_fast_rover.py). False falls back to crowd-kit.
+  use_fast_rover: True
+  # Batched stateful RNN-T greedy decode for transducer models (giga_rnnt
+  # and the vosk Kaldi adapter). Stock onnx-asr decodes RNN-T utterances
+  # one at a time, firing 200+ sequential batch-1 ONNX decoder/joiner calls
+  # per file — the stage critical path (~7 it/s vs ~60 for CTC). The fast
+  # path runs the decoder/joiner across all utterances of a batch in
+  # lockstep (one batched ONNX call per greedy step), with per-sequence
+  # blank/emit/max-tokens bookkeeping identical to stock. Token- AND
+  # timestamp-identical to stock decode at batch sizes 1/4/8 on the 250
+  # real-wav bench (giga_rnnt + vosk, CPU EP, 0/250; plus a GPU-1 spot
+  # check, 0/50); pinned by tests/test_fast_rnnt.py. CTC / non-transducer /
+  # unknown topologies and any build error fall back to stock decode
+  # automatically. Works in both share_decode modes. The win is on GPU,
+  # where the per-step ONNX launches dominate: giga_rnnt at batch 8 went
+  # 9.5 -> 23.2 it/s (2.4x) on the contended GPU. It needs batch > 1 to
+  # help — at batch 1 it is parity-to-slightly-slower (two rebuilt
+  # decoder/joiner graphs add ~110 ms one-time worker init and no batching
+  # benefit), so keep transcription.batch_size >= 4 for giga_rnnt (the node
+  # profile already picks 8). Set False to force stock per-utterance decode.
+  use_fast_rnnt: True
+  # Intra-bucket work-shard order. "duration" reproduces the old flow
+  # bit-for-bit. "path" reads audio in directory order — on HDD datasets this
+  # removes ~1 random seek per file per model pass — but changes ASR batch
+  # composition: measured on 250 knife-edge bench clips (CPU, giga_ctc and
+  # e2e-ctc), ~15% of transcripts shift by ~1 character (~1.2% of characters);
+  # each order is itself fully deterministic. Recommended "path" on HDD.
+  shard_order: path
   # CPU processes for ROVER shard aggregation.
-  rover_workers: 4
-  batch_size: 8
-  num_workers: 16
+  rover_workers: 16
+  batch_size: 4
+  num_workers: 8
   prefetch_factor: 4
-  retry_empty_outputs: True
+  # Keep DataLoader workers alive across work shards. Each GPU worker claims
+  # 10k-file shards in a loop; the old flow built a fresh DataLoader (spawning
+  # up to num_workers loader processes + refilling prefetch) per shard, idling
+  # the GPU a few seconds at every shard boundary. With this enabled one
+  # persistent loader feeds every shard a GPU worker claims — proven to yield
+  # the identical sequence of (shard, batch contents, order) as the per-shard
+  # loader (tests/test_transcription_persistent_loaders.py), so ASR outputs are
+  # byte-identical. Only active when num_workers > 0. Set False to restore the
+  # per-shard loader construction exactly.
+  persistent_loaders: True
+  retry_empty_outputs: False
 
 punctuation:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # Hugging Face model id for RUPunct.
   model_name: "RUPunct/RUPunct_big"
   # Parallel worker count for punctuation jobs (see punctuation.py).
   num_workers: 1
 
 accent:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   num_workers: 1
   # ruAccent package model tag (e.g. turbo3.1).
   model_name: turbo3.1
   # TensorRT EP for ruAccent ONNX path when supported.
   # Disabled — ruAccent model uses UINT8 casts unsupported by TensorRT.
   use_tensorrt: False
+  # "cuda" runs the four ruAccent ONNX sessions on cuda:N; "cpu" runs them on
+  # CPU (the report measures CPU as competitive on this 48-thread box and it
+  # uses zero VRAM — recommended when the GPUs are busy with training).
+  device: cuda
+  # FastRUAccent master switch. True (default) uses the in-repo fast path:
+  #   cross-file ONNX batching, a context-free per-word accent memo, and a lazy
+  #   skip of the unused koziev/rulemma rule engine (~180 MB + ~5 s/worker).
+  #   Proven character-identical to stock ruAccent on the fixture corpus
+  #   (tests/test_accents_fast.py). False restores stock RUAccent.process_all
+  #   per file bit-for-bit.
+  use_fast_accent: True
+  # Files per submit slab. The stage submits one Future per slab (not per file)
+  # and batches each slab's sentences through the ONNX models in one call each.
+  # Real ASR-chunk transcripts are ~1 sentence, so this batches ACROSS files —
+  # measured ~1.75x at 64 on CPU (250 real transcripts, 0/250 char diffs). Also
+  # caps O(N) Futures + per-file IPC pickling at multi-million-file scale.
+  batch_size: 64
+  # Intra-op thread cap for EACH of the four ruAccent ONNX sessions. ruAccent's
+  # load() exposes no SessionOptions hook, so without this every session would
+  # default to all 48 logical cores; with num_workers>1 that oversubscribes the
+  # 2-NUMA box (sessions x workers). 0 = stock (all cores). 4 is a safe default
+  # for multi-worker runs; raise toward 48/num_workers for a single worker.
+  intra_op_threads: 4
+  # Per-feature FastRUAccent knobs (all default True; each is independently
+  # verified character-identical). Turn one off to isolate a divergence.
+  batch_sentences: True   # cross-file/sentence ONNX batching
+  memo_accent: True       # context-free per-word put_accent memo
+  lazy_rule_engine: True  # skip the unused koziev/rulemma rule engine load
 
 phonemizer:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   num_workers: 1
+  # "cpu" runs G2P on CPU instead of cuda:N. The model is tiny (d=128);
+  # batched CPU decode (~8 ms/word) is close to a busy GPU and uses no VRAM.
+  device: cuda
+  # Files per submit slab. The stage submits one Future per slab instead of one
+  # per file, collapsing O(N) Future objects + per-file IPC pickling to
+  # O(N/chunk) at multi-million-file scale. Does NOT change G2P math (each file
+  # is still decoded independently; the worker's dict/OOV caches are shared).
+  submit_chunk_size: 256
+  # Unique OOV words per padded greedy-decode batch.
+  g2p_batch_size: 64
+  # Cross-run/worker cache of OOV decodes, keyed by a model-weights
+  # fingerprint. Set empty ("") to disable persistence. Relative paths are
+  # anchored to the repo root. It is a pickle: point it only at directories
+  # writable solely by the user running the pipeline (never shared/scratch
+  # dirs on multi-user nodes).
+  oov_cache_path: cache/g2p_oov_cache.pkl
 
 denoising:
   # Root containing chunked audio and balalaika.csv.
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
+  podcasts_path: /mnt/ssd_1tb_1/04072026
   # MossFormer2_SE_48K dynamic ONNX. If missing, it is downloaded from Hugging Face.
   onnx_path: ./models/MossFormer2_SE_48K_dynamic_fp32.onnx
   # Fill after uploading the ONNX model.
   # Batch and DataLoader settings per GPU worker.
   batch_size: 2
-  num_workers: 4
-  prefetch_factor: 2
+  num_workers: 1
+  prefetch_factor: 1
   # Number of stage worker processes. 0 = one process per visible GPU.
   processes: 0
   # TensorRT EP uses the shared runtime.trt_cache_path cache.
-  use_tensorrt: True
+  use_tensorrt: False
+  # Optimization-profile "opt" length in seconds for the TRT engine. TensorRT
+  # tunes kernel tactics at this shape. 1.0 (default) reproduces the historical
+  # 1 s opt point byte-for-byte; real length-bucketed batches cluster at
+  # 5-15 s, so set ~= the dominant bucket (e.g. 15.0) to retune tactics for the
+  # lengths actually run. Clamped to the engine's [min, 20 s] bounds; rebuilds
+  # the engine once per node, then cached.
+  trt_opt_seconds: 1.0
+  # Background audio-save pool per GPU worker. 0 (default) saves synchronously
+  # inside the inference loop (byte- and behavior-identical to before). >0
+  # (e.g. 2-4) overlaps the HDD encode/write with the next GPU batch; the
+  # partial-CSV row is still written only after a successful save, and the
+  # shard is only marked done once all queued saves land. async_save_queue
+  # caps in-flight saves (RAM ~= queue x file size).
+  async_save_workers: 0
+  async_save_queue: 8
 
 export:
-  podcasts_path: /mnt/hdd_6tb_1/yandex_data
-  # Parallel processes writing WebDataset shards.
-  num_workers: 1
+  podcasts_path: /mnt/ssd_1tb_1/04072026
+  # Exact directory where shard_*.tar files are written. This may be on a
+  # different disk from podcasts_path. Empty keeps the legacy location:
+  # <podcasts_path parent>/<podcasts_path name>_webdataset/train.
+  output_path: /mnt/ssd_1tb_1/04072026_webdataset/train
+  # Parallel processes writing WebDataset shards. With readahead > 0 a few
+  # processes saturate an HDD: 8 workers + readahead 128 measured 1.7x faster
+  # than 32 workers without readahead, and beat even 128 stock workers
+  # (10k-chunk cold-cache bench on one spindle). Without readahead, throughput
+  # keeps growing with worker count (queue depth), at 16x the process cost.
+  num_workers: 8
+  # Per-worker sliding window of files queued for async kernel readahead
+  # (posix_fadvise WILLNEED on the next N audio+json files). Many outstanding
+  # requests let the disk elevator sort reads by on-disk location — the whole
+  # win on HDD for ~0.5 MB chunk files. Measured optimum is broad (64..256);
+  # 512 already regresses (page-cache churn). 0 disables (bit-identical
+  # output either way; readahead only warms the page cache).
+  readahead: 128
+  # Local shard number each worker starts from. For a partial export, set this
+  # to one greater than the last uploaded shard index. Example: after
+  # shard_000_0049.tar, use 50; worker 0 then starts at shard_000_0050.tar.
+  # Existing tar files are opened exclusively and will never be overwritten.
+  shard_start_index: 0
   # Approximate max uncompressed bytes per .tar shard before rolling to next file.
   max_shard_size: 536870912
   # Max samples per shard file.
-  max_shard_count: 10000
+  max_shard_count: 50000

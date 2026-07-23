@@ -65,6 +65,10 @@ def setup_logging(
     resolved_level = str(level or os.environ.get("BALALAIKA_LOG_LEVEL", "INFO")).upper()
     resolved_dir = _resolve_log_dir(log_dir)
     resolved_dir.mkdir(parents=True, exist_ok=True)
+    # Export for child processes: spawned stage workers and DataLoader
+    # workers re-import loguru and would otherwise keep its default
+    # DEBUG-to-stderr sink, emitting per-file debug lines in production.
+    os.environ["BALALAIKA_LOG_LEVEL"] = resolved_level
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = resolved_dir / f"{stage}_{timestamp}.log"
@@ -112,3 +116,29 @@ def setup_logging(
 
     logger.info(f"[{stage}] log file: {log_path}")
     return log_path
+
+
+def init_worker_logging(level: Optional[str] = None) -> None:
+    """Configure loguru in a spawned worker process.
+
+    Replaces the library-default DEBUG stderr sink with one honoring the
+    level ``setup_logging`` resolved in the parent (via the
+    ``BALALAIKA_LOG_LEVEL`` env var inherited through spawn). Hot per-file
+    ``logger.debug`` calls become no-ops at the default INFO level instead
+    of serialized stderr writes.
+    """
+    resolved_level = str(level or os.environ.get("BALALAIKA_LOG_LEVEL", "INFO")).upper()
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        format=_FORMAT_CONSOLE,
+        level=resolved_level,
+        enqueue=True,
+        backtrace=True,
+        diagnose=False,
+    )
+
+
+def dataloader_worker_init(_worker_id: int = 0) -> None:
+    """``worker_init_fn`` for torch DataLoaders (datasets log per file)."""
+    init_worker_logging()

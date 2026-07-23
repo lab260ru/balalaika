@@ -2,16 +2,20 @@ import argparse
 from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 import concurrent.futures
 from loguru import logger
 
-from src.utils.csv_manager import discover_audio_paths
+from src.utils.csv_manager import (
+    discover_audio_paths,
+    read_state_dataframe,
+    state_path,
+)
+from src.utils.chunk_json import JSON_SUFFIX, get_field, read_chunk_json
 from src.utils.logging_setup import setup_logging
-from src.utils.stage_status import write_stage_status
-from src.utils.utils import load_config, read_file_content
+from src.utils.stage_status import last_line, write_stage_status
+from src.utils.utils import load_config, model_key
 
-SUPPORTED_TIMESTAMP_MODELS = {'giga_ctc', 'giga_ctc_lm', 'tone', 'parakeet_v2', 'parakeet_v3', 'canary'}
 ASR_CONSISTENCY_COLUMN = "asr_consistency_percent"
 
 TEXT_COLUMNS = {
@@ -40,8 +44,8 @@ TEXT_COLUMNS = {
 
 
 def output_suffix_for_model(model_name: str) -> str:
-    """Match transcription.py sidecar naming."""
-    return "vosk" if "vosk" in str(model_name) else str(model_name)
+    """Match transcription.py JSON-key naming (last ``/``-segment of the name)."""
+    return model_key(model_name)
 
 
 def transcription_sidecar_columns(model_names: Iterable[str]) -> set[str]:
@@ -55,7 +59,7 @@ def transcription_sidecar_columns(model_names: Iterable[str]) -> set[str]:
 
 
 def drop_csv_text_columns(df: pd.DataFrame, extra_columns: Optional[set[str]] = None) -> pd.DataFrame:
-    """Keep balalaika.csv as metadata-only; sidecars feed final parquet text."""
+    """Keep the parquet state metadata-only; chunk JSONs feed final text columns."""
     extra_columns = extra_columns or set()
     drop_cols = [
         col
@@ -70,12 +74,43 @@ def drop_csv_text_columns(df: pd.DataFrame, extra_columns: Optional[set[str]] = 
     return df.drop(columns=drop_cols)
 
 
+def read_state_for_collate(
+    base_path: Path | str,
+    sidecar_columns: set[str],
+    config_path: str | None,
+) -> pd.DataFrame:
+    """Load the pipeline-state frame collate folds chunk JSONs into.
+
+    Reads the parquet state (``balalaika.parquet``) so direct upserters — e.g.
+    stage-7's duration cache — are reflected. Falls back to bootstrapping from
+    the audio tree when no state file exists yet. Drops duplicate filepaths and
+    the text columns (those are re-sourced from each chunk's ``<stem>.json``).
+    """
+    if state_path(base_path).exists():
+        logger.info(f"Loading existing dataframe from {state_path(base_path)}")
+        df = read_state_dataframe(base_path)
+        df.drop_duplicates(subset="filepath", inplace=True)
+        df = drop_csv_text_columns(df, extra_columns=sidecar_columns)
+    else:
+        logger.info("No existing dataframe found. Creating new one from audio paths.")
+        audio_paths = discover_audio_paths(base_path, config_path=config_path)
+        df = pd.DataFrame({"filepath": audio_paths})
+    return df.reset_index(drop=True)
+
+
 def sidecar_specs(model_names: Iterable[str]) -> Dict[str, str]:
+    """Map each output column to its dotted key inside the chunk ``<stem>.json``.
+
+    The four text stages and ROVER write a single JSON per chunk
+    (see :mod:`src.utils.chunk_json`); collate reads that one file and projects
+    its keys into the final parquet columns.
+    """
     specs = {
-        'accent': '_accent.txt',
-        'rover': '_rover.txt',
-        'punct': '_punct.txt',
-        'phonemes': '_rover_phonemes.txt',
+        'accent': 'accent',
+        'rover': 'rover',
+        'punct': 'punct',
+        'phonemes': 'rover_phonemes',
+        ASR_CONSISTENCY_COLUMN: 'asr_consistency',
     }
 
     seen_suffixes = set()
@@ -84,81 +119,144 @@ def sidecar_specs(model_names: Iterable[str]) -> Dict[str, str]:
         if suffix in seen_suffixes:
             continue
         seen_suffixes.add(suffix)
-        specs[suffix] = f"_{suffix}.txt"
-        specs[f"{suffix}_timestamps"] = f"_{suffix}.tst"
+        specs[suffix] = f"asr.{suffix}"
+        specs[f"{suffix}_timestamps"] = f"asr_ts.{suffix}"
 
     return specs
 
 
-def normalize_transcript(text: object) -> str:
-    if text is None:
-        return ""
-    if pd.isna(text):
-        return ""
-    return " ".join(str(text).lower().split())
-
-
-def asr_consistency_percent(row: pd.Series, asr_columns: list[str]) -> float:
-    transcripts = [
-        normalized
-        for col in asr_columns
-        if col in row.index
-        for normalized in [normalize_transcript(row[col])]
-        if normalized
-    ]
-    if len(transcripts) < 2:
+def _coerce_asr_consistency(value: Any) -> float:
+    if value is None or value == "":
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid asr_consistency value in chunk JSON: {value!r}")
         return float("nan")
 
-    best_matching_others = max(
-        transcripts.count(transcript) - 1
-        for transcript in set(transcripts)
-    )
-    return best_matching_others / (len(transcripts) - 1) * 100.0
+
+def _field_default(key: str, value: Any) -> Any:
+    if key == ASR_CONSISTENCY_COLUMN:
+        return _coerce_asr_consistency(value)
+    return '' if value is None else value
 
 
-def add_asr_consistency_column(df: pd.DataFrame, model_names: Iterable[str]) -> pd.DataFrame:
-    asr_columns = []
-    seen = set()
-    for model_name in model_names:
-        suffix = output_suffix_for_model(model_name)
-        if suffix in seen:
-            continue
-        seen.add(suffix)
-        if suffix in df.columns:
-            asr_columns.append(suffix)
+def process_audio_file(
+    audio_path_str: str,
+    base_path: Path,
+    file_types: Dict[str, str],
+    _dir_names: Optional[Dict[str, set]] = None,
+) -> Dict[str, Any]:
+    import os
 
-    out = df
-    if len(asr_columns) < 2:
-        out[ASR_CONSISTENCY_COLUMN] = float("nan")
-        logger.info("ASR consistency skipped: fewer than two ASR text columns found.")
-        return out
+    dirname, filename = os.path.split(audio_path_str)
+    base_name = os.path.splitext(filename)[0]
+    # os.path.join mirrors the original Path join: an absolute dirname wins
+    # over base_path, a relative one is anchored under it.
+    target_dir = os.path.join(str(base_path), dirname)
+    json_name = f"{base_name}{JSON_SUFFIX}"
 
-    out[ASR_CONSISTENCY_COLUMN] = out.apply(
-        asr_consistency_percent,
-        axis=1,
-        asr_columns=asr_columns,
-    )
-    logger.info(
-        f"Added {ASR_CONSISTENCY_COLUMN} from ASR columns: {asr_columns}"
-    )
-    return out
+    names = None
+    if _dir_names is not None:
+        names = _dir_names.get(target_dir)
+        if names is None:
+            try:
+                names = {entry.name for entry in os.scandir(target_dir)}
+            except OSError:
+                # Transient failure (EMFILE, concurrent rename, ...): never
+                # cache the error. Fall through to the direct read path for THIS
+                # call (names=None) so the file is read loudly instead of every
+                # later file in this dir silently reading ''. The next call for
+                # the same dir retries scandir.
+                names = None
+            else:
+                _dir_names[target_dir] = names
 
+    results: Dict[str, Optional[str]] = {'filepath': audio_path_str}
+    if names is not None and json_name not in names:
+        # directory listing says the chunk JSON doesn't exist -> every column
+        # is empty, same as the old missing-sidecar path, without the open.
+        for key in file_types:
+            results[key] = _field_default(key, None)
+        return results
 
-def process_audio_file(audio_path_str: str, base_path: Path, file_types: Dict[str, str]) -> Dict[str, Optional[str]]:
-
-    audio_path = Path(audio_path_str)
-    dir_path = audio_path.parent
-    base_name = audio_path.stem
-
-    results = {'filepath': audio_path_str}
-    for key, suffix in file_types.items():
-        file_path = base_path / dir_path / f"{base_name}{suffix}"
-        results[key] = read_file_content(file_path)
+    data = read_chunk_json(os.path.join(target_dir, json_name))
+    for key, dotted in file_types.items():
+        value = get_field(data, dotted)
+        results[key] = _field_default(key, value)
 
     return results
 
 
+def build_slab_frame(
+    metadata_slab: pd.DataFrame,
+    file_types: Dict[str, str],
+    model_names: Iterable[str],
+    base_path: Path,
+    dir_names_cache: Dict[str, set],
+    num_workers: int,
+    executor: concurrent.futures.Executor,
+) -> tuple[pd.DataFrame, list[tuple[str, Exception]]]:
+    """Read sidecars for one slab of rows and assemble the merged frame.
+
+    ``metadata_slab`` is a contiguous slice of the (deduplicated, text-column-
+    dropped) metadata frame, in audio-path order. Its sidecar columns are read
+    per-file, then column-aligned by position (paths are unique and the slab
+    order is preserved), which is exactly equivalent to
+    ``pd.merge(df, extracted_df, on='filepath', how='left')`` on the unique
+    join key — same values, same row order, same column order
+    (metadata columns first, then sidecar columns in ``file_types`` order, then
+    the appended consistency column) — but it only ever materialises one slab's
+    worth of sidecar text instead of the whole dataset's.
+    """
+    paths = metadata_slab['filepath'].tolist()
+
+    # Split into sub-slabs so per-future dispatch overhead stays amortised while
+    # we still parallelise the (GIL-released) os.scandir / open work.
+    sub = max(1, len(paths) // max(1, num_workers))
+    sub_slabs = [paths[i:i + sub] for i in range(0, len(paths), sub)]
+
+    def process_sub(sub_paths):
+        sub_results, sub_errors = [], []
+        for path in sub_paths:
+            try:
+                sub_results.append(
+                    process_audio_file(path, base_path, file_types, dir_names_cache)
+                )
+            except Exception as exc:  # keep per-file error attribution
+                sub_results.append(None)
+                sub_errors.append((path, exc))
+        return sub_results, sub_errors
+
+    import numpy as np
+
+    # Per-column accumulators preserve the input order (executor.map is ordered),
+    # so the slab aligns 1:1 with metadata_slab without building one dict per row.
+    # A file that raised keeps its metadata row but gets NaN sidecar values —
+    # exactly what the old `pd.merge(df, extracted_df, how='left')` produced when
+    # that path was missing from extracted_df (the row stayed, sidecars NaN).
+    columns: Dict[str, list] = {key: [] for key in file_types}
+    errors: list[tuple[str, Exception]] = []
+    for sub_results, sub_errors in executor.map(process_sub, sub_slabs):
+        errors.extend(sub_errors)
+        for res in sub_results:
+            if res is None:
+                for key in file_types:
+                    columns[key].append(np.nan)
+                continue
+            for key in file_types:
+                columns[key].append(res[key])
+
+    kept_meta = metadata_slab.reset_index(drop=True)
+    sidecar_df = pd.DataFrame(columns, index=kept_meta.index)
+    slab = pd.concat([kept_meta, sidecar_df], axis=1)
+    return slab, errors
+
+
 def main(args):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     processed = 0
     errors = 0
     error_details: list[dict] = []
@@ -167,64 +265,112 @@ def main(args):
     config = load_config(args.config_path, 'download')
     transcription_config = load_config(args.config_path, 'transcription')
     model_names = transcription_config.get('model_names', [])
-    configured_timestamp_models = [
-        name for name in model_names if name in SUPPORTED_TIMESTAMP_MODELS
-    ]
     base_path = Path(config.get('podcasts_path', '../../balalaika'))
     num_workers = config.get('num_workers', 32)
+    # Rows per streamed slab. Caps peak RAM at ~O(slab) instead of O(dataset):
+    # only one slab's sidecar text is resident at a time. Lower it on very
+    # low-RAM nodes; raise it to trade RAM for fewer parquet row-groups.
+    slab_rows = int(config.get('collate_slab_rows', 200_000))
+    # Parquet compression for balalaika.parquet. snappy = old default; zstd
+    # is ~2x smaller on text-heavy frames (fewer HDD bytes) when readers allow.
+    parquet_compression = config.get('collate_parquet_compression', 'snappy')
     file_types = sidecar_specs(model_names)
     sidecar_columns = set(file_types.keys()) | transcription_sidecar_columns(model_names)
     logger.info(
         f"Collating {len(file_types)} sidecar columns "
-        f"({len(model_names)} ASR model(s), {len(configured_timestamp_models)} timestamp-capable)."
+        f"({len(model_names)} ASR model(s); timestamp columns are populated for "
+        f"whichever models onnx-asr emits timestamps for, empty otherwise)."
     )
 
-    df_path = Path(base_path) / "balalaika.csv"
-    if df_path.exists():
-        logger.info(f"Loading existing dataframe from {df_path}")
-        df = pd.read_csv(df_path)
-        df.drop_duplicates(subset='filepath', inplace=True)
-        df = drop_csv_text_columns(df, extra_columns=sidecar_columns)
-    else:
-        logger.info(f"No existing dataframe found. Creating new one from audio paths.")
-        audio_paths = discover_audio_paths(base_path, config_path=args.config_path)
-        df = pd.DataFrame({'filepath': audio_paths})
-    
-    audio_paths = df['filepath'].tolist()
-    results = []
+    df = read_state_for_collate(base_path, sidecar_columns, args.config_path)
+    n_rows = len(df)
+    logger.info(f"Starting chunked processing of {n_rows} rows with {num_workers} workers")
 
-    logger.info(f"Starting processing with {num_workers} workers")
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        future_to_path = {executor.submit(process_audio_file, path, base_path, file_types): path for path in audio_paths}
-        
-        for future in tqdm(concurrent.futures.as_completed(future_to_path), total=len(audio_paths), desc="Processing files"):
-            try:
-                data = future.result()
-                if data:
-                    results.append(data)
-                    processed += 1
-            except Exception as exc:
-                path = future_to_path[future]
-                logger.error(f'{path} generated an exception: {exc}')
-                errors += 1
-                error_details.append({"file": str(path), "reason": str(exc)})
-
-    if not results:
+    if n_rows == 0:
         logger.info("No data was processed. Exiting.")
         return
-        
-    extracted_df = pd.DataFrame(results)
-
-    final_df = pd.merge(df, extracted_df, on='filepath', how='left')
-    final_df = add_asr_consistency_column(final_df, model_names)
 
     output_path = base_path / "balalaika.parquet"
-    final_df.to_parquet(output_path, engine='pyarrow', index=False)
+    dir_names_cache: Dict[str, set] = {}
+    writer: Optional[pq.ParquetWriter] = None
+    schema: Optional[pa.Schema] = None
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            with tqdm(total=n_rows, desc="Processing files") as bar:
+                for start in range(0, n_rows, slab_rows):
+                    metadata_slab = df.iloc[start:start + slab_rows]
+                    slab, slab_errors = build_slab_frame(
+                        metadata_slab,
+                        file_types,
+                        model_names,
+                        base_path,
+                        dir_names_cache,
+                        num_workers,
+                        executor,
+                    )
+                    # `processed` counts successfully-read files (old semantics:
+                    # only rows that made it into extracted_df), errors counted
+                    # separately. Both rows still land in the parquet (the row
+                    # itself is kept with NaN sidecars, as the old left-merge did).
+                    processed += len(slab) - len(slab_errors)
+                    for path, exc in slab_errors:
+                        logger.error(f'{path} generated an exception: {exc}')
+                        errors += 1
+                        error_details.append({"file": str(path), "reason": last_line(exc)})
+
+                    table = pa.Table.from_pandas(slab, preserve_index=False)
+                    if writer is None:
+                        # Lock the schema from the first slab; every metadata
+                        # column comes from one CSV read so dtypes are stable,
+                        # and sidecar columns are always strings. A metadata
+                        # column that is all-NaN across the whole first slab is
+                        # inferred as pyarrow ``null`` -- promote those fields to
+                        # ``string`` so a later slab carrying strings in that
+                        # column casts cleanly (null->string) instead of raising
+                        # 'Unsupported cast from string to null' and silently
+                        # truncating the parquet to slab 0.
+                        promoted = pa.schema(
+                            [
+                                pa.field(f.name, pa.string()) if pa.types.is_null(f.type) else f
+                                for f in table.schema
+                            ]
+                        )
+                        if not promoted.equals(table.schema):
+                            table = table.cast(promoted)
+                        schema = table.schema
+                        writer = pq.ParquetWriter(
+                            output_path, schema, compression=parquet_compression
+                        )
+                    else:
+                        try:
+                            table = table.cast(schema)
+                        except (pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError) as exc:
+                            locked = {f.name: f.type for f in schema}
+                            mismatched = [
+                                f.name
+                                for f in table.schema
+                                if f.name not in locked or not f.type.equals(locked[f.name])
+                            ]
+                            raise RuntimeError(
+                                f"collate slab at rows [{start}:{start + slab_rows}] "
+                                f"could not be cast to the locked parquet schema; "
+                                f"column(s) {mismatched} disagree with slab 0"
+                            ) from exc
+                    writer.write_table(table)
+                    bar.update(len(metadata_slab))
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if writer is None:
+        logger.info("No data was processed. Exiting.")
+        return
+
     logger.info(f"Successfully saved data to {output_path}")
 
     write_stage_status(
-        stage=12,
+        stage=13,
         stage_name="collate",
         log_dir=args.log_dir or "./logs",
         processed=processed,

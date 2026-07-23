@@ -1,11 +1,22 @@
 from pathlib import Path
 from typing import List, Tuple
 
-import torch
-
 import re
 import yaml
 from loguru import logger
+
+
+def model_key(model_name: str) -> str:
+    """Deterministic short key for an onnx-asr model name (no lookup table).
+
+    Model names are passed straight to ``onnx_asr.load_model`` (e.g.
+    ``gigaam-v3-ctc``, ``t-tech/t-one``, ``alphacep/vosk-model-ru``); this is the
+    name used as the JSON/parquet key for that model's outputs. We take the last
+    ``/``-segment so HF-style ``org/model`` names yield a clean column
+    (``t-tech/t-one`` -> ``t-one``, ``alphacep/vosk-model-ru`` -> ``vosk-model-ru``).
+    """
+    return str(model_name).split("/")[-1]
+
 
 def load_config(config_path: str, process_name: str):
     config = {}
@@ -33,15 +44,24 @@ def read_file_content(file_path):
     except FileNotFoundError:
         return ''
 
+AUDIO_SUFFIXES = (".mp3", ".wav", ".flac", ".ogg", ".opus")
+
+
 def get_audio_paths(podcast_path: str):
-    podcast_path=Path(podcast_path)
-    return (
-        list(podcast_path.rglob("*.mp3")) +
-        list(podcast_path.rglob("*.wav")) +
-        list(podcast_path.rglob("*.flac")) +
-        list(podcast_path.rglob("*.ogg")) +
-        list(podcast_path.rglob("*.opus")) 
-    )
+    """Collect audio files in one os.walk pass (was: five full rglob scans).
+
+    Matching stays case-sensitive for parity with the original
+    ``rglob('*.mp3')`` behavior. Directory symlinks are not followed.
+    """
+    import os
+
+    out = []
+    append = out.append
+    for root, _dirs, files in os.walk(podcast_path):
+        for name in files:
+            if name.endswith(AUDIO_SUFFIXES):
+                append(Path(os.path.join(root, name)))
+    return out
 
 
 def process_token(token, label):
@@ -111,6 +131,8 @@ def process_token(token, label):
         return token.upper() + "..."
     if label == "UPPER_TOTAL_QUESTIONVOSKL":
         return token.upper() + "?!"
+    logger.debug(f"process_token: unrecognized label {label!r}; returning token unchanged.")
+    return token
 
 def normalize_text(text: str) -> str:
     text = text.lower().strip()

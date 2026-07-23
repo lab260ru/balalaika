@@ -1,8 +1,9 @@
 ## Punctuation (RUPunct)
 
-Restores punctuation and capitalization from **`{stem}_rover.txt`**.
+Restores punctuation and capitalization from the **`rover`** text in each
+chunk's **`{stem}.json`**, writing the **`punct`** key back.
 
-Multi-GPU pool orchestration, sidecar discovery, and skip-already-done
+Multi-GPU pool orchestration, chunk-JSON discovery, and skip-already-done
 filtering all come from `src/utils` — the stage script is just `init_process`
 + `make_punct_txt` + a `main()` glue that calls
 `src.utils.parallel.run_per_gpu_pool` once.

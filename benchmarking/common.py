@@ -15,10 +15,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Model identifiers accepted by src/transcription/transcription.py (the keys of
+# its MODEL_MAP). The transcription stage selects a model via
+# transcription.model_names, so a per-model benchmark target just pins
+# model_names=[<name>]. Keep this aligned with MODEL_MAP — unknown names fall
+# through to onnx_asr.load_model(name) and fail.
 TRANSCRIPTION_MODELS: tuple[str, ...] = (
+    "gigaam-v3-e2e-ctc",
     "giga_ctc",
-    "giga_rnnt",
     "giga_ctc_lm",
+    "giga_rnnt",
     "tone",
     "vosk",
     "vosk_small",

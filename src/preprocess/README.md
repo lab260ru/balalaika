@@ -11,7 +11,10 @@ normalization (ITU-R BS.1770-4).
    `chunk_duration`, overlap filtering, Smart VAD; writes
    `{start}_{end}_{playlist}_{podcast}.{ext}` (extension follows `chunk_format`,
    default `auto`), upserts rows into `balalaika.csv`; **deletes the original
-   long file** after successful chunking. With `fuse_audio_preprocessing: true`,
+   long file** after successful chunking. Cut points are tail-aware
+   (SPEC_drop_criteria.md): balanced-split cuts snap to the quietest nearby
+   frame (`split_snap_window`) and chunk ends keep a `tail_pad` trailing
+   margin, so chunks no longer end mid-word at full level. With `fuse_audio_preprocessing: true`,
    crest filtering and LUFS normalization happen on each in-memory native-rate
    chunk before its first and only write.
 2. **`crest_factor_remover`** — computes crest factor (peak/RMS) for every
@@ -22,6 +25,12 @@ normalization (ITU-R BS.1770-4).
    (FLAC / WAV) are written through `soundfile` and stay lossless; lossy
    containers (MP3 / OGG / OPUS) round-trip through `torchaudio.save`. Marks
    each successfully normalized file with `loudness_normalized=True`.
+4. **`tail_score`** (stage 3.5) — scores the SPEC_drop_criteria.md
+   clipped-tail signals per chunk (`tail_db`: loudest 20 ms frame in the last
+   80 ms, dB relative to the robust peak; `trailing_silence_ms`: margin after
+   the last voiced frame) into `balalaika.parquet`. Score-only backfill for
+   trees cut before the smart stage-1 boundaries (`split_snap_window` /
+   `tail_pad`); chunks with `tail_db` already present are skipped on resume.
 
 Stages 2 and 3 remain independently runnable. After a successful fused stage
 1 they are metadata-only no-ops because `crest_factor` and

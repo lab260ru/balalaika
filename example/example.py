@@ -5,7 +5,7 @@ if __name__ == "__main__":
     # Hugging Face will find all .tar archives in the folder and collect them into a dataset
     dataset = load_dataset(
         "webdataset", 
-        data_dir="/home/nikita/balalaika/dataset_webdataset", 
+        data_dir="/home/nikita/test_data_webdataset", 
         split="train",
         streaming=True # Streaming reading, does not fill up the RAM
     )

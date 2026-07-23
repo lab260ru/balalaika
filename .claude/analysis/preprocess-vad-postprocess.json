@@ -1,0 +1,173 @@
+{
+  "area": "preprocess-vad-postprocess (src/preprocess/audio_postprocessing.py, src/libs/smart_turn/inference.py, src/libs/smart_turn/offline_svad.py)",
+  "data_flow": "These three files implement (a) shared in-memory crest-filter + LUFS loudness normalization, and (b) the SmartTurn end-of-speech (EOS) VAD classifier.\n\nCREST + LOUDNESS (audio_postprocessing.py): postprocess_audio_tensor() is the fused entry point used by preprocess.py (cut_audio path) and preprocess_existing_chunks.py. Flow per chunk: (1) samples.detach().to(float32, cpu) + unsqueeze + .contiguous() [audio_postprocessing.py:86-89]; (2) calculate_crest_factor() which AGAIN does .detach().to(float32,cpu) and computes mean-over-channels, peak=abs().amax(), rms=square().mean().sqrt() [34-50]; (3) if crest > threshold -> reject (no copy/normalize); (4) else audio.numpy(), call normalize_audio_loudness() which fetches/creates a cached pyln.Meter [_get_meter, 53-59], runs meter.integrated_loudness() (BS.1770 K-weighting + gating, pure-Python nested loops over channels x ~hundreds of 400ms blocks, plus an internal data.copy()), then pyln.normalize.loudness() (allocates gain*data copy) [62-73]; (5) np.ascontiguousarray + torch.as_tensor back to a CPU float32 tensor [118-121]. normalize_audio_loudness() is also called directly from the standalone loudness stage in preprocess_audio.py (per-file, in DataLoader workers).\n\nSMART VAD (offline_svad.py): SmartVAD.predict_endpoint() is called once PER diarized segment inside a Python for-loop in preprocess.py apply_eos_classification() [preprocess.py:248-259]. Per segment: optional torchaudio resample if source_rate != 16k [86-93]; _truncate_audio() truncates to last 8s OR np.pad-prepends zeros to exactly 8*16000 samples [94-98,152-161]; WhisperFeatureExtractor() builds log-mel with padding='max_length', max_length=8*16000, do_normalize=True, device=self.device (GPU) [100-109] — this runs STFT/mel on GPU then copies result back to host numpy; input_features.contiguous().to(torch_device, float32) RE-UPLOADS to GPU [111-114]; _run_session() either uses CUDA IOBinding via DLPack (zero-copy, with torch.cuda.synchronize per call) or falls back to .cpu().numpy()+session.run [124-150]; returns single float probability. inference.py is an older standalone module-level variant (CPU-only session, no providers list) used only by its __main__; it is effectively dead in the pipeline but contains a hard bug.",
+  "operations": [
+    {
+      "name": "crest factor double-decode",
+      "what": "postprocess_audio_tensor first does samples.detach().to(float32,cpu).contiguous() (audio_postprocessing.py:86-89), then calculate_crest_factor() repeats .detach().to(float32,cpu) on the same tensor (audio_postprocessing.py:35) - a second device/dtype conversion + an extra mean/squeeze copy",
+      "cost": "light"
+    },
+    {
+      "name": "crest factor compute",
+      "what": "abs().amax(), square().mean().sqrt() over the (already float32 cpu) waveform (audio_postprocessing.py:46-47); cheap relative to loudness",
+      "cost": "light"
+    },
+    {
+      "name": "pyloudnorm integrated_loudness",
+      "what": "normalize_audio_loudness -> meter.integrated_loudness (audio_postprocessing.py:72). Pure-Python BS.1770 gating: nested for-loops over channels x numBlocks (~hundreds of 400ms blocks per chunk) with np.sum per block, list-comprehension loudness array, plus an internal input_data=data.copy() and per-channel IIR filter passes. This is the dominant CPU cost of the loudness/fused stage and is fully GIL-bound",
+      "cost": "dominant"
+    },
+    {
+      "name": "pyloudnorm normalize gain",
+      "what": "pyln.normalize.loudness allocates output=gain*data, a full extra copy of the chunk (audio_postprocessing.py:73)",
+      "cost": "light"
+    },
+    {
+      "name": "numpy<->torch round trips (loudness)",
+      "what": "audio.numpy() (101), .squeeze/.T reshapes, np.ascontiguousarray + torch.as_tensor back to tensor (118-121); mono path adds [np.newaxis,:], multichannel transposes twice (.T then .T)",
+      "cost": "light"
+    },
+    {
+      "name": "meter cache lookup",
+      "what": "_get_meter builds/caches pyln.Meter keyed by (rate,block_size) (audio_postprocessing.py:53-59); avoids re-instantiating filters - good. But Meter is stateful (mutates self.blockwise_loudness) so the cache is not thread-safe",
+      "cost": "trivial"
+    },
+    {
+      "name": "VAD per-segment Python loop",
+      "what": "apply_eos_classification iterates segments and calls smart_vad.predict_endpoint once per segment (preprocess.py:248-259); no batching across the (often dozens-hundreds of) segments of a file",
+      "cost": "heavy"
+    },
+    {
+      "name": "VAD resample",
+      "what": "torchaudio.functional.resample per call when source_rate != 16k (offline_svad.py:89-93). In the pipeline caller resamples the WHOLE file once to vad_sr first (preprocess.py:243), so per-segment resample is usually skipped - good",
+      "cost": "light"
+    },
+    {
+      "name": "VAD truncate/pad then re-pad",
+      "what": "_truncate_audio pads/truncates to EXACTLY 8*16000 (offline_svad.py:94-98,152-161), then WhisperFeatureExtractor is called AGAIN with padding='max_length', max_length=8*16000, truncation=True (100-109) - the FE re-pads/re-truncates redundantly to the same length",
+      "cost": "light"
+    },
+    {
+      "name": "Whisper feature extraction (mel STFT)",
+      "what": "feature_extractor(... device=self.device) computes log-mel via torch.stft on GPU then .detach().cpu().numpy() back to host (offline_svad.py:100-109; FE _torch_extract_fbank_features). Always processes a fixed 8s window even for short segments. zero_mean_unit_var_norm + np.stack also run on host",
+      "cost": "moderate"
+    },
+    {
+      "name": "VAD GPU->CPU->GPU re-upload",
+      "what": "FE returns host numpy, then input_features.contiguous().to(torch_device,float32) uploads back to GPU (offline_svad.py:111-114) before IOBinding - a redundant device round trip per segment",
+      "cost": "moderate"
+    },
+    {
+      "name": "VAD ONNX inference",
+      "what": "_run_session: DLPack IOBinding path with torch.cuda.synchronize per call (offline_svad.py:132-143) or fallback session.run on a fixed (1,128,3000)-ish mel. Single-item batch, intra/inter-op threads=1, ORT_SEQUENTIAL (offline_svad.py:42-44)",
+      "cost": "moderate"
+    },
+    {
+      "name": "per-call cuda.synchronize",
+      "what": "torch.cuda.synchronize(self.torch_device) after every IOBinding run (offline_svad.py:142) forces a full device sync per segment, serializing with any overlap",
+      "cost": "light"
+    },
+    {
+      "name": "ONNX session options",
+      "what": "build_session/_init_smart_vad set inter_op_num_threads=1, ORT_SEQUENTIAL, ORT_ENABLE_ALL; no intra_op_num_threads set, no TensorRT EP for SmartVAD (offline_svad.py:41-54, inference.py:9-13)",
+      "cost": "light"
+    }
+  ],
+  "optimizations": [
+    {
+      "title": "Batch SmartVAD across all segments of a file",
+      "location": "src/preprocess/preprocess.py:248-259 (caller); src/libs/smart_turn/offline_svad.py:72-150",
+      "description": "predict_endpoint runs once per segment in a Python loop. Add a predict_endpoint_batch(list_of_segments) that stacks N truncated/padded 8s windows into one (N,8*16000) array, runs the WhisperFeatureExtractor once on the batch (it already supports batched STFT), and runs a single ONNX session.run / IOBinding with batch dim N. This collapses N python calls + N GPU launches + N cuda.synchronize into one. The model is fully convolutional/transformer over a fixed mel length so batching is trivial.",
+      "expected_gain": "2-6x on the VAD stage for files with many segments; removes per-segment Python/launch overhead which dominates for short segments",
+      "risk": "low",
+      "low_resource_note": "Batch size must be a config knob (e.g. vad_batch_size); on a single low-VRAM GPU cap it (e.g. 16-32) and chunk the segment list. Falls back to current per-item behavior at batch=1."
+    },
+    {
+      "title": "Eliminate redundant GPU->CPU->GPU round trip in VAD feature extraction",
+      "location": "src/libs/smart_turn/offline_svad.py:100-114",
+      "description": "feature_extractor is called with device=self.device so the mel STFT runs on GPU, but the FE internally copies the result back to host numpy (_torch_extract_fbank_features does .detach().cpu().numpy()), and line 111-114 then re-uploads to GPU. Either (a) pass device='cpu' to the FE and let the FE produce host tensors that ORT consumes on CPU/copies once, or (b) compute the log-mel with a small in-house torch.stft kernel that stays on-GPU and feed it straight to IOBinding without the host hop. Option (b) is best for the CUDA EP path.",
+      "expected_gain": "removes one H2D + one D2H transfer per segment; meaningful when batched and for short segments where transfer ~ compute",
+      "risk": "medium",
+      "low_resource_note": "On CPU-only nodes pass device='cpu' (current GPU FE path would error or be pointless); make FE device follow self.torch_device.type, not the raw cuda string."
+    },
+    {
+      "title": "Replace pure-Python pyloudnorm gating with a vectorized / batched loudness",
+      "location": "src/preprocess/audio_postprocessing.py:62-73 (and integrated_loudness loops)",
+      "description": "Meter.integrated_loudness is the dominant cost of the loudness/fused stage and is GIL-bound nested Python loops over channels x blocks. Options: (1) vectorize the gating block mean-square via a strided/cumsum reduction (compute z[i,j] with np.add.reduceat or a reshape over non-overlapping windows + sliding sum) instead of the per-block python loop; (2) for the common mono 24k/16k case, precompute once. Even a numpy-vectorized rewrite of the block loop removes the dominant hotspot. The K-weighting IIR filter (scipy lfilter) is already C-level.",
+      "expected_gain": "loudness measure 3-10x faster; large win because this is the dominant CPU op in the fused/loudness stage",
+      "risk": "medium",
+      "low_resource_note": "Pure numpy vectorization helps everywhere and uses less CPU; ideal for low-CPU nodes. Must reproduce BS.1770 numbers within tolerance to keep output bit-similar - validate against pyloudnorm on a sample."
+    },
+    {
+      "title": "Remove the duplicate tensor decode in crest path",
+      "location": "src/preprocess/audio_postprocessing.py:86-91, 34-50",
+      "description": "postprocess_audio_tensor converts samples to float32/cpu/contiguous (86-89), then calculate_crest_factor immediately repeats .detach().to(float32,cpu) (35). Pass the already-converted `audio` and add an internal _crest_from_prepared(audio) that skips the redundant conversion and the extra mean/squeeze allocation. Compute peak/rms directly on the (C,F) tensor with dim reductions.",
+      "expected_gain": "small per-chunk (one fewer copy + conversion); adds up over millions of chunks",
+      "risk": "low",
+      "low_resource_note": "Pure win, lowers peak RAM on 31GB node by avoiding an extra waveform copy per chunk."
+    },
+    {
+      "title": "Avoid full 8s mel for short segments / skip do_normalize re-pad",
+      "location": "src/libs/smart_turn/offline_svad.py:94-109",
+      "description": "_truncate_audio already pads to exactly 8*16000, then the FE re-applies padding='max_length' + truncation to the same length - redundant work. More importantly every segment is forced to a fixed 8s mel (3000 frames) even when the speech is 1-2s; combined with batching, group by actual length or feed shorter padded windows where the model permits. At minimum, since input is already exactly max_length, the FE padding/truncation passes are wasted; could call FE with padding=False.",
+      "expected_gain": "modest per-call; compounds with batching",
+      "risk": "medium",
+      "low_resource_note": "Helps low-CPU nodes (less FE work). Must verify model expects fixed 3000-frame input; if so the 8s window is mandatory and only the duplicate pad can be dropped."
+    },
+    {
+      "title": "Use intra_op threads / consider TensorRT or fp16 for SmartVAD ONNX",
+      "location": "src/libs/smart_turn/offline_svad.py:41-54; src/preprocess/inference.py:9-13",
+      "description": "Session sets inter_op_num_threads=1 and ORT_SEQUENTIAL but never sets intra_op_num_threads. On the CPU fallback path this leaves threading at defaults; on a 48-thread node that may over- or under-subscribe across multiprocessing workers. SmartVAD is not given the TensorRT EP (unlike Sortformer which uses get_onnx_providers with use_tensorrt=True). An fp16 TRT engine for the small EOS classifier would cut latency and VRAM. Also the per-call torch.cuda.synchronize (offline_svad.py:142) can be dropped if .item() already syncs.",
+      "expected_gain": "TRT/fp16: ~1.3-2x inference latency on GPU; correct intra_op tuning avoids worker oversubscription",
+      "risk": "medium",
+      "low_resource_note": "TRT engine build is heavy and per-GPU; gate behind a config flag and cache engines. On low-VRAM node the model is tiny so fp16 mainly buys latency. Set intra_op_num_threads explicitly to ~ (cores / num_workers) so multiprocessing workers don't thrash 48 threads each."
+    },
+    {
+      "title": "Run loudness normalization off the critical path / overlap with IO",
+      "location": "src/preprocess/preprocess_audio.py:79-109; src/preprocess/audio_postprocessing.py:100-127",
+      "description": "In the standalone loudness stage each file does: decode -> integrated_loudness (CPU heavy, GIL) -> gain copy -> torchaudio.save_with_torchcodec (IO). Because integrated_loudness is GIL-bound, a thread pool won't help, but a process pool / DataLoader workers (already used) should size num_workers to CPU not GPU. Ensure the dominant pyloudnorm cost is parallelized across workers and that the synchronous save_with_torchcodec is overlapped with the next file's loudness compute (prefetch).",
+      "expected_gain": "near-linear with worker count for the loudness measure since it's the bottleneck",
+      "risk": "low",
+      "low_resource_note": "On low-CPU (but 48-thread) node, workers help; on truly low-CPU nodes cap num_workers via config to avoid RAM blowup (each worker holds a chunk + meter)."
+    }
+  ],
+  "bugs": [
+    {
+      "title": "NameError: numpy used but never imported in inference.py",
+      "location": "src/libs/smart_turn/inference.py:26,58,59 (np.pad / np.expand_dims / np.float32) with no `import numpy as np` at module top",
+      "description": "Module-level code imports torch/transformers/onnxruntime but NOT numpy, yet truncate_audio_to_last_n_seconds() uses np.pad (line 26) and predict_endpoint() uses np.float32/np.expand_dims (58-59). numpy is only imported inside the __main__ block (line 78), so any real import-and-call of predict_endpoint/truncate from this module raises NameError. The file appears to be dead/legacy (the pipeline uses offline_svad.SmartVAD), but it lies about being usable.",
+      "severity": "low"
+    },
+    {
+      "title": "Cached pyln.Meter is stateful and not thread-safe",
+      "location": "src/preprocess/audio_postprocessing.py:11,53-59 (shared _METER_CACHE) + pyloudnorm Meter.integrated_loudness mutates self.blockwise_loudness",
+      "description": "_METER_CACHE returns a shared Meter per (rate,block_size). integrated_loudness mutates meter.blockwise_loudness and copies/filters internally; if two threads in the same process call normalize_audio_loudness with the same rate concurrently they share one Meter and corrupt each other's intermediate state. Current callers use multiprocessing (separate per-process caches) so it's latent, but any future ThreadPool/DataLoader-with-threads loudness path would produce wrong LUFS silently. Make the cache thread-local or instantiate per call (Meter init is cheap; the filter coeffs are the only reusable part).",
+      "severity": "medium"
+    },
+    {
+      "title": "_use_cuda_dlpack permanently disabled on first transient failure",
+      "location": "src/libs/smart_turn/offline_svad.py:144-146",
+      "description": "On any exception in the IOBinding path, _use_cuda_dlpack is set False for the lifetime of the SmartVAD instance, permanently downgrading every subsequent segment to the slower .cpu().numpy()+session.run path even if the failure was transient (e.g. a one-off OOM). Worth logging-once and retrying, or scoping the disable.",
+      "severity": "low"
+    },
+    {
+      "title": "peak parameter accepted but ignored (silent no-op)",
+      "location": "src/preprocess/audio_postprocessing.py:62-73 (`_ = peak` at 70) and threaded through postprocess_audio_tensor/_postprocess_chunk",
+      "description": "normalize_audio_loudness takes `peak` and immediately discards it (`_ = peak`). The whole call chain (preprocess.py:408 config.get('peak'), _postprocess_chunk) plumbs a peak value that does nothing - no true-peak limiting is applied after gain, so pyln.normalize.loudness can produce clipped samples (it only warns). Dead parameter that lies about behavior; if peak limiting is intended it's missing.",
+      "severity": "medium"
+    },
+    {
+      "title": "Broad except swallows all loudness errors as 'keep without normalize'",
+      "location": "src/preprocess/audio_postprocessing.py:128-135",
+      "description": "Any exception during loudness normalization (including real bugs like shape/dtype errors) is caught and the chunk is kept UN-normalized with only loudness_error recorded. Combined with the peak no-op, a systematic normalization failure would silently pass through raw audio while reporting success-ish. Caller logs it (preprocess.py:412-416) but the data still ships. Acceptable as resilience, but masks correctness regressions in benchmarking.",
+      "severity": "low"
+    },
+    {
+      "title": "VAD device string vs torch_device mismatch can route FE to a dead device",
+      "location": "src/libs/smart_turn/offline_svad.py:28-30,108",
+      "description": "torch_device falls back to 'cpu' when cuda unavailable (28-30), but feature_extractor is always called with device=self.device (the raw 'cuda:N' string, 108). On a CPU-only node torch_device='cpu' yet device='cuda:0' is still passed to the FE, which will either error or force a GPU path that doesn't exist. FE device should follow self.torch_device, not the constructor string.",
+      "severity": "medium"
+    }
+  ],
+  "instrumentation": "Reusable perf hooks already present: (1) SmartVAD per-segment timing - logger.debug f\"perf model=smart_vad event=inference seconds=... sample_rate=... frames=...\" at preprocess.py:254-258 wraps each predict_endpoint call (use to measure VAD batching gains). (2) Sortformer inference timing at preprocess.py:159-163 (same format, adjacent stage). (3) Loudness stage: per-file process timing perf model=loudness_normalize event=process_file at preprocess_audio.py:172, plus perf audio_save stage=loudness ... seconds=... frames=... at preprocess_audio.py:73 and dataloader_config/dataloader_wait at 146/156. (4) Fused crest/postprocess audit counters _new_crest_audit/_merge_crest_audit (preprocess.py:380-393) track files_in/out, duration_in/out_s, postprocess_errors. (5) Crest stage batch timing perf model=crest_factor event=batch_compute at crest_factor_remover.py:169. NOTE: there is NO direct timing around the pyloudnorm integrated_loudness call itself (the dominant cost) nor around the WhisperFeatureExtractor mel extraction inside predict_endpoint - add time.perf_counter around audio_postprocessing.py:72 and offline_svad.py:100-114 to attribute the loudness-measure vs FE-vs-ONNX split before/after optimizing. All hooks gate on logger.debug, so enable DEBUG to collect."
+}
