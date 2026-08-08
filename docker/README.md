@@ -1,9 +1,11 @@
 # Пилотная Docker-версия Balalaika
 
-В этом каталоге находится первый контейнерный слой для запуска на одной ноде в
-рамках мультинодовой архитектуры, описанной в
-[`docs/multinode_architecture.md`](../docs/multinode_architecture.md). Координатор,
-задания Nomad и передача партиций пока не реализованы.
+В этом каталоге находится контейнерный слой для запуска на одной ноде в рамках
+мультинодовой архитектуры, описанной в
+[`docs/multinode_architecture.md`](../docs/multinode_architecture.md). Необязательный
+SSH/rsync controller для 4-5 нод находится в [`cluster_admin`](../cluster_admin/)
+и описан в [`docs/cluster_admin.md`](../docs/cluster_admin.md). Ручной запуск
+этого Docker-слоя и обычный `base.sh` остаются самостоятельными сценариями.
 
 ## Требования к хосту
 

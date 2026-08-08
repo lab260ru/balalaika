@@ -1,0 +1,55 @@
+# Controller runs on the source machine. Relative paths are resolved from this file.
+controller:
+  source_root: /mnt/hdd_6tb_1/youtube_data_incoming
+  state_dir: ../.balalaika-cluster
+  poll_seconds: 15
+  max_attempts: 3
+  # Reserve room for a writable workspace/output in addition to input bytes.
+  workspace_multiplier: 2.0
+  disk_headroom_gib: 20
+
+pipeline:
+  config: ../configs/config.yaml
+  # Use the same immutable image digest (or image ID) on every node in production.
+  image: balalaika:cuda12.8
+  stage_start: "1"
+  stage_stop: "15"
+  shm_size: 8g
+
+partitioning:
+  # Four partitions per node gives the queue enough room to balance long recordings.
+  partitions_per_node: 4
+  # Current dataset layout is <date>/<recording-id>/<audio-and-sidecars>.
+  group_depth: 2
+  audio_extensions: [.flac, .wav, .mp3, .ogg, .opus, .m4a]
+  exclude_top_level:
+    - .balalaika_work
+    - balalaika_analysis
+    - filter_report.md
+    - filter_summary.csv
+
+ssh:
+  identity_file: ~/.ssh/id_ed25519
+  # Populate this file only after verifying every host-key fingerprint.
+  known_hosts: ~/.ssh/known_hosts
+  connect_timeout: 10
+
+nodes:
+  - id: node-01
+    host: 10.10.0.11
+    user: balalaika
+    port: 22
+    work_root: /var/lib/balalaika
+    models_root: /var/lib/balalaika/models
+    cache_root: /var/lib/balalaika/cache
+    enabled: true
+    # env_file: /var/lib/balalaika/secrets/worker.env
+
+  - id: node-02
+    host: 10.10.0.12
+    user: balalaika
+    port: 22
+    work_root: /var/lib/balalaika
+    models_root: /var/lib/balalaika/models
+    cache_root: /var/lib/balalaika/cache
+    enabled: true

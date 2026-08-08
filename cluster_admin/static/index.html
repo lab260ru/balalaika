@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Balalaika Cluster Admin</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar__inner">
+        <div class="brand-block">
+          <strong class="brand">Balalaika</strong>
+          <span class="product-label">Cluster Admin</span>
+        </div>
+
+        <div class="controller-status" aria-live="polite">
+          <span
+            id="connectionDot"
+            class="connection-dot connection-dot--loading"
+            aria-hidden="true"
+          ></span>
+          <span id="connectionLabel">Подключение...</span>
+          <span class="separator" aria-hidden="true"></span>
+          <span id="updatedAt" class="updated-at">Нет данных</span>
+          <button
+            id="refreshButton"
+            class="button button--primary"
+            type="button"
+            title="Обновить данные"
+          >
+            <span class="refresh-symbol" aria-hidden="true">&#8635;</span>
+            <span>Обновить</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="app-shell">
+      <div id="alert" class="alert" role="alert" hidden></div>
+
+      <section class="run-section" aria-labelledby="runTitle">
+        <div class="section-heading section-heading--run">
+          <div>
+            <p class="eyebrow">Текущий запуск</p>
+            <div class="title-line">
+              <h1 id="runTitle">Ожидание данных</h1>
+              <span id="runState" class="status-badge status-badge--unknown"
+                >Неизвестно</span
+              >
+            </div>
+          </div>
+          <dl class="run-meta">
+            <div>
+              <dt>Конфигурация</dt>
+              <dd id="configDigest">-</dd>
+            </div>
+            <div>
+              <dt>Образ</dt>
+              <dd id="imageDigest">-</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div class="summary-grid" role="group" aria-label="Сводка запуска">
+          <div class="metric">
+            <span class="metric__label">Прогресс</span>
+            <strong id="runProgress" class="metric__value">0%</strong>
+            <span id="partitionProgress" class="metric__detail"
+              >0 из 0 частей</span
+            >
+          </div>
+          <div class="metric">
+            <span class="metric__label">Аудио</span>
+            <strong id="audioProgress" class="metric__value">0 ч</strong>
+            <span id="audioTotal" class="metric__detail">из 0 ч</span>
+          </div>
+          <div class="metric">
+            <span class="metric__label">Ноды</span>
+            <strong id="onlineNodes" class="metric__value">0 / 0</strong>
+            <span class="metric__detail">доступно</span>
+          </div>
+          <div class="metric">
+            <span class="metric__label">В работе</span>
+            <strong id="runningJobs" class="metric__value">0</strong>
+            <span class="metric__detail">партиций</span>
+          </div>
+          <div class="metric">
+            <span class="metric__label">Ошибки</span>
+            <strong id="failedJobs" class="metric__value metric__value--danger"
+              >0</strong
+            >
+            <span class="metric__detail">требуют внимания</span>
+          </div>
+          <div class="metric">
+            <span class="metric__label">Время работы</span>
+            <strong id="elapsedTime" class="metric__value">-</strong>
+            <span id="startedAt" class="metric__detail">Не запущено</span>
+          </div>
+        </div>
+
+        <div class="overall-progress" aria-hidden="true">
+          <span id="overallProgressBar"></span>
+        </div>
+      </section>
+
+      <section class="nodes-section" aria-labelledby="nodesTitle">
+        <div class="section-heading">
+          <div class="title-line">
+            <h2 id="nodesTitle">Ноды</h2>
+            <span id="nodeCount" class="count-label">0</span>
+          </div>
+        </div>
+        <div id="nodesGrid" class="nodes-grid">
+          <p class="empty-state">Данные о нодах ещё не получены.</p>
+        </div>
+      </section>
+
+      <section class="partitions-section" aria-labelledby="partitionsTitle">
+        <div class="section-heading section-heading--partitions">
+          <div class="title-line">
+            <h2 id="partitionsTitle">Партиции</h2>
+            <span id="visiblePartitionCount" class="count-label">0</span>
+          </div>
+
+          <div class="filters" role="group" aria-label="Фильтры партиций">
+            <label class="search-field">
+              <span class="visually-hidden">Поиск</span>
+              <span class="search-symbol" aria-hidden="true"></span>
+              <input
+                id="searchInput"
+                type="search"
+                placeholder="ID, нода или этап"
+                autocomplete="off"
+              />
+            </label>
+            <label>
+              <span class="visually-hidden">Состояние</span>
+              <select id="stateFilter">
+                <option value="">Все состояния</option>
+              </select>
+            </label>
+            <label>
+              <span class="visually-hidden">Нода</span>
+              <select id="nodeFilter">
+                <option value="">Все ноды</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="table-frame">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Партиция</th>
+                <th scope="col">Состояние</th>
+                <th scope="col">Нода</th>
+                <th scope="col">Этап</th>
+                <th scope="col">Прогресс</th>
+                <th scope="col">Файлы</th>
+                <th scope="col">Аудио</th>
+                <th scope="col">Попытка</th>
+                <th scope="col">Обновлено</th>
+              </tr>
+            </thead>
+            <tbody id="partitionsTableBody">
+              <tr class="table-message-row">
+                <td colspan="9">Данные о партициях ещё не получены.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <noscript>
+      <div class="noscript-message">Для панели требуется JavaScript.</div>
+    </noscript>
+  </body>
+</html>

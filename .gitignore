@@ -24,6 +24,8 @@ logs/
 .dev_venv/
 .docker-cache/
 .docker-output/
+.balalaika-cluster/
+cluster_admin/config.yaml
 
 .Python
 build/
