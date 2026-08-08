@@ -22,6 +22,8 @@ __pycache__/
 logs/
 *.so
 .dev_venv/
+.docker-cache/
+.docker-output/
 
 .Python
 build/

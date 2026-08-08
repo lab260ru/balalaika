@@ -8,6 +8,7 @@ restores the stock per-file ``RUAccent.process_all`` flow bit-for-bit.
 """
 import argparse
 import multiprocessing
+import os
 from pathlib import Path
 
 from loguru import logger
@@ -44,6 +45,7 @@ def init_process(
     device: str,
     intra_op_threads: int,
     fast_knobs: tuple,
+    workdir: str | None,
     config_path=None,
 ) -> None:
     global accentizer
@@ -69,6 +71,7 @@ def init_process(
             use_dictionary=True,
             tiny_mode=False,
             providers=providers,
+            workdir=workdir,
         )
 
 
@@ -148,6 +151,9 @@ def main(args):
     device = str(config.get("device", "cuda")).lower()
     chunk_size = int(config.get("batch_size", 64))
     intra_op_threads = int(config.get("intra_op_threads", 4))
+    workdir = config.get("workdir") or os.environ.get(
+        "BALALAIKA_RUACCENT_WORKDIR"
+    )
     use_fast = config.get("use_fast_accent", True)
     fast_knobs = (
         bool(config.get("batch_sentences", True)) and use_fast,
@@ -189,6 +195,7 @@ def main(args):
             device,
             intra_op_threads,
             fast_knobs,
+            workdir,
             args.config_path,
         ),
         chunk_size=chunk_size,

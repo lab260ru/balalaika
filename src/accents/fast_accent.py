@@ -40,6 +40,10 @@ from __future__ import annotations
 
 import contextlib
 import re
+import sys
+from importlib import import_module
+from pathlib import Path
+from types import ModuleType
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -82,6 +86,34 @@ def capped_onnx_threads(intra_op_threads: Optional[int]):
         ort.InferenceSession.__init__ = real_init
 
 
+@contextlib.contextmanager
+def ruaccent_asset_root(workdir: Optional[str]):
+    """Make upstream RUAccent keep every downloaded asset in ``workdir``.
+
+    RUAccent honors ``workdir`` for dictionaries and neural models, but still
+    derives the koziev path from its module ``__file__``. Redirect that lookup
+    only while ``load()`` runs so an immutable site-packages directory works.
+    """
+    if not workdir:
+        yield
+        return
+
+    ruaccent_package = import_module("ruaccent")
+    ruaccent_module = import_module("ruaccent.ruaccent")
+    asset_root = Path(workdir).expanduser().resolve()
+    asset_root.mkdir(parents=True, exist_ok=True)
+    real_module_file = ruaccent_module.__file__
+    real_package_path = list(ruaccent_package.__path__)
+    ruaccent_module.__file__ = str(asset_root / "ruaccent.py")
+    if str(asset_root) not in ruaccent_package.__path__:
+        ruaccent_package.__path__.append(str(asset_root))
+    try:
+        yield
+    finally:
+        ruaccent_module.__file__ = real_module_file
+        ruaccent_package.__path__[:] = real_package_path
+
+
 class FastRUAccent(RUAccent):
     """``ruaccent.RUAccent`` with cross-sentence ONNX batching + accent memo."""
 
@@ -112,27 +144,63 @@ class FastRUAccent(RUAccent):
     # load — optionally skip the unused rule engine (item 3)             #
     # ------------------------------------------------------------------ #
     def load(self, *args, **kwargs):
-        if not self._lazy_rule_engine:
-            return super().load(*args, **kwargs)
+        with ruaccent_asset_root(kwargs.get("workdir")):
+            workdir = kwargs.get("workdir")
+            if not self._lazy_rule_engine:
+                if workdir:
+                    koziev_path = Path(workdir).expanduser().resolve() / "koziev"
+                    marker = koziev_path / ".balalaika_lazy_placeholder"
+                    if marker.exists():
+                        if any(path != marker for path in koziev_path.iterdir()):
+                            raise RuntimeError(
+                                "RUAccent koziev cache contains a lazy placeholder "
+                                "and unexpected assets"
+                            )
+                        marker.unlink()
+                        koziev_path.rmdir()
+                return super().load(*args, **kwargs)
 
-        # Temporarily neutralize RuleEngine.load so the koziev / rulemma assets
-        # are never read.  Restored afterwards so a second non-lazy loader in
-        # the same process is unaffected.
-        import ruaccent.rule_accent_engine as rae
+            # A fresh RUAccent install has no koziev package until load() downloads
+            # it. The fast path never uses RuleEngine, so expose a temporary module
+            # instead of downloading/importing ~180 MB of unused assets.
+            module_name = "ruaccent.rule_accent_engine"
+            ruaccent_package = import_module("ruaccent")
+            real_module = sys.modules.get(module_name)
+            had_package_attr = hasattr(ruaccent_package, "rule_accent_engine")
+            real_package_attr = getattr(
+                ruaccent_package, "rule_accent_engine", None
+            )
+            skipped = {"hit": False}
+            fake_module = ModuleType(module_name)
 
-        real_load = rae.RuleEngine.load
-        skipped = {"hit": False}
+            class SkippedRuleEngine:
+                def load(self_re, path):  # noqa: ANN001
+                    skipped["hit"] = True
 
-        def _skip_load(self_re, path):  # noqa: ANN001
-            skipped["hit"] = True  # never touches koziev/rulemma/rule_engine
+            fake_module.RuleEngine = SkippedRuleEngine
+            sys.modules[module_name] = fake_module
+            ruaccent_package.rule_accent_engine = fake_module
 
-        rae.RuleEngine.load = _skip_load
-        try:
-            super().load(*args, **kwargs)
-        finally:
-            rae.RuleEngine.load = real_load
-        if skipped["hit"]:
-            logger.debug("FastRUAccent: skipped unused koziev/rulemma rule engine load")
+            if workdir:
+                koziev_path = Path(workdir).expanduser().resolve() / "koziev"
+                koziev_path.mkdir(parents=True, exist_ok=True)
+                if not any(koziev_path.iterdir()):
+                    (koziev_path / ".balalaika_lazy_placeholder").touch()
+            try:
+                super().load(*args, **kwargs)
+            finally:
+                if real_module is None:
+                    sys.modules.pop(module_name, None)
+                else:
+                    sys.modules[module_name] = real_module
+                if had_package_attr:
+                    ruaccent_package.rule_accent_engine = real_package_attr
+                else:
+                    delattr(ruaccent_package, "rule_accent_engine")
+            if skipped["hit"]:
+                logger.debug(
+                    "FastRUAccent: skipped unused koziev/rulemma rule engine load"
+                )
         return None
 
     # ------------------------------------------------------------------ #

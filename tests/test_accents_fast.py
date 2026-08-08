@@ -19,6 +19,8 @@ import inspect
 import os
 import re
 import types
+from importlib import import_module
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -27,11 +29,52 @@ ruaccent = pytest.importorskip("ruaccent")
 from ruaccent import RUAccent  # noqa: E402
 from ruaccent.text_postprocessor import fix_capital  # noqa: E402
 
-from src.accents.fast_accent import FastRUAccent, capped_onnx_threads  # noqa: E402
+from src.accents.fast_accent import (  # noqa: E402
+    FastRUAccent,
+    capped_onnx_threads,
+    ruaccent_asset_root,
+)
 
 WORKDIR = "/home/kirill/mnt/ssd_work/balalaika/cache/ruaccent_workdir"
 MODEL = "turbo3.1"
 PROVIDERS = ["CPUExecutionProvider"]
+
+
+def test_ruaccent_asset_root_redirects_module_path_and_restores(tmp_path):
+    ruaccent_module = import_module("ruaccent.ruaccent")
+    original = ruaccent_module.__file__
+    with ruaccent_asset_root(str(tmp_path)):
+        assert Path(ruaccent_module.__file__).parent == tmp_path.resolve()
+    assert ruaccent_module.__file__ == original
+
+
+def test_fast_load_uses_writable_asset_root_without_koziev(monkeypatch, tmp_path):
+    ruaccent_module = import_module("ruaccent.ruaccent")
+    ruaccent_package = import_module("ruaccent")
+    original_file = ruaccent_module.__file__
+    original_path = list(ruaccent_package.__path__)
+    observed = {}
+
+    def fake_load(self, *args, **kwargs):
+        from ruaccent.rule_accent_engine import RuleEngine
+
+        observed["module_file"] = ruaccent_module.__file__
+        observed["package_path"] = list(ruaccent_package.__path__)
+        self.rule_accent = RuleEngine()
+        self.rule_accent.load("unused")
+
+    monkeypatch.setattr(RUAccent, "load", fake_load)
+    FastRUAccent(lazy_rule_engine=True).load(workdir=str(tmp_path))
+
+    assert Path(observed["module_file"]).parent == tmp_path.resolve()
+    assert str(tmp_path.resolve()) in observed["package_path"]
+    assert (tmp_path / "koziev" / ".balalaika_lazy_placeholder").is_file()
+    assert ruaccent_module.__file__ == original_file
+    assert list(ruaccent_package.__path__) == original_path
+
+    monkeypatch.setattr(RUAccent, "load", lambda self, *args, **kwargs: None)
+    FastRUAccent(lazy_rule_engine=False).load(workdir=str(tmp_path))
+    assert not (tmp_path / "koziev").exists()
 
 
 def _workdir_available() -> bool:

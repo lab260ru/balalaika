@@ -1,0 +1,37 @@
+.git
+.github
+.claude
+.dev_venv
+.main_venv
+.support_venv
+.pytest_cache
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.so
+.env
+
+# Runtime data is mounted from the node. It must never become an image layer.
+models
+cache
+logs
+downloads
+temp
+*.csv
+*.parquet
+*.pkl
+*.tar
+*.tar.zst
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.opus
+
+# Local analysis and benchmark artifacts are not required at runtime.
+balalaika_analysis
+benchmarking/.trt_cache*
+benchmarking/*_metrics*.json
+.docker-cache
+.docker-output
