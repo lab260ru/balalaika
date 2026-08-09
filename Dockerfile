@@ -2,10 +2,15 @@
 
 ARG CUDA_BASE=docker.io/nvidia/cuda:12.8.1-base-ubuntu24.04@sha256:133c78a0575303be34164d0b90137a042172bdf60696af01a3c424ab402d86e2
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a
+ARG REQUIREMENTS_FILE=requirements_dev.cuda128.txt
+ARG ONNXRUNTIME_GPU_VERSION=1.26.0
 
 FROM ${UV_IMAGE} AS uv
 
 FROM ${CUDA_BASE} AS builder
+
+ARG REQUIREMENTS_FILE
+ARG ONNXRUNTIME_GPU_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy
@@ -24,7 +29,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=uv /uv /usr/local/bin/uv
-COPY requirements_dev.cuda128.txt /tmp/requirements.txt
+COPY ${REQUIREMENTS_FILE} /tmp/requirements.txt
 
 # ruaccent declares the CPU onnxruntime distribution. Reinstall the pinned GPU
 # wheel last so it owns the shared `onnxruntime` module files.
@@ -37,7 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --python /opt/balalaika/.venv/bin/python \
         --reinstall \
         --no-deps \
-        onnxruntime-gpu==1.26.0
+        "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}"
 
 FROM ${CUDA_BASE} AS runtime
 

@@ -22,6 +22,8 @@ Python, пользовательские wheel-пакеты CUDA, ONNX Runtime, 
 
 ## Сборка
 
+### CUDA 12.8 (текущий стабильный образ)
+
 ```bash
 bash docker/build.sh
 ```
@@ -30,6 +32,49 @@ bash docker/build.sh
 переустанавливается `onnxruntime-gpu==1.26.0`. Благодаря этому CPU-зависимость
 `onnxruntime`, объявленная пакетом ruaccent, не может перезаписать общие файлы
 Python-модуля.
+
+### CUDA 13.0
+
+CUDA 13 собирается отдельной командой и не заменяет образ CUDA 12.8:
+
+```bash
+bash docker/build_cuda13.sh
+```
+
+В образ копируется текущий checkout репозитория в `/opt/balalaika/app`, а
+Python-окружение создаётся в `/opt/balalaika/.venv`. Поэтому после изменения
+кода образ нужно пересобрать. CUDA 13 lock использует Python 3.12,
+PyTorch 2.11, ONNX Runtime GPU 1.28 и TensorRT 10.16.
+
+Для запуска CUDA 13 нужны NVIDIA Container Toolkit, GPU Turing (compute
+capability 7.5) или новее и Linux-драйвер NVIDIA не ниже `580.95.05`.
+
+Проверка на одной карте:
+
+```bash
+BALALAIKA_GPU_DEVICES=0 bash docker/run_cuda13.sh smoke
+BALALAIKA_GPU_DEVICES=0 bash docker/run_cuda13.sh smoke --tensorrt
+```
+
+Запуск пайплайна на нескольких выбранных картах:
+
+```bash
+BALALAIKA_GPU_DEVICES=0,1 \
+BALALAIKA_HOST_DATA=/absolute/path/to/dataset \
+BALALAIKA_HOST_MODELS=/absolute/path/to/models \
+BALALAIKA_HOST_CONFIG=/absolute/path/to/config.yaml \
+BALALAIKA_HOST_CACHE=/absolute/path/to/cache \
+BALALAIKA_HOST_OUTPUT=/absolute/path/to/output \
+  bash docker/run_cuda13.sh \
+  pipeline --stage 1 --stop_stage 15 --strict
+```
+
+`BALALAIKA_GPU_DEVICES` содержит индексы физических GPU хоста. Контейнер видит
+только выбранные карты, перенумерованные в `cuda:0..N-1`; существующий код
+Balalaika сам поднимает локальные процессы по `torch.cuda.device_count()`.
+Датасет, модели, config, cache и output не копируются в image и передаются как
+bind mounts. Исходный config остаётся read-only, а entrypoint создаёт его
+рабочую контейнерную копию.
 
 Модели и данные времени выполнения исключены через `.dockerignore`. Локальный
 каталог `models/` размером 5,3 ГБ монтируется при запуске, а не копируется в слой
