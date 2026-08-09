@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     user TEXT NOT NULL,
     port INTEGER NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
+    drained INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'UNKNOWN',
     last_seen_at TEXT,
     current_partition_id TEXT,
@@ -56,6 +57,8 @@ CREATE TABLE IF NOT EXISTS runs (
     config_path TEXT NOT NULL,
     config_sha256 TEXT NOT NULL,
     execution_config_sha256 TEXT,
+    execution_config_version INTEGER,
+    execution_config_json TEXT,
     stage_start TEXT NOT NULL,
     stage_stop TEXT NOT NULL,
     partitions_total INTEGER NOT NULL,
@@ -101,6 +104,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     node_host TEXT,
     node_user TEXT,
     node_port INTEGER,
+    gpu_uuids_json TEXT,
     container_name TEXT,
     started_at TEXT,
     updated_at TEXT NOT NULL,
@@ -140,6 +144,13 @@ class StateDB:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            node_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(nodes)")
+            }
+            if "drained" not in node_columns:
+                connection.execute(
+                    "ALTER TABLE nodes ADD COLUMN drained INTEGER NOT NULL DEFAULT 0"
+                )
             run_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(runs)")
             }
@@ -151,6 +162,14 @@ class StateDB:
             if "execution_config_sha256" not in run_columns:
                 connection.execute(
                     "ALTER TABLE runs ADD COLUMN execution_config_sha256 TEXT"
+                )
+            if "execution_config_version" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN execution_config_version INTEGER"
+                )
+            if "execution_config_json" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN execution_config_json TEXT"
                 )
             partition_columns = {
                 row["name"]
@@ -168,6 +187,7 @@ class StateDB:
                 ("node_host", "TEXT"),
                 ("node_user", "TEXT"),
                 ("node_port", "INTEGER"),
+                ("gpu_uuids_json", "TEXT"),
             ):
                 if column not in attempt_columns:
                     connection.execute(
@@ -217,10 +237,11 @@ class StateDB:
                 INSERT INTO runs(
                   id, created_at, updated_at, state, desired_state, source_root, image,
                   config_path, config_sha256, execution_config_sha256,
+                  execution_config_version, execution_config_json,
                   stage_start, stage_stop,
                   partitions_total, input_bytes, audio_seconds
                 ) VALUES (
-                  ?, ?, ?, 'PLANNED', 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                  ?, ?, ?, 'PLANNED', 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -232,6 +253,8 @@ class StateDB:
                     run["config_path"],
                     run["config_sha256"],
                     run.get("execution_config_sha256"),
+                    run.get("execution_config_version"),
+                    run.get("execution_config_json"),
                     run["stage_start"],
                     run["stage_stop"],
                     len(partitions),
@@ -291,12 +314,85 @@ class StateDB:
     def list_nodes(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute("SELECT * FROM nodes ORDER BY id").fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["details"] = json.loads(item.pop("details_json") or "{}")
-            result.append(item)
-        return result
+        return [self._decode_node(row) for row in rows]
+
+    def get_node(self, node_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM nodes WHERE id=?", (node_id,)
+            ).fetchone()
+        return self._decode_node(row) if row else None
+
+    @staticmethod
+    def _decode_node(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["enabled"] = bool(item["enabled"])
+        item["drained"] = bool(item["drained"])
+        item["details"] = json.loads(item.pop("details_json") or "{}")
+        return item
+
+    def set_node_drained(
+        self,
+        node_id: str,
+        drained: bool,
+        *,
+        expected_run_id: str | None = None,
+        expected_partition_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT drained, current_partition_id FROM nodes WHERE id=?",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown node: {node_id}")
+            if expected_run_id is not None and expected_partition_id is not None:
+                partition = connection.execute(
+                    """SELECT state, node_id FROM partitions
+                       WHERE run_id=? AND id=?""",
+                    (expected_run_id, expected_partition_id),
+                ).fetchone()
+                if (
+                    partition is None
+                    or partition["state"] in TERMINAL_PARTITION_STATES
+                    or partition["node_id"] != node_id
+                ):
+                    raise RuntimeError(
+                        f"Partition {expected_run_id}/{expected_partition_id} "
+                        f"is no longer active on node {node_id}"
+                    )
+            if (
+                expected_partition_id is not None
+                and row["current_partition_id"] != expected_partition_id
+            ):
+                raise RuntimeError(
+                    f"Node {node_id} is no longer running partition "
+                    f"{expected_partition_id}"
+                )
+            changed = bool(row["drained"]) != drained
+            connection.execute(
+                "UPDATE nodes SET drained=? WHERE id=?", (int(drained), node_id)
+            )
+            if changed:
+                connection.execute(
+                    """INSERT INTO events(
+                         created_at, node_id, level, message, details_json
+                       ) VALUES (?, ?, 'INFO', ?, ?)""",
+                    (
+                        now,
+                        node_id,
+                        "Node drained" if drained else "Node resumed",
+                        json.dumps({"drained": drained}),
+                    ),
+                )
+            updated = connection.execute(
+                "SELECT * FROM nodes WHERE id=?", (node_id,)
+            ).fetchone()
+        if updated is None:  # pragma: no cover - protected by the write transaction
+            raise KeyError(f"Unknown node: {node_id}")
+        return self._decode_node(updated)
 
     def list_partitions(self, run_id: str | None = None) -> list[dict[str, Any]]:
         query = (
@@ -369,10 +465,16 @@ class StateDB:
         node_host: str | None = None,
         node_user: str | None = None,
         node_port: int | None = None,
+        gpu_uuids: list[str] | None = None,
     ) -> dict[str, Any] | None:
         now = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            node = connection.execute(
+                "SELECT enabled, drained FROM nodes WHERE id=?", (node_id,)
+            ).fetchone()
+            if node is None or not bool(node["enabled"]) or bool(node["drained"]):
+                return None
             active = connection.execute(
                 f"SELECT 1 FROM attempts WHERE node_id=? AND state IN "
                 f"({','.join('?' for _ in ACTIVE_ATTEMPT_STATES)})",
@@ -403,8 +505,9 @@ class StateDB:
             connection.execute(
                 """INSERT INTO attempts(
                      id, run_id, partition_id, node_id, ordinal, fencing_token,
-                     state, remote_root, node_host, node_user, node_port, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, 'ASSIGNED', ?, ?, ?, ?, ?)""",
+                     state, remote_root, node_host, node_user, node_port,
+                     gpu_uuids_json, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'ASSIGNED', ?, ?, ?, ?, ?, ?)""",
                 (
                     attempt_id,
                     run_id,
@@ -416,6 +519,7 @@ class StateDB:
                     node_host,
                     node_user,
                     node_port,
+                    json.dumps(gpu_uuids) if gpu_uuids is not None else None,
                     now,
                 ),
             )
@@ -666,6 +770,33 @@ class StateDB:
                 "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_event(
+        self,
+        *,
+        level: str,
+        message: str,
+        run_id: str | None = None,
+        partition_id: str | None = None,
+        node_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO events(
+                     created_at, run_id, partition_id, node_id, level, message,
+                     details_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    utc_now(),
+                    run_id,
+                    partition_id,
+                    node_id,
+                    level,
+                    message,
+                    json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
+                ),
+            )
 
     def cancel_queued(self, run_id: str, partition_id: str | None = None) -> int:
         now = utc_now()

@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
+import sqlite3
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,7 @@ from cluster_admin.config import (
     load_cluster_config,
     validate_slug,
 )
+from cluster_admin.cli import build_parser, command_nodes
 from cluster_admin.db import StateDB
 from cluster_admin.node_runner import (
     RunnerError,
@@ -225,6 +228,73 @@ def _create_db(tmp_path: Path) -> tuple[StateDB, tuple[NodeConfig, NodeConfig]]:
         ],
     )
     return db, nodes
+
+
+def test_node_drain_migrates_and_survives_config_sync(tmp_path):
+    path = tmp_path / "controller.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("""CREATE TABLE nodes (
+                 id TEXT PRIMARY KEY, host TEXT NOT NULL, user TEXT NOT NULL,
+                 port INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+                 state TEXT NOT NULL DEFAULT 'UNKNOWN', last_seen_at TEXT,
+                 current_partition_id TEXT, details_json TEXT NOT NULL DEFAULT '{}',
+                 error TEXT
+               )""")
+        connection.execute("""INSERT INTO nodes(id, host, user, port, enabled)
+               VALUES ('node-a', 'old.example.test', 'old-user', 23, 1)""")
+
+    db = StateDB(path)
+    db.initialize()
+    assert db.get_node("node-a")["drained"] is False
+
+    drained = db.set_node_drained("node-a", True)
+    assert drained["drained"] is True
+    assert drained["enabled"] is True
+
+    disabled_config = replace(_node("node-a"), enabled=False)
+    db.sync_nodes((disabled_config,))
+    persisted = db.get_node("node-a")
+    assert persisted["drained"] is True
+    assert persisted["enabled"] is False
+
+    resumed = db.set_node_drained("node-a", False)
+    assert resumed["drained"] is False
+    assert resumed["enabled"] is False
+
+
+def test_drained_or_disabled_node_cannot_claim(tmp_path):
+    db, nodes = _create_db(tmp_path)
+    node = nodes[0]
+
+    db.set_node_drained(node.id, True)
+    assert db.claim_next("run-a", node.id, node.work_root) is None
+    db.sync_nodes((node, replace(nodes[1], enabled=False)))
+    assert db.claim_next("run-a", nodes[1].id, nodes[1].work_root) is None
+
+    db.set_node_drained(node.id, False)
+    claimed = db.claim_next("run-a", node.id, node.work_root)
+    assert claimed is not None
+
+
+def test_cli_nodes_drain_and_resume(tmp_path, capsys):
+    config = _config(tmp_path, _node("node-a"))
+    parser = build_parser()
+
+    drain_args = parser.parse_args(["nodes", "drain", "node-a"])
+    assert command_nodes(drain_args, config) == 0
+    drained_payload = json.loads(capsys.readouterr().out)
+    assert drained_payload == {
+        "drained": True,
+        "enabled": True,
+        "node_id": "node-a",
+        "ok": True,
+    }
+
+    resume_args = parser.parse_args(["nodes", "resume", "node-a"])
+    assert command_nodes(resume_args, config) == 0
+    resumed_payload = json.loads(capsys.readouterr().out)
+    assert resumed_payload["drained"] is False
+    assert StateDB(config.db_path).get_node("node-a")["drained"] is False
 
 
 def test_db_claim_is_weighted_exclusive_and_requeue_increments_attempt(tmp_path):

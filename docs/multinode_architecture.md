@@ -1,9 +1,12 @@
 # Balalaika multi-node: архитектура и план реализации
 
-**Статус:** исследование завершено, Docker-пилот подготовлен; сборка ожидает
-host Docker daemon
+**Статус:** исследование завершено; дополнительный SSH/rsync controller,
+Docker/direct runtime, multi-GPU mapping, dashboard stop/drain, глобальные
+WebDataset shard ranks и dataset finalizer реализованы. Первый пилот предполагает,
+что pipeline, venv, models и rsync уже подготовлены на worker-нодах; обычный
+`base.sh` остаётся независимым от controller.
 
-**Последнее обновление:** 2026-08-08
+**Последнее обновление:** 2026-08-09
 
 **Рабочая ветка:** `feat/multinode-docker`
 
@@ -40,7 +43,8 @@ NCCL или разделение одной модели между машина
 ## Цели
 
 - Управлять пулом из 2-10 bare-metal GPU-нод из одной точки.
-- Не настраивать Python-окружение вручную на каждой ноде.
+- Явно задавать уже подготовленные pipeline, venv, models и cache пути каждой
+  ноды без скрытых host/container предположений.
 - Использовать внутри каждого контейнера только явно выделенные GPU.
 - Динамически балансировать разнородное аудио между разнородными нодами.
 - Не читать удалённо миллионы мелких аудиофайлов при каждом проходе.
@@ -421,6 +425,13 @@ shards. Кластерный finalizer проверяет все markers `_SUCCE
 - [`docker/smoke_test.py`](../docker/smoke_test.py) выполняет реальные проверки
   Torch CUDA, ONNX Runtime CUDA и FFmpeg/audio;
 - [`docker/README.md`](../docker/README.md) содержит команды сборки и запуска.
+
+Ручной `run_gpu0.sh` намеренно остаётся простым single-GPU smoke launcher.
+Мультинодовый controller находится в [`cluster_admin`](../cluster_admin/) и
+описан в [`docs/cluster_admin.md`](cluster_admin.md): для каждой ноды он принимает
+ordered `gpu_devices`, фиксирует resolved GPU UUID и передаёт дочернему Balalaika
+компактный набор `cuda:0..N-1`. Режим `direct` запускает `base.sh` внутри уже
+существующего worker-контейнера без доступа к Docker socket.
 
 Dockerfile проходит `hadolint`, вспомогательные скрипты проходят проверки
 syntax/unit/format, а оба закреплённых digest исходных OCI-образов получены из

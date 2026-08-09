@@ -3,6 +3,11 @@
 
   const API_URL = "/api/v1/overview";
   const DEFAULT_POLL_INTERVAL_MS = 5000;
+  const TERMINAL_PARTITION_STATES = new Set([
+    "completed",
+    "failed",
+    "cancelled",
+  ]);
 
   const STATUS = {
     planned: { label: "Запланировано", tone: "planned", order: 70 },
@@ -18,6 +23,7 @@
     online: { label: "Доступна", tone: "online", order: 10 },
     busy: { label: "Занята", tone: "busy", order: 10 },
     draining: { label: "Завершает работу", tone: "draining", order: 30 },
+    drained: { label: "Приостановлена", tone: "drained", order: 35 },
     offline: { label: "Недоступна", tone: "offline", order: 0 },
     success: { label: "Завершено", tone: "success", order: 90 },
     warning: { label: "Предупреждение", tone: "warning", order: 20 },
@@ -51,6 +57,8 @@
     request: null,
     pollTimer: null,
     pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
+    csrfToken: "",
+    stoppingPartitions: new Set(),
   };
 
   const elements = {};
@@ -140,6 +148,7 @@
       }
 
       const payload = await response.json();
+      state.csrfToken = stringValue(asObject(payload.controller).csrf_token);
       state.overview = normalizeOverview(payload);
       state.lastSuccessAt = new Date();
       hideAlert();
@@ -279,16 +288,54 @@
   function normalizeNode(rawValue, index) {
     const raw = asObject(rawValue);
     const details = asObject(raw.details);
-    const gpu = asObject(
-      raw.gpu ||
-        arrayFrom(raw.gpus)[0] ||
-        details.gpu ||
-        arrayFrom(details.gpus)[0],
+    let gpuValues = arrayFrom(raw.gpus).filter(
+      (value) => Object.keys(asObject(value)).length,
     );
+    if (!gpuValues.length) {
+      gpuValues = arrayFrom(details.gpus).filter(
+        (value) => Object.keys(asObject(value)).length,
+      );
+    }
+    if (!gpuValues.length) {
+      const legacyGpu = raw.gpu || details.gpu;
+      if (Object.keys(asObject(legacyGpu)).length) gpuValues = [legacyGpu];
+    }
+    let gpus = gpuValues.map(normalizeGpu);
+    let configuredGpuValues = arrayFrom(raw.gpu_devices);
+    if (!configuredGpuValues.length) {
+      configuredGpuValues = arrayFrom(details.gpu_devices);
+    }
+    const configuredGpuIndexes = [
+      ...new Set(
+        configuredGpuValues
+          .map(numberOrNull)
+          .filter((value) => value !== null),
+      ),
+    ];
+    if (configuredGpuIndexes.length) {
+      const configuredSet = new Set(configuredGpuIndexes);
+      const byIndex = new Map(
+        gpus
+          .filter((gpu) => gpu.index !== null)
+          .map((gpu) => [gpu.index, gpu]),
+      );
+      gpus = [
+        ...configuredGpuIndexes.map(
+          (gpuIndex) =>
+            byIndex.get(gpuIndex) || normalizeGpu({ index: gpuIndex }),
+        ),
+        ...gpus.filter(
+          (gpu) => gpu.index === null || !configuredSet.has(gpu.index),
+        ),
+      ];
+    }
     const disk = asObject(
       raw.disk || raw.storage || details.disk || details.storage,
     );
     const stateValue = canonicalState(raw.state || raw.status || "unknown");
+    const drained =
+      stateValue === "drained" ||
+      truthyFlag(firstDefined(raw.drained, details.drained));
 
     return {
       id: stringValue(raw.id || raw.node_id || raw.name || `node-${index + 1}`),
@@ -304,28 +351,33 @@
         raw.current_partition_id || raw.partition_id || raw.current_job_id,
       ),
       error: stringValue(raw.error || raw.last_error),
-      gpu: {
-        name: stringValue(gpu.name || gpu.model),
-        index: numberOrNull(gpu.index ?? gpu.device_index ?? 0),
-        utilizationPercent:
-          normalizePercent(
-            gpu.utilization_percent ?? gpu.utilization ?? gpu.util,
-          ) ?? 0,
-        memoryUsedBytes: bytesValue(
-          gpu.memory_used_bytes,
-          firstDefined(gpu.memory_used_mib, gpu.memory_used_mb),
-          gpu.memory_used,
-        ),
-        memoryTotalBytes: bytesValue(
-          gpu.memory_total_bytes,
-          firstDefined(gpu.memory_total_mib, gpu.memory_total_mb),
-          gpu.memory_total,
-        ),
-      },
+      drained,
+      gpus,
       disk: {
         freeBytes: bytesValue(disk.free_bytes, disk.free_mb, disk.free),
         totalBytes: bytesValue(disk.total_bytes, disk.total_mb, disk.total),
       },
+    };
+  }
+
+  function normalizeGpu(rawValue, index) {
+    const gpu = asObject(rawValue);
+    return {
+      name: stringValue(gpu.name || gpu.model),
+      index: numberOrNull(gpu.index ?? gpu.device_index ?? index),
+      utilizationPercent: normalizePercent(
+        gpu.utilization_percent ?? gpu.utilization ?? gpu.util,
+      ),
+      memoryUsedBytes: bytesValue(
+        gpu.memory_used_bytes,
+        firstDefined(gpu.memory_used_mib, gpu.memory_used_mb),
+        gpu.memory_used,
+      ),
+      memoryTotalBytes: bytesValue(
+        gpu.memory_total_bytes,
+        firstDefined(gpu.memory_total_mib, gpu.memory_total_mb),
+        gpu.memory_total,
+      ),
     };
   }
 
@@ -391,6 +443,7 @@
       runId: stringValue(raw.run_id),
       nodeId: stringValue(raw.node_id || raw.worker_id || raw.assigned_node),
       state: stateValue,
+      desiredState: canonicalState(raw.desired_state),
       stage: stringValue(
         stage.name ||
           stage.id ||
@@ -415,7 +468,7 @@
   function renderOverview() {
     const overview = state.overview;
     renderRun(overview.activeRun, overview.nodes);
-    renderNodes(overview.nodes);
+    renderNodes(overview.nodes, overview.partitions);
     refreshFilterOptions(overview.partitions, overview.nodes);
     renderPartitions();
     renderUpdatedAt();
@@ -423,8 +476,10 @@
 
   function renderRun(run, nodes) {
     const hasRun = Boolean(run.id || run.name || run.partitionsTotal);
-    const onlineCount = nodes.filter((node) =>
-      ["online", "busy", "running", "draining"].includes(node.state),
+    const onlineCount = nodes.filter(
+      (node) =>
+        !node.drained &&
+        ["online", "busy", "running", "draining"].includes(node.state),
     ).length;
 
     setText(
@@ -458,7 +513,7 @@
     elements.overallProgressBar.style.width = `${clamp(run.progressPercent, 0, 100)}%`;
   }
 
-  function renderNodes(nodes) {
+  function renderNodes(nodes, partitions) {
     elements.nodesGrid.replaceChildren();
     setText(elements.nodeCount, String(nodes.length));
 
@@ -475,13 +530,16 @@
       return orderA - orderB || a.name.localeCompare(b.name, "ru");
     });
     const fragment = document.createDocumentFragment();
-    sorted.forEach((node) => fragment.append(createNodeCard(node)));
+    sorted.forEach((node) =>
+      fragment.append(createNodeCard(node, partitions)),
+    );
     elements.nodesGrid.append(fragment);
   }
 
-  function createNodeCard(node) {
+  function createNodeCard(node, partitions) {
     const card = createElement("article", "node-card");
     if (node.state === "offline") card.classList.add("node-card--offline");
+    if (node.drained) card.classList.add("node-card--drained");
     if (node.error || node.state === "error")
       card.classList.add("node-card--error");
 
@@ -496,24 +554,16 @@
     );
     host.title = node.host || "";
     identity.append(name, host);
-    header.append(identity, createBadge(node.state));
+    const statuses = createElement("div", "node-card__statuses");
+    statuses.append(createBadge(node.state));
+    if (node.drained && node.state !== "drained") {
+      statuses.append(createBadge("drained"));
+    }
+    header.append(identity, statuses);
 
     const resources = createElement("div", "node-card__resources");
-    const gpuMemoryPercent = ratioPercent(
-      node.gpu.memoryUsedBytes,
-      node.gpu.memoryTotalBytes,
-    );
     resources.append(
-      createResourceRow(
-        `GPU ${node.gpu.index ?? 0}${node.gpu.name ? ` · ${node.gpu.name}` : ""}`,
-        `${formatNumber(node.gpu.utilizationPercent, 0)}%`,
-        node.gpu.utilizationPercent,
-      ),
-      createResourceRow(
-        "Память GPU",
-        formatUsedTotal(node.gpu.memoryUsedBytes, node.gpu.memoryTotalBytes),
-        gpuMemoryPercent,
-      ),
+      createGpuList(node.gpus),
       createResourceRow(
         "Локальный диск",
         formatFreeTotal(node.disk.freeBytes, node.disk.totalBytes),
@@ -536,7 +586,17 @@
       node.lastSeenAt ? relativeTime(node.lastSeenAt) : "Нет heartbeat",
     );
     seen.title = node.lastSeenAt ? formatDateTime(node.lastSeenAt) : "";
-    footer.append(current, seen);
+    const details = createElement("div", "node-card__details");
+    details.append(current, seen);
+    footer.append(details);
+
+    const partition = partitions.find(
+      (item) =>
+        item.id === node.currentPartitionId && item.nodeId === node.id,
+    );
+    if (partition && !TERMINAL_PARTITION_STATES.has(partition.state)) {
+      footer.append(createStopButton(node, partition));
+    }
 
     card.append(header, resources, footer);
     if (node.error) {
@@ -545,6 +605,175 @@
       card.append(error);
     }
     return card;
+  }
+
+  function createGpuList(gpus) {
+    const list = createElement("div", "gpu-list");
+    list.setAttribute("role", "table");
+    list.setAttribute("aria-label", "GPU");
+
+    const heading = createElement("div", "gpu-list__heading");
+    heading.setAttribute("role", "row");
+    const deviceHeading = createElement("span", "", "GPU");
+    const utilizationHeading = createElement("span", "", "Загрузка");
+    const memoryHeading = createElement("span", "", "Память");
+    [deviceHeading, utilizationHeading, memoryHeading].forEach((cell) =>
+      cell.setAttribute("role", "columnheader"),
+    );
+    heading.append(
+      deviceHeading,
+      utilizationHeading,
+      memoryHeading,
+    );
+    list.append(heading);
+
+    if (!gpus.length) {
+      const emptyRow = createElement("div", "gpu-list__empty");
+      const emptyCell = createElement("span", "", "Данные GPU недоступны");
+      emptyRow.setAttribute("role", "row");
+      emptyCell.setAttribute("role", "cell");
+      emptyCell.setAttribute("aria-colspan", "3");
+      emptyRow.append(emptyCell);
+      list.append(emptyRow);
+      return list;
+    }
+
+    gpus.forEach((gpu) => list.append(createGpuRow(gpu)));
+    return list;
+  }
+
+  function createGpuRow(gpu) {
+    const row = createElement("div", "gpu-row");
+    row.setAttribute("role", "row");
+    const device = createElement("div", "gpu-row__device");
+    device.setAttribute("role", "cell");
+    const index = createElement(
+      "strong",
+      "gpu-row__index",
+      `GPU ${gpu.index ?? "-"}`,
+    );
+    const name = createElement(
+      "span",
+      "gpu-row__name",
+      gpu.name || "Модель не указана",
+    );
+    device.title = gpu.name
+      ? `GPU ${gpu.index ?? "-"}: ${gpu.name}`
+      : `GPU ${gpu.index ?? "-"}`;
+    device.append(index, name);
+
+    const utilization = createElement(
+      "span",
+      "gpu-row__utilization",
+      gpu.utilizationPercent === null
+        ? "-"
+        : `${formatNumber(gpu.utilizationPercent, 0)}%`,
+    );
+    utilization.title =
+      gpu.utilizationPercent === null
+        ? "Загрузка недоступна"
+        : `Загрузка: ${formatNumber(gpu.utilizationPercent, 0)}%`;
+    utilization.setAttribute("role", "cell");
+
+    const memory = createElement(
+      "span",
+      "gpu-row__memory",
+      formatGpuMemory(gpu.memoryUsedBytes, gpu.memoryTotalBytes),
+    );
+    memory.title = `Память: ${formatUsedTotal(
+      gpu.memoryUsedBytes,
+      gpu.memoryTotalBytes,
+    )}`;
+    memory.setAttribute("role", "cell");
+
+    row.append(device, utilization, memory);
+    return row;
+  }
+
+  function createStopButton(node, partition) {
+    const key = `${partition.runId}:${partition.id}`;
+    const stopping =
+      state.stoppingPartitions.has(key) || partition.desiredState === "cancelled";
+    const button = createElement(
+      "button",
+      "button button--danger node-card__stop",
+    );
+    button.type = "button";
+    button.disabled = stopping || !partition.runId || !state.csrfToken;
+    button.classList.toggle("is-loading", stopping);
+    button.title = stopping
+      ? "Остановка уже запрошена"
+      : `Остановить ${partition.id} на ${node.name}`;
+    button.setAttribute(
+      "aria-label",
+      stopping
+        ? `Остановка ${partition.id} запрошена`
+        : `Остановить ${partition.id} на ноде ${node.name}`,
+    );
+    button.append(
+      createElement("span", "stop-symbol", "■"),
+      createElement(
+        "span",
+        "node-card__stop-label",
+        stopping ? "Остановка" : "Остановить",
+      ),
+    );
+    if (!stopping) {
+      button.addEventListener("click", () => requestStop(node, partition));
+    }
+    return button;
+  }
+
+  async function requestStop(node, partition) {
+    const key = `${partition.runId}:${partition.id}`;
+    const confirmed = window.confirm(
+      [
+        `Остановить партицию ${partition.id} на ноде ${node.name}?`,
+        "Нода будет приостановлена и не получит новую задачу.",
+      ].join(" "),
+    );
+    if (!confirmed) return;
+
+    state.stoppingPartitions.add(key);
+    renderNodes(state.overview.nodes, state.overview.partitions);
+    try {
+      const runId = encodeURIComponent(partition.runId);
+      const partitionId = encodeURIComponent(partition.id);
+      const url = `/api/v1/runs/${runId}/partitions/${partitionId}/cancel`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-CSRF-Token": state.csrfToken,
+        },
+        credentials: "same-origin",
+        body: JSON.stringify({ node_id: node.id }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || `HTTP ${response.status}`);
+      }
+
+      await refreshOverview(true);
+      const drainedNodeId = stringValue(payload.drained_node_id || node.id);
+      const resumeHint =
+        `Нода ${drainedNodeId} приостановлена до ` +
+        `nodes resume ${drainedNodeId}.`;
+      showAlert(
+        payload.warning
+          ? `Остановка ${partition.id} сохранена, но нода пока не подтвердила её: ${payload.warning}. ${resumeHint}`
+          : `Партиция ${partition.id} остановлена. ${resumeHint}`,
+        payload.warning ? "warning" : "success",
+      );
+    } catch (error) {
+      showAlert(`Не удалось остановить ${partition.id}: ${error.message}.`);
+    } finally {
+      state.stoppingPartitions.delete(key);
+      if (state.overview) {
+        renderNodes(state.overview.nodes, state.overview.partitions);
+      }
+    }
   }
 
   function createResourceRow(label, value, percent) {
@@ -810,13 +1039,15 @@
     elements.updatedAt.title = formatDateTime(state.lastSuccessAt);
   }
 
-  function showAlert(message) {
+  function showAlert(message, tone = "error") {
     setText(elements.alert, message);
+    elements.alert.className = `alert alert--${tone}`;
     elements.alert.hidden = false;
   }
 
   function hideAlert() {
     elements.alert.hidden = true;
+    elements.alert.className = "alert";
     setText(elements.alert, "");
   }
 
@@ -959,6 +1190,23 @@
     return `${formatBytes(used ?? 0)} / ${formatBytes(total ?? 0)}`;
   }
 
+  function formatGpuMemory(used, total) {
+    if (used === null && total === null) return "-";
+    const largest = Math.max(used ?? 0, total ?? 0);
+    const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+    let divisor = 1;
+    let unitIndex = 0;
+    while (largest / divisor >= 1024 && unitIndex < units.length - 1) {
+      divisor *= 1024;
+      unitIndex += 1;
+    }
+    const value = (bytes) =>
+      bytes === null
+        ? "-"
+        : formatNumber(bytes / divisor, bytes / divisor >= 10 ? 0 : 1);
+    return `${value(used)} / ${value(total)} ${units[unitIndex]}`;
+  }
+
   function formatFreeTotal(free, total) {
     if (free === null && total === null) return "Нет данных";
     return `${formatBytes(free ?? 0)} свободно`;
@@ -1011,6 +1259,12 @@
     if (value === null || value === undefined || value === "") return null;
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
+  }
+
+  function truthyFlag(value) {
+    if (value === true || value === 1) return true;
+    if (typeof value !== "string") return false;
+    return ["1", "true"].includes(value.trim().toLowerCase());
   }
 
   function stringValue(value) {

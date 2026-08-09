@@ -12,7 +12,8 @@ from typing import Any
 
 from .config import ClusterConfig, load_cluster_config, validate_slug
 from .db import StateDB
-from .scheduler import ClusterScheduler, SchedulerError
+from .finalizer import FinalizerError, finalize_run
+from .scheduler import ClusterScheduler, SchedulerError, controller_lock
 from .server import serve_panel
 from .transport import executable_prerequisites
 
@@ -103,18 +104,35 @@ def command_init(args: argparse.Namespace) -> int:
 
 def command_nodes(args: argparse.Namespace, config: ClusterConfig) -> int:
     scheduler = ClusterScheduler(config)
-    selected = set(args.node_id) if getattr(args, "node_id", None) else None
     if args.nodes_command == "list":
         rows = _database(config).list_nodes()
         if args.json:
             _json(rows)
         else:
+            print(f"{'ID':<18} {'STATE':<10} {'ENABLED':<7} {'DRAINED':<7} ENDPOINT")
             for row in rows:
                 print(
                     f"{row['id']:<18} {row['state']:<10} "
+                    f"{str(bool(row['enabled'])).lower():<7} "
+                    f"{str(bool(row['drained'])).lower():<7} "
                     f"{row['user']}@{row['host']}:{row['port']}"
                 )
         return 0
+    if args.nodes_command in {"drain", "resume"}:
+        node_id = validate_slug(args.node_id, "node id")
+        config.node(node_id)
+        scheduler.initialize()
+        node = scheduler.db.set_node_drained(node_id, args.nodes_command == "drain")
+        _json(
+            {
+                "ok": True,
+                "node_id": node_id,
+                "drained": bool(node["drained"]),
+                "enabled": bool(node["enabled"]),
+            }
+        )
+        return 0
+    selected = set(args.node_id) if args.node_id else None
     if args.nodes_command == "bootstrap":
         result = scheduler.bootstrap_nodes(selected)
     elif args.nodes_command == "probe":
@@ -161,6 +179,19 @@ def command_run(args: argparse.Namespace, config: ClusterConfig) -> int:
         cancelled = scheduler.cancel(run_id, partition_id)
         target = f"{run_id}/{partition_id}" if partition_id else run_id
         print(f"Cancelled {cancelled} partition(s) for {target}")
+        return 0
+    if args.run_command == "finalize":
+        with controller_lock(config.state_dir):
+            scheduler.initialize()
+            result = finalize_run(config, scheduler.db, run_id)
+        if args.json:
+            _json(result)
+        else:
+            print(
+                f"Finalized {run_id}: {result['path']} "
+                f"({result['parquet']['rows']} rows, "
+                f"{result['webdataset']['shards']} WebDataset shards)"
+            )
         return 0
     raise AssertionError(args.run_command)
 
@@ -210,7 +241,16 @@ def command_doctor(config: ClusterConfig) -> int:
         "identity": str(config.ssh_identity) if config.ssh_identity else None,
         "identity_ok": not config.ssh_identity or config.ssh_identity.is_file(),
         "nodes": len(config.nodes),
-        "gpu_policy": "device=0",
+        "node_runtime": {
+            node.id: {
+                "runtime": node.runtime,
+                "gpu_devices": list(node.gpu_devices),
+                "pipeline_root": node.pipeline_root,
+                "venv_path": node.venv_path,
+                "models_root": node.models_root,
+            }
+            for node in config.nodes
+        },
     }
     checks["ok"] = all(
         (
@@ -241,6 +281,9 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("bootstrap", "probe"):
         command = node_commands.add_parser(name)
         command.add_argument("node_id", nargs="*")
+    for name in ("drain", "resume"):
+        command = node_commands.add_parser(name)
+        command.add_argument("node_id")
 
     run = subparsers.add_parser("run", help="plan and execute a dataset run")
     run_commands = run.add_subparsers(dest="run_command", required=True)
@@ -261,6 +304,11 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = run_commands.add_parser("cancel")
     cancel.add_argument("run_id")
     cancel.add_argument("partition_id", nargs="?")
+    finalize = run_commands.add_parser(
+        "finalize", help="publish a completed run as one immutable dataset"
+    )
+    finalize.add_argument("run_id")
+    finalize.add_argument("--json", action="store_true")
 
     status = subparsers.add_parser("status", help="show controller state")
     status.add_argument("run_id", nargs="?")
@@ -272,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     partitions.add_argument("run_id", nargs="?")
     partitions.add_argument("--json", action="store_true")
 
-    serve = subparsers.add_parser("serve", help="serve the read-only dashboard")
+    serve = subparsers.add_parser("serve", help="serve the local dashboard")
     serve.add_argument("--bind", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
 
@@ -300,7 +348,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "doctor":
             return command_doctor(config)
-    except (OSError, ValueError, SchedulerError, KeyError, json.JSONDecodeError) as exc:
+    except (
+        OSError,
+        ValueError,
+        SchedulerError,
+        FinalizerError,
+        KeyError,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"error: {_safe_text(exc)}", file=sys.stderr)
         return 2
     parser.error("unknown command")

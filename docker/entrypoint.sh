@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly APP_ROOT="/opt/balalaika/app"
+readonly APP_ROOT="${BALALAIKA_PIPELINE_ROOT:-/opt/balalaika/app}"
 readonly GENERATED_CONFIG="/tmp/balalaika/config.yaml"
 
 export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"

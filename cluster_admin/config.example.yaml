@@ -42,6 +42,16 @@ nodes:
     work_root: /var/lib/balalaika
     models_root: /var/lib/balalaika/models
     cache_root: /var/lib/balalaika/cache
+    # Docker is the backward-compatible default. This attempt uses both GPUs;
+    # Balalaika sees them inside the child container as cuda:0 and cuda:1.
+    runtime: docker
+    transfer: rsync
+    gpu_devices: [0, 1]
+    # Refuse externally occupied cards before staging and immediately before start.
+    max_gpu_memory_used_mib: 1024
+    max_gpu_utilization_percent: 20
+    pipeline_root: /opt/balalaika/app
+    venv_path: /opt/balalaika/.venv
     enabled: true
     # env_file: /var/lib/balalaika/secrets/worker.env
 
@@ -49,7 +59,17 @@ nodes:
     host: 10.10.0.12
     user: balalaika
     port: 22
-    work_root: /var/lib/balalaika
-    models_root: /var/lib/balalaika/models
-    cache_root: /var/lib/balalaika/cache
+    # Use direct when this SSH endpoint is already inside a persistent worker
+    # container and cannot access the host Docker socket. All paths and GPU
+    # indices below are in that container's namespace.
+    runtime: direct
+    transfer: rsync
+    gpu_devices: [0, 1]
+    max_gpu_memory_used_mib: 1024
+    max_gpu_utilization_percent: 20
+    work_root: /worker/balalaika
+    pipeline_root: /workspace/balalaika
+    venv_path: /workspace/.venv
+    models_root: /worker/models
+    cache_root: /worker/cache
     enabled: true

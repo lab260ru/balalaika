@@ -2,10 +2,11 @@ import argparse
 import math
 import json
 import os
+import re
 import pandas as pd
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List, Dict
+from typing import Dict, List, Mapping
 
 import webdataset as wds
 from tqdm import tqdm
@@ -41,6 +42,10 @@ TEXT_COLUMNS = {
     "whisper_turbo",
 }
 
+SHARD_PARTITION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+GLOBAL_RANK_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+MAX_GLOBAL_RANK = 2**31 - 1
+
 
 def _open_shard_exclusive(path: str):
     """Never truncate an existing shard when a start index is reused."""
@@ -52,6 +57,50 @@ def resolve_output_dir(podcasts_path: Path, output_path: str | None) -> Path:
     if output_path and str(output_path).strip():
         return Path(output_path).expanduser()
     return podcasts_path.parent / f"{podcasts_path.name}_webdataset" / "train"
+
+
+def resolve_shard_namespace(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, int] | None:
+    """Read the optional multinode shard namespace from the environment.
+
+    Both values are required together.  Keeping the unset case separate is
+    deliberate: ordinary ``base.sh`` runs must retain their historical shard
+    names exactly.
+    """
+    values = os.environ if environ is None else environ
+    partition_id = values.get("BALALAIKA_PARTITION_ID")
+    global_rank_text = values.get("BALALAIKA_GLOBAL_RANK")
+    if partition_id is None and global_rank_text is None:
+        return None
+    if partition_id is None or global_rank_text is None:
+        raise ValueError(
+            "BALALAIKA_PARTITION_ID and BALALAIKA_GLOBAL_RANK must be set together"
+        )
+    if not SHARD_PARTITION_RE.fullmatch(partition_id):
+        raise ValueError("BALALAIKA_PARTITION_ID must be a valid cluster slug")
+    if not GLOBAL_RANK_RE.fullmatch(global_rank_text):
+        raise ValueError("BALALAIKA_GLOBAL_RANK must be a non-negative integer")
+    global_rank = int(global_rank_text)
+    if global_rank > MAX_GLOBAL_RANK:
+        raise ValueError(
+            f"BALALAIKA_GLOBAL_RANK must not exceed {MAX_GLOBAL_RANK}"
+        )
+    return partition_id, global_rank
+
+
+def shard_pattern(
+    output_dir: Path,
+    worker_id: int,
+    namespace: tuple[str, int] | None = None,
+) -> str:
+    if namespace is None:
+        return str(output_dir / f"shard_{worker_id:03d}_%04d.tar")
+    partition_id, global_rank = namespace
+    return str(
+        output_dir
+        / f"shard_g{global_rank:06d}_{partition_id}_w{worker_id:03d}_%04d.tar"
+    )
 
 
 def load_metadata(podcasts_path: Path) -> Dict[str, dict]:
@@ -212,11 +261,12 @@ def worker_fn(
     max_shard_count: int,
     shard_start_index: int = 0,
     readahead: int = 0,
+    shard_namespace: tuple[str, int] | None = None,
 ):
     if not audio_paths:
         return 0, 0
 
-    pattern = str(output_dir / f"shard_{worker_id:03d}_%04d.tar")
+    pattern = shard_pattern(output_dir, worker_id, shard_namespace)
     samples_processed = 0
     errors_count = 0
     dir_cache: Dict[str, set] = {}
@@ -336,6 +386,7 @@ def main(config, config_path: str | None = None):
     shard_start_index = int(config.get("shard_start_index", 0))
     if shard_start_index < 0:
         raise ValueError("export.shard_start_index must be >= 0")
+    shard_namespace = resolve_shard_namespace()
 
     podcasts_path = Path(podcasts_path_str)
 
@@ -373,6 +424,12 @@ def main(config, config_path: str | None = None):
     logger.info(
         f"Shard numbering starts at {shard_start_index}; existing shard files will not be overwritten."
     )
+    if shard_namespace is not None:
+        partition_id, global_rank = shard_namespace
+        logger.info(
+            f"WebDataset shard namespace: partition={partition_id}, "
+            f"global_rank={global_rank}."
+        )
 
     def chunk_metadata(chunk: List[str]) -> Dict[str, dict]:
         # Ship each worker only its own chunk's records — the full dict is
@@ -394,6 +451,7 @@ def main(config, config_path: str | None = None):
                 max_shard_count,
                 shard_start_index,
                 readahead,
+                shard_namespace,
             )
             for worker_id, chunk in enumerate(chunks)
         ]

@@ -39,6 +39,8 @@ ALLOWED_STAGES = (
     "14",
     "15",
 )
+RUNTIME_MODES = ("docker", "direct")
+TRANSFER_MODES = ("auto", "rsync", "stream")
 
 
 def validate_slug(value: str, label: str = "identifier") -> str:
@@ -78,6 +80,13 @@ class NodeConfig:
     image: str | None = None
     env_file: str | None = None
     enabled: bool = True
+    runtime: str = "docker"
+    gpu_devices: tuple[int, ...] = (0,)
+    pipeline_root: str = "/opt/balalaika/app"
+    venv_path: str = "/opt/balalaika/.venv"
+    transfer: str = "rsync"
+    max_gpu_memory_used_mib: int = 1024
+    max_gpu_utilization_percent: int = 20
 
     @property
     def destination(self) -> str:
@@ -86,6 +95,10 @@ class NodeConfig:
     @property
     def runner_path(self) -> str:
         return f"{self.work_root}/bin/balalaika-node-runner.py"
+
+    @property
+    def renderer_path(self) -> str:
+        return f"{self.work_root}/bin/balalaika-prepare-config.py"
 
 
 @dataclass(frozen=True)
@@ -187,6 +200,57 @@ def load_cluster_config(path: str | Path) -> ClusterConfig:
         if not 1 <= port <= 65535:
             raise ValueError(f"Invalid SSH port for {node_id}: {port}")
         env_file = item.get("env_file")
+        runtime = str(item.get("runtime", "docker"))
+        if runtime not in RUNTIME_MODES:
+            raise ValueError(
+                f"nodes.{node_id}.runtime must be one of {', '.join(RUNTIME_MODES)}"
+            )
+        transfer = str(item.get("transfer", "rsync"))
+        if transfer not in TRANSFER_MODES:
+            raise ValueError(
+                f"nodes.{node_id}.transfer must be one of "
+                f"{', '.join(TRANSFER_MODES)}"
+            )
+        gpu_values = item.get("gpu_devices", [0])
+        if not isinstance(gpu_values, list) or not gpu_values:
+            raise ValueError(f"nodes.{node_id}.gpu_devices must be a non-empty list")
+        gpu_devices: list[int] = []
+        for value in gpu_values:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"nodes.{node_id}.gpu_devices must contain integer indices"
+                )
+            if not 0 <= value <= 255:
+                raise ValueError(
+                    f"nodes.{node_id}.gpu_devices index is out of range: {value}"
+                )
+            if value in gpu_devices:
+                raise ValueError(
+                    f"nodes.{node_id}.gpu_devices contains duplicate index: {value}"
+                )
+            gpu_devices.append(value)
+        max_gpu_memory_used_mib = item.get("max_gpu_memory_used_mib", 1024)
+        if (
+            isinstance(max_gpu_memory_used_mib, bool)
+            or not isinstance(max_gpu_memory_used_mib, int)
+            or not 0 <= max_gpu_memory_used_mib <= 1024 * 1024
+        ):
+            raise ValueError(
+                f"nodes.{node_id}.max_gpu_memory_used_mib must be an integer "
+                "from 0 to 1048576"
+            )
+        max_gpu_utilization_percent = item.get(
+            "max_gpu_utilization_percent", 20
+        )
+        if (
+            isinstance(max_gpu_utilization_percent, bool)
+            or not isinstance(max_gpu_utilization_percent, int)
+            or not 0 <= max_gpu_utilization_percent <= 100
+        ):
+            raise ValueError(
+                f"nodes.{node_id}.max_gpu_utilization_percent must be an integer "
+                "from 0 to 100"
+            )
         nodes.append(
             NodeConfig(
                 id=node_id,
@@ -212,6 +276,19 @@ def load_cluster_config(path: str | Path) -> ClusterConfig:
                     else None
                 ),
                 enabled=bool(item.get("enabled", True)),
+                runtime=runtime,
+                gpu_devices=tuple(gpu_devices),
+                pipeline_root=_remote_path(
+                    str(item.get("pipeline_root", "/opt/balalaika/app")),
+                    f"nodes.{node_id}.pipeline_root",
+                ),
+                venv_path=_remote_path(
+                    str(item.get("venv_path", "/opt/balalaika/.venv")),
+                    f"nodes.{node_id}.venv_path",
+                ),
+                transfer=transfer,
+                max_gpu_memory_used_mib=max_gpu_memory_used_mib,
+                max_gpu_utilization_percent=max_gpu_utilization_percent,
             )
         )
 

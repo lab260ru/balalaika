@@ -60,8 +60,41 @@ class ClusterScheduler:
         self.db.initialize()
         self.db.sync_nodes(self.config.nodes)
 
-    def _execution_config_sha256(self) -> str:
-        payload = {
+    def _execution_config_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": 2,
+            "source_root": str(self.config.source_root),
+            "image": self.config.image,
+            "stage_start": self.config.stage_start,
+            "stage_stop": self.config.stage_stop,
+            "shm_size": self.config.shm_size,
+            "nodes": [
+                {
+                    "id": node.id,
+                    "host": node.host,
+                    "user": node.user,
+                    "port": node.port,
+                    "work_root": node.work_root,
+                    "models_root": node.models_root,
+                    "cache_root": node.cache_root,
+                    "image": node.image,
+                    "env_file": node.env_file,
+                    "enabled": node.enabled,
+                    "runtime": node.runtime,
+                    "gpu_devices": list(node.gpu_devices),
+                    "pipeline_root": node.pipeline_root,
+                    "venv_path": node.venv_path,
+                    "max_gpu_memory_used_mib": node.max_gpu_memory_used_mib,
+                    "max_gpu_utilization_percent": (
+                        node.max_gpu_utilization_percent
+                    ),
+                }
+                for node in sorted(self.config.nodes, key=lambda item: item.id)
+            ],
+        }
+
+    def _legacy_execution_config_payload(self) -> dict[str, Any]:
+        return {
             "schema_version": 1,
             "source_root": str(self.config.source_root),
             "image": self.config.image,
@@ -84,18 +117,46 @@ class ClusterScheduler:
                 for node in sorted(self.config.nodes, key=lambda item: item.id)
             ],
         }
+
+    @staticmethod
+    def _hash_execution_payload(payload: dict[str, Any]) -> str:
         encoded = json.dumps(
             payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
         ).encode("ascii")
         return hashlib.sha256(encoded).hexdigest()
 
+    def _execution_config_sha256(self) -> str:
+        return self._hash_execution_payload(self._execution_config_payload())
+
     def _assert_execution_config(self, run: dict[str, Any]) -> None:
         expected = run.get("execution_config_sha256")
-        actual = self._execution_config_sha256()
         if not expected:
             raise SchedulerError(
                 f"Run {run['id']} predates the execution-config snapshot; "
                 "create a new run plan"
+            )
+        version = run.get("execution_config_version")
+        if version is None:
+            legacy_compatible = all(
+                node.runtime == "docker"
+                and node.gpu_devices == (0,)
+                and node.pipeline_root == "/opt/balalaika/app"
+                and node.venv_path == "/opt/balalaika/.venv"
+                for node in self.config.nodes
+            )
+            if not legacy_compatible:
+                raise SchedulerError(
+                    f"Run {run['id']} uses the legacy Docker/GPU-0 execution snapshot; "
+                    "restore legacy node runtime settings or create a new run"
+                )
+            actual = self._hash_execution_payload(
+                self._legacy_execution_config_payload()
+            )
+        elif version == 2:
+            actual = self._execution_config_sha256()
+        else:
+            raise SchedulerError(
+                f"Run {run['id']} has unsupported execution-config version {version!r}"
             )
         if expected != actual:
             raise SchedulerError(
@@ -127,7 +188,17 @@ class ClusterScheduler:
             partition_count=count,
             split_state=split_state,
         )
-        plan.run["execution_config_sha256"] = self._execution_config_sha256()
+        execution_payload = self._execution_config_payload()
+        plan.run["execution_config_version"] = 2
+        plan.run["execution_config_json"] = json.dumps(
+            execution_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        plan.run["execution_config_sha256"] = self._hash_execution_payload(
+            execution_payload
+        )
         self.db.create_run(plan.run, plan.partitions)
         return {
             "run": plan.run,
@@ -157,6 +228,8 @@ class ClusterScheduler:
                 continue
             if not node.enabled:
                 continue
+            persisted = self.db.get_node(node.id)
+            drained = bool(persisted and persisted.get("drained"))
             try:
                 result = self.transport.probe(node)
                 error = self._probe_error(node, result)
@@ -168,11 +241,19 @@ class ClusterScheduler:
                         "node_id": node.id,
                         "ok": state == "ONLINE",
                         "error": error,
+                        "drained": drained,
                     }
                 )
             except TransportError as exc:
                 self.db.update_node(node.id, "OFFLINE", error=str(exc))
-                results.append({"node_id": node.id, "ok": False, "error": str(exc)})
+                results.append(
+                    {
+                        "node_id": node.id,
+                        "ok": False,
+                        "error": str(exc),
+                        "drained": drained,
+                    }
+                )
         return results
 
     def _probe_error(self, node: NodeConfig, result: dict[str, Any]) -> str | None:
@@ -182,16 +263,72 @@ class ClusterScheduler:
                 f"{RUNNER_SCHEMA_VERSION}, got {result.get('runner_schema')!r}; "
                 "run nodes bootstrap"
             )
-        if result.get("docker_ok") is not True:
-            return f"Docker is unavailable: {result.get('docker_error') or 'unknown error'}"
+        if result.get("runtime") != node.runtime:
+            return (
+                f"Worker runtime mismatch: expected {node.runtime!r}, "
+                f"got {result.get('runtime')!r}"
+            )
+        if tuple(result.get("gpu_devices") or ()) != node.gpu_devices:
+            return (
+                f"Worker GPU mapping mismatch: expected {list(node.gpu_devices)}, "
+                f"got {result.get('gpu_devices')!r}"
+            )
+        gpu_uuids = result.get("gpu_uuids")
+        if (
+            not isinstance(gpu_uuids, list)
+            or len(gpu_uuids) != len(node.gpu_devices)
+            or any(not isinstance(value, str) or not value for value in gpu_uuids)
+        ):
+            return "Worker did not resolve every configured GPU to a stable UUID"
         if result.get("gpu_ok") is not True:
-            return f"GPU 0 is unavailable: {result.get('gpu_error') or 'unknown error'}"
+            return (
+                f"Configured GPUs {list(node.gpu_devices)} are unavailable: "
+                f"{result.get('gpu_error') or 'unknown error'}"
+            )
+        gpu_details = result.get("gpus")
+        if not isinstance(gpu_details, list) or len(gpu_details) != len(
+            node.gpu_devices
+        ):
+            return "Worker did not return occupancy for every configured GPU"
+        for detail in gpu_details:
+            if not isinstance(detail, dict):
+                return "Worker returned invalid GPU occupancy details"
+            used = detail.get("memory_used_mib")
+            utilization = detail.get("utilization_percent")
+            if not isinstance(used, int) or not isinstance(utilization, int):
+                return "Worker returned incomplete GPU occupancy metrics"
+            if used > node.max_gpu_memory_used_mib:
+                return (
+                    f"GPU {detail.get('index')} is busy: {used} MiB used exceeds "
+                    f"limit {node.max_gpu_memory_used_mib} MiB"
+                )
+            if utilization > node.max_gpu_utilization_percent:
+                return (
+                    f"GPU {detail.get('index')} is busy: {utilization}% utilization "
+                    f"exceeds limit {node.max_gpu_utilization_percent}%"
+                )
         if result.get("ok") is not True:
             return "Node probe did not report a healthy worker"
-        if not result.get("image_id"):
-            return f"Docker image is not present: {node.image or self.config.image}"
         if result.get("models_ok") is not True:
             return f"Models directory is empty or missing: {node.models_root}"
+        if node.runtime == "direct":
+            if result.get("pipeline_ok") is not True:
+                return f"Pipeline is missing or invalid: {node.pipeline_root}/base.sh"
+            if result.get("renderer_ok") is not True:
+                return (
+                    "Direct config renderer is missing on the node; "
+                    "run nodes bootstrap"
+                )
+            if result.get("venv_ok") is not True:
+                return f"Virtual environment is missing or invalid: {node.venv_path}"
+        else:
+            if result.get("docker_ok") is not True:
+                return (
+                    "Docker is unavailable: "
+                    f"{result.get('docker_error') or 'unknown error'}"
+                )
+            if not result.get("image_id"):
+                return f"Docker image is not present: {node.image or self.config.image}"
         return None
 
     @staticmethod
@@ -310,8 +447,19 @@ class ClusterScheduler:
         attempt: dict[str, Any],
         run: dict[str, Any] | None = None,
     ) -> None:
+        saved_run, partition = self._run_and_partition(attempt)
         if run is None:
-            run, _ = self._run_and_partition(attempt)
+            run = saved_run
+        try:
+            gpu_uuids = json.loads(attempt.get("gpu_uuids_json") or "null")
+        except json.JSONDecodeError as exc:
+            raise SchedulerError("Attempt contains invalid GPU UUID state") from exc
+        if (
+            not isinstance(gpu_uuids, list)
+            or len(gpu_uuids) != len(node.gpu_devices)
+            or any(not isinstance(value, str) or not value for value in gpu_uuids)
+        ):
+            raise SchedulerError("Attempt has no complete GPU UUID snapshot")
         self.db.update_attempt(attempt["id"], "STARTING")
         response = self.transport.rpc(
             node,
@@ -319,9 +467,17 @@ class ClusterScheduler:
                 **self._attempt_request(attempt),
                 "operation": "start",
                 "image": node.image or run["image"],
+                "runtime": node.runtime,
+                "gpu_devices": list(node.gpu_devices),
+                "gpu_uuids": gpu_uuids,
+                "pipeline_root": node.pipeline_root,
+                "venv_path": node.venv_path,
                 "models_root": node.models_root,
                 "cache_root": node.cache_root,
                 "env_file": node.env_file,
+                "global_rank": int(partition["ordinal"]),
+                "max_gpu_memory_used_mib": node.max_gpu_memory_used_mib,
+                "max_gpu_utilization_percent": node.max_gpu_utilization_percent,
                 "stage_start": run["stage_start"],
                 "stage_stop": run["stage_stop"],
                 "shm_size": self.config.shm_size,
@@ -529,8 +685,16 @@ class ClusterScheduler:
                 self._record_attempt_error(attempt, exc)
 
         active_by_node = {item["node_id"] for item in self.db.list_active_attempts()}
+        persisted_nodes = {item["id"]: item for item in self.db.list_nodes()}
         for node in self.config.nodes:
-            if not node.enabled or node.id in active_by_node:
+            persisted = persisted_nodes.get(node.id)
+            if (
+                not node.enabled
+                or persisted is None
+                or not persisted["enabled"]
+                or persisted["drained"]
+                or node.id in active_by_node
+            ):
                 continue
             queued = self.db.next_queued_partition(run_id)
             if queued is None:
@@ -570,6 +734,7 @@ class ClusterScheduler:
                 node_host=node.host,
                 node_user=node.user,
                 node_port=node.port,
+                gpu_uuids=probe["gpu_uuids"],
             )
             if not claimed:
                 continue
